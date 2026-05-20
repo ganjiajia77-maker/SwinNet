@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# Environment
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+weights/
+runs/
+logs/
+wandb/
+tensorboard/
+
+# Dataset
+data/
+data1/
+datasets/
+DeepGlobe/
+DeepGlobe_512/
+CHN6_CUG/
+
+# Outputs
+model_out/
+diagnose_output/
+output/
+outputs/
+results/
+predictions/
+vis/
+visualization/
+
+# Large generated files
+*.npy
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
