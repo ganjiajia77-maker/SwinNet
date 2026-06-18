@@ -14,7 +14,7 @@ from datetime import datetime
 from networks.vision_transformer import SwinUnet as ViT_seg
 from datasets.dataset_synapse import ImageDataset, RandomGenerator
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from losses.road_losses import SurfaceSkeletonLoss
+from losses.road_losses import SurfaceStructureLoss
 from config import get_config
 
 parser = argparse.ArgumentParser()
@@ -23,8 +23,11 @@ parser.add_argument('--dataset', type=str, default='ImageData', help='dataset na
 parser.add_argument('--num_classes', type=int, default=1, help='output channel of network')
 parser.add_argument('--output_dir', type=str, default='./predictions', help='output dir')
 parser.add_argument('--batch_size', type=int, default=24, help='batch_size per gpu')
-parser.add_argument('--img_size', type=int, default=224, help='input patch size of network input')
+parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
+parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
+parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
+parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -141,15 +144,15 @@ if __name__ == "__main__":
     args.num_classes = 1
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes, use_asterisk=True,
-                    return_skeleton=True).cuda()
+                    return_skeleton=True, bottleneck_type=args.bottleneck_type).cuda()
     
     # 加载模型
     if os.path.exists(args.model_path):
         checkpoint = torch.load(args.model_path, map_location='cpu')
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         else:
-            model.load_state_dict(checkpoint)
+            model.load_state_dict(checkpoint, strict=(args.bottleneck_type == 'global_local'))
         print(f"已加载模型: {args.model_path}")
     else:
         print(f"错误: 模型文件不存在 {args.model_path}")
@@ -166,10 +169,92 @@ if __name__ == "__main__":
     print(f"  Label目录: {test_label_dir}")
     print(f"  阈值: {args.threshold}")
     
-    test_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='test', image_size=args.img_size)
-    
+    # 评估
+    print("\n开始推理...")
+    model.eval()
+
+    total_loss = 0
+    tp = fp = fn = 0
+    total_samples = 0
+
+    if args.overlap_infer:
+        # Overlap-tile inference on original images
+        import cv2
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_basename = os.path.splitext(os.path.basename(args.model_path))[0]
+        pred_dir = make_unique_dir(args.output_dir, f'{model_basename}_{timestamp}_overlap')
+        os.makedirs(pred_dir, exist_ok=True)
+        surface_dir = os.path.join(pred_dir, 'surface')
+        os.makedirs(surface_dir, exist_ok=True)
+
+        stride = args.img_size // 2
+        image_list = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'))])
+        print(f"使用滑窗推理: tile={args.img_size}, stride={stride}, cases={len(image_list)}")
+
+        with torch.no_grad():
+            for image_name in tqdm(image_list):
+                img_path = os.path.join(test_image_dir, image_name)
+                img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+                img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                h, w, _ = img.shape
+
+                # canvas to accumulate probabilities and counts
+                prob_canvas = np.zeros((h, w), dtype=np.float32)
+                count_canvas = np.zeros((h, w), dtype=np.float32)
+
+                # sliding
+                for y in range(0, max(1, h - args.img_size + 1), stride):
+                    for x in range(0, max(1, w - args.img_size + 1), stride):
+                        y1 = y
+                        x1 = x
+                        y2 = min(y1 + args.img_size, h)
+                        x2 = min(x1 + args.img_size, w)
+                        crop = img[y1:y2, x1:x2]
+
+                        # pad if needed
+                        ph = args.img_size - crop.shape[0]
+                        pw = args.img_size - crop.shape[1]
+                        if ph > 0 or pw > 0:
+                            crop = np.pad(crop, ((0, ph), (0, pw), (0, 0)), mode='constant', constant_values=0)
+
+                        # preprocess
+                        crop_f = crop.astype(np.float32) / 255.0
+                        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+                        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+                        crop_f = (crop_f - mean) / std
+                        crop_f = crop_f.transpose(2, 0, 1)
+                        inp = torch.from_numpy(crop_f).unsqueeze(0).cuda()
+
+                        outputs = model(inp)
+                        surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                        prob = torch.sigmoid(surface_logits)[0, 0].cpu().numpy()
+
+                        # crop to original size if padded
+                        prob = prob[:(y2 - y1), :(x2 - x1)]
+
+                        prob_canvas[y1:y2, x1:x2] += prob
+                        count_canvas[y1:y2, x1:x2] += 1.0
+
+                avg_prob = prob_canvas / (count_canvas + 1e-7)
+                pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
+
+                # save
+                case_name = os.path.splitext(image_name)[0]
+                png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
+                cv2.imwrite(png_save_path, pred)
+
+                total_samples += 1
+
+        print(f"滑窗推理完成，结果保存在: {pred_dir}")
+        # exit after sliding infer
+        sys.exit(0)
+
+    # 非滑窗情况：使用 Dataset + DataLoader（会对图像做 resize 到 args.img_size）
+    test_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='test', image_size=args.img_size, source_patch_size=args.source_patch_size)
+
     print(f"测试集大小: {len(test_dataset)}")
-    
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=1,
@@ -177,14 +262,6 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True
     )
-    
-    # 评估
-    print("\n开始推理...")
-    model.eval()
-    
-    total_loss = 0
-    tp = fp = fn = 0
-    total_samples = 0
     
     # 创建预测结果目录（包含模型名和时间戳，保留历史结果）
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -197,10 +274,14 @@ if __name__ == "__main__":
     os.makedirs(surface_dir, exist_ok=True)
     os.makedirs(skeleton_dir, exist_ok=True)
     
-    criterion = SurfaceSkeletonLoss(
+    criterion = SurfaceStructureLoss(
         surface_dice_weight=0.5,
         skeleton_dice_weight=1.0,
-        skeleton_weight=0.3
+        skeleton_weight=0.02,
+        connectivity_weight=0.03,
+        connectivity_erode_kernel_size=1,
+        skeleton_cldice_weight=0.01,
+        skeleton_cldice_iterations=10,
     ).cuda()
     
     with torch.no_grad():
@@ -208,15 +289,25 @@ if __name__ == "__main__":
             images = batch['image'].cuda()
             masks = batch['mask'].cuda()
             skeletons = batch['skeleton'].cuda()
+            skeletons_dilate = batch['skeleton_dilate'].cuda()
             
-            surface_logits, skeleton_logits, skeleton_attn = model(images)
+            outputs = model(images)
+            if isinstance(outputs, tuple):
+                surface_logits, skeleton_logits, connectivity_logits = outputs[:3]
+            else:
+                raise RuntimeError("Structure-guided test requires auxiliary model outputs.")
             
-            # 计算损失 - CE Loss + Dice Loss
-            loss, _ = criterion(surface_logits, skeleton_logits, masks, skeletons)
+            loss, _ = criterion(
+                surface_logits,
+                skeleton_logits,
+                connectivity_logits,
+                masks,
+                skeletons,
+                skeletons_dilate,
+            )
             total_loss += loss.item()
             
             pred = (torch.sigmoid(surface_logits) >= args.threshold).float()
-            skeleton_pred = (torch.sigmoid(skeleton_logits) >= args.threshold).float()
             masks = (masks > 0.5).float()
             
             tp += int((pred * masks).sum().item())
@@ -228,21 +319,37 @@ if __name__ == "__main__":
             # 自动保存预测结果（NPY 格式用于计算，PNG 格式便于查看）
             case_name = batch['case_name'][0]
             
-            # 保存为 NPY（二进制，用于后续处理）
-            npy_save_path = os.path.join(surface_dir, f'{case_name}_pred.npy')
-            np.save(npy_save_path, pred.squeeze(0).squeeze(0).cpu().numpy())
-            skeleton_npy_save_path = os.path.join(skeleton_dir, f'{case_name}_skeleton_pred.npy')
-            np.save(skeleton_npy_save_path, skeleton_pred.squeeze(0).squeeze(0).cpu().numpy())
-            
-            # 保存为 PNG（可视化）
-            pred_numpy = (pred.squeeze(0).squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            # 仅保存 PNG：最多保留 30 张代表性预测（按前 30 个 case）
+            prob_numpy = torch.sigmoid(surface_logits).squeeze(0).squeeze(0).cpu().numpy()
+            skeleton_prob_numpy = torch.sigmoid(skeleton_logits).squeeze(0).squeeze(0).cpu().numpy()
+            if args.source_patch_size and args.source_patch_size != args.img_size:
+                prob_resized = np.array(
+                    Image.fromarray(prob_numpy.astype(np.float32), mode='F').resize(
+                        (args.source_patch_size, args.source_patch_size),
+                        Image.BILINEAR,
+                    ),
+                    dtype=np.float32,
+                )
+                skeleton_prob_resized = np.array(
+                    Image.fromarray(skeleton_prob_numpy.astype(np.float32), mode='F').resize(
+                        (args.source_patch_size, args.source_patch_size),
+                        Image.BILINEAR,
+                    ),
+                    dtype=np.float32,
+                )
+                pred_numpy = (prob_resized >= args.threshold).astype(np.uint8) * 255
+                skeleton_pred_numpy = (skeleton_prob_resized >= args.threshold).astype(np.uint8) * 255
+            else:
+                pred_numpy = (prob_numpy >= args.threshold).astype(np.uint8) * 255
+                skeleton_pred_numpy = (skeleton_prob_numpy >= args.threshold).astype(np.uint8) * 255
             pred_img = Image.fromarray(pred_numpy, mode='L')
-            png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
-            pred_img.save(png_save_path)
-            skeleton_numpy = (skeleton_pred.squeeze(0).squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            skeleton_img = Image.fromarray(skeleton_numpy, mode='L')
-            skeleton_png_save_path = os.path.join(skeleton_dir, f'{case_name}_skeleton_pred.png')
-            skeleton_img.save(skeleton_png_save_path)
+            skeleton_pred_img = Image.fromarray(skeleton_pred_numpy, mode='L')
+            # 只保存前 30 张到 surface_dir
+            if total_samples <= 30:
+                png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
+                pred_img.save(png_save_path)
+                skeleton_png_save_path = os.path.join(skeleton_dir, f'{case_name}_skeleton_pred.png')
+                skeleton_pred_img.save(skeleton_png_save_path)
     
     print(f"预测结果已保存到: {pred_dir}")
     

@@ -21,15 +21,37 @@ from .dilated_asterisk import DilatedAsteriskWithDirections
 
 logger = logging.getLogger(__name__)
 
+
+def load_state_dict_ignore_mismatch(model, state_dict, prefix=""):
+    model_dict = model.state_dict()
+    filtered_dict = {}
+    skipped_keys = []
+
+    for key, value in state_dict.items():
+        if key in model_dict and model_dict[key].shape == value.shape:
+            filtered_dict[key] = value
+        else:
+            skipped_keys.append(key)
+
+    model_dict.update(filtered_dict)
+    msg = model.load_state_dict(model_dict, strict=False)
+    print(f"{prefix}loaded keys: {len(filtered_dict)}")
+    print(f"{prefix}skipped keys: {len(skipped_keys)}")
+    for key in skipped_keys[:20]:
+        print(f"{prefix}skipped: {key}")
+    return msg
+
+
 class SwinUnet(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
-                 use_asterisk=False, return_skeleton=False):
+                 use_asterisk=False, return_skeleton=False, bottleneck_type="global_local"):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.config = config
         self.use_asterisk = use_asterisk
         self.return_skeleton = return_skeleton
+        self.bottleneck_type = bottleneck_type
 
         self.swin_unet = SwinTransformerSys(img_size=config.DATA.IMG_SIZE,
                                 patch_size=config.MODEL.SWIN.PATCH_SIZE,
@@ -47,7 +69,8 @@ class SwinUnet(nn.Module):
                                 ape=config.MODEL.SWIN.APE,
                                 patch_norm=config.MODEL.SWIN.PATCH_NORM,
                                 use_checkpoint=config.TRAIN.USE_CHECKPOINT,
-                                return_skeleton=self.return_skeleton)
+                                return_skeleton=self.return_skeleton,
+                                bottleneck_type=self.bottleneck_type)
         
         # ===== 可选：添加 DilatedAsterisk 空洞空间特征增强模块 =====
         if self.use_asterisk:
@@ -62,19 +85,20 @@ class SwinUnet(nn.Module):
     def forward(self, x):
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)
-        logits = self.swin_unet(x)
+        outputs = self.swin_unet(x)
 
-        if self.return_skeleton:
-            # new guided head returns (surface_logits, skeleton_logits, skeleton_attn)
-            surface_logits, skeleton_logits, skeleton_attn = logits
-            if self.use_asterisk:
-                surface_logits = self.asterisk(surface_logits)
-            return surface_logits, skeleton_logits, skeleton_attn
-        
-        # 如果启用了 DilatedAsterisk，对 logits 进行空间特征增强
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+            aux_outputs = outputs[1:]
+        else:
+            logits = outputs
+            aux_outputs = ()
+
         if self.use_asterisk:
             logits = self.asterisk(logits)
-        
+
+        if self.return_skeleton:
+            return (logits, *aux_outputs)
         return logits
 
     def load_from(self, config):
@@ -90,7 +114,7 @@ class SwinUnet(nn.Module):
                     if "output" in k:
                         print("delete key:{}".format(k))
                         del pretrained_dict[k]
-                msg = self.swin_unet.load_state_dict(pretrained_dict,strict=False)
+                msg = load_state_dict_ignore_mismatch(self.swin_unet, pretrained_dict)
                 # print(msg)
                 return
             pretrained_dict = pretrained_dict['model']
@@ -104,12 +128,17 @@ class SwinUnet(nn.Module):
                     current_k = "layers_up." + str(current_layer_num) + k[8:]
                     full_dict.update({current_k:v})
             for k in list(full_dict.keys()):
+                if ".reduction.weight" in k and ".linear_reduction.weight" not in k:
+                    linear_key = k.replace(".reduction.weight", ".linear_reduction.weight")
+                    if linear_key not in full_dict:
+                        full_dict[linear_key] = full_dict[k]
+            for k in list(full_dict.keys()):
                 if k in model_dict:
                     if full_dict[k].shape != model_dict[k].shape:
-                        print("delete:{};shape pretrain:{};shape model:{}".format(k,v.shape,model_dict[k].shape))
+                        print("delete:{};shape pretrain:{};shape model:{}".format(k, full_dict[k].shape, model_dict[k].shape))
                         del full_dict[k]
 
-            msg = self.swin_unet.load_state_dict(full_dict, strict=False)
+            msg = load_state_dict_ignore_mismatch(self.swin_unet, full_dict)
             # print(msg)
         else:
             print("none pretrain")

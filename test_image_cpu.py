@@ -24,6 +24,8 @@ parser.add_argument('--num_classes', type=int, default=1, help='output channel o
 parser.add_argument('--output_dir', type=str, default='./predictions', help='output dir')
 parser.add_argument('--batch_size', type=int, default=24, help='batch_size per gpu')
 parser.add_argument('--img_size', type=int, default=224, help='input patch size of network input')
+parser.add_argument('--img_size', type=int, default=512, help='input patch size of network input')
+parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
@@ -66,27 +68,27 @@ class ResizeToTensor:
 
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
-        # image: [3, H, W], label: [H, W] (已二值化�?0 �?1)
+        # image: [3, H, W], label: [H, W] (已二值化�?0 �?1)
         
-        # 转换�?[H, W, 3] 便于 PIL 处理
+        # 转换�?[H, W, 3] 便于 PIL 处理
         image = image.transpose(1, 2, 0)  # [3, H, W] -> [H, W, 3]
         
-        # 转换�?uint8 进行 PIL 操作（反去归一化和标准化）
+        # 转换�?uint8 进行 PIL 操作（反去归一化和标准化）
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        image = (image * std + mean) * 255  # 反归一�?
+        image = (image * std + mean) * 255  # 反归一�?
         image = np.clip(image, 0, 255).astype(np.uint8)
         
         image = Image.fromarray(image, mode='RGB').resize(self.output_size, Image.BILINEAR)
         
-        # 标签已经二值化�?0.0 �?1.0，需要转换为 0-255 再进�?resize
-        label_255 = (label * 255).astype(np.uint8)  # 转换�?0-255 用于 resize
+        # 标签已经二值化�?0.0 �?1.0，需要转换为 0-255 再进�?resize
+        label_255 = (label * 255).astype(np.uint8)  # 转换�?0-255 用于 resize
         label = Image.fromarray(label_255).resize(self.output_size, Image.NEAREST)
         
-        # 转回 float32 并重新归一�?
+        # 转回 float32 并重新归一�?
         image = np.array(image, dtype=np.float32) / 255.0
         
-        # ImageNet 标准�?
+        # ImageNet 标准�?
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         image = (image - mean) / std
@@ -101,11 +103,11 @@ class ResizeToTensor:
 def dice_loss(pred, target, threshold=0.5):
     """
     计算 Dice Loss
-    pred: [B, 2, H, W] - 模型输出（logits�?
+    pred: [B, 2, H, W] - 模型输出（logits�?
     target: [B, H, W] - 目标标签
-    threshold: 二值化阈�?
+    threshold: 二值化阈�?
     """
-    # 如果�?[B, 2, H, W]，取�?1 类的概率
+    # 如果�?[B, 2, H, W]，取�?1 类的概率
     if pred.dim() == 4 and pred.size(1) == 2:
         pred_prob = torch.softmax(pred, dim=1)[:, 1]  # [B, H, W]
     else:
@@ -151,9 +153,9 @@ if __name__ == "__main__":
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint)
-        print(f"已加载模�? {args.model_path}")
+        print(f"已加载模�? {args.model_path}")
     else:
-        print(f"错误: 模型文件不存�?{args.model_path}")
+        print(f"错误: 模型文件不存�?{args.model_path}")
         exit(1)
     
     # 加载测试数据
@@ -165,11 +167,11 @@ if __name__ == "__main__":
     print(f"加载测试数据...")
     print(f"  Image目录: {test_image_dir}")
     print(f"  Label目录: {test_label_dir}")
-    print(f"  阈�? {args.threshold}")
+    print(f"  阈�? {args.threshold}")
     
     test_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='test', image_size=args.img_size)
     
-    print(f"测试集大�? {len(test_dataset)}")
+    print(f"测试集大�? {len(test_dataset)}")
     
     test_loader = DataLoader(
         test_dataset,
@@ -180,7 +182,7 @@ if __name__ == "__main__":
     )
     
     # 评估
-    print("\n开始推�?..")
+    print("\n开始推�?..")
     model.eval()
     
     total_loss = 0
@@ -189,7 +191,7 @@ if __name__ == "__main__":
     
     # 创建预测结果目录（包含模型名和时间戳，保留历史结果）
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 使用模型文件名作为标识，方便对比不同checkpoint的结�?
+    # 使用模型文件名作为标识，方便对比不同checkpoint的结�?
     model_basename = os.path.splitext(os.path.basename(args.model_path))[0]
     pred_dir = make_unique_dir(args.output_dir, f'{model_basename}_{timestamp}')
     os.makedirs(pred_dir, exist_ok=True)
@@ -201,7 +203,7 @@ if __name__ == "__main__":
     criterion = SurfaceSkeletonLoss(
         surface_dice_weight=0.5,
         skeleton_dice_weight=1.0,
-        skeleton_weight=0.3
+        skeleton_weight=0.3,
     ).to(device)
     
     with torch.no_grad():
@@ -226,16 +228,16 @@ if __name__ == "__main__":
             
             total_samples += 1
             
-            # 自动保存预测结果（NPY 格式用于计算，PNG 格式便于查看�?
+            # 自动保存预测结果（NPY 格式用于计算，PNG 格式便于查看�?
             case_name = batch['case_name'][0]
             
-            # 保存�?NPY（二进制，用于后续处理）
+            # 保存�?NPY（二进制，用于后续处理）
             npy_save_path = os.path.join(surface_dir, f'{case_name}_pred.npy')
             np.save(npy_save_path, pred.squeeze(0).squeeze(0).cpu().numpy())
             skeleton_npy_save_path = os.path.join(skeleton_dir, f'{case_name}_skeleton_pred.npy')
             np.save(skeleton_npy_save_path, skeleton_pred.squeeze(0).squeeze(0).cpu().numpy())
             
-            # 保存�?PNG（可视化�?
+            # 保存�?PNG（可视化�?
             pred_numpy = (pred.squeeze(0).squeeze(0).cpu().numpy() * 255).astype(np.uint8)
             pred_img = Image.fromarray(pred_numpy, mode='L')
             png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
@@ -253,7 +255,7 @@ if __name__ == "__main__":
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
     iou = tp / (tp + fp + fn + 1e-8)
     
-    # 打印到控制台�?txt 日志
+    # 打印到控制台�?txt 日志
     result_lines = []
     result_lines.append(f"\n测试完成!")
     result_lines.append(f"  平均损失: {avg_loss:.4f}")
@@ -261,7 +263,7 @@ if __name__ == "__main__":
     result_lines.append(f"  F1: {f1:.4f}")
     result_lines.append(f"  Precision: {precision:.4f}")
     result_lines.append(f"  Recall: {recall:.4f}")
-    result_lines.append(f"  总测试样�? {len(test_loader)}")
+    result_lines.append(f"  总测试样�? {len(test_loader)}")
     result_lines.append(f"  预测掩码保存位置: {pred_dir}")
     
     result_lines.append(f"  Surface mask save dir: {surface_dir}")
@@ -270,24 +272,24 @@ if __name__ == "__main__":
     for line in result_lines:
         print(line, flush=True)
     
-    # 保存测试结果�?txt 文件（保存到带时间戳的文件夹下）
+    # 保存测试结果�?txt 文件（保存到带时间戳的文件夹下）
     test_log_path = os.path.join(pred_dir, 'test_results.txt')
     with open(test_log_path, 'w', encoding='utf-8') as log_f:
         log_f.write("="*80 + "\n")
         log_f.write("测试结果\n")
         log_f.write("="*80 + "\n")
-        log_f.write(f"时间�? {timestamp}\n")
+        log_f.write(f"时间�? {timestamp}\n")
         log_f.write(f"模型路径: {args.model_path}\n")
-        log_f.write(f"阈�? {args.threshold}\n")
+        log_f.write(f"阈�? {args.threshold}\n")
         log_f.write(f"输入图像大小: {args.img_size}\n")
         log_f.write(f"测试数据路径: {args.root_path}\n")
         log_f.write("="*80 + "\n")
-        for line in result_lines[1:]:  # 跳过第一�?测试完成"
+        for line in result_lines[1:]:  # 跳过第一�?测试完成"
             log_f.write(line + "\n")
         log_f.write("="*80 + "\n")
     
     print(f"测试日志已保存到: {test_log_path}", flush=True)
     
     if args.is_savenii:
-        print(f"  预测结果保存�? {args.output_dir}")
+        print(f"  预测结果保存�? {args.output_dir}")
 

@@ -1,8 +1,10 @@
 import argparse
 import csv
+import math
 import os
 import random
 import sys
+import tempfile
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -13,7 +15,7 @@ from torch.utils.data import DataLoader
 from networks.vision_transformer import SwinUnet as ViT_seg
 from datasets.dataset_synapse import ImageDataset, RandomGenerator
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from losses.road_losses import SurfaceSkeletonLoss
+from losses.road_losses import SurfaceStructureLoss
 from config import get_config
 
 parser = argparse.ArgumentParser()
@@ -24,11 +26,14 @@ parser.add_argument('--num_classes', type=int, default=2, help='output channel o
 parser.add_argument('--output_dir', type=str, default='./model_out', help='output dir')
 parser.add_argument('--run_name', type=str, default='', help='optional run folder name under output_dir')
 parser.add_argument('--max_epochs', type=int, default=100, help='maximum epoch number to train')
-parser.add_argument('--batch_size', type=int, default=12, help='batch_size per gpu')
 parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
-parser.add_argument('--base_lr', type=float, default=0.001, help='segmentation network learning rate')
-parser.add_argument('--img_size', type=int, default=224, help='input patch size of network input')
+parser.add_argument('--base_lr', type=float, default=5e-4, help='segmentation network learning rate')
+parser.add_argument('--min_lr', type=float, default=1e-5, help='minimum learning rate for cosine decay')
+parser.add_argument('--warmup_epochs', type=int, default=3, help='warmup epochs before cosine decay')
+parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
+parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
+parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml', 
                     help='path to config file')
@@ -36,6 +41,10 @@ parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
+parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
+parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
+parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
+parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
 # Options expected by the original config updater
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
 parser.add_argument('--zip', action='store_true', help='use zipped dataset')
@@ -61,6 +70,56 @@ def make_unique_dir(base_dir, run_name):
         if not os.path.exists(candidate):
             return candidate
         index += 1
+
+
+def save_checkpoint_safely(checkpoint, target_path):
+    """Save directly on Windows to avoid orphaned temporary checkpoint files."""
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    torch.save(checkpoint, target_path, _use_new_zipfile_serialization=False)
+
+
+def model_state_is_finite(model):
+    for param in model.state_dict().values():
+        if torch.is_tensor(param) and not torch.isfinite(param).all():
+            return False
+    return True
+
+
+def get_cosine_warmup_lr(epoch, max_epochs, base_lr, min_lr, warmup_epochs):
+    if max_epochs <= 0:
+        return base_lr
+
+    warmup_epochs = max(0, warmup_epochs)
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        return base_lr * float(epoch + 1) / float(warmup_epochs)
+
+    decay_epochs = max(1, max_epochs - warmup_epochs)
+    if decay_epochs == 1:
+        return min_lr
+
+    progress = min(float(epoch - warmup_epochs) / float(decay_epochs - 1), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def pad_to_window_multiple(x, window_size=7):
+    """
+    Pad input tensor to be divisible by window_size.
+    Returns: (padded_tensor, original_shape)
+    """
+    B, C, H, W = x.shape
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
+    return x, (H, W)
+
+
+def crop_to_shape(x, target_shape):
+    """Crop tensor back to target shape."""
+    H, W = target_shape
+    return x[:, :, :H, :W]
 
 # 模块级别定义，以便被 DataLoader worker 进程使用
 class ResizeToTensor:
@@ -102,7 +161,7 @@ class ResizeToTensor:
         sample = {'image': torch.from_numpy(image), 'label': torch.from_numpy(label).long()}
         return sample
 
-def load_split(split_name, train_mode=True, root_path='.', img_size=224, num_workers=4):
+def load_split(split_name, train_mode=True, root_path='.', img_size=512, num_workers=4):
     image_dir = os.path.join(root_path, split_name, 'image')
     label_dir = os.path.join(root_path, split_name, 'label')
     print(f"加载{split_name}数据...")
@@ -145,15 +204,11 @@ def evaluate(model, loader, criterion, threshold=0.2):
     debug_printed = False  # 仅打印第一个batch的调试信息
     with torch.no_grad():
         for batch in loader:
-            images = batch['image'].cuda()
-            labels = batch['label'].long().cuda()
+            images = batch['image'].to(device)
+            labels = batch['label'].long().to(device)
 
             outputs = model(images)
-            # model now returns (surface_logits, skeleton_logits, skeleton_attn) when return_skeleton
-            if isinstance(outputs, tuple) and len(outputs) == 3:
-                surface_logits, skeleton_logits, _ = outputs
-            else:
-                surface_logits = outputs
+            surface_logits = outputs
 
             # CE Loss
             ce_loss = criterion(surface_logits, labels)
@@ -197,32 +252,51 @@ def evaluate_skeleton(model, loader, criterion, threshold=0.2):
 
     with torch.no_grad():
         for batch in loader:
-            images = batch['image'].cuda()
-            masks = batch['mask'].cuda()
-            skeletons = batch['skeleton'].cuda()
+            images = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+            skeletons = batch['skeleton'].to(device)
+            skeletons_dilate = batch['skeleton_dilate'].to(device)
 
-            outputs = model(images)
-            if isinstance(outputs, tuple) and len(outputs) == 3:
-                surface_logits, skeleton_logits, _ = outputs
+            images_padded, orig_shape = pad_to_window_multiple(images, window_size=8)
+            masks_padded, _ = pad_to_window_multiple(masks, window_size=8)
+            skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=8)
+            skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=8)
+            
+            outputs = model(images_padded)
+
+            if isinstance(outputs, tuple):
+                surface_logits, skeleton_logits, connectivity_logits = outputs[:3]
             else:
-                surface_logits = outputs
-                skeleton_logits = outputs
+                raise RuntimeError("Structure-guided training requires auxiliary model outputs.")
+            surface_logits = crop_to_shape(surface_logits, orig_shape)
+            skeleton_logits = crop_to_shape(skeleton_logits, orig_shape)
+            connectivity_logits = crop_to_shape(connectivity_logits, orig_shape)
+            
+            masks_padded = crop_to_shape(masks_padded, orig_shape)
+            skeletons_padded = crop_to_shape(skeletons_padded, orig_shape)
+            skeletons_dilate_padded = crop_to_shape(skeletons_dilate_padded, orig_shape)
 
-            loss, _ = criterion(surface_logits, skeleton_logits, masks, skeletons)
+            loss, _ = criterion(
+                surface_logits,
+                skeleton_logits,
+                connectivity_logits,
+                masks_padded,
+                skeletons_padded,
+                skeletons_dilate_padded,
+            )
             total_loss += loss.item()
 
-            surface_pred = (torch.sigmoid(surface_logits) >= threshold).float()
-            skeleton_pred = (torch.sigmoid(skeleton_logits) >= threshold).float()
-            masks = (masks > 0.5).float()
-            skeletons = (skeletons > 0.5).float()
+            surface_pred = (torch.sigmoid(surface_logits) >= threshold).float().squeeze(1)
+            skeleton_pred = (torch.sigmoid(skeleton_logits) >= threshold).float().squeeze(1)
+            masks_bin = (masks_padded > 0.5).float().squeeze(1)
+            skeletons_bin = (skeletons_padded > 0.5).float().squeeze(1)
 
-            surface_tp += int((surface_pred * masks).sum().item())
-            surface_fp += int((surface_pred * (1.0 - masks)).sum().item())
-            surface_fn += int(((1.0 - surface_pred) * masks).sum().item())
-
-            skeleton_tp += int((skeleton_pred * skeletons).sum().item())
-            skeleton_fp += int((skeleton_pred * (1.0 - skeletons)).sum().item())
-            skeleton_fn += int(((1.0 - skeleton_pred) * skeletons).sum().item())
+            surface_tp += int((surface_pred * masks_bin).sum().item())
+            surface_fp += int((surface_pred * (1.0 - masks_bin)).sum().item())
+            surface_fn += int(((1.0 - surface_pred) * masks_bin).sum().item())
+            skeleton_tp += int((skeleton_pred * skeletons_bin).sum().item())
+            skeleton_fp += int((skeleton_pred * (1.0 - skeletons_bin)).sum().item())
+            skeleton_fn += int(((1.0 - skeleton_pred) * skeletons_bin).sum().item())
 
     avg_loss = total_loss / max(len(loader), 1)
 
@@ -230,7 +304,6 @@ def evaluate_skeleton(model, loader, criterion, threshold=0.2):
     surface_recall = surface_tp / (surface_tp + surface_fn + 1e-8)
     surface_f1 = 2 * surface_precision * surface_recall / (surface_precision + surface_recall + 1e-8)
     surface_iou = surface_tp / (surface_tp + surface_fp + surface_fn + 1e-8)
-
     skeleton_precision = skeleton_tp / (skeleton_tp + skeleton_fp + 1e-8)
     skeleton_recall = skeleton_tp / (skeleton_tp + skeleton_fn + 1e-8)
     skeleton_f1 = 2 * skeleton_precision * skeleton_recall / (skeleton_precision + skeleton_recall + 1e-8)
@@ -249,6 +322,10 @@ def evaluate_skeleton(model, loader, criterion, threshold=0.2):
     }
 
 if __name__ == "__main__":
+    # 自动检测可用设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[INFO] Using device: {device}")
+    
     if not args.deterministic:
         cudnn.benchmark = True
         cudnn.deterministic = False
@@ -259,7 +336,8 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
 
     # 设置训练参数
     base_output_dir = args.output_dir
@@ -276,14 +354,24 @@ if __name__ == "__main__":
     # 加载配置
     config = get_config(args)
     
+    # 对齐 img_size 到 window_size=8 的倍数（模型初始化时需要）
+    window_size = 8
+    aligned_img_size = ((args.img_size + window_size - 1) // window_size) * window_size
+    if aligned_img_size != args.img_size:
+        print(f"[INFO] 对齐 img_size: {args.img_size} -> {aligned_img_size} (window_size={window_size})")
+        config.defrost()
+        config.DATA.IMG_SIZE = aligned_img_size
+        config.freeze()
+        args.img_size = aligned_img_size
+    
     # 创建网络（启用 DilatedAsterisk 空间特征增强）
     args.num_classes = 1
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes, use_asterisk=True,
-                    return_skeleton=True).cuda()
+                    return_skeleton=True, bottleneck_type=args.bottleneck_type).to(device)
 
     # 加载数据
-    train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size)
+    train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -292,7 +380,7 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-    val_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='val', image_size=args.img_size)
+    val_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='val', image_size=args.img_size, source_patch_size=args.source_patch_size)
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
@@ -305,11 +393,15 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr, weight_decay=0.0001)
 
     # 损失函数
-    criterion = SurfaceSkeletonLoss(
+    criterion = SurfaceStructureLoss(
         surface_dice_weight=0.5,
         skeleton_dice_weight=1.0,
-        skeleton_weight=0.3
-    ).cuda()
+        skeleton_weight=0.02,
+        connectivity_weight=0.03,
+        connectivity_erode_kernel_size=1,
+        skeleton_cldice_weight=0.01,
+        skeleton_cldice_iterations=10,
+    ).to(device)
 
     # 检查是否恢复训练
     start_epoch = 0
@@ -317,7 +409,7 @@ if __name__ == "__main__":
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location='cuda')
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint.get('epoch', 0)
             print(f"从epoch {start_epoch} 继续训练...")
@@ -330,9 +422,23 @@ if __name__ == "__main__":
     print(f"  最大轮数: {args.max_epochs}")
     print(f"  批大小: {args.batch_size}")
     print(f"  学习率: {args.base_lr}")
+    print(f"  最小学习率: {args.min_lr}")
+    print(f"  Warmup轮数: {args.warmup_epochs}")
+    print("  Structure head: skeleton + top-2 connectivity residual attention")
+    print("  Skeleton target: regenerated from resized road mask")
+    print("  Skeleton loss weight: 0.02")
+    print("  Skeleton loss: BCE on dilated skeleton + Dice on hard skeleton")
+    print("  Connectivity loss weight: 0.03")
+    print("  Connectivity target: hard skeleton 8-neighbor connectivity")
+    print("  Skeleton clDice loss weight: 0.01")
+    print("  Skeleton clDice iterations: 10")
+    print("  Edge loss: disabled")
+    print("  Edge skip enhance: disabled")
     print(f"  输出目录: {args.output_dir}")
     print(f"  Checkpoints目录: {checkpoints_dir}")
     print(f"  验证阈值: {args.threshold}")
+    if args.max_train_batches > 0:
+        print(f"  每轮最多训练batch数: {args.max_train_batches}")
     if args.resume:
         print(f"  从checkpoint恢复: {args.resume}")
         print(f"  起始epoch: {start_epoch}")
@@ -348,8 +454,22 @@ if __name__ == "__main__":
         log_f.write(f"  最大轮数: {args.max_epochs}\n")
         log_f.write(f"  批大小: {args.batch_size}\n")
         log_f.write(f"  学习率: {args.base_lr}\n")
+        log_f.write(f"  最小学习率: {args.min_lr}\n")
+        log_f.write(f"  Warmup轮数: {args.warmup_epochs}\n")
+        log_f.write("  Structure head: skeleton + top-2 connectivity residual attention\n")
+        log_f.write("  Skeleton target: regenerated from resized road mask\n")
+        log_f.write("  Skeleton loss weight: 0.02\n")
+        log_f.write("  Skeleton loss: BCE on dilated skeleton + Dice on hard skeleton\n")
+        log_f.write("  Connectivity loss weight: 0.03\n")
+        log_f.write("  Connectivity target: hard skeleton 8-neighbor connectivity\n")
+        log_f.write("  Skeleton clDice loss weight: 0.01\n")
+        log_f.write("  Skeleton clDice iterations: 10\n")
+        log_f.write("  Edge loss: disabled\n")
+        log_f.write("  Edge skip enhance: disabled\n")
         log_f.write(f"  验证阈值: {args.threshold}\n")
         log_f.write(f"  数据目录: {args.root_path}\n")
+        if args.max_train_batches > 0:
+            log_f.write(f"  每轮最多训练batch数: {args.max_train_batches}\n")
         log_f.write("="*100 + "\n\n")
     
     with open(loss_log_path, 'w', newline='', encoding='utf-8') as loss_log_file, \
@@ -357,35 +477,91 @@ if __name__ == "__main__":
         loss_writer = csv.writer(loss_log_file)
         batch_loss_writer = csv.writer(batch_loss_log_file)
         loss_writer.writerow([
-            'epoch', 'train_avg_loss', 'val_loss',
+            'epoch', 'lr', 'train_avg_loss', 'val_loss',
             'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
             'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
         ])
         batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
 
         for epoch in range(start_epoch, args.max_epochs):
+            current_lr = get_cosine_warmup_lr(
+                epoch,
+                args.max_epochs,
+                args.base_lr,
+                args.min_lr,
+                args.warmup_epochs,
+            )
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+
             model.train()
             total_loss = 0
+            train_batches = 0
+            skipped_batches = 0
 
             for i, batch in enumerate(train_loader):
-                images = batch['image'].cuda()
-                masks = batch['mask'].cuda()
-                skeletons = batch['skeleton'].cuda()
+                if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
+                    break
 
-                outputs = model(images)
-                if isinstance(outputs, tuple) and len(outputs) == 3:
-                    surface_logits, skeleton_logits, _ = outputs
+                images = batch['image'].to(device)
+                masks = batch['mask'].to(device)
+                skeletons = batch['skeleton'].to(device)
+                skeletons_dilate = batch['skeleton_dilate'].to(device)
+
+                images_padded, orig_shape = pad_to_window_multiple(images, window_size=8)
+                masks_padded, _ = pad_to_window_multiple(masks, window_size=8)
+                skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=8)
+                skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=8)
+
+                outputs = model(images_padded)
+
+                if isinstance(outputs, tuple):
+                    surface_logits, skeleton_logits, connectivity_logits = outputs[:3]
                 else:
-                    surface_logits = outputs
+                    raise RuntimeError("Structure-guided training requires auxiliary model outputs.")
+                surface_logits = crop_to_shape(surface_logits, orig_shape)
+                skeleton_logits = crop_to_shape(skeleton_logits, orig_shape)
+                connectivity_logits = crop_to_shape(connectivity_logits, orig_shape)
                 
-                # CE Loss + Dice Loss (权重调整: Dice从1.0降到0.5)
-                loss, loss_dict = criterion(surface_logits, skeleton_logits, masks, skeletons)
+                masks_padded = crop_to_shape(masks_padded, orig_shape)
+                skeletons_padded = crop_to_shape(skeletons_padded, orig_shape)
+                skeletons_dilate_padded = crop_to_shape(skeletons_dilate_padded, orig_shape)
+                
+                loss, loss_dict = criterion(
+                    surface_logits,
+                    skeleton_logits,
+                    connectivity_logits,
+                    masks_padded,
+                    skeletons_padded,
+                    skeletons_dilate_padded,
+                )
+
+                if not torch.isfinite(loss):
+                    skipped_batches += 1
+                    print(
+                        f"[WARN] Non-finite loss skipped at epoch {epoch+1}, batch {i+1}: {loss.item()}",
+                        flush=True,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 optimizer.zero_grad()
                 loss.backward()
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if not torch.isfinite(grad_norm):
+                    skipped_batches += 1
+                    print(
+                        f"[WARN] Non-finite gradients skipped at epoch {epoch+1}, batch {i+1}: {grad_norm}",
+                        flush=True,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 optimizer.step()
 
                 total_loss += loss.item()
+                train_batches += 1
                 batch_loss_writer.writerow([epoch + 1, i + 1, f'{loss.item():.6f}'])
                 batch_loss_log_file.flush()
 
@@ -393,33 +569,40 @@ if __name__ == "__main__":
                     print(
                         f"Epoch [{epoch+1}/{args.max_epochs}], Batch [{i+1}/{len(train_loader)}], "
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
-                        f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}",
+                        f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
+                        f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
+                        f"SkelClDice: {loss_dict['skeleton_cldice_loss'].item():.4f}",
                         flush=True
                     )
 
-            train_avg_loss = total_loss / len(train_loader)
+            train_avg_loss = total_loss / max(train_batches, 1)
             val_metrics = evaluate_skeleton(model, val_loader, criterion, args.threshold)
             val_loss = val_metrics['loss']
             val_iou = val_metrics['surface_iou']
             val_f1 = val_metrics['surface_f1']
             val_precision = val_metrics['surface_precision']
             val_recall = val_metrics['surface_recall']
+            skeleton_iou = val_metrics['skeleton_iou']
+            skeleton_f1 = val_metrics['skeleton_f1']
+            skeleton_precision = val_metrics['skeleton_precision']
+            skeleton_recall = val_metrics['skeleton_recall']
             
             # 打印到控制台
             epoch_msg = (
-                f"Epoch {epoch+1}/{args.max_epochs}, Train Loss: {train_avg_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                f"Epoch {epoch+1}/{args.max_epochs}, LR: {current_lr:.6g}, Train Loss: {train_avg_loss:.4f}, Val Loss: {val_loss:.4f}, "
                 f"Surface IoU: {val_iou:.4f}, Surface F1: {val_f1:.4f}, "
                 f"Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, "
-                f"Skeleton IoU: {val_metrics['skeleton_iou']:.4f}, Skeleton F1: {val_metrics['skeleton_f1']:.4f}"
+                f"Skeleton IoU: {skeleton_iou:.4f}, Skeleton F1: {skeleton_f1:.4f}"
             )
             print(epoch_msg, flush=True)
+            if skipped_batches > 0:
+                print(f"[WARN] Skipped non-finite batches this epoch: {skipped_batches}", flush=True)
             
             # 写入 CSV
             loss_writer.writerow([
-                epoch + 1, f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
+                epoch + 1, f'{current_lr:.8f}', f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
                 f'{val_iou:.6f}', f'{val_f1:.6f}', f'{val_precision:.6f}', f'{val_recall:.6f}',
-                f"{val_metrics['skeleton_iou']:.6f}", f"{val_metrics['skeleton_f1']:.6f}",
-                f"{val_metrics['skeleton_precision']:.6f}", f"{val_metrics['skeleton_recall']:.6f}"
+                f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}'
             ])
             loss_log_file.flush()
             
@@ -432,13 +615,20 @@ if __name__ == "__main__":
                 log_f.write(f"  Val F1: {val_f1:.6f}\n")
                 log_f.write(f"  Val Precision: {val_precision:.6f}\n")
                 log_f.write(f"  Val Recall: {val_recall:.6f}\n")
-                log_f.write(f"  Skeleton IoU: {val_metrics['skeleton_iou']:.6f}\n")
-                log_f.write(f"  Skeleton F1: {val_metrics['skeleton_f1']:.6f}\n")
-                log_f.write(f"  Skeleton Precision: {val_metrics['skeleton_precision']:.6f}\n")
-                log_f.write(f"  Skeleton Recall: {val_metrics['skeleton_recall']:.6f}\n")
+                log_f.write(f"  Skeleton IoU: {skeleton_iou:.6f}\n")
+                log_f.write(f"  Skeleton F1: {skeleton_f1:.6f}\n")
+                log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
+                log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
+                log_f.write(f"  Skipped non-finite batches: {skipped_batches}\n")
                 log_f.write("-"*100 + "\n")
 
-            epoch_checkpoint = os.path.join(checkpoints_dir, f'epoch_{epoch+1}.pth')
+            if not np.isfinite(train_avg_loss) or not np.isfinite(val_loss) or not model_state_is_finite(model):
+                print(
+                    f"[WARN] Non-finite epoch state at epoch {epoch+1}; checkpoint not saved.",
+                    flush=True,
+                )
+                continue
+
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -449,21 +639,20 @@ if __name__ == "__main__":
                 'val_f1': val_f1,
                 'val_precision': val_precision,
                 'val_recall': val_recall,
-                'skeleton_iou': val_metrics['skeleton_iou'],
-                'skeleton_f1': val_metrics['skeleton_f1'],
-                'skeleton_precision': val_metrics['skeleton_precision'],
-                'skeleton_recall': val_metrics['skeleton_recall'],
+                'skeleton_iou': skeleton_iou,
+                'skeleton_f1': skeleton_f1,
+                'skeleton_precision': skeleton_precision,
+                'skeleton_recall': skeleton_recall,
                 'args': vars(args),
             }
-            torch.save(checkpoint, epoch_checkpoint)
-            torch.save(checkpoint, os.path.join(args.output_dir, 'latest.pth'))
-            print(f"模型已保存到: {epoch_checkpoint}", flush=True)
+            # 保存 last.pth（总是覆盖）
+            save_checkpoint_safely(checkpoint, os.path.join(args.output_dir, 'last.pth'))
 
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
                 best_path = os.path.join(args.output_dir, 'best.pth')
-                torch.save(checkpoint, best_path)
-                print(f"当前最优模型已保存到: {best_path}", flush=True)
+                save_checkpoint_safely(checkpoint, best_path)
+                print(f"[BEST] 当前最优模型已保存: best.pth (F1={val_f1:.4f})", flush=True)
 
     # 训练完成，写总结日志
     with open(training_log_path, 'a', encoding='utf-8') as log_f:
@@ -472,10 +661,25 @@ if __name__ == "__main__":
         log_f.write("="*100 + "\n")
         log_f.write(f"总 Epochs: {args.max_epochs}\n")
         log_f.write(f"最佳 F1 分数: {best_val_f1:.6f}\n")
-        log_f.write(f"最佳模型位置: {os.path.join(args.output_dir, 'best.pth')}\n")
-        log_f.write(f"最新模型位置: {os.path.join(args.output_dir, 'latest.pth')}\n")
-        log_f.write(f"所有 checkpoints 位置: {checkpoints_dir}\n")
+        log_f.write(f"最佳模型: best.pth\n")
+        log_f.write(f"最后模型: last.pth\n")
         log_f.write("="*100 + "\n")
+
+    best_path = os.path.join(args.output_dir, 'best.pth')
+    if os.path.isfile(best_path):
+        best_checkpoint = torch.load(best_path, map_location='cuda')
+        model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
+        best_val_metrics = evaluate_skeleton(model, val_loader, criterion, args.threshold)
+
+        best_eval_msg = (
+            f"Best Checkpoint Eval, Val Loss: {best_val_metrics['loss']:.4f}, "
+            f"Surface IoU: {best_val_metrics['surface_iou']:.4f}, Surface F1: {best_val_metrics['surface_f1']:.4f}"
+        )
+        print("\n" + best_eval_msg, flush=True)
+        with open(training_log_path, 'a', encoding='utf-8') as log_f:
+            log_f.write("\n" + best_eval_msg + "\n")
     
     print("\n训练完成!")
+    print(f"   best.pth: {best_path}")
+    print(f"   last.pth: {os.path.join(args.output_dir, 'last.pth')}")
     print(f"Training log: {training_log_path}")

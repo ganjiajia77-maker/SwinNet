@@ -6,7 +6,13 @@
 # ============================================================
 
 # 默认参数训练（推荐新手使用）
-# python train_image.py
+# python train_image.py --base_lr 5e-4 --min_lr 1e-5 --warmup_epochs 3 --img_size 512
+
+# 先做 512 patch 的 smoke test，只跑前 50 个 batch
+# python train_image.py --img_size 512 --max_epochs 1 --max_train_batches 50 --base_lr 5e-4 --min_lr 1e-5 --warmup_epochs 3
+
+# 没问题后正式跑 20 epoch
+# python train_image.py --img_size 512 --max_epochs 20 --base_lr 5e-4 --min_lr 1e-5 --warmup_epochs 3
 
 # 自定义参数训练示例
 # python train_image.py --batch_size 16 --max_epochs 50 --base_lr 0.001
@@ -16,10 +22,10 @@
 # ============================================================
 
 # 基础测试
-# python test_image.py --model_path ./model_out/epoch_50.pth
+# python test_image.py --model_path ./model_out/<run_name>/best.pth --img_size 512
 
 # 保存预测结果
-# python test_image.py --model_path ./model_out/epoch_50.pth --is_savenii
+# python test_image.py --model_path ./model_out/<run_name>/best.pth --img_size 512 --is_savenii
 
 
 # ============================================================

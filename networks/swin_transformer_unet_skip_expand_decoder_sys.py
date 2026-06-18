@@ -1,10 +1,14 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from .dca_fpn_lite import DCAFPNLite
+from .msfe_block import MSFEBlock
+from .bottleneck_context_fusion import GlobalLocalContextFusion
+from .g2l2_bottleneck import G2L2Bottleneck
 from .skeleton_guided_head import SkeletonGuidedHead
-from .dca_fpn import DCAFPNBlock
 
 
 class MoEFFNGating(nn.Module):
@@ -174,6 +178,41 @@ class WindowAttention(nn.Module):
         return flops
 
 
+# ============== Token ↔ Feature Map 转换函数 ==============
+def token_to_map(x, H, W):
+    """
+    将 token 格式转换为特征图格式
+    
+    Args:
+        x: [B, L, C] token 格式
+        H, W: 特征图的空间分辨率
+    
+    Returns:
+        [B, C, H, W] 特征图格式
+    """
+    B, L, C = x.shape
+    assert L == H * W, f"Token数量 {L} 不匹配 H×W={H}×{W}"
+    x = x.view(B, H, W, C)
+    x = x.permute(0, 3, 1, 2).contiguous()
+    return x
+
+
+def map_to_token(x):
+    """
+    将特征图格式转换为 token 格式
+    
+    Args:
+        x: [B, C, H, W] 特征图格式
+    
+    Returns:
+        [B, L, C] token 格式
+    """
+    B, C, H, W = x.shape
+    x = x.permute(0, 2, 3, 1).contiguous()
+    x = x.view(B, H * W, C)
+    return x
+
+
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
 
@@ -315,7 +354,13 @@ class PatchMerging(nn.Module):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.linear_reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.mlp_reduction = nn.Sequential(
+            nn.Linear(4 * dim, 2 * dim, bias=False),
+            nn.GELU(),
+            nn.Linear(2 * dim, 2 * dim, bias=False),
+        )
+        self.alpha = nn.Parameter(torch.tensor(0.1))
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
@@ -337,7 +382,9 @@ class PatchMerging(nn.Module):
         x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
 
         x = self.norm(x)
-        x = self.reduction(x)
+        x_linear = self.linear_reduction(x)
+        x_mlp = self.mlp_reduction(x)
+        x = x_linear + self.alpha * x_mlp
 
         return x
 
@@ -348,6 +395,7 @@ class PatchMerging(nn.Module):
         H, W = self.input_resolution
         flops = H * W * self.dim
         flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
+        flops += (H // 2) * (W // 2) * (4 * self.dim * 2 * self.dim + 2 * self.dim * 2 * self.dim)
         return flops
 
 
@@ -565,7 +613,6 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
@@ -612,7 +659,8 @@ class SwinTransformerSys(nn.Module):
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, final_upsample="expand_first", return_skeleton=False, **kwargs):
+                 use_checkpoint=False, final_upsample="expand_first", return_skeleton=False,
+                 bottleneck_type="global_local", **kwargs):
         super().__init__()
 
         print(
@@ -630,6 +678,7 @@ class SwinTransformerSys(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.final_upsample = final_upsample
         self.return_skeleton = return_skeleton
+        self.bottleneck_type = bottleneck_type.lower()
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -700,33 +749,92 @@ class SwinTransformerSys(nn.Module):
 
         self.norm = norm_layer(self.num_features)
         self.norm_up = norm_layer(self.embed_dim)
-
-        # ===== 添加 DCA-FPN 模块（在 inx=1 处，两个输入都已是 shallow_channels_dca3）=====
-        shallow_channels_dca3 = int(embed_dim * 2 ** (self.num_layers - 2))  # 384
-        
-        self.dca3 = DCAFPNBlock(
-            deep_channels=shallow_channels_dca3,  # 384（layer_up[0] 输出）
-            shallow_channels=shallow_channels_dca3,  # 384（skip feature）
-            out_channels=shallow_channels_dca3,  # 384
-            num_heads=4,
-            num_points=4,
-            max_offset=0.20,
-            init_alpha=0.1
+        self.bottleneck_resolution = (
+            patches_resolution[0] // (2 ** (self.num_layers - 1)),
+            patches_resolution[1] // (2 ** (self.num_layers - 1)),
         )
-        print(f"[INFO] DCA-FPN initialized: {shallow_channels_dca3} ↔ {shallow_channels_dca3}")
+        if self.bottleneck_type in {"global_local", "original", "default"}:
+            self.bottleneck_context_fusion = GlobalLocalContextFusion(
+                channels=self.num_features,
+                input_resolution=self.bottleneck_resolution,
+                reduction=4,
+            )
+            print(
+                "[INFO] GlobalLocalContextFusion bottleneck: resolution={}, channels={}".format(
+                    self.bottleneck_resolution, self.num_features
+                )
+            )
+        elif self.bottleneck_type in {"g2l2", "g2l2attention"}:
+            self.bottleneck_context_fusion = G2L2Bottleneck(
+                channels=self.num_features,
+                input_resolution=self.bottleneck_resolution,
+                mlp_ratio=4,
+            )
+            print(
+                "[INFO] G2L2Attention bottleneck: resolution={}, channels={}".format(
+                    self.bottleneck_resolution, self.num_features
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported bottleneck_type: {bottleneck_type}")
+
+        # ===== 仅在 Layer 1、2 上添加 MSFE + DCA-FPN 模块 (inx=2,3) =====
+        self.bottleneck_swin_block = SwinTransformerBlock(
+            dim=self.num_features,
+            input_resolution=self.bottleneck_resolution,
+            num_heads=num_heads[-1],
+            window_size=window_size,
+            shift_size=0,
+            mlp_ratio=self.mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop=drop_rate,
+            attn_drop=attn_drop_rate,
+            drop_path=dpr[-1] if len(dpr) > 0 else 0.0,
+            norm_layer=norm_layer,
+        )
+        print(
+            "[INFO] Bottleneck SwinTransformerBlock after fusion: resolution={}, channels={}, heads={}".format(
+                self.bottleneck_resolution, self.num_features, num_heads[-1]
+            )
+        )
+
+        self.msce_blocks = nn.ModuleList()
+        self.dca_blocks = nn.ModuleList()
+        
+        for skip_idx in range(2, self.num_layers):  # inx=2,3: Layer2 和 Layer1
+            # 通道数: skip_idx=2 → 384 (Layer2), skip_idx=3 → 192 (Layer1)
+            skip_channels = int(embed_dim * 2 ** (self.num_layers - 1 - skip_idx))
+            
+            # MSFE 模块（多尺度特征增强）
+            msce_block = MSFEBlock(channel=skip_channels)
+            self.msce_blocks.append(msce_block)
+            
+            # DCA-FPN-Lite 模块（轻量级可变形交叉注意）
+            dca_block = DCAFPNLite(
+                channels=skip_channels,
+                num_heads=4,
+                num_points=4,
+                max_offset=0.20
+            )
+            self.dca_blocks.append(dca_block)
+            
+            layer_name = "Layer 2" if skip_idx == 2 else "Layer 1"
+            print(f"[INFO] MSFE Block {layer_name} (inx={skip_idx}): {skip_channels} channels")
+            print(f"[INFO] DCA-FPN-Lite {layer_name} (inx={skip_idx}): {skip_channels} channels")
 
         if self.final_upsample == "expand_first":
             print("---final upsample expand_first---")
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
-            # keep a simple output head when skeleton return is disabled
-            if not self.return_skeleton:
-                self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
+            if self.return_skeleton:
+                self.guided_head = SkeletonGuidedHead(
+                    in_channels=embed_dim,
+                    hidden_channels=max(embed_dim // 2, 32),
+                    init_alpha=0.0,
+                )
             else:
-                # replace surface and skeleton conv heads with SkeletonGuidedHead
-                self.guided_head = SkeletonGuidedHead(in_channels=embed_dim,
-                                                      hidden_channels=max(embed_dim // 2, 32),
-                                                      init_alpha=0.0)
+                self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
         self.apply(self._init_weights)
 
@@ -759,39 +867,60 @@ class SwinTransformerSys(nn.Module):
             x_downsample.append(x)
             x = layer(x)
 
+        x = self.bottleneck_context_fusion(x)
+        x = self.bottleneck_swin_block(x)
         x = self.norm(x)  # B L C
 
         return x, x_downsample
 
     # Dencoder and Skip connection
-    # Dencoder and Skip connection with DCA-FPN
+    # Dencoder and Skip connection with DCA-FPN and MSFE
     def forward_up_features(self, x, x_downsample):
+        """
+        Decoder with enhanced skip connection fusion using MSFE + DCA-FPN-Lite
+        仅在 Layer 1、2 (inx=2,3) 上应用 MSFE + DCA-FPN
+        
+        Args:
+            x: bottleneck feature [B, L, C]
+            x_downsample: list of encoder skip features [[B, L, C], ...]
+        
+        Returns:
+            decoder output [B, L, C]
+        """
         for inx, layer_up in enumerate(self.layers_up):
             if inx == 0:
+                # Bottleneck layer, no skip connection
                 x = layer_up(x)
             elif inx == 1:
-                # First skip connection with DCA-FPN enhancement
-                # x shape: [B, L, C], x_downsample[2] shape: [B, L, C]
-                skip_feat = x_downsample[3 - inx]  # x_downsample[2]
-                
-                # Convert from token format [B, L, C] to 2D format [B, C, H, W]
-                B, L, C = skip_feat.shape
-                H, W = self.patches_resolution[0] // (2 ** (3 - inx)), self.patches_resolution[1] // (2 ** (3 - inx))
-                
-                skip_feat_2d = skip_feat.view(B, H, W, C).permute(0, 3, 1, 2)  # [B, C, H, W]
-                x_2d = x.view(B, H, W, C).permute(0, 3, 1, 2)
-                
-                # Apply DCA-FPN: refine skip feature using deep feature
-                skip_feat_refined = self.dca3(x_2d, skip_feat_2d)  # [B, C, H, W]
-                
-                # Convert back to token format
-                skip_feat = skip_feat_refined.permute(0, 2, 3, 1).reshape(B, L, C)
-                
-                x = torch.cat([x, skip_feat], -1)
+                # inx=1 (Layer 3 skip, 1/16分辨率): 直接 concat，不加 MSFE + DCA
+                x = torch.cat([x, x_downsample[3 - inx]], -1)
                 x = self.concat_back_dim[inx](x)
                 x = layer_up(x)
             else:
-                x = torch.cat([x, x_downsample[3 - inx]], -1)
+                # inx=2,3 (Layer 2,1 skip): 应用 MSFE + DCA-FPN
+                skip = x_downsample[3 - inx]  # [B, L, C]
+                
+                # 计算当前层的空间分辨率
+                H = self.patches_resolution[0] // (2 ** (3 - inx))
+                W = self.patches_resolution[1] // (2 ** (3 - inx))
+                
+                # 1. Token → Feature Map 转换
+                skip_map = token_to_map(skip, H, W)  # [B, C, H, W]
+                x_map = token_to_map(x, H, W)  # [B, C, H, W]
+                
+                # 2. MSFE 增强 skip feature
+                # msce_blocks[0] for inx=2 (Layer2), msce_blocks[1] for inx=3 (Layer1)
+                block_idx = inx - 2
+                skip_msce = self.msce_blocks[block_idx](skip_map)  # [B, C, H, W]
+                
+                # 3. DCA-FPN 用 decoder feature 精化 skip
+                skip_refined = self.dca_blocks[block_idx](deep=x_map, shallow=skip_msce)  # [B, C, H, W]
+                
+                # 4. Feature Map → Token 转换
+                skip_refined = map_to_token(skip_refined)  # [B, L, C]
+                
+                # 5. Skip concatenation
+                x = torch.cat([x, skip_refined], -1)
                 x = self.concat_back_dim[inx](x)
                 x = layer_up(x)
 
@@ -799,7 +928,7 @@ class SwinTransformerSys(nn.Module):
 
         return x
 
-    def up_x4(self, x):
+    def up_x4(self, x, input_image=None):
         H, W = self.patches_resolution
         B, L, C = x.shape
         assert L == H * W, "input features has wrong size"
@@ -808,13 +937,10 @@ class SwinTransformerSys(nn.Module):
             x = self.up(x)
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
-            # If guided head is available (return_skeleton), use it to produce surface and skeleton outputs
             if self.return_skeleton:
-                surface_logits, skeleton_logits, skeleton_attn = self.guided_head(x)
-                return surface_logits, skeleton_logits, skeleton_attn
+                x = self.guided_head(x)
             else:
-                surface_logits = self.output(x)
-                x = surface_logits
+                x = self.output(x)
 
         return x
 
