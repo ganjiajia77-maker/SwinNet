@@ -41,6 +41,7 @@ parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
+parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final 256x256 skeleton threshold for validation')
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
@@ -101,6 +102,15 @@ def get_cosine_warmup_lr(epoch, max_epochs, base_lr, min_lr, warmup_epochs):
     progress = min(float(epoch - warmup_epochs) / float(decay_epochs - 1), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr + (base_lr - min_lr) * cosine
+
+
+def get_stage_distill_scale(epoch):
+    epoch_number = epoch + 1
+    if epoch_number <= 5:
+        return 0.0
+    if epoch_number < 10:
+        return (epoch_number - 5) / 5.0
+    return 1.0
 
 
 def pad_to_window_multiple(x, window_size=7):
@@ -244,7 +254,14 @@ def evaluate(model, loader, criterion, threshold=0.2):
     iou = tp / (tp + fp + fn + 1e-8)
     return avg_loss, iou, f1, precision, recall
 
-def evaluate_skeleton(model, loader, criterion, threshold=0.2):
+def evaluate_skeleton(
+    model,
+    loader,
+    criterion,
+    threshold=0.2,
+    skeleton_threshold=0.5,
+    stage_distill_scale=1.0,
+):
     model.eval()
     total_loss = 0.0
     surface_tp = surface_fp = surface_fn = 0
@@ -265,10 +282,17 @@ def evaluate_skeleton(model, loader, criterion, threshold=0.2):
             outputs = model(images_padded)
 
             if isinstance(outputs, tuple):
-                surface_logits, skeleton_logits, connectivity_logits = outputs[:3]
+                (
+                    surface_logits,
+                    boundary_logits,
+                    skeleton_logits,
+                    connectivity_logits,
+                    stage_outputs,
+                ) = outputs[:5]
             else:
                 raise RuntimeError("Structure-guided training requires auxiliary model outputs.")
             surface_logits = crop_to_shape(surface_logits, orig_shape)
+            boundary_logits = crop_to_shape(boundary_logits, orig_shape)
             skeleton_logits = crop_to_shape(skeleton_logits, orig_shape)
             connectivity_logits = crop_to_shape(connectivity_logits, orig_shape)
             
@@ -278,16 +302,21 @@ def evaluate_skeleton(model, loader, criterion, threshold=0.2):
 
             loss, _ = criterion(
                 surface_logits,
-                skeleton_logits,
-                connectivity_logits,
-                masks_padded,
-                skeletons_padded,
-                skeletons_dilate_padded,
+                surface_gt=masks_padded,
+                skeleton_gt=skeletons_padded,
+                skeleton_dilate_gt=skeletons_dilate_padded,
+                stage_outputs=stage_outputs,
+                boundary_logits=boundary_logits,
+                skeleton_logits=skeleton_logits,
+                connectivity_logits=connectivity_logits,
+                stage_distill_scale=stage_distill_scale,
             )
             total_loss += loss.item()
 
             surface_pred = (torch.sigmoid(surface_logits) >= threshold).float().squeeze(1)
-            skeleton_pred = (torch.sigmoid(skeleton_logits) >= threshold).float().squeeze(1)
+            skeleton_pred = (
+                torch.sigmoid(skeleton_logits) >= skeleton_threshold
+            ).float().squeeze(1)
             masks_bin = (masks_padded > 0.5).float().squeeze(1)
             skeletons_bin = (skeletons_padded > 0.5).float().squeeze(1)
 
@@ -401,6 +430,12 @@ if __name__ == "__main__":
         connectivity_erode_kernel_size=1,
         skeleton_cldice_weight=0.01,
         skeleton_cldice_iterations=10,
+        boundary_weight=0.03,
+        boundary_radius=1,
+        stage_structure_weights=(0.0, 0.0, 0.0, 0.0),
+        stage_connectivity_factor=0.5,
+        stage_distill_weights=(0.004, 0.006),
+        stage_distill_connectivity_factor=0.5,
     ).to(device)
 
     # 检查是否恢复训练
@@ -424,14 +459,19 @@ if __name__ == "__main__":
     print(f"  学习率: {args.base_lr}")
     print(f"  最小学习率: {args.min_lr}")
     print(f"  Warmup轮数: {args.warmup_epochs}")
-    print("  Structure head: skeleton + top-2 connectivity residual attention")
-    print("  Skeleton target: regenerated from resized road mask")
-    print("  Skeleton loss weight: 0.02")
-    print("  Skeleton loss: BCE on dilated skeleton + Dice on hard skeleton")
-    print("  Connectivity loss weight: 0.03")
-    print("  Connectivity target: hard skeleton 8-neighbor connectivity")
-    print("  Skeleton clDice loss weight: 0.01")
-    print("  Skeleton clDice iterations: 10")
+    print("  Decoder stage2/stage3: topology-aware window attention + directional value aggregation")
+    print("  Surface target resize: 1024 -> 256 nearest-neighbor")
+    print("  Original decoder structure gate: disabled")
+    print("  Stage teacher: detached final 256 skeleton/connectivity -> soft max-pool 64")
+    print("  Stage distillation: stage2=0.004, stage3=0.006, connectivity factor=0.5")
+    print("  Stage distillation schedule: epochs 1-5 off, epochs 6-10 linear ramp")
+    print("  Final structure: skeleton + top-2 connectivity attention -> surface residual")
+    print("  Final skeleton loss weight: 0.02")
+    print("  Final connectivity loss weight: 0.03")
+    print("  Final skeleton clDice weight: 0.01")
+    print("  Boundary-aware refinement: enabled")
+    print("  Boundary loss weight: 0.03")
+    print("  Boundary target: dilate(mask, r=1) - erode(mask, k=3)")
     print("  Edge loss: disabled")
     print("  Edge skip enhance: disabled")
     print(f"  输出目录: {args.output_dir}")
@@ -456,14 +496,19 @@ if __name__ == "__main__":
         log_f.write(f"  学习率: {args.base_lr}\n")
         log_f.write(f"  最小学习率: {args.min_lr}\n")
         log_f.write(f"  Warmup轮数: {args.warmup_epochs}\n")
-        log_f.write("  Structure head: skeleton + top-2 connectivity residual attention\n")
-        log_f.write("  Skeleton target: regenerated from resized road mask\n")
-        log_f.write("  Skeleton loss weight: 0.02\n")
-        log_f.write("  Skeleton loss: BCE on dilated skeleton + Dice on hard skeleton\n")
-        log_f.write("  Connectivity loss weight: 0.03\n")
-        log_f.write("  Connectivity target: hard skeleton 8-neighbor connectivity\n")
-        log_f.write("  Skeleton clDice loss weight: 0.01\n")
-        log_f.write("  Skeleton clDice iterations: 10\n")
+        log_f.write("  Decoder stage2/stage3: topology-aware window attention + directional value aggregation\n")
+        log_f.write("  Surface target resize: 1024 -> 256 nearest-neighbor\n")
+        log_f.write("  Original decoder structure gate: disabled\n")
+        log_f.write("  Stage teacher: detached final 256 skeleton/connectivity -> soft max-pool 64\n")
+        log_f.write("  Stage distillation: stage2=0.004, stage3=0.006, connectivity factor=0.5\n")
+        log_f.write("  Stage distillation schedule: epochs 1-5 off, epochs 6-10 linear ramp\n")
+        log_f.write("  Final structure: skeleton + top-2 connectivity attention -> surface residual\n")
+        log_f.write("  Final skeleton loss weight: 0.02\n")
+        log_f.write("  Final connectivity loss weight: 0.03\n")
+        log_f.write("  Final skeleton clDice weight: 0.01\n")
+        log_f.write("  Boundary-aware refinement: enabled\n")
+        log_f.write("  Boundary loss weight: 0.03\n")
+        log_f.write("  Boundary target: dilate(mask, r=1) - erode(mask, k=3)\n")
         log_f.write("  Edge loss: disabled\n")
         log_f.write("  Edge skip enhance: disabled\n")
         log_f.write(f"  验证阈值: {args.threshold}\n")
@@ -498,6 +543,7 @@ if __name__ == "__main__":
             total_loss = 0
             train_batches = 0
             skipped_batches = 0
+            stage_distill_scale = get_stage_distill_scale(epoch)
 
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
@@ -516,10 +562,17 @@ if __name__ == "__main__":
                 outputs = model(images_padded)
 
                 if isinstance(outputs, tuple):
-                    surface_logits, skeleton_logits, connectivity_logits = outputs[:3]
+                    (
+                        surface_logits,
+                        boundary_logits,
+                        skeleton_logits,
+                        connectivity_logits,
+                        stage_outputs,
+                    ) = outputs[:5]
                 else:
                     raise RuntimeError("Structure-guided training requires auxiliary model outputs.")
                 surface_logits = crop_to_shape(surface_logits, orig_shape)
+                boundary_logits = crop_to_shape(boundary_logits, orig_shape)
                 skeleton_logits = crop_to_shape(skeleton_logits, orig_shape)
                 connectivity_logits = crop_to_shape(connectivity_logits, orig_shape)
                 
@@ -529,11 +582,14 @@ if __name__ == "__main__":
                 
                 loss, loss_dict = criterion(
                     surface_logits,
-                    skeleton_logits,
-                    connectivity_logits,
-                    masks_padded,
-                    skeletons_padded,
-                    skeletons_dilate_padded,
+                    surface_gt=masks_padded,
+                    skeleton_gt=skeletons_padded,
+                    skeleton_dilate_gt=skeletons_dilate_padded,
+                    stage_outputs=stage_outputs,
+                    boundary_logits=boundary_logits,
+                    skeleton_logits=skeleton_logits,
+                    connectivity_logits=connectivity_logits,
+                    stage_distill_scale=stage_distill_scale,
                 )
 
                 if not torch.isfinite(loss):
@@ -571,12 +627,22 @@ if __name__ == "__main__":
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
-                        f"SkelClDice: {loss_dict['skeleton_cldice_loss'].item():.4f}",
+                        f"ClDice: {loss_dict['skeleton_cldice_loss'].item():.4f}, "
+                        f"StageKD: {loss_dict['stage_distill_loss'].item():.4f}"
+                        f"x{stage_distill_scale:.2f}, "
+                        f"Boundary: {loss_dict['boundary_loss'].item():.4f}",
                         flush=True
                     )
 
             train_avg_loss = total_loss / max(train_batches, 1)
-            val_metrics = evaluate_skeleton(model, val_loader, criterion, args.threshold)
+            val_metrics = evaluate_skeleton(
+                model,
+                val_loader,
+                criterion,
+                args.threshold,
+                args.skeleton_threshold,
+                stage_distill_scale,
+            )
             val_loss = val_metrics['loss']
             val_iou = val_metrics['surface_iou']
             val_f1 = val_metrics['surface_f1']
@@ -669,7 +735,14 @@ if __name__ == "__main__":
     if os.path.isfile(best_path):
         best_checkpoint = torch.load(best_path, map_location='cuda')
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
-        best_val_metrics = evaluate_skeleton(model, val_loader, criterion, args.threshold)
+        best_val_metrics = evaluate_skeleton(
+            model,
+            val_loader,
+            criterion,
+            args.threshold,
+            args.skeleton_threshold,
+            1.0,
+        )
 
         best_eval_msg = (
             f"Best Checkpoint Eval, Val Loss: {best_val_metrics['loss']:.4f}, "

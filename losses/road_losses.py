@@ -255,6 +255,16 @@ def dilate_binary_mask(mask, radius=3):
     ).clamp(0.0, 1.0)
 
 
+def build_boundary_target(surface_gt, radius=1):
+    if surface_gt.dim() == 3:
+        surface_gt = surface_gt.unsqueeze(1)
+
+    road = (surface_gt > 0.5).float()
+    dilated = dilate_binary_mask(road, radius=radius)
+    eroded = erode_binary_mask(road, kernel_size=2 * radius + 1)
+    return (dilated - eroded).clamp(0.0, 1.0)
+
+
 def build_connectivity_target(surface_gt, erode_kernel_size=1):
     if surface_gt.dim() == 3:
         surface_gt = surface_gt.unsqueeze(1)
@@ -295,6 +305,14 @@ class SurfaceStructureLoss(nn.Module):
         connectivity_erode_kernel_size=1,
         skeleton_cldice_weight=0.0,
         skeleton_cldice_iterations=10,
+        boundary_weight=0.01,
+        boundary_radius=1,
+        skeleton_stage_weight=0.0,
+        skeleton_stage_weights=(0.1, 0.2, 0.3, 0.3),
+        stage_structure_weights=None,
+        stage_connectivity_factor=0.5,
+        stage_distill_weights=(0.004, 0.006),
+        stage_distill_connectivity_factor=0.5,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -314,23 +332,24 @@ class SurfaceStructureLoss(nn.Module):
         self.connectivity_weight = connectivity_weight
         self.connectivity_erode_kernel_size = connectivity_erode_kernel_size
         self.skeleton_cldice_weight = skeleton_cldice_weight
+        self.boundary_weight = boundary_weight
+        self.boundary_radius = boundary_radius
         self.skeleton_cldice_loss = SoftClDiceLoss(
             iterations=skeleton_cldice_iterations,
         )
+        self.boundary_loss = BCEDiceLoss(dice_weight=1.0, bce_weight=1.0)
+        self.skeleton_stage_weight = skeleton_stage_weight
+        self.skeleton_stage_weights = tuple(float(w) for w in skeleton_stage_weights)
+        if stage_structure_weights is None:
+            stage_structure_weights = (0.0, 0.0, 0.004, 0.006)
+        self.stage_structure_weights = tuple(float(w) for w in stage_structure_weights)
+        self.stage_connectivity_factor = float(stage_connectivity_factor)
+        self.stage_distill_weights = tuple(float(w) for w in stage_distill_weights)
+        self.stage_distill_connectivity_factor = float(
+            stage_distill_connectivity_factor
+        )
 
-    def forward(
-        self,
-        surface_logits,
-        skeleton_logits,
-        connectivity_logits,
-        surface_gt,
-        skeleton_gt,
-        skeleton_dilate_gt=None,
-    ):
-        loss_surface, bce_surface, dice_surface = self.surface_loss(surface_logits, surface_gt)
-        if skeleton_dilate_gt is None:
-            skeleton_dilate_gt = skeleton_gt
-
+    def skeleton_pixel_loss(self, skeleton_logits, skeleton_gt, skeleton_dilate_gt):
         skeleton_pos_weight = (
             self.skeleton_loss.pos_weight.to(skeleton_logits.device)
             if self.skeleton_loss.pos_weight is not None
@@ -343,20 +362,274 @@ class SurfaceStructureLoss(nn.Module):
         )
         dice_skeleton = self.skeleton_loss.dice(skeleton_logits, skeleton_gt)
         loss_skeleton = bce_skeleton + self.skeleton_loss.dice_weight * dice_skeleton
-        connectivity_gt = build_connectivity_target(
-            skeleton_gt,
-            erode_kernel_size=self.connectivity_erode_kernel_size,
-        ).to(
-            device=connectivity_logits.device,
-            dtype=connectivity_logits.dtype,
+        return loss_skeleton, bce_skeleton, dice_skeleton
+
+    def stage_skeleton_loss(self, stage_outputs, skeleton_gt, skeleton_dilate_gt):
+        if not stage_outputs:
+            return skeleton_gt.sum() * 0.0
+
+        total = skeleton_gt.sum() * 0.0
+        for idx, stage_output in enumerate(stage_outputs):
+            if idx >= len(self.skeleton_stage_weights):
+                break
+            stage_logits = stage_output["skeleton"]
+            target_size = stage_logits.shape[-2:]
+            stage_skel = F.interpolate(
+                skeleton_gt,
+                size=target_size,
+                mode="nearest",
+            )
+            stage_skel_dilate = F.interpolate(
+                skeleton_dilate_gt,
+                size=target_size,
+                mode="nearest",
+            )
+            loss_stage, _, _ = self.skeleton_pixel_loss(
+                stage_logits,
+                stage_skel,
+                stage_skel_dilate,
+            )
+            total = total + self.skeleton_stage_weights[idx] * loss_stage
+
+        return total
+
+    def stage_structure_loss(
+        self,
+        stage_outputs,
+        skeleton_gt,
+        skeleton_dilate_gt,
+        stage_skeleton_gt=None,
+        stage_skeleton_dilate_gt=None,
+    ):
+        if not stage_outputs:
+            return skeleton_gt.sum() * 0.0
+
+        total = skeleton_gt.sum() * 0.0
+        for idx, stage_output in enumerate(stage_outputs):
+            if idx >= len(self.stage_structure_weights):
+                break
+
+            stage_weight = self.stage_structure_weights[idx]
+            if stage_weight <= 0:
+                continue
+
+            stage_skeleton_logits = stage_output["skeleton"]
+            stage_connectivity_logits = stage_output["connectivity"]
+            target_size = stage_skeleton_logits.shape[-2:]
+            source_stage_skel = (
+                stage_skeleton_gt
+                if stage_skeleton_gt is not None
+                else skeleton_gt
+            )
+            source_stage_skel_dilate = (
+                stage_skeleton_dilate_gt
+                if stage_skeleton_dilate_gt is not None
+                else skeleton_dilate_gt
+            )
+            if source_stage_skel.shape[-2:] == target_size:
+                stage_skel = source_stage_skel
+                stage_skel_dilate = source_stage_skel_dilate
+            else:
+                stage_skel = F.interpolate(
+                    source_stage_skel,
+                    size=target_size,
+                    mode="nearest",
+                )
+                stage_skel_dilate = F.interpolate(
+                    source_stage_skel_dilate,
+                    size=target_size,
+                    mode="nearest",
+                )
+            loss_skeleton_stage, _, _ = self.skeleton_pixel_loss(
+                stage_skeleton_logits,
+                stage_skel,
+                stage_skel_dilate,
+            )
+            connectivity_gt = build_connectivity_target(
+                stage_skel,
+                erode_kernel_size=self.connectivity_erode_kernel_size,
+            ).to(
+                device=stage_connectivity_logits.device,
+                dtype=stage_connectivity_logits.dtype,
+            )
+            loss_connectivity_stage = F.binary_cross_entropy_with_logits(
+                stage_connectivity_logits,
+                connectivity_gt,
+            )
+            total = total + stage_weight * (
+                loss_skeleton_stage + self.stage_connectivity_factor * loss_connectivity_stage
+            )
+
+        return total
+
+    @staticmethod
+    def _confidence_weighted_soft_bce(logits, target, confidence):
+        loss_map = F.binary_cross_entropy_with_logits(
+            logits,
+            target,
+            reduction="none",
         )
-        loss_connectivity = F.binary_cross_entropy_with_logits(
+        return (loss_map * confidence).sum() / confidence.sum().clamp_min(1.0)
+
+    def stage_teacher_distillation_loss(
+        self,
+        stage_outputs,
+        final_skeleton_logits,
+        final_connectivity_logits,
+    ):
+        if (
+            not stage_outputs
+            or final_skeleton_logits is None
+            or final_connectivity_logits is None
+        ):
+            reference = (
+                final_skeleton_logits
+                if final_skeleton_logits is not None
+                else final_connectivity_logits
+            )
+            if reference is None:
+                raise ValueError("A final structure logit is required for stage distillation.")
+            return reference.sum() * 0.0
+
+        teacher_skeleton = torch.sigmoid(final_skeleton_logits).detach()
+        teacher_connectivity = (
+            torch.sigmoid(final_connectivity_logits).detach() * teacher_skeleton
+        )
+        total = final_skeleton_logits.sum() * 0.0
+
+        for index, stage_output in enumerate(stage_outputs):
+            if index >= len(self.stage_distill_weights):
+                break
+            stage_weight = self.stage_distill_weights[index]
+            if stage_weight <= 0:
+                continue
+
+            stage_skeleton_logits = stage_output["skeleton"]
+            stage_connectivity_logits = stage_output["connectivity"]
+            target_size = stage_skeleton_logits.shape[-2:]
+            teacher_skeleton_stage = F.adaptive_max_pool2d(
+                teacher_skeleton,
+                output_size=target_size,
+            )
+            teacher_connectivity_stage = F.adaptive_max_pool2d(
+                teacher_connectivity,
+                output_size=target_size,
+            )
+
+            skeleton_confidence = (
+                2.0 * (teacher_skeleton_stage - 0.5).abs()
+            ).detach()
+            connectivity_confidence = (
+                teacher_skeleton_stage
+                * 2.0
+                * (teacher_connectivity_stage - 0.5).abs()
+            ).detach()
+
+            loss_skeleton = self._confidence_weighted_soft_bce(
+                stage_skeleton_logits,
+                teacher_skeleton_stage,
+                skeleton_confidence,
+            )
+            loss_connectivity = self._confidence_weighted_soft_bce(
+                stage_connectivity_logits,
+                teacher_connectivity_stage,
+                connectivity_confidence,
+            )
+            total = total + stage_weight * (
+                loss_skeleton
+                + self.stage_distill_connectivity_factor * loss_connectivity
+            )
+
+        return total
+
+    def forward(
+        self,
+        surface_logits,
+        skeleton_logits=None,
+        connectivity_logits=None,
+        surface_gt=None,
+        skeleton_gt=None,
+        skeleton_dilate_gt=None,
+        stage_outputs=None,
+        boundary_logits=None,
+        stage_skeleton_gt=None,
+        stage_skeleton_dilate_gt=None,
+        stage_distill_scale=1.0,
+    ):
+        if surface_gt is None or skeleton_gt is None:
+            raise ValueError("surface_gt and skeleton_gt are required.")
+
+        loss_surface, bce_surface, dice_surface = self.surface_loss(surface_logits, surface_gt)
+        if skeleton_dilate_gt is None:
+            skeleton_dilate_gt = skeleton_gt
+
+        if skeleton_logits is not None:
+            loss_skeleton, bce_skeleton, dice_skeleton = self.skeleton_pixel_loss(
+                skeleton_logits,
+                skeleton_gt,
+                skeleton_dilate_gt,
+            )
+            loss_skeleton_cldice = self.skeleton_cldice_loss(
+                torch.sigmoid(skeleton_logits),
+                skeleton_gt,
+            )
+        else:
+            loss_skeleton = surface_logits.sum() * 0.0
+            loss_skeleton_cldice = loss_skeleton
+            bce_skeleton = loss_skeleton.detach()
+            dice_skeleton = loss_skeleton.detach()
+
+        if connectivity_logits is not None:
+            connectivity_gt = build_connectivity_target(
+                skeleton_gt,
+                erode_kernel_size=self.connectivity_erode_kernel_size,
+            ).to(
+                device=connectivity_logits.device,
+                dtype=connectivity_logits.dtype,
+            )
+            loss_connectivity = F.binary_cross_entropy_with_logits(
+                connectivity_logits,
+                connectivity_gt,
+            )
+        else:
+            loss_connectivity = surface_logits.sum() * 0.0
+        if boundary_logits is not None and self.boundary_weight > 0:
+            boundary_gt = build_boundary_target(
+                surface_gt,
+                radius=self.boundary_radius,
+            ).to(
+                device=boundary_logits.device,
+                dtype=boundary_logits.dtype,
+            )
+            loss_boundary, bce_boundary, dice_boundary = self.boundary_loss(
+                boundary_logits,
+                boundary_gt,
+            )
+        else:
+            loss_boundary = surface_logits.sum() * 0.0
+            bce_boundary = loss_boundary.detach()
+            dice_boundary = loss_boundary.detach()
+
+        if self.skeleton_stage_weight > 0 and stage_outputs:
+            loss_skeleton_stage = self.stage_skeleton_loss(
+                stage_outputs,
+                skeleton_gt,
+                skeleton_dilate_gt,
+            )
+        else:
+            loss_skeleton_stage = surface_logits.sum() * 0.0
+
+        loss_stage_structure = self.stage_structure_loss(
+            stage_outputs,
+            skeleton_gt,
+            skeleton_dilate_gt,
+            stage_skeleton_gt=stage_skeleton_gt,
+            stage_skeleton_dilate_gt=stage_skeleton_dilate_gt,
+        )
+        loss_stage_distill = self.stage_teacher_distillation_loss(
+            stage_outputs,
+            skeleton_logits,
             connectivity_logits,
-            connectivity_gt,
-        )
-        loss_skeleton_cldice = self.skeleton_cldice_loss(
-            torch.sigmoid(skeleton_logits),
-            skeleton_gt,
         )
 
         total_loss = (
@@ -364,6 +637,10 @@ class SurfaceStructureLoss(nn.Module):
             + self.skeleton_weight * loss_skeleton
             + self.connectivity_weight * loss_connectivity
             + self.skeleton_cldice_weight * loss_skeleton_cldice
+            + self.boundary_weight * loss_boundary
+            + self.skeleton_stage_weight * loss_skeleton_stage
+            + loss_stage_structure
+            + float(stage_distill_scale) * loss_stage_distill
         )
 
         loss_dict = {
@@ -372,10 +649,20 @@ class SurfaceStructureLoss(nn.Module):
             "skeleton_loss": loss_skeleton.detach(),
             "connectivity_loss": loss_connectivity.detach(),
             "skeleton_cldice_loss": loss_skeleton_cldice.detach(),
+            "boundary_loss": loss_boundary.detach(),
+            "skeleton_stage_loss": loss_skeleton_stage.detach(),
+            "stage_structure_loss": loss_stage_structure.detach(),
+            "stage_distill_loss": loss_stage_distill.detach(),
+            "stage_distill_scale": torch.as_tensor(
+                stage_distill_scale,
+                device=surface_logits.device,
+            ).detach(),
             "surface_bce": bce_surface,
             "surface_dice": dice_surface,
             "skeleton_bce": bce_skeleton,
             "skeleton_dice": dice_skeleton,
+            "boundary_bce": bce_boundary,
+            "boundary_dice": dice_boundary,
         }
 
         return total_loss, loss_dict

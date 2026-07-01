@@ -96,6 +96,8 @@ def main():
     print('\nRunning inference on validation set')
     all_surface_logits = []
     all_surface_targets = []
+    all_skeleton_logits = []
+    all_skeleton_targets = []
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc='Inference'):
@@ -106,11 +108,14 @@ def main():
             
             if isinstance(outputs, tuple):
                 surface_logits = outputs[0]
+                skeleton_logits = outputs[2]
             else:
-                surface_logits = outputs
+                raise RuntimeError("Structure-guided threshold sweep requires auxiliary outputs.")
             
             all_surface_logits.append(surface_logits.cpu())
             all_surface_targets.append(masks.cpu())
+            all_skeleton_logits.append(skeleton_logits.cpu())
+            all_skeleton_targets.append(batch["skeleton"].cpu())
     
     print('Inference complete')
     
@@ -143,6 +148,47 @@ def main():
         best_threshold_iou, surface_results[best_threshold_iou]['iou']))
     print('Best threshold (F1):  {:.2f} -> F1: {:.4f}'.format(
         best_threshold_f1, surface_results[best_threshold_f1]['f1']))
+
+    print('\n' + '='*80)
+    print('FINAL SKELETON (256x256) - THRESHOLD SWEEP')
+    print('='*80)
+    print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format(
+        'Threshold', 'IoU', 'F1', 'Precision', 'Recall'
+    ))
+    print('-'*60)
+
+    skeleton_results = {}
+    for threshold in thresholds:
+        metrics = compute_metrics_all_samples(
+            all_skeleton_logits,
+            all_skeleton_targets,
+            threshold,
+        )
+        skeleton_results[threshold] = metrics
+        print('{:<12.2f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f}'.format(
+            threshold,
+            metrics['iou'],
+            metrics['f1'],
+            metrics['precision'],
+            metrics['recall'],
+        ))
+
+    best_skeleton_threshold_iou = max(
+        skeleton_results.keys(),
+        key=lambda t: skeleton_results[t]['iou'],
+    )
+    best_skeleton_threshold_f1 = max(
+        skeleton_results.keys(),
+        key=lambda t: skeleton_results[t]['f1'],
+    )
+    print('\nBest final skeleton threshold (IoU): {:.2f} -> IoU: {:.4f}'.format(
+        best_skeleton_threshold_iou,
+        skeleton_results[best_skeleton_threshold_iou]['iou'],
+    ))
+    print('Best final skeleton threshold (F1):  {:.2f} -> F1: {:.4f}'.format(
+        best_skeleton_threshold_f1,
+        skeleton_results[best_skeleton_threshold_f1]['f1'],
+    ))
     
     print('\n' + '='*80)
     print('Threshold sweep complete!')

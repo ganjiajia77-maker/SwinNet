@@ -27,6 +27,7 @@ parser.add_argument('--img_size', type=int, default=256, help='network input siz
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
+parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final 256x256 skeleton')
 parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
@@ -121,6 +122,7 @@ def dice_loss(pred, target, threshold=0.5):
     
     dice_score = 2 * intersection / (union + 1e-8)
     return 1 - dice_score
+
 
 if __name__ == "__main__":
     if not args.deterministic:
@@ -282,6 +284,12 @@ if __name__ == "__main__":
         connectivity_erode_kernel_size=1,
         skeleton_cldice_weight=0.01,
         skeleton_cldice_iterations=10,
+        boundary_weight=0.03,
+        boundary_radius=1,
+        stage_structure_weights=(0.0, 0.0, 0.0, 0.0),
+        stage_connectivity_factor=0.5,
+        stage_distill_weights=(0.004, 0.006),
+        stage_distill_connectivity_factor=0.5,
     ).cuda()
     
     with torch.no_grad():
@@ -293,26 +301,37 @@ if __name__ == "__main__":
             
             outputs = model(images)
             if isinstance(outputs, tuple):
-                surface_logits, skeleton_logits, connectivity_logits = outputs[:3]
+                (
+                    surface_logits,
+                    boundary_logits,
+                    skeleton_logits,
+                    connectivity_logits,
+                    stage_outputs,
+                ) = outputs[:5]
             else:
                 raise RuntimeError("Structure-guided test requires auxiliary model outputs.")
             
             loss, _ = criterion(
                 surface_logits,
-                skeleton_logits,
-                connectivity_logits,
-                masks,
-                skeletons,
-                skeletons_dilate,
+                surface_gt=masks,
+                skeleton_gt=skeletons,
+                skeleton_dilate_gt=skeletons_dilate,
+                stage_outputs=stage_outputs,
+                boundary_logits=boundary_logits,
+                skeleton_logits=skeleton_logits,
+                connectivity_logits=connectivity_logits,
             )
             total_loss += loss.item()
             
             pred = (torch.sigmoid(surface_logits) >= args.threshold).float()
             masks = (masks > 0.5).float()
             
-            tp += int((pred * masks).sum().item())
-            fp += int((pred * (1.0 - masks)).sum().item())
-            fn += int(((1.0 - pred) * masks).sum().item())
+            case_tp = int((pred * masks).sum().item())
+            case_fp = int((pred * (1.0 - masks)).sum().item())
+            case_fn = int(((1.0 - pred) * masks).sum().item())
+            tp += case_tp
+            fp += case_fp
+            fn += case_fn
             
             total_samples += 1
             
@@ -321,7 +340,13 @@ if __name__ == "__main__":
             
             # 仅保存 PNG：最多保留 30 张代表性预测（按前 30 个 case）
             prob_numpy = torch.sigmoid(surface_logits).squeeze(0).squeeze(0).cpu().numpy()
-            skeleton_prob_numpy = torch.sigmoid(skeleton_logits).squeeze(0).squeeze(0).cpu().numpy()
+            skeleton_prob = (
+                torch.sigmoid(skeleton_logits)
+                .squeeze(0)
+                .squeeze(0)
+                .cpu()
+                .numpy()
+            )
             if args.source_patch_size and args.source_patch_size != args.img_size:
                 prob_resized = np.array(
                     Image.fromarray(prob_numpy.astype(np.float32), mode='F').resize(
@@ -330,26 +355,31 @@ if __name__ == "__main__":
                     ),
                     dtype=np.float32,
                 )
+                pred_numpy = (prob_resized >= args.threshold).astype(np.uint8) * 255
                 skeleton_prob_resized = np.array(
-                    Image.fromarray(skeleton_prob_numpy.astype(np.float32), mode='F').resize(
+                    Image.fromarray(skeleton_prob.astype(np.float32), mode='F').resize(
                         (args.source_patch_size, args.source_patch_size),
                         Image.BILINEAR,
                     ),
                     dtype=np.float32,
                 )
-                pred_numpy = (prob_resized >= args.threshold).astype(np.uint8) * 255
-                skeleton_pred_numpy = (skeleton_prob_resized >= args.threshold).astype(np.uint8) * 255
             else:
                 pred_numpy = (prob_numpy >= args.threshold).astype(np.uint8) * 255
-                skeleton_pred_numpy = (skeleton_prob_numpy >= args.threshold).astype(np.uint8) * 255
+                skeleton_prob_resized = skeleton_prob
             pred_img = Image.fromarray(pred_numpy, mode='L')
-            skeleton_pred_img = Image.fromarray(skeleton_pred_numpy, mode='L')
+            skeleton_pred_img = Image.fromarray(
+                (skeleton_prob_resized >= args.skeleton_threshold).astype(np.uint8) * 255,
+                mode='L',
+            )
             # 只保存前 30 张到 surface_dir
             if total_samples <= 30:
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
                 pred_img.save(png_save_path)
-                skeleton_png_save_path = os.path.join(skeleton_dir, f'{case_name}_skeleton_pred.png')
-                skeleton_pred_img.save(skeleton_png_save_path)
+                skeleton_pred_path = os.path.join(
+                    skeleton_dir,
+                    f'{case_name}_skeleton_pred.png',
+                )
+                skeleton_pred_img.save(skeleton_pred_path)
     
     print(f"预测结果已保存到: {pred_dir}")
     
@@ -367,11 +397,12 @@ if __name__ == "__main__":
     result_lines.append(f"  F1: {f1:.4f}")
     result_lines.append(f"  Precision: {precision:.4f}")
     result_lines.append(f"  Recall: {recall:.4f}")
+    result_lines.append(f"  Final skeleton threshold: {args.skeleton_threshold:.2f}")
     result_lines.append(f"  总测试样本: {len(test_loader)}")
     result_lines.append(f"  预测掩码保存位置: {pred_dir}")
     
     result_lines.append(f"  Surface mask save dir: {surface_dir}")
-    result_lines.append(f"  Skeleton pred save dir: {skeleton_dir}")
+    result_lines.append(f"  Final 256x256 skeleton save dir: {skeleton_dir}")
 
     for line in result_lines:
         print(line, flush=True)
@@ -385,6 +416,7 @@ if __name__ == "__main__":
         log_f.write(f"时间戳: {timestamp}\n")
         log_f.write(f"模型路径: {args.model_path}\n")
         log_f.write(f"阈值: {args.threshold}\n")
+        log_f.write(f"Final skeleton threshold: {args.skeleton_threshold}\n")
         log_f.write(f"输入图像大小: {args.img_size}\n")
         log_f.write(f"测试数据路径: {args.root_path}\n")
         log_f.write("="*80 + "\n")

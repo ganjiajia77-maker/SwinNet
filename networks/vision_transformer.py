@@ -72,15 +72,26 @@ class SwinUnet(nn.Module):
                                 return_skeleton=self.return_skeleton,
                                 bottleneck_type=self.bottleneck_type)
         
-        # ===== 可选：添加 DilatedAsterisk 空洞空间特征增强模块 =====
+        # Keep DilatedAsterisk in the graph, but turn off its residual effect.
         if self.use_asterisk:
-            # 在 decoder 输出后加入 DilatedAsterisk 进行空间特征增强
-            # 使用 num_classes 作为通道数，在最后分类层后进行增强
             self.asterisk = DilatedAsteriskWithDirections(
-                in_channels=self.num_classes,  # 动态获取输出通道数
-                out_channels=self.num_classes
+                in_channels=self.num_classes,
+                out_channels=self.num_classes,
+                alpha_init=0.0,
             )
-            print("[INFO] DilatedAsterisk spatial enhancement enabled (in_channels={})".format(self.num_classes))
+            self._disable_asterisk_alpha()
+            print("[INFO] DilatedAsterisk code kept but disabled: alpha=0 (in_channels={})".format(self.num_classes))
+
+    def _disable_asterisk_alpha(self):
+        if self.use_asterisk and hasattr(self, "asterisk") and hasattr(self.asterisk, "alpha"):
+            with torch.no_grad():
+                self.asterisk.alpha.zero_()
+            self.asterisk.alpha.requires_grad_(False)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._disable_asterisk_alpha()
+        return result
 
     def forward(self, x):
         if x.size()[1] == 1:

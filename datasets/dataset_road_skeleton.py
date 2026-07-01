@@ -86,19 +86,70 @@ class RoadSkeletonDataset(Dataset):
         return array
 
     @staticmethod
-    def _skeletonize_binary(mask):
-        binary = ((mask > 127).astype(np.uint8)) * 255
-        skeleton = np.zeros_like(binary)
-        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    def _zhang_suen_fallback(mask):
+        image = (mask > 0).astype(np.uint8)
 
-        while cv2.countNonZero(binary) > 0:
-            eroded = cv2.erode(binary, element)
-            opened = cv2.dilate(eroded, element)
-            residue = cv2.subtract(binary, opened)
-            skeleton = cv2.bitwise_or(skeleton, residue)
-            binary = eroded
+        while True:
+            changed = False
+            for step in (0, 1):
+                padded = np.pad(image, 1, mode="constant")
+                p2 = padded[:-2, 1:-1]
+                p3 = padded[:-2, 2:]
+                p4 = padded[1:-1, 2:]
+                p5 = padded[2:, 2:]
+                p6 = padded[2:, 1:-1]
+                p7 = padded[2:, :-2]
+                p8 = padded[1:-1, :-2]
+                p9 = padded[:-2, :-2]
 
-        return skeleton
+                neighbors = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+                transitions = np.stack(
+                    [
+                        (p2 == 0) & (p3 == 1),
+                        (p3 == 0) & (p4 == 1),
+                        (p4 == 0) & (p5 == 1),
+                        (p5 == 0) & (p6 == 1),
+                        (p6 == 0) & (p7 == 1),
+                        (p7 == 0) & (p8 == 1),
+                        (p8 == 0) & (p9 == 1),
+                        (p9 == 0) & (p2 == 1),
+                    ],
+                    axis=0,
+                ).sum(axis=0)
+
+                common = (
+                    (image == 1)
+                    & (neighbors >= 2)
+                    & (neighbors <= 6)
+                    & (transitions == 1)
+                )
+                if step == 0:
+                    removable = common & ((p2 * p4 * p6) == 0) & ((p4 * p6 * p8) == 0)
+                else:
+                    removable = common & ((p2 * p4 * p8) == 0) & ((p2 * p6 * p8) == 0)
+
+                if removable.any():
+                    image[removable] = 0
+                    changed = True
+
+            if not changed:
+                break
+
+        return image * 255
+
+    @classmethod
+    def _skeletonize_binary(cls, mask):
+        binary = ((mask > 0).astype(np.uint8)) * 255
+        if (
+            hasattr(cv2, "ximgproc")
+            and hasattr(cv2.ximgproc, "thinning")
+            and hasattr(cv2.ximgproc, "THINNING_ZHANGSUEN")
+        ):
+            return cv2.ximgproc.thinning(
+                binary,
+                thinningType=cv2.ximgproc.THINNING_ZHANGSUEN,
+            )
+        return cls._zhang_suen_fallback(binary)
 
     @staticmethod
     def _dilate_skeleton(skeleton, iterations=1):
@@ -137,8 +188,9 @@ class RoadSkeletonDataset(Dataset):
         image = (image - mean) / std
 
         mask = (mask > 127).astype(np.float32)
-        skeleton_hard = self._skeletonize_binary((mask * 255).astype(np.uint8))
+        skeleton_hard = self._skeletonize_binary(mask)
         skeleton_dilate = self._dilate_skeleton(skeleton_hard, iterations=1)
+
         skeleton_hard = (skeleton_hard > 127).astype(np.float32)
         skeleton_dilate = (skeleton_dilate > 127).astype(np.float32)
 
