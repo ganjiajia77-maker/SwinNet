@@ -21,6 +21,121 @@ from .dilated_asterisk import DilatedAsteriskWithDirections
 
 logger = logging.getLogger(__name__)
 
+TOPOLOGY_ATTENTION_VERSION = "0621-gates-local-gap-topology-refiner-v4"
+
+
+def get_topology_coefficients(model):
+    module = model.module if hasattr(model, "module") else model
+    swin_unet = module.swin_unet
+    coefficients = {}
+
+    for stage, structure_block in enumerate(
+        swin_unet.decoder_structure_blocks
+    ):
+        coefficients[f"decoder_stage{stage}"] = {
+            "gamma1": float(structure_block.gamma1.detach().cpu()),
+            "gamma2": float(structure_block.gamma2.detach().cpu()),
+        }
+    topology_attention = swin_unet.guided_head.final_topology_attention
+    coefficients["final_topology"] = {
+        "raw_eta": float(topology_attention.raw_eta.detach().cpu()),
+        "eta_eff": float(topology_attention.effective_eta().detach().cpu()),
+        "raw_rho_gap": float(swin_unet.guided_head.raw_rho_gap.detach().cpu()),
+        "rho_gap_eff": float(
+            swin_unet.guided_head.effective_rho_gap().detach().cpu()
+        ),
+    }
+
+    return coefficients
+
+
+def format_topology_coefficients(model):
+    coefficients = get_topology_coefficients(model)
+    fields = [f"version={TOPOLOGY_ATTENTION_VERSION}"]
+    for stage in (
+        "decoder_stage0",
+        "decoder_stage1",
+        "decoder_stage2",
+        "decoder_stage3",
+    ):
+        values = coefficients[stage]
+        fields.append(
+            "{} gamma1={:.6f} gamma2={:.6f}".format(
+                stage,
+                values["gamma1"],
+                values["gamma2"],
+            )
+        )
+    final_values = coefficients["final_topology"]
+    fields.append(
+        "final_topology raw_eta={:.6f} eta_eff={:.8f} "
+        "raw_rho_gap={:.6f} rho_gap_eff={:.8f}".format(
+            final_values["raw_eta"],
+            final_values["eta_eff"],
+            final_values["raw_rho_gap"],
+            final_values["rho_gap_eff"],
+        )
+    )
+    return " | ".join(fields)
+
+
+def print_topology_coefficients(model, prefix="[TOPOLOGY]"):
+    message = f"{prefix} {format_topology_coefficients(model)}"
+    print(message, flush=True)
+    return message
+
+
+def load_topology_checkpoint_state(
+    model,
+    state_dict,
+    checkpoint_version,
+    strict=True,
+):
+    missing_final_topology = not any(
+        "final_topology_attention." in key for key in state_dict
+    )
+    is_legacy_structure_checkpoint = (
+        any("decoder_structure_blocks." in key for key in state_dict)
+        and not any("raw_rho_gap" in key for key in state_dict)
+    )
+    if is_legacy_structure_checkpoint:
+        result = model.load_state_dict(state_dict, strict=False)
+        allowed_missing_prefixes = (
+            "swin_unet.guided_head.final_topology_attention.",
+            "swin_unet.guided_head.raw_rho_gap",
+            "swin_unet.guided_head.fixed_rho_gap",
+        )
+        invalid_missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith(allowed_missing_prefixes)
+        ]
+        if invalid_missing or result.unexpected_keys:
+            raise RuntimeError(
+                "Legacy structure checkpoint mismatch: "
+                f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+            )
+        module = model.module if hasattr(model, "module") else model
+        guided_head = module.swin_unet.guided_head
+        with torch.no_grad():
+            guided_head.fixed_rho_gap.zero_()
+            guided_head.raw_rho_gap.zero_()
+        guided_head.raw_rho_gap.requires_grad_(False)
+        if missing_final_topology:
+            topology_attention = guided_head.final_topology_attention
+            with torch.no_grad():
+                topology_attention.fixed_eta.zero_()
+                topology_attention.raw_eta.zero_()
+            topology_attention.raw_eta.requires_grad_(False)
+        print(
+            "[TOPOLOGY] Loaded legacy structure checkpoint; missing final "
+            "topology parameters use runtime initialization and rho_gap is "
+            "disabled for output compatibility.",
+            flush=True,
+        )
+        return result
+    return model.load_state_dict(state_dict, strict=strict)
+
 
 def load_state_dict_ignore_mismatch(model, state_dict, prefix=""):
     model_dict = model.state_dict()
@@ -44,7 +159,8 @@ def load_state_dict_ignore_mismatch(model, state_dict, prefix=""):
 
 class SwinUnet(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
-                 use_asterisk=False, return_skeleton=False, bottleneck_type="global_local"):
+                 use_asterisk=False, return_skeleton=False, bottleneck_type="global_local",
+                 final_topology_eta_init=0.005, final_gap_rho_init=0.005):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -70,7 +186,9 @@ class SwinUnet(nn.Module):
                                 patch_norm=config.MODEL.SWIN.PATCH_NORM,
                                 use_checkpoint=config.TRAIN.USE_CHECKPOINT,
                                 return_skeleton=self.return_skeleton,
-                                bottleneck_type=self.bottleneck_type)
+                                bottleneck_type=self.bottleneck_type,
+                                final_topology_eta_init=final_topology_eta_init,
+                                final_gap_rho_init=final_gap_rho_init)
         
         # Keep DilatedAsterisk in the graph, but turn off its residual effect.
         if self.use_asterisk:

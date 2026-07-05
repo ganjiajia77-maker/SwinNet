@@ -11,7 +11,13 @@ from tqdm import tqdm
 from PIL import Image
 from datetime import datetime
 
-from networks.vision_transformer import SwinUnet as ViT_seg
+from networks.vision_transformer import (
+    TOPOLOGY_ATTENTION_VERSION,
+    SwinUnet as ViT_seg,
+    format_topology_coefficients,
+    load_topology_checkpoint_state,
+    print_topology_coefficients,
+)
 from datasets.dataset_synapse import ImageDataset, RandomGenerator
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
@@ -28,6 +34,8 @@ parser.add_argument('--source_patch_size', type=int, default=1024, help='source 
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
 parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final 256x256 skeleton')
+parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final 256 topology repair coefficient')
+parser.add_argument('--final_gap_rho_init', type=float, default=0.005, help='initial localized gap-repair coefficient')
 parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
@@ -146,16 +154,35 @@ if __name__ == "__main__":
     args.num_classes = 1
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes, use_asterisk=True,
-                    return_skeleton=True, bottleneck_type=args.bottleneck_type).cuda()
+                    return_skeleton=True, bottleneck_type=args.bottleneck_type,
+                    final_topology_eta_init=args.final_topology_eta_init,
+                    final_gap_rho_init=args.final_gap_rho_init).cuda()
     
     # 加载模型
     if os.path.exists(args.model_path):
         checkpoint = torch.load(args.model_path, map_location='cpu')
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
+            load_topology_checkpoint_state(
+                model,
+                checkpoint['model_state_dict'],
+                checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+                strict=(args.bottleneck_type == 'global_local'),
+            )
         else:
             model.load_state_dict(checkpoint, strict=(args.bottleneck_type == 'global_local'))
         print(f"已加载模型: {args.model_path}")
+        print("Using topology attention constrained version", flush=True)
+        print_topology_coefficients(model)
+        if isinstance(checkpoint, dict):
+            saved_version = checkpoint.get(
+                "topology_attention_version",
+                "legacy-unrecorded",
+            )
+            print(
+                f"[TOPOLOGY] checkpoint_version={saved_version}; "
+                f"runtime_version={TOPOLOGY_ATTENTION_VERSION}",
+                flush=True,
+            )
     else:
         print(f"错误: 模型文件不存在 {args.model_path}")
         exit(1)
@@ -288,7 +315,7 @@ if __name__ == "__main__":
         boundary_radius=1,
         stage_structure_weights=(0.0, 0.0, 0.0, 0.0),
         stage_connectivity_factor=0.5,
-        stage_distill_weights=(0.004, 0.006),
+        stage_distill_weights=(0.0, 0.0),
         stage_distill_connectivity_factor=0.5,
     ).cuda()
     
@@ -403,6 +430,10 @@ if __name__ == "__main__":
     
     result_lines.append(f"  Surface mask save dir: {surface_dir}")
     result_lines.append(f"  Final 256x256 skeleton save dir: {skeleton_dir}")
+    result_lines.append(
+        f"  Topology attention version: {TOPOLOGY_ATTENTION_VERSION}"
+    )
+    result_lines.append(f"  {format_topology_coefficients(model)}")
 
     for line in result_lines:
         print(line, flush=True)

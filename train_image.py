@@ -12,7 +12,12 @@ from datetime import datetime
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from networks.vision_transformer import SwinUnet as ViT_seg
+from networks.vision_transformer import (
+    TOPOLOGY_ATTENTION_VERSION,
+    SwinUnet as ViT_seg,
+    get_topology_coefficients,
+    print_topology_coefficients,
+)
 from datasets.dataset_synapse import ImageDataset, RandomGenerator
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
@@ -42,6 +47,8 @@ parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
 parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final 256x256 skeleton threshold for validation')
+parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help='initial final 256 topology repair coefficient')
+parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
@@ -397,7 +404,9 @@ if __name__ == "__main__":
     args.num_classes = 1
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes, use_asterisk=True,
-                    return_skeleton=True, bottleneck_type=args.bottleneck_type).to(device)
+                    return_skeleton=True, bottleneck_type=args.bottleneck_type,
+                    final_topology_eta_init=args.final_topology_eta_init,
+                    final_gap_rho_init=args.final_gap_rho_init).to(device)
 
     # 加载数据
     train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
@@ -434,7 +443,7 @@ if __name__ == "__main__":
         boundary_radius=1,
         stage_structure_weights=(0.0, 0.0, 0.0, 0.0),
         stage_connectivity_factor=0.5,
-        stage_distill_weights=(0.004, 0.006),
+        stage_distill_weights=(0.0, 0.0),
         stage_distill_connectivity_factor=0.5,
     ).to(device)
 
@@ -459,13 +468,19 @@ if __name__ == "__main__":
     print(f"  学习率: {args.base_lr}")
     print(f"  最小学习率: {args.min_lr}")
     print(f"  Warmup轮数: {args.warmup_epochs}")
-    print("  Decoder stage2/stage3: topology-aware window attention + directional value aggregation")
+    print("  Decoder structure gates: restored 0621 stages 0/1/2/3")
+    print(
+        "  Final 256 structure-only topology refiner: "
+        f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4"
+    )
+    print(
+        "  Localized gap repair: "
+        f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap"
+    )
     print("  Surface target resize: 1024 -> 256 nearest-neighbor")
-    print("  Original decoder structure gate: disabled")
-    print("  Stage teacher: detached final 256 skeleton/connectivity -> soft max-pool 64")
-    print("  Stage distillation: stage2=0.004, stage3=0.006, connectivity factor=0.5")
-    print("  Stage distillation schedule: epochs 1-5 off, epochs 6-10 linear ramp")
-    print("  Final structure: skeleton + top-2 connectivity attention -> surface residual")
+    print("  Decoder structure gate auxiliary loss: disabled (0621 setting)")
+    print("  Final topology refines skeleton/connectivity only")
+    print("  Global alpha * structure residual on surface: disabled")
     print("  Final skeleton loss weight: 0.02")
     print("  Final connectivity loss weight: 0.03")
     print("  Final skeleton clDice weight: 0.01")
@@ -483,6 +498,9 @@ if __name__ == "__main__":
         print(f"  从checkpoint恢复: {args.resume}")
         print(f"  起始epoch: {start_epoch}")
 
+    print("Using topology attention constrained version", flush=True)
+    print_topology_coefficients(model)
+
     best_val_f1 = -1.0
     
     # 写入训练日志头
@@ -496,13 +514,19 @@ if __name__ == "__main__":
         log_f.write(f"  学习率: {args.base_lr}\n")
         log_f.write(f"  最小学习率: {args.min_lr}\n")
         log_f.write(f"  Warmup轮数: {args.warmup_epochs}\n")
-        log_f.write("  Decoder stage2/stage3: topology-aware window attention + directional value aggregation\n")
+        log_f.write("  Decoder structure gates: restored 0621 stages 0/1/2/3\n")
+        log_f.write(
+            "  Final 256 structure-only topology refiner: "
+            f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4\n"
+        )
+        log_f.write(
+            "  Localized gap repair: "
+            f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap\n"
+        )
         log_f.write("  Surface target resize: 1024 -> 256 nearest-neighbor\n")
-        log_f.write("  Original decoder structure gate: disabled\n")
-        log_f.write("  Stage teacher: detached final 256 skeleton/connectivity -> soft max-pool 64\n")
-        log_f.write("  Stage distillation: stage2=0.004, stage3=0.006, connectivity factor=0.5\n")
-        log_f.write("  Stage distillation schedule: epochs 1-5 off, epochs 6-10 linear ramp\n")
-        log_f.write("  Final structure: skeleton + top-2 connectivity attention -> surface residual\n")
+        log_f.write("  Decoder structure gate auxiliary loss: disabled (0621 setting)\n")
+        log_f.write("  Final topology refines skeleton/connectivity only\n")
+        log_f.write("  Global alpha * structure residual on surface: disabled\n")
         log_f.write("  Final skeleton loss weight: 0.02\n")
         log_f.write("  Final connectivity loss weight: 0.03\n")
         log_f.write("  Final skeleton clDice weight: 0.01\n")
@@ -661,6 +685,10 @@ if __name__ == "__main__":
                 f"Skeleton IoU: {skeleton_iou:.4f}, Skeleton F1: {skeleton_f1:.4f}"
             )
             print(epoch_msg, flush=True)
+            topology_msg = print_topology_coefficients(
+                model,
+                prefix=f"[TOPOLOGY][Epoch {epoch + 1}]",
+            )
             if skipped_batches > 0:
                 print(f"[WARN] Skipped non-finite batches this epoch: {skipped_batches}", flush=True)
             
@@ -686,6 +714,7 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
                 log_f.write(f"  Skipped non-finite batches: {skipped_batches}\n")
+                log_f.write(topology_msg + "\n")
                 log_f.write("-"*100 + "\n")
 
             if not np.isfinite(train_avg_loss) or not np.isfinite(val_loss) or not model_state_is_finite(model):
@@ -709,6 +738,8 @@ if __name__ == "__main__":
                 'skeleton_f1': skeleton_f1,
                 'skeleton_precision': skeleton_precision,
                 'skeleton_recall': skeleton_recall,
+                'topology_attention_version': TOPOLOGY_ATTENTION_VERSION,
+                'topology_coefficients': get_topology_coefficients(model),
                 'args': vars(args),
             }
             # 保存 last.pth（总是覆盖）

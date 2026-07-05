@@ -9,7 +9,11 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from networks.vision_transformer import SwinUnet as ViT_seg
+from networks.vision_transformer import (
+    SwinUnet as ViT_seg,
+    load_topology_checkpoint_state,
+    print_topology_coefficients,
+)
 from losses.road_losses import binary_metrics_from_logits
 from config import get_config
 
@@ -45,6 +49,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--img_size', type=int, default=224)
+    parser.add_argument('--final_topology_eta_init', type=float, default=0.005)
+    parser.add_argument('--final_gap_rho_init', type=float, default=0.005)
     parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml')
     parser.add_argument('--zip', action='store_true', help='use zipped dataset')
     parser.add_argument('--cache_mode', type=str, default='', help='cache mode for dataset')
@@ -72,12 +78,20 @@ def main():
         num_classes=1,
         use_asterisk=True,
         return_skeleton=True,
+        final_topology_eta_init=args.final_topology_eta_init,
+        final_gap_rho_init=args.final_gap_rho_init,
     )
     checkpoint = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    load_topology_checkpoint_state(
+        model,
+        checkpoint['model_state_dict'],
+        checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+    )
     model = model.to(device)
     model.eval()
     print('Model loaded')
+    print("Using topology attention constrained version", flush=True)
+    print_topology_coefficients(model)
     
     print('\nLoading validation dataset')
     val_dataset = RoadSkeletonDataset(
@@ -125,7 +139,24 @@ def main():
     print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format('Threshold', 'IoU', 'F1', 'Precision', 'Recall'))
     print('-'*60)
     
-    thresholds = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+    thresholds = [
+        0.10,
+        0.15,
+        0.20,
+        0.22,
+        0.24,
+        0.25,
+        0.26,
+        0.28,
+        0.30,
+        0.32,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+    ]
     surface_results = {}
     
     for threshold in thresholds:
