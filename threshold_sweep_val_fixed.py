@@ -13,6 +13,8 @@ from networks.vision_transformer import (
     SwinUnet as ViT_seg,
     load_topology_checkpoint_state,
     print_topology_coefficients,
+    STRUCTURE_PROFILE_FULL,
+    STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
 )
 from losses.road_losses import binary_metrics_from_logits
 from config import get_config
@@ -48,9 +50,18 @@ def main():
                        default='./model_out/train_skeleton_20260521_094935/best.pth')
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--img_size', type=int, default=224)
+    parser.add_argument('--img_size', type=int, default=256)
+    parser.add_argument('--source_patch_size', type=int, default=1024)
     parser.add_argument('--final_topology_eta_init', type=float, default=0.005)
     parser.add_argument('--final_gap_rho_init', type=float, default=0.005)
+    parser.add_argument(
+        '--stage_topology_stages',
+        type=str,
+        default='none',
+        choices=['none', 'stage3', 'stage23'],
+    )
+    parser.add_argument('--stage_topology_alpha_max', type=float, default=1.0)
+    parser.add_argument('--stage_topology_alpha_init', type=float, default=0.1)
     parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml')
     parser.add_argument('--zip', action='store_true', help='use zipped dataset')
     parser.add_argument('--cache_mode', type=str, default='', help='cache mode for dataset')
@@ -64,8 +75,37 @@ def main():
     parser.add_argument('--dataset', type=str, default='ImageData')
     parser.add_argument('--n_class', default=2, type=int)
     parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None)
+    parser.add_argument(
+        '--structure_profile',
+        type=str,
+        default=STRUCTURE_PROFILE_FULL,
+        choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
+    )
+    parser.add_argument(
+        '--enable_graph_prop',
+        action='store_true',
+        help='enable final soft skeleton graph propagation',
+    )
     
     args = parser.parse_args()
+    
+    enable_graph_prop = args.enable_graph_prop
+    checkpoint = None
+    if os.path.exists(args.model_path):
+        checkpoint = torch.load(args.model_path, map_location='cpu')
+        if isinstance(checkpoint, dict):
+            saved_profile = checkpoint.get("structure_profile")
+            if saved_profile:
+                args.structure_profile = saved_profile
+            elif isinstance(checkpoint.get("args"), dict):
+                args.structure_profile = checkpoint["args"].get(
+                    "structure_profile",
+                    args.structure_profile,
+                )
+            if not enable_graph_prop and isinstance(checkpoint.get("args"), dict):
+                enable_graph_prop = bool(
+                    checkpoint["args"].get("enable_graph_prop", False)
+                )
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device: {}'.format(device))
@@ -80,8 +120,14 @@ def main():
         return_skeleton=True,
         final_topology_eta_init=args.final_topology_eta_init,
         final_gap_rho_init=args.final_gap_rho_init,
+        stage_topology_stages=args.stage_topology_stages,
+        stage_topology_alpha_max=args.stage_topology_alpha_max,
+        stage_topology_alpha_init=args.stage_topology_alpha_init,
+        structure_profile=args.structure_profile,
+        enable_final_graph_prop=enable_graph_prop,
     )
-    checkpoint = torch.load(args.model_path, map_location=device)
+    if checkpoint is None:
+        checkpoint = torch.load(args.model_path, map_location=device)
     load_topology_checkpoint_state(
         model,
         checkpoint['model_state_dict'],
@@ -98,6 +144,7 @@ def main():
         root_dir=args.root_path,
         split='val',
         image_size=args.img_size,
+        source_patch_size=args.source_patch_size,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -122,14 +169,15 @@ def main():
             
             if isinstance(outputs, tuple):
                 surface_logits = outputs[0]
-                skeleton_logits = outputs[2]
+                skeleton_logits = outputs[2] if len(outputs) > 2 else None
             else:
                 raise RuntimeError("Structure-guided threshold sweep requires auxiliary outputs.")
             
             all_surface_logits.append(surface_logits.cpu())
             all_surface_targets.append(masks.cpu())
-            all_skeleton_logits.append(skeleton_logits.cpu())
-            all_skeleton_targets.append(batch["skeleton"].cpu())
+            if skeleton_logits is not None:
+                all_skeleton_logits.append(skeleton_logits.cpu())
+                all_skeleton_targets.append(batch["skeleton"].cpu())
     
     print('Inference complete')
     
@@ -181,45 +229,51 @@ def main():
         best_threshold_f1, surface_results[best_threshold_f1]['f1']))
 
     print('\n' + '='*80)
-    print('FINAL SKELETON (256x256) - THRESHOLD SWEEP')
+    if all_skeleton_logits:
+        print('FINAL SKELETON (256x256) - THRESHOLD SWEEP')
+    else:
+        print('FINAL SKELETON (256x256) - SKIPPED (final skeleton head disabled)')
     print('='*80)
-    print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format(
-        'Threshold', 'IoU', 'F1', 'Precision', 'Recall'
-    ))
-    print('-'*60)
-
-    skeleton_results = {}
-    for threshold in thresholds:
-        metrics = compute_metrics_all_samples(
-            all_skeleton_logits,
-            all_skeleton_targets,
-            threshold,
-        )
-        skeleton_results[threshold] = metrics
-        print('{:<12.2f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f}'.format(
-            threshold,
-            metrics['iou'],
-            metrics['f1'],
-            metrics['precision'],
-            metrics['recall'],
+    if all_skeleton_logits:
+        print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format(
+            'Threshold', 'IoU', 'F1', 'Precision', 'Recall'
         ))
+        print('-'*60)
 
-    best_skeleton_threshold_iou = max(
-        skeleton_results.keys(),
-        key=lambda t: skeleton_results[t]['iou'],
-    )
-    best_skeleton_threshold_f1 = max(
-        skeleton_results.keys(),
-        key=lambda t: skeleton_results[t]['f1'],
-    )
-    print('\nBest final skeleton threshold (IoU): {:.2f} -> IoU: {:.4f}'.format(
-        best_skeleton_threshold_iou,
-        skeleton_results[best_skeleton_threshold_iou]['iou'],
-    ))
-    print('Best final skeleton threshold (F1):  {:.2f} -> F1: {:.4f}'.format(
-        best_skeleton_threshold_f1,
-        skeleton_results[best_skeleton_threshold_f1]['f1'],
-    ))
+        skeleton_results = {}
+        for threshold in thresholds:
+            metrics = compute_metrics_all_samples(
+                all_skeleton_logits,
+                all_skeleton_targets,
+                threshold,
+            )
+            skeleton_results[threshold] = metrics
+            print('{:<12.2f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f}'.format(
+                threshold,
+                metrics['iou'],
+                metrics['f1'],
+                metrics['precision'],
+                metrics['recall'],
+            ))
+
+        best_skeleton_threshold_iou = max(
+            skeleton_results.keys(),
+            key=lambda t: skeleton_results[t]['iou'],
+        )
+        best_skeleton_threshold_f1 = max(
+            skeleton_results.keys(),
+            key=lambda t: skeleton_results[t]['f1'],
+        )
+        print('\nBest final skeleton threshold (IoU): {:.2f} -> IoU: {:.4f}'.format(
+            best_skeleton_threshold_iou,
+            skeleton_results[best_skeleton_threshold_iou]['iou'],
+        ))
+        print('Best final skeleton threshold (F1):  {:.2f} -> F1: {:.4f}'.format(
+            best_skeleton_threshold_f1,
+            skeleton_results[best_skeleton_threshold_f1]['f1'],
+        ))
+    else:
+        print('No final skeleton logits; use stage2/3 structure for skeleton quality.')
     
     print('\n' + '='*80)
     print('Threshold sweep complete!')

@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader
 
 from networks.vision_transformer import (
     TOPOLOGY_ATTENTION_VERSION,
+    STRUCTURE_PROFILE_FULL,
+    STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet as ViT_seg,
     get_topology_coefficients,
     print_topology_coefficients,
@@ -49,10 +51,50 @@ parser.add_argument('--threshold', default=0.2, type=float, help='binary thresho
 parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final 256x256 skeleton threshold for validation')
 parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help='initial final 256 topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
+parser.add_argument(
+    '--stage_topology_stages',
+    type=str,
+    default='none',
+    choices=['none', 'stage3', 'stage23'],
+    help='which decoder stages get topology attention',
+)
+parser.add_argument('--stage_topology_alpha_max', type=float, default=1.0)
+parser.add_argument('--stage_topology_alpha_init', type=float, default=0.1)
+parser.add_argument(
+    '--stage_topology_bias_mode',
+    type=str,
+    default='pairwise_skeleton',
+    choices=['pairwise_skeleton', 'gap_query'],
+    help='stage topology bias construction mode',
+)
+parser.add_argument('--stage_topology_ratio', type=float, default=0.08)
+parser.add_argument('--stage_topology_topo_clip', type=float, default=4.0)
+parser.add_argument('--stage_topology_warmup_epochs', type=int, default=5)
+parser.add_argument(
+    '--stage_topology_teacher_forcing_end',
+    type=int,
+    default=15,
+    help='epoch at which teacher forcing ratio drops to 0',
+)
+parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
+parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
+parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
 parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
+parser.add_argument(
+    '--structure_profile',
+    type=str,
+    default=STRUCTURE_PROFILE_FULL,
+    choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
+    help='0626 profile: stage2/3 structure only, final skeleton/connectivity off',
+)
+parser.add_argument(
+    '--enable_graph_prop',
+    action='store_true',
+    help='final surface feature soft skeleton graph propagation (stage2/3 priors)',
+)
 # Options expected by the original config updater
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
 parser.add_argument('--zip', action='store_true', help='use zipped dataset')
@@ -66,6 +108,97 @@ parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
 args = parser.parse_args()
+
+
+def apply_structure_profile_defaults(args):
+    if args.structure_profile != STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
+        return
+
+    args.stage_topology_stages = "none"
+    args.stage2_skeleton_weight = 0.004
+    args.stage3_skeleton_weight = 0.006
+    args.stage3_roadness_weight = 0.0
+    args.final_topology_eta_init = 0.0
+    args.final_gap_rho_init = 0.0
+    if args.warmup_epochs == 3:
+        args.warmup_epochs = 10
+    if args.max_epochs == 100:
+        args.max_epochs = 60
+
+
+apply_structure_profile_defaults(args)
+
+
+def get_final_loss_weights(args):
+    if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
+        return {
+            "skeleton_weight": 0.0,
+            "connectivity_weight": 0.0,
+            "skeleton_cldice_weight": 0.0,
+            "boundary_weight": 0.01,
+        }
+    return {
+        "skeleton_weight": 0.02,
+        "connectivity_weight": 0.03,
+        "skeleton_cldice_weight": 0.01,
+        "boundary_weight": 0.03,
+    }
+
+def format_training_config_lines(args, loss_weights):
+    lines = [
+        f"  结构配置: {args.structure_profile}",
+    ]
+    if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
+        lines.extend([
+            "  Structure head: decoder stage2/stage3 skeleton + top-2 connectivity residual attention",
+            "  Final skeleton/connectivity heads: disabled",
+            "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
+            "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
+            "  Stage loss: skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
+            "(corridor-weighted BCE + edge Dice + symmetry)",
+            "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
+            "  Global context gate strength: 0.03",
+            "  Stage topology attention: none",
+        ])
+        if args.enable_graph_prop:
+            lines.extend([
+                "  Final graph propagation: stage2/3 priors -> surface feature",
+                "  Graph propagation lambda: init=0.05, max=0.20, edge_beta=0.7",
+                "  Graph propagation masks: H(topo_conf x surface_anchor), G(near_H x weak_surface)",
+            ])
+    else:
+        lines.extend([
+            "  Decoder structure gates: restored 0621 stages 0/1/2/3",
+            "  Final 256 structure-only topology refiner: "
+            f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4",
+            "  Localized gap repair: "
+            f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap",
+            "  Stage topology attention: "
+            f"{args.stage_topology_stages}, mode={args.stage_topology_bias_mode}, "
+            f"ratio={args.stage_topology_ratio}, topo_clip={args.stage_topology_topo_clip}, "
+            f"alpha_init={args.stage_topology_alpha_init}, "
+            f"alpha_max={args.stage_topology_alpha_max}, "
+            f"warmup={args.stage_topology_warmup_epochs}",
+            "  Stage topology teacher forcing: "
+            f"epoch 0 -> {args.stage_topology_teacher_forcing_end}",
+        ])
+    lines.extend([
+        "  Stage structure weights: "
+        f"stage2={args.stage2_skeleton_weight}, "
+        f"stage3={args.stage3_skeleton_weight}, "
+        f"stage3_roadness={args.stage3_roadness_weight}",
+        "  Surface target resize: 1024 -> 256 nearest-neighbor",
+        "  Boundary-aware refinement: enabled",
+        "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
+        "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
+        "  Final skeleton loss weight: {:.2f}".format(loss_weights["skeleton_weight"]),
+        "  Final connectivity loss weight: {:.2f}".format(loss_weights["connectivity_weight"]),
+        "  Final skeleton clDice weight: {:.2f}".format(loss_weights["skeleton_cldice_weight"]),
+        "  Edge loss: disabled",
+        "  Edge skip enhance: disabled",
+    ])
+    return lines
+
 
 def make_unique_dir(base_dir, run_name):
     run_dir = os.path.join(base_dir, run_name)
@@ -120,6 +253,24 @@ def get_stage_distill_scale(epoch):
     return 1.0
 
 
+def get_stage_topology_alpha_scale(epoch, warmup_epochs=5):
+    if warmup_epochs <= 0:
+        return 1.0
+    if epoch < warmup_epochs:
+        return 0.0
+    return min(1.0, (epoch - warmup_epochs + 1) / warmup_epochs)
+
+
+def get_teacher_forcing_ratio(epoch, tf_start=0, tf_end=15):
+    if tf_end <= tf_start:
+        return 0.0 if epoch >= tf_end else 1.0
+    if epoch < tf_start:
+        return 1.0
+    if epoch >= tf_end:
+        return 0.0
+    return 1.0 - (epoch - tf_start) / (tf_end - tf_start)
+
+
 def pad_to_window_multiple(x, window_size=7):
     """
     Pad input tensor to be divisible by window_size.
@@ -135,6 +286,8 @@ def pad_to_window_multiple(x, window_size=7):
 
 def crop_to_shape(x, target_shape):
     """Crop tensor back to target shape."""
+    if x is None:
+        return None
     H, W = target_shape
     return x[:, :, :H, :W]
 
@@ -268,6 +421,7 @@ def evaluate_skeleton(
     threshold=0.2,
     skeleton_threshold=0.5,
     stage_distill_scale=1.0,
+    stage_topology_alpha_scale=1.0,
 ):
     model.eval()
     total_loss = 0.0
@@ -286,7 +440,11 @@ def evaluate_skeleton(
             skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=8)
             skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=8)
             
-            outputs = model(images_padded)
+            outputs = model(
+                images_padded,
+                topology_alpha_scale=stage_topology_alpha_scale,
+                teacher_forcing_ratio=0.0,
+            )
 
             if isinstance(outputs, tuple):
                 (
@@ -321,18 +479,20 @@ def evaluate_skeleton(
             total_loss += loss.item()
 
             surface_pred = (torch.sigmoid(surface_logits) >= threshold).float().squeeze(1)
-            skeleton_pred = (
-                torch.sigmoid(skeleton_logits) >= skeleton_threshold
-            ).float().squeeze(1)
             masks_bin = (masks_padded > 0.5).float().squeeze(1)
-            skeletons_bin = (skeletons_padded > 0.5).float().squeeze(1)
 
             surface_tp += int((surface_pred * masks_bin).sum().item())
             surface_fp += int((surface_pred * (1.0 - masks_bin)).sum().item())
             surface_fn += int(((1.0 - surface_pred) * masks_bin).sum().item())
-            skeleton_tp += int((skeleton_pred * skeletons_bin).sum().item())
-            skeleton_fp += int((skeleton_pred * (1.0 - skeletons_bin)).sum().item())
-            skeleton_fn += int(((1.0 - skeleton_pred) * skeletons_bin).sum().item())
+
+            if skeleton_logits is not None:
+                skeleton_pred = (
+                    torch.sigmoid(skeleton_logits) >= skeleton_threshold
+                ).float().squeeze(1)
+                skeletons_bin = (skeletons_padded > 0.5).float().squeeze(1)
+                skeleton_tp += int((skeleton_pred * skeletons_bin).sum().item())
+                skeleton_fp += int((skeleton_pred * (1.0 - skeletons_bin)).sum().item())
+                skeleton_fn += int(((1.0 - skeleton_pred) * skeletons_bin).sum().item())
 
     avg_loss = total_loss / max(len(loader), 1)
 
@@ -402,11 +562,20 @@ if __name__ == "__main__":
     
     # 创建网络（启用 DilatedAsterisk 空间特征增强）
     args.num_classes = 1
+    loss_weights = get_final_loss_weights(args)
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes, use_asterisk=True,
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
                     final_topology_eta_init=args.final_topology_eta_init,
-                    final_gap_rho_init=args.final_gap_rho_init).to(device)
+                    final_gap_rho_init=args.final_gap_rho_init,
+                    stage_topology_stages=args.stage_topology_stages,
+                    stage_topology_alpha_max=args.stage_topology_alpha_max,
+                    stage_topology_alpha_init=args.stage_topology_alpha_init,
+                    stage_topology_bias_mode=args.stage_topology_bias_mode,
+                    stage_topology_ratio=args.stage_topology_ratio,
+                    stage_topology_topo_clip=args.stage_topology_topo_clip,
+                    structure_profile=args.structure_profile,
+                    enable_final_graph_prop=args.enable_graph_prop).to(device)
 
     # 加载数据
     train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
@@ -434,17 +603,26 @@ if __name__ == "__main__":
     criterion = SurfaceStructureLoss(
         surface_dice_weight=0.5,
         skeleton_dice_weight=1.0,
-        skeleton_weight=0.02,
-        connectivity_weight=0.03,
+        skeleton_weight=loss_weights["skeleton_weight"],
+        connectivity_weight=loss_weights["connectivity_weight"],
         connectivity_erode_kernel_size=1,
-        skeleton_cldice_weight=0.01,
+        skeleton_cldice_weight=loss_weights["skeleton_cldice_weight"],
         skeleton_cldice_iterations=10,
-        boundary_weight=0.03,
+        boundary_weight=loss_weights["boundary_weight"],
         boundary_radius=1,
-        stage_structure_weights=(0.0, 0.0, 0.0, 0.0),
+        stage_structure_weights=(
+            0.0,
+            0.0,
+            args.stage2_skeleton_weight,
+            args.stage3_skeleton_weight,
+        ),
+        stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
         stage_connectivity_factor=0.5,
         stage_distill_weights=(0.0, 0.0),
         stage_distill_connectivity_factor=0.5,
+        use_legacy_stage_connectivity_loss=(
+            args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
+        ),
     ).to(device)
 
     # 检查是否恢复训练
@@ -453,8 +631,43 @@ if __name__ == "__main__":
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location='cuda')
-            model.load_state_dict(checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            strict_load = args.bottleneck_type == 'global_local'
+            try:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=strict_load)
+            except RuntimeError as exc:
+                allowed_missing_prefixes = (
+                    "swin_unet.stage2_topology_source.",
+                    "swin_unet.stage_topology_scales.",
+                    "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
+                )
+                result = model.load_state_dict(
+                    checkpoint['model_state_dict'],
+                    strict=False,
+                )
+                invalid_missing = [
+                    key
+                    for key in result.missing_keys
+                    if not key.startswith(allowed_missing_prefixes)
+                ]
+                if invalid_missing or result.unexpected_keys:
+                    raise RuntimeError(
+                        "Checkpoint mismatch on resume: "
+                        f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+                    ) from exc
+                print(
+                    "[WARN] Loaded checkpoint with strict=False; "
+                    "new stage-topology modules use fresh initialization.",
+                    flush=True,
+                )
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (ValueError, RuntimeError) as exc:
+                print(
+                    "[WARN] Optimizer state not restored; "
+                    "continuing with a fresh optimizer for current parameters.",
+                    flush=True,
+                )
+                print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
             start_epoch = checkpoint.get('epoch', 0)
             print(f"从epoch {start_epoch} 继续训练...")
         else:
@@ -468,27 +681,8 @@ if __name__ == "__main__":
     print(f"  学习率: {args.base_lr}")
     print(f"  最小学习率: {args.min_lr}")
     print(f"  Warmup轮数: {args.warmup_epochs}")
-    print("  Decoder structure gates: restored 0621 stages 0/1/2/3")
-    print(
-        "  Final 256 structure-only topology refiner: "
-        f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4"
-    )
-    print(
-        "  Localized gap repair: "
-        f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap"
-    )
-    print("  Surface target resize: 1024 -> 256 nearest-neighbor")
-    print("  Decoder structure gate auxiliary loss: disabled (0621 setting)")
-    print("  Final topology refines skeleton/connectivity only")
-    print("  Global alpha * structure residual on surface: disabled")
-    print("  Final skeleton loss weight: 0.02")
-    print("  Final connectivity loss weight: 0.03")
-    print("  Final skeleton clDice weight: 0.01")
-    print("  Boundary-aware refinement: enabled")
-    print("  Boundary loss weight: 0.03")
-    print("  Boundary target: dilate(mask, r=1) - erode(mask, k=3)")
-    print("  Edge loss: disabled")
-    print("  Edge skip enhance: disabled")
+    for line in format_training_config_lines(args, loss_weights):
+        print(line)
     print(f"  输出目录: {args.output_dir}")
     print(f"  Checkpoints目录: {checkpoints_dir}")
     print(f"  验证阈值: {args.threshold}")
@@ -514,27 +708,8 @@ if __name__ == "__main__":
         log_f.write(f"  学习率: {args.base_lr}\n")
         log_f.write(f"  最小学习率: {args.min_lr}\n")
         log_f.write(f"  Warmup轮数: {args.warmup_epochs}\n")
-        log_f.write("  Decoder structure gates: restored 0621 stages 0/1/2/3\n")
-        log_f.write(
-            "  Final 256 structure-only topology refiner: "
-            f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4\n"
-        )
-        log_f.write(
-            "  Localized gap repair: "
-            f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap\n"
-        )
-        log_f.write("  Surface target resize: 1024 -> 256 nearest-neighbor\n")
-        log_f.write("  Decoder structure gate auxiliary loss: disabled (0621 setting)\n")
-        log_f.write("  Final topology refines skeleton/connectivity only\n")
-        log_f.write("  Global alpha * structure residual on surface: disabled\n")
-        log_f.write("  Final skeleton loss weight: 0.02\n")
-        log_f.write("  Final connectivity loss weight: 0.03\n")
-        log_f.write("  Final skeleton clDice weight: 0.01\n")
-        log_f.write("  Boundary-aware refinement: enabled\n")
-        log_f.write("  Boundary loss weight: 0.03\n")
-        log_f.write("  Boundary target: dilate(mask, r=1) - erode(mask, k=3)\n")
-        log_f.write("  Edge loss: disabled\n")
-        log_f.write("  Edge skip enhance: disabled\n")
+        for line in format_training_config_lines(args, loss_weights):
+            log_f.write(line + "\n")
         log_f.write(f"  验证阈值: {args.threshold}\n")
         log_f.write(f"  数据目录: {args.root_path}\n")
         if args.max_train_batches > 0:
@@ -568,6 +743,15 @@ if __name__ == "__main__":
             train_batches = 0
             skipped_batches = 0
             stage_distill_scale = get_stage_distill_scale(epoch)
+            stage_topology_alpha_scale = get_stage_topology_alpha_scale(
+                epoch,
+                args.stage_topology_warmup_epochs,
+            )
+            teacher_forcing_ratio = get_teacher_forcing_ratio(
+                epoch,
+                tf_start=0,
+                tf_end=args.stage_topology_teacher_forcing_end,
+            )
 
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
@@ -583,7 +767,12 @@ if __name__ == "__main__":
                 skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=8)
                 skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=8)
 
-                outputs = model(images_padded)
+                outputs = model(
+                    images_padded,
+                    gt_skeleton=skeletons_padded,
+                    topology_alpha_scale=stage_topology_alpha_scale,
+                    teacher_forcing_ratio=teacher_forcing_ratio,
+                )
 
                 if isinstance(outputs, tuple):
                     (
@@ -652,8 +841,12 @@ if __name__ == "__main__":
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                         f"ClDice: {loss_dict['skeleton_cldice_loss'].item():.4f}, "
+                        f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
+                        f"StageRoad: {loss_dict['stage_roadness_loss'].item():.4f}, "
                         f"StageKD: {loss_dict['stage_distill_loss'].item():.4f}"
                         f"x{stage_distill_scale:.2f}, "
+                        f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
+                        f"TF: {teacher_forcing_ratio:.2f}, "
                         f"Boundary: {loss_dict['boundary_loss'].item():.4f}",
                         flush=True
                     )
@@ -666,6 +859,7 @@ if __name__ == "__main__":
                 args.threshold,
                 args.skeleton_threshold,
                 stage_distill_scale,
+                stage_topology_alpha_scale,
             )
             val_loss = val_metrics['loss']
             val_iou = val_metrics['surface_iou']
@@ -713,6 +907,14 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton F1: {skeleton_f1:.6f}\n")
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
+                log_f.write(
+                    f"  Stage topology alpha scale: "
+                    f"{stage_topology_alpha_scale:.6f}\n"
+                )
+                log_f.write(
+                    f"  Stage topology teacher forcing ratio: "
+                    f"{teacher_forcing_ratio:.6f}\n"
+                )
                 log_f.write(f"  Skipped non-finite batches: {skipped_batches}\n")
                 log_f.write(topology_msg + "\n")
                 log_f.write("-"*100 + "\n")
@@ -739,7 +941,10 @@ if __name__ == "__main__":
                 'skeleton_precision': skeleton_precision,
                 'skeleton_recall': skeleton_recall,
                 'topology_attention_version': TOPOLOGY_ATTENTION_VERSION,
+                'structure_profile': args.structure_profile,
                 'topology_coefficients': get_topology_coefficients(model),
+                'stage_topology_alpha_scale': stage_topology_alpha_scale,
+                'stage_topology_teacher_forcing_ratio': teacher_forcing_ratio,
                 'args': vars(args),
             }
             # 保存 last.pth（总是覆盖）

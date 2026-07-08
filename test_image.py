@@ -13,6 +13,8 @@ from datetime import datetime
 
 from networks.vision_transformer import (
     TOPOLOGY_ATTENTION_VERSION,
+    STRUCTURE_PROFILE_FULL,
+    STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet as ViT_seg,
     format_topology_coefficients,
     load_topology_checkpoint_state,
@@ -36,7 +38,34 @@ parser.add_argument('--threshold', type=float, default=0.2, help='binary thresho
 parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final 256x256 skeleton')
 parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final 256 topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', type=float, default=0.005, help='initial localized gap-repair coefficient')
+parser.add_argument(
+    '--stage_topology_stages',
+    type=str,
+    default='none',
+    choices=['none', 'stage3', 'stage23'],
+)
+parser.add_argument('--stage_topology_alpha_max', type=float, default=1.0)
+parser.add_argument('--stage_topology_alpha_init', type=float, default=0.1)
+parser.add_argument(
+    '--stage_topology_bias_mode',
+    type=str,
+    default='pairwise_skeleton',
+    choices=['pairwise_skeleton', 'gap_query'],
+)
+parser.add_argument('--stage_topology_ratio', type=float, default=0.08)
+parser.add_argument('--stage_topology_topo_clip', type=float, default=4.0)
 parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
+parser.add_argument(
+    '--structure_profile',
+    type=str,
+    default=STRUCTURE_PROFILE_FULL,
+    choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
+)
+parser.add_argument(
+    '--enable_graph_prop',
+    action='store_true',
+    help='enable final soft skeleton graph propagation (auto-read from checkpoint when omitted)',
+)
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -152,15 +181,40 @@ if __name__ == "__main__":
     
     # 创建网络
     args.num_classes = 1
+    checkpoint = None
+    enable_graph_prop = args.enable_graph_prop
+    if os.path.exists(args.model_path):
+        checkpoint = torch.load(args.model_path, map_location='cpu')
+        if isinstance(checkpoint, dict):
+            saved_profile = checkpoint.get("structure_profile")
+            if saved_profile:
+                args.structure_profile = saved_profile
+            elif isinstance(checkpoint.get("args"), dict):
+                args.structure_profile = checkpoint["args"].get(
+                    "structure_profile",
+                    args.structure_profile,
+                )
+            if not enable_graph_prop and isinstance(checkpoint.get("args"), dict):
+                enable_graph_prop = bool(
+                    checkpoint["args"].get("enable_graph_prop", False)
+                )
+
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes, use_asterisk=True,
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
                     final_topology_eta_init=args.final_topology_eta_init,
-                    final_gap_rho_init=args.final_gap_rho_init).cuda()
+                    final_gap_rho_init=args.final_gap_rho_init,
+                    stage_topology_stages=args.stage_topology_stages,
+                    stage_topology_alpha_max=args.stage_topology_alpha_max,
+                    stage_topology_alpha_init=args.stage_topology_alpha_init,
+                    stage_topology_bias_mode=args.stage_topology_bias_mode,
+                    stage_topology_ratio=args.stage_topology_ratio,
+                    stage_topology_topo_clip=args.stage_topology_topo_clip,
+                    structure_profile=args.structure_profile,
+                    enable_final_graph_prop=enable_graph_prop).cuda()
     
     # 加载模型
-    if os.path.exists(args.model_path):
-        checkpoint = torch.load(args.model_path, map_location='cpu')
+    if checkpoint is not None:
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             load_topology_checkpoint_state(
                 model,
@@ -186,8 +240,6 @@ if __name__ == "__main__":
     else:
         print(f"错误: 模型文件不存在 {args.model_path}")
         exit(1)
-    
-    # 加载测试数据
     test_image_dir = os.path.join(args.root_path, 'test', 'image')
     test_label_dir = os.path.join(args.root_path, 'test', 'mask')
     if not os.path.exists(test_label_dir):
@@ -367,13 +419,16 @@ if __name__ == "__main__":
             
             # 仅保存 PNG：最多保留 30 张代表性预测（按前 30 个 case）
             prob_numpy = torch.sigmoid(surface_logits).squeeze(0).squeeze(0).cpu().numpy()
-            skeleton_prob = (
-                torch.sigmoid(skeleton_logits)
-                .squeeze(0)
-                .squeeze(0)
-                .cpu()
-                .numpy()
-            )
+            if skeleton_logits is not None:
+                skeleton_prob = (
+                    torch.sigmoid(skeleton_logits)
+                    .squeeze(0)
+                    .squeeze(0)
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                skeleton_prob = None
             if args.source_patch_size and args.source_patch_size != args.img_size:
                 prob_resized = np.array(
                     Image.fromarray(prob_numpy.astype(np.float32), mode='F').resize(
@@ -383,30 +438,34 @@ if __name__ == "__main__":
                     dtype=np.float32,
                 )
                 pred_numpy = (prob_resized >= args.threshold).astype(np.uint8) * 255
-                skeleton_prob_resized = np.array(
-                    Image.fromarray(skeleton_prob.astype(np.float32), mode='F').resize(
-                        (args.source_patch_size, args.source_patch_size),
-                        Image.BILINEAR,
-                    ),
-                    dtype=np.float32,
-                )
+                if skeleton_prob is not None:
+                    skeleton_prob_resized = np.array(
+                        Image.fromarray(skeleton_prob.astype(np.float32), mode='F').resize(
+                            (args.source_patch_size, args.source_patch_size),
+                            Image.BILINEAR,
+                        ),
+                        dtype=np.float32,
+                    )
+                else:
+                    skeleton_prob_resized = None
             else:
                 pred_numpy = (prob_numpy >= args.threshold).astype(np.uint8) * 255
                 skeleton_prob_resized = skeleton_prob
             pred_img = Image.fromarray(pred_numpy, mode='L')
-            skeleton_pred_img = Image.fromarray(
-                (skeleton_prob_resized >= args.skeleton_threshold).astype(np.uint8) * 255,
-                mode='L',
-            )
             # 只保存前 30 张到 surface_dir
             if total_samples <= 30:
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
                 pred_img.save(png_save_path)
-                skeleton_pred_path = os.path.join(
-                    skeleton_dir,
-                    f'{case_name}_skeleton_pred.png',
-                )
-                skeleton_pred_img.save(skeleton_pred_path)
+                if skeleton_prob_resized is not None:
+                    skeleton_pred_img = Image.fromarray(
+                        (skeleton_prob_resized >= args.skeleton_threshold).astype(np.uint8) * 255,
+                        mode='L',
+                    )
+                    skeleton_pred_path = os.path.join(
+                        skeleton_dir,
+                        f'{case_name}_skeleton_pred.png',
+                    )
+                    skeleton_pred_img.save(skeleton_pred_path)
     
     print(f"预测结果已保存到: {pred_dir}")
     
