@@ -17,7 +17,9 @@ from networks.vision_transformer import (
     STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet as ViT_seg,
+    freeze_backbone_train_graph_only,
     get_topology_coefficients,
+    load_topology_checkpoint_state,
     print_topology_coefficients,
 )
 from datasets.dataset_synapse import ImageDataset, RandomGenerator
@@ -93,7 +95,63 @@ parser.add_argument(
 parser.add_argument(
     '--enable_graph_prop',
     action='store_true',
-    help='final surface feature soft skeleton graph propagation (stage2/3 priors)',
+    help='final surface delta-logit soft graph propagation (stage2/3 priors)',
+)
+parser.add_argument(
+    '--freeze_0626_backbone',
+    action='store_true',
+    help='freeze 0626 encoder/decoder/heads; train graph_propagation only',
+)
+parser.add_argument(
+    '--graph_corr_weight',
+    type=float,
+    default=0.10,
+    help='continuous baseline-error correction loss weight',
+)
+parser.add_argument(
+    '--graph_corr_k',
+    type=float,
+    default=2.0,
+    help='scale for target_delta = k * (GT - P_base)',
+)
+parser.add_argument(
+    '--graph_corr_m_pos',
+    type=float,
+    default=0.15,
+    help='max positive target delta for graph residual',
+)
+parser.add_argument(
+    '--graph_corr_m_neg',
+    type=float,
+    default=0.15,
+    help='max negative target delta magnitude for graph residual',
+)
+parser.add_argument(
+    '--graph_fn_push_weight',
+    type=float,
+    default=0.0,
+    help='deprecated; use --graph_corr_weight',
+)
+parser.add_argument(
+    '--graph_fp_suppress_weight',
+    type=float,
+    default=0.0,
+    help='deprecated; use --graph_corr_weight',
+)
+parser.add_argument(
+    '--graph_delta_sparse_weight',
+    type=float,
+    default=0.0,
+    help='deprecated; use --graph_corr_weight',
+)
+parser.add_argument(
+    '--graph_base_lr',
+    type=float,
+    default=1e-3,
+    help='learning rate for graph-only training when backbone is frozen',
+)
+DEFAULT_0626_CHECKPOINT = (
+    './model_out/train_stage23_structure_final_boundary_nw0_20260626/best.pth'
 )
 # Options expected by the original config updater
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
@@ -128,6 +186,11 @@ def apply_structure_profile_defaults(args):
 
 apply_structure_profile_defaults(args)
 
+if args.freeze_0626_backbone and not args.enable_graph_prop:
+    parser.error("--freeze_0626_backbone requires --enable_graph_prop")
+if args.freeze_0626_backbone and not args.resume:
+    args.resume = DEFAULT_0626_CHECKPOINT
+
 
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
@@ -143,6 +206,54 @@ def get_final_loss_weights(args):
         "skeleton_cldice_weight": 0.01,
         "boundary_weight": 0.03,
     }
+
+def get_graph_outputs_from_model(model):
+    module = model.module if hasattr(model, "module") else model
+    head = module.swin_unet.guided_head
+    return (
+        head.last_surface_pre_logits,
+        head.last_delta_logit,
+        head.last_graph_delta,
+    )
+
+
+def build_criterion(args, loss_weights, device):
+    stage2_weight = 0.0 if args.freeze_0626_backbone else args.stage2_skeleton_weight
+    stage3_weight = 0.0 if args.freeze_0626_backbone else args.stage3_skeleton_weight
+    boundary_weight = 0.0 if args.freeze_0626_backbone else loss_weights["boundary_weight"]
+    graph_corr = args.graph_corr_weight if args.enable_graph_prop else 0.0
+    if args.freeze_0626_backbone:
+        graph_corr = args.graph_corr_weight
+
+    return SurfaceStructureLoss(
+        surface_dice_weight=0.5,
+        skeleton_dice_weight=1.0,
+        skeleton_weight=loss_weights["skeleton_weight"],
+        connectivity_weight=loss_weights["connectivity_weight"],
+        connectivity_erode_kernel_size=1,
+        skeleton_cldice_weight=loss_weights["skeleton_cldice_weight"],
+        skeleton_cldice_iterations=10,
+        boundary_weight=boundary_weight,
+        boundary_radius=1,
+        stage_structure_weights=(
+            0.0,
+            0.0,
+            stage2_weight,
+            stage3_weight,
+        ),
+        stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
+        stage_connectivity_factor=0.5,
+        stage_distill_weights=(0.0, 0.0),
+        stage_distill_connectivity_factor=0.5,
+        use_legacy_stage_connectivity_loss=(
+            args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
+        ),
+        graph_corr_weight=graph_corr,
+        graph_corr_k=args.graph_corr_k,
+        graph_corr_m_pos=args.graph_corr_m_pos,
+        graph_corr_m_neg=args.graph_corr_m_neg,
+    ).to(device)
+
 
 def format_training_config_lines(args, loss_weights):
     lines = [
@@ -162,10 +273,16 @@ def format_training_config_lines(args, loss_weights):
         ])
         if args.enable_graph_prop:
             lines.extend([
-                "  Final graph propagation: stage2/3 priors -> surface feature",
+                "  Final graph propagation: stage2/3 priors -> delta-logit residual",
                 "  Graph propagation lambda: init=0.05, max=0.20, edge_beta=0.7",
-                "  Graph propagation masks: H(topo_conf x surface_anchor), G(near_H x weak_surface)",
+                "  Graph G: learned gate_mlp(P, weak, two_sided_support, near_H, H, S, C)",
+                "  Graph support: sqrt(H_l*H_r) * mean(C_l,C_r); candidate=weak*(1-H)",
+                "  Graph correction loss: weighted SmoothL1(delta_logit, k*(GT-P_base))",
             ])
+            if args.freeze_0626_backbone:
+                lines.append(
+                    "  Backbone: frozen 0626 (train graph_propagation + lambda only)"
+                )
     else:
         lines.extend([
             "  Decoder structure gates: restored 0621 stages 0/1/2/3",
@@ -465,6 +582,14 @@ def evaluate_skeleton(
             skeletons_padded = crop_to_shape(skeletons_padded, orig_shape)
             skeletons_dilate_padded = crop_to_shape(skeletons_dilate_padded, orig_shape)
 
+            graph_base_logits, graph_delta_logit, graph_delta = (
+                get_graph_outputs_from_model(model)
+            )
+            if graph_base_logits is not None:
+                graph_base_logits = crop_to_shape(graph_base_logits, orig_shape)
+            if graph_delta_logit is not None:
+                graph_delta_logit = crop_to_shape(graph_delta_logit, orig_shape)
+
             loss, _ = criterion(
                 surface_logits,
                 surface_gt=masks_padded,
@@ -475,6 +600,8 @@ def evaluate_skeleton(
                 skeleton_logits=skeleton_logits,
                 connectivity_logits=connectivity_logits,
                 stage_distill_scale=stage_distill_scale,
+                graph_base_logits=graph_base_logits,
+                graph_delta_logit=graph_delta_logit,
             )
             total_loss += loss.item()
 
@@ -596,82 +723,101 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-    # 优化器
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.base_lr, weight_decay=0.0001)
-
-    # 损失函数
-    criterion = SurfaceStructureLoss(
-        surface_dice_weight=0.5,
-        skeleton_dice_weight=1.0,
-        skeleton_weight=loss_weights["skeleton_weight"],
-        connectivity_weight=loss_weights["connectivity_weight"],
-        connectivity_erode_kernel_size=1,
-        skeleton_cldice_weight=loss_weights["skeleton_cldice_weight"],
-        skeleton_cldice_iterations=10,
-        boundary_weight=loss_weights["boundary_weight"],
-        boundary_radius=1,
-        stage_structure_weights=(
-            0.0,
-            0.0,
-            args.stage2_skeleton_weight,
-            args.stage3_skeleton_weight,
-        ),
-        stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
-        stage_connectivity_factor=0.5,
-        stage_distill_weights=(0.0, 0.0),
-        stage_distill_connectivity_factor=0.5,
-        use_legacy_stage_connectivity_loss=(
-            args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
-        ),
-    ).to(device)
+    # 优化器 / 损失（graph-only 模式在加载 checkpoint 后再建 optimizer）
+    criterion = build_criterion(args, loss_weights, device)
+    optimizer = None
 
     # 检查是否恢复训练
     start_epoch = 0
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location='cuda')
-            strict_load = args.bottleneck_type == 'global_local'
-            try:
-                model.load_state_dict(checkpoint['model_state_dict'], strict=strict_load)
-            except RuntimeError as exc:
-                allowed_missing_prefixes = (
-                    "swin_unet.stage2_topology_source.",
-                    "swin_unet.stage_topology_scales.",
-                    "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
+            checkpoint = torch.load(args.resume, map_location=device)
+            if args.freeze_0626_backbone:
+                load_topology_checkpoint_state(
+                    model,
+                    checkpoint["model_state_dict"],
+                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
                 )
-                result = model.load_state_dict(
-                    checkpoint['model_state_dict'],
-                    strict=False,
-                )
-                invalid_missing = [
-                    key
-                    for key in result.missing_keys
-                    if not key.startswith(allowed_missing_prefixes)
-                ]
-                if invalid_missing or result.unexpected_keys:
-                    raise RuntimeError(
-                        "Checkpoint mismatch on resume: "
-                        f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
-                    ) from exc
+            else:
+                strict_load = args.bottleneck_type == 'global_local'
+                try:
+                    model.load_state_dict(checkpoint['model_state_dict'], strict=strict_load)
+                except RuntimeError as exc:
+                    allowed_missing_prefixes = (
+                        "swin_unet.stage2_topology_source.",
+                        "swin_unet.stage_topology_scales.",
+                        "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
+                        "swin_unet.guided_head.graph_propagation.",
+                    )
+                    result = model.load_state_dict(
+                        checkpoint['model_state_dict'],
+                        strict=False,
+                    )
+                    invalid_missing = [
+                        key
+                        for key in result.missing_keys
+                        if not key.startswith(allowed_missing_prefixes)
+                    ]
+                    if invalid_missing or result.unexpected_keys:
+                        raise RuntimeError(
+                            "Checkpoint mismatch on resume: "
+                            f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+                        ) from exc
+                    print(
+                        "[WARN] Loaded checkpoint with strict=False; "
+                        "some modules use fresh initialization.",
+                        flush=True,
+                    )
+            if args.freeze_0626_backbone:
+                trainable = freeze_backbone_train_graph_only(model)
                 print(
-                    "[WARN] Loaded checkpoint with strict=False; "
-                    "new stage-topology modules use fresh initialization.",
+                    "[INFO] Frozen 0626 backbone; trainable graph params: "
+                    f"{len(trainable)} tensors",
                     flush=True,
                 )
-            try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except (ValueError, RuntimeError) as exc:
+                # 0626 ckpt epoch 可能 > max_epochs；graph-only 是新实验，从 0 开始
+                start_epoch = 0
                 print(
-                    "[WARN] Optimizer state not restored; "
-                    "continuing with a fresh optimizer for current parameters.",
+                    "[INFO] Graph-only fine-tune: reset start_epoch to 0 "
+                    f"(checkpoint had epoch={checkpoint.get('epoch', '?')})",
                     flush=True,
                 )
-                print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
-            start_epoch = checkpoint.get('epoch', 0)
+            else:
+                start_epoch = checkpoint.get('epoch', 0)
+            if not args.freeze_0626_backbone:
+                try:
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(),
+                        lr=args.base_lr,
+                        weight_decay=0.0001,
+                    )
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                except (ValueError, RuntimeError) as exc:
+                    print(
+                        "[WARN] Optimizer state not restored; "
+                        "continuing with a fresh optimizer for current parameters.",
+                        flush=True,
+                    )
+                    print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
             print(f"从epoch {start_epoch} 继续训练...")
         else:
             print(f"Warning: checkpoint未找到 {args.resume}")
+
+    if optimizer is None:
+        if args.freeze_0626_backbone:
+            graph_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                graph_params,
+                lr=args.graph_base_lr,
+                weight_decay=0.0001,
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.base_lr,
+                weight_decay=0.0001,
+            )
 
     # 训练循环
     print("\n开始训练...")
@@ -793,6 +939,9 @@ if __name__ == "__main__":
                 skeletons_padded = crop_to_shape(skeletons_padded, orig_shape)
                 skeletons_dilate_padded = crop_to_shape(skeletons_dilate_padded, orig_shape)
                 
+                graph_base_logits, graph_delta_logit, graph_delta = (
+                    get_graph_outputs_from_model(model)
+                )
                 loss, loss_dict = criterion(
                     surface_logits,
                     surface_gt=masks_padded,
@@ -803,6 +952,8 @@ if __name__ == "__main__":
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
                     stage_distill_scale=stage_distill_scale,
+                    graph_base_logits=graph_base_logits,
+                    graph_delta_logit=graph_delta_logit,
                 )
 
                 if not torch.isfinite(loss):
@@ -847,7 +998,8 @@ if __name__ == "__main__":
                         f"x{stage_distill_scale:.2f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
                         f"TF: {teacher_forcing_ratio:.2f}, "
-                        f"Boundary: {loss_dict['boundary_loss'].item():.4f}",
+                        f"Boundary: {loss_dict['boundary_loss'].item():.4f}, "
+                        f"GraphCorr: {loss_dict['graph_corr_loss'].item():.4f}",
                         flush=True
                     )
 

@@ -315,6 +315,13 @@ class SurfaceStructureLoss(nn.Module):
         stage_distill_weights=(0.004, 0.006),
         stage_distill_connectivity_factor=0.5,
         use_legacy_stage_connectivity_loss=False,
+        graph_corr_weight=0.0,
+        graph_corr_k=2.0,
+        graph_corr_m_pos=0.15,
+        graph_corr_m_neg=0.15,
+        graph_fn_push_weight=0.0,
+        graph_fp_suppress_weight=0.0,
+        graph_delta_sparse_weight=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -356,6 +363,41 @@ class SurfaceStructureLoss(nn.Module):
         self.stage_distill_connectivity_factor = float(
             stage_distill_connectivity_factor
         )
+        self.graph_corr_weight = float(graph_corr_weight)
+        self.graph_corr_k = float(graph_corr_k)
+        self.graph_corr_m_pos = float(graph_corr_m_pos)
+        self.graph_corr_m_neg = float(graph_corr_m_neg)
+        self.graph_fn_push_weight = float(graph_fn_push_weight)
+        self.graph_fp_suppress_weight = float(graph_fp_suppress_weight)
+        self.graph_delta_sparse_weight = float(graph_delta_sparse_weight)
+
+    def graph_correction_loss(self, base_logits, delta_logit, surface_gt):
+        zero = surface_gt.sum() * 0.0
+        if base_logits is None or delta_logit is None:
+            return zero, {
+                "graph_corr_loss": zero.detach(),
+            }
+
+        if surface_gt.dim() == 3:
+            gt = surface_gt.unsqueeze(1)
+        else:
+            gt = surface_gt
+        gt = gt.float()
+        p_base = torch.sigmoid(base_logits.detach())
+        error = gt - p_base
+        target_delta = torch.clamp(
+            self.graph_corr_k * error,
+            min=-self.graph_corr_m_neg,
+            max=self.graph_corr_m_pos,
+        )
+        weight = torch.abs(error).detach()
+        per_pixel = F.smooth_l1_loss(
+            delta_logit,
+            target_delta,
+            reduction="none",
+        )
+        loss_corr = (weight * per_pixel).sum() / weight.sum().clamp_min(1e-6)
+        return loss_corr, {"graph_corr_loss": loss_corr.detach()}
 
     def skeleton_pixel_loss(self, skeleton_logits, skeleton_gt, skeleton_dilate_gt):
         skeleton_pos_weight = (
@@ -675,6 +717,8 @@ class SurfaceStructureLoss(nn.Module):
         stage_skeleton_gt=None,
         stage_skeleton_dilate_gt=None,
         stage_distill_scale=1.0,
+        graph_base_logits=None,
+        graph_delta_logit=None,
     ):
         if surface_gt is None or skeleton_gt is None:
             raise ValueError("surface_gt and skeleton_gt are required.")
@@ -756,6 +800,12 @@ class SurfaceStructureLoss(nn.Module):
             connectivity_logits,
         )
 
+        loss_graph_corr, graph_loss_dict = self.graph_correction_loss(
+            graph_base_logits,
+            graph_delta_logit,
+            surface_gt,
+        )
+
         total_loss = (
             loss_surface
             + self.skeleton_weight * loss_skeleton
@@ -766,6 +816,7 @@ class SurfaceStructureLoss(nn.Module):
             + loss_stage_structure
             + loss_stage_roadness
             + float(stage_distill_scale) * loss_stage_distill
+            + self.graph_corr_weight * loss_graph_corr
         )
 
         loss_dict = {
@@ -779,6 +830,7 @@ class SurfaceStructureLoss(nn.Module):
             "stage_structure_loss": loss_stage_structure.detach(),
             "stage_roadness_loss": loss_stage_roadness.detach(),
             "stage_distill_loss": loss_stage_distill.detach(),
+            "graph_corr_loss": graph_loss_dict["graph_corr_loss"],
             "stage_distill_scale": torch.as_tensor(
                 stage_distill_scale,
                 device=surface_logits.device,

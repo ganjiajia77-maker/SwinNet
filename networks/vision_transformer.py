@@ -176,6 +176,24 @@ def apply_structure_profile_runtime(model):
     guided_head.raw_rho_gap.requires_grad_(False)
 
 
+def freeze_backbone_train_graph_only(model):
+    """Freeze encoder/decoder/heads; leave graph_propagation trainable."""
+    module = model.module if hasattr(model, "module") else model
+    for param in module.parameters():
+        param.requires_grad = False
+
+    graph = getattr(module.swin_unet.guided_head, "graph_propagation", None)
+    if graph is None:
+        raise RuntimeError(
+            "freeze_backbone_train_graph_only requires enable_graph_prop=True"
+        )
+    for param in graph.parameters():
+        param.requires_grad = True
+
+    trainable = [name for name, p in module.named_parameters() if p.requires_grad]
+    return trainable
+
+
 def format_topology_coefficients(model):
     coefficients = get_topology_coefficients(model)
     fields = [
