@@ -186,17 +186,28 @@ if __name__ == "__main__":
     if os.path.exists(args.model_path):
         checkpoint = torch.load(args.model_path, map_location='cpu')
         if isinstance(checkpoint, dict):
+            saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
             saved_profile = checkpoint.get("structure_profile")
             if saved_profile:
                 args.structure_profile = saved_profile
-            elif isinstance(checkpoint.get("args"), dict):
-                args.structure_profile = checkpoint["args"].get(
+            elif saved_args:
+                args.structure_profile = saved_args.get(
                     "structure_profile",
                     args.structure_profile,
                 )
-            if not enable_graph_prop and isinstance(checkpoint.get("args"), dict):
+            for name in (
+                "stage_topology_stages",
+                "stage_topology_alpha_max",
+                "stage_topology_alpha_init",
+                "stage_topology_bias_mode",
+                "stage_topology_ratio",
+                "stage_topology_topo_clip",
+            ):
+                if name in saved_args:
+                    setattr(args, name, saved_args[name])
+            if not enable_graph_prop and saved_args:
                 enable_graph_prop = bool(
-                    checkpoint["args"].get("enable_graph_prop", False)
+                    saved_args.get("enable_graph_prop", False)
                 )
 
     model = ViT_seg(config=config, img_size=args.img_size,

@@ -1140,7 +1140,13 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_chans, embed_dim, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=2, dilation=2, bias=False),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=7, stride=patch_size, padding=3),
+        )
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -1157,7 +1163,10 @@ class PatchEmbed(nn.Module):
 
     def flops(self):
         Ho, Wo = self.patches_resolution
-        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
+        H, W = self.img_size
+        flops = H * W * self.embed_dim * self.in_chans * 3 * 3
+        flops += H * W * self.embed_dim * self.embed_dim * 3 * 3
+        flops += Ho * Wo * self.embed_dim * self.embed_dim * 7 * 7
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
