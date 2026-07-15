@@ -22,7 +22,6 @@ from networks.vision_transformer import (
     load_topology_checkpoint_state,
     print_topology_coefficients,
 )
-from datasets.dataset_synapse import ImageDataset, RandomGenerator
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
@@ -471,6 +470,8 @@ class ResizeToTensor:
         return sample
 
 def load_split(split_name, train_mode=True, root_path='.', img_size=512, num_workers=4):
+    from datasets.dataset_synapse import ImageDataset, RandomGenerator
+
     image_dir = os.path.join(root_path, split_name, 'image')
     label_dir = os.path.join(root_path, split_name, 'label')
     print(f"加载{split_name}数据...")
