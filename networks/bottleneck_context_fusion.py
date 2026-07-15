@@ -62,14 +62,21 @@ class GlobalLocalContextFusion(nn.Module):
         self.fusion = AttentionalFeatureFusion(channels, reduction=reduction)
         self.out_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
 
+    @staticmethod
+    def _token_to_map(tokens, height, width):
+        B, L, C = tokens.shape
+        assert L == height * width, "token length does not match spatial resolution"
+        return tokens.view(B, height, width, C).permute(0, 3, 1, 2).contiguous()
+
     def forward(self, x):
         B, L, C = x.shape
         H, W = self.input_resolution
         assert L == H * W, "bottleneck token length does not match spatial resolution"
         assert C == self.channels, "bottleneck channel count does not match fusion module"
 
-        global_map = x.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        local_map = self.local_context(global_map)
+        final_map = self._token_to_map(x, H, W)
+        global_map = final_map
+        local_map = self.local_context(final_map)
         fused = self.fusion(local_map, global_map)
         fused = self.out_proj(fused)
         return fused.permute(0, 2, 3, 1).contiguous().view(B, L, C)

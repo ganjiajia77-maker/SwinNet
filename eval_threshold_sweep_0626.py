@@ -33,6 +33,12 @@ def parse_args():
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--source_patch_size", type=int, default=1024)
     parser.add_argument(
+        "--bottleneck_type",
+        type=str,
+        default="global_local",
+        choices=("global_local", "legacy_global_local", "g2l2"),
+    )
+    parser.add_argument(
         "--thresholds",
         type=str,
         default="0.10,0.15,0.20,0.22,0.24,0.25,0.26,0.28,0.30,0.32,0.35,0.40",
@@ -63,7 +69,7 @@ def build_model(args):
         num_classes=1,
         use_asterisk=True,
         return_skeleton=True,
-        bottleneck_type="global_local",
+        bottleneck_type=args.bottleneck_type,
         final_topology_eta_init=0.0,
         final_gap_rho_init=0.0,
         stage_topology_stages="none",

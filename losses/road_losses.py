@@ -312,6 +312,7 @@ class SurfaceStructureLoss(nn.Module):
         stage_structure_weights=None,
         stage_connectivity_factor=0.5,
         stage_roadness_weights=None,
+        road_attention_weight=0.0,
         stage_distill_weights=(0.004, 0.006),
         stage_distill_connectivity_factor=0.5,
         use_legacy_stage_connectivity_loss=False,
@@ -359,6 +360,7 @@ class SurfaceStructureLoss(nn.Module):
         if stage_roadness_weights is None:
             stage_roadness_weights = (0.0, 0.0, 0.0, 0.0)
         self.stage_roadness_weights = tuple(float(w) for w in stage_roadness_weights)
+        self.road_attention_weight = float(road_attention_weight)
         self.stage_distill_weights = tuple(float(w) for w in stage_distill_weights)
         self.stage_distill_connectivity_factor = float(
             stage_distill_connectivity_factor
@@ -629,6 +631,32 @@ class SurfaceStructureLoss(nn.Module):
             total = total + stage_weight * loss_roadness
         return total
 
+    def road_attention_loss(self, stage_outputs, surface_gt):
+        if not stage_outputs or self.road_attention_weight <= 0:
+            return surface_gt.sum() * 0.0
+
+        total = surface_gt.sum() * 0.0
+        for stage_output in stage_outputs:
+            road_attention = stage_output.get("road_attention")
+            if road_attention is None:
+                continue
+
+            target_size = road_attention.shape[-2:]
+            road_target = surface_gt
+            if road_target.shape[-2:] != target_size:
+                road_target = F.interpolate(
+                    road_target,
+                    size=target_size,
+                    mode="nearest",
+                )
+            road_attention = road_attention.clamp(1e-6, 1.0 - 1e-6)
+            bce = F.binary_cross_entropy(road_attention, road_target.float())
+            intersection = (road_attention * road_target).sum(dim=(1, 2, 3))
+            union = road_attention.sum(dim=(1, 2, 3)) + road_target.sum(dim=(1, 2, 3))
+            dice = (1.0 - (2.0 * intersection + 1.0) / (union + 1.0)).mean()
+            total = total + self.road_attention_weight * (bce + dice)
+        return total
+
     @staticmethod
     def _confidence_weighted_soft_bce(logits, target, confidence):
         loss_map = F.binary_cross_entropy_with_logits(
@@ -794,6 +822,10 @@ class SurfaceStructureLoss(nn.Module):
             stage_outputs,
             surface_gt,
         )
+        loss_road_attention = self.road_attention_loss(
+            stage_outputs,
+            surface_gt,
+        )
         loss_stage_distill = self.stage_teacher_distillation_loss(
             stage_outputs,
             skeleton_logits,
@@ -815,6 +847,7 @@ class SurfaceStructureLoss(nn.Module):
             + self.skeleton_stage_weight * loss_skeleton_stage
             + loss_stage_structure
             + loss_stage_roadness
+            + loss_road_attention
             + float(stage_distill_scale) * loss_stage_distill
             + self.graph_corr_weight * loss_graph_corr
         )
@@ -829,6 +862,7 @@ class SurfaceStructureLoss(nn.Module):
             "skeleton_stage_loss": loss_skeleton_stage.detach(),
             "stage_structure_loss": loss_stage_structure.detach(),
             "stage_roadness_loss": loss_stage_roadness.detach(),
+            "road_attention_loss": loss_road_attention.detach(),
             "stage_distill_loss": loss_stage_distill.detach(),
             "graph_corr_loss": graph_loss_dict["graph_corr_loss"],
             "stage_distill_scale": torch.as_tensor(

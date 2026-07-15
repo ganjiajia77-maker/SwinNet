@@ -283,6 +283,10 @@ def load_topology_checkpoint_state(
             "swin_unet.stage_topology_scales.",
             "swin_unet.stage2_topology_source.",
             "swin_unet.guided_head.graph_propagation.",
+            "swin_unet.encoder_road_attention_head.",
+            "swin_unet.encoder_road_attention_alpha",
+            "swin_unet.bottleneck_context_fusion.scale_projections.",
+            "swin_unet.bottleneck_context_fusion.scale_attention.",
         )
         if is_0626_checkpoint:
             allowed_missing_prefixes = allowed_missing_prefixes + (
@@ -329,7 +333,39 @@ def load_topology_checkpoint_state(
             )
         apply_structure_profile_runtime(model)
         return result
-    result = model.load_state_dict(state_dict, strict=strict)
+    road_attention_missing_prefixes = (
+        "swin_unet.encoder_road_attention_head.",
+        "swin_unet.encoder_road_attention_alpha",
+    )
+    msaf_missing_prefixes = (
+        "swin_unet.bottleneck_context_fusion.scale_projections.",
+        "swin_unet.bottleneck_context_fusion.scale_attention.",
+    )
+    allowed_new_missing_prefixes = (
+        road_attention_missing_prefixes + msaf_missing_prefixes
+    )
+    if strict and not any(
+        key.startswith(allowed_new_missing_prefixes)
+        for key in state_dict
+    ):
+        result = model.load_state_dict(state_dict, strict=False)
+        invalid_missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith(allowed_new_missing_prefixes)
+        ]
+        if invalid_missing or result.unexpected_keys:
+            raise RuntimeError(
+                "Checkpoint mismatch after allowing new encoder additions: "
+                f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+            )
+        print(
+            "[TOPOLOGY] Loaded checkpoint without new encoder additions; "
+            "new parameters use runtime initialization.",
+            flush=True,
+        )
+    else:
+        result = model.load_state_dict(state_dict, strict=strict)
     apply_structure_profile_runtime(model)
     return result
 

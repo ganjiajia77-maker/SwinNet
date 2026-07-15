@@ -81,10 +81,17 @@ parser.add_argument(
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
+parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
-parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
+parser.add_argument(
+    '--bottleneck_type',
+    type=str,
+    default='global_local',
+    choices=['global_local', 'legacy_global_local', 'g2l2'],
+    help='choose bottleneck implementation',
+)
 parser.add_argument(
     '--structure_profile',
     type=str,
@@ -105,13 +112,13 @@ parser.add_argument(
 parser.add_argument(
     '--graph_corr_weight',
     type=float,
-    default=0.10,
+    default=0.05,
     help='continuous baseline-error correction loss weight',
 )
 parser.add_argument(
     '--graph_corr_k',
     type=float,
-    default=2.0,
+    default=1.0,
     help='scale for target_delta = k * (GT - P_base)',
 )
 parser.add_argument(
@@ -147,7 +154,7 @@ parser.add_argument(
 parser.add_argument(
     '--graph_base_lr',
     type=float,
-    default=1e-3,
+    default=3e-4,
     help='learning rate for graph-only training when backbone is frozen',
 )
 DEFAULT_0626_CHECKPOINT = (
@@ -168,13 +175,22 @@ parser.add_argument('--throughput', action='store_true', help='test throughput o
 args = parser.parse_args()
 
 
+def _cli_has(flag):
+    return any(
+        arg == flag or arg.startswith(flag + "=")
+        for arg in sys.argv[1:]
+    )
+
+
 def apply_structure_profile_defaults(args):
     if args.structure_profile != STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         return
 
     args.stage_topology_stages = "none"
-    args.stage2_skeleton_weight = 0.004
-    args.stage3_skeleton_weight = 0.006
+    if not _cli_has("--stage2_skeleton_weight"):
+        args.stage2_skeleton_weight = 0.004
+    if not _cli_has("--stage3_skeleton_weight"):
+        args.stage3_skeleton_weight = 0.006
     args.stage3_roadness_weight = 0.0
     args.final_topology_eta_init = 0.0
     args.final_gap_rho_init = 0.0
@@ -242,6 +258,7 @@ def build_criterion(args, loss_weights, device):
             stage3_weight,
         ),
         stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
+        road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
         stage_connectivity_factor=0.5,
         stage_distill_weights=(0.0, 0.0),
         stage_distill_connectivity_factor=0.5,
@@ -267,6 +284,9 @@ def format_training_config_lines(args, loss_weights):
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage loss: skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
             "(corridor-weighted BCE + edge Dice + symmetry)",
+            "  Encoder road attention: stage2 prior -> F*(1+alpha*A), loss weight {:.3f}".format(
+                args.road_attention_weight
+            ),
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
             "  Stage topology attention: none",
@@ -274,7 +294,8 @@ def format_training_config_lines(args, loss_weights):
         if args.enable_graph_prop:
             lines.extend([
                 "  Final graph propagation: stage2/3 priors -> delta-logit residual",
-                "  Graph propagation lambda: init=0.05, max=0.20, edge_beta=0.7",
+                "  Graph propagation lambda: init=0.05, max=0.10, edge_beta=0.7",
+                "  Graph delta_logit: clamp(-0.3, 0.3) before lambda*G residual",
                 "  Graph G: learned gate_mlp(P, weak, two_sided_support, near_H, H, S, C)",
                 "  Graph support: sqrt(H_l*H_r) * mean(C_l,C_r); candidate=weak*(1-H)",
                 "  Graph correction loss: weighted SmoothL1(delta_logit, k*(GT-P_base))",
@@ -303,7 +324,8 @@ def format_training_config_lines(args, loss_weights):
         "  Stage structure weights: "
         f"stage2={args.stage2_skeleton_weight}, "
         f"stage3={args.stage3_skeleton_weight}, "
-        f"stage3_roadness={args.stage3_roadness_weight}",
+        f"stage3_roadness={args.stage3_roadness_weight}, "
+        f"road_attention={args.road_attention_weight}",
         "  Surface target resize: 1024 -> 256 nearest-neighbor",
         "  Boundary-aware refinement: enabled",
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
@@ -994,6 +1016,7 @@ if __name__ == "__main__":
                         f"ClDice: {loss_dict['skeleton_cldice_loss'].item():.4f}, "
                         f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
                         f"StageRoad: {loss_dict['stage_roadness_loss'].item():.4f}, "
+                        f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"StageKD: {loss_dict['stage_distill_loss'].item():.4f}"
                         f"x{stage_distill_scale:.2f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "

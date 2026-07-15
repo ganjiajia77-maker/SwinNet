@@ -643,6 +643,8 @@ class SoftSkeletonGraphPropagation(nn.Module):
         final_logits = base_logits + lambda * G * delta_logit
     """
 
+    DELTA_LOGIT_CLAMP = 0.3
+
     DIRECTIONS = [
         (-1, 0),
         (1, 0),
@@ -658,7 +660,7 @@ class SoftSkeletonGraphPropagation(nn.Module):
     def __init__(
         self,
         lambda_init=0.05,
-        lambda_max=0.20,
+        lambda_max=0.10,
         edge_beta=0.7,
         radii=(1, 2, 4),
         near_pool=7,
@@ -863,6 +865,10 @@ class SoftSkeletonGraphPropagation(nn.Module):
         delta_logit = self.graph_proj(
             torch.cat([base_logits, message_logits, raw_delta_logits], dim=1)
         )
+        delta_logit = delta_logit.clamp(
+            -self.DELTA_LOGIT_CLAMP,
+            self.DELTA_LOGIT_CLAMP,
+        )
         if self.eval_lambda_override is not None:
             lam = base_logits.new_tensor(float(self.eval_lambda_override))
         else:
@@ -952,7 +958,7 @@ class SkeletonGuidedHead(nn.Module):
         enable_final_structure=True,
         enable_graph_prop=False,
         graph_prop_lambda_init=0.05,
-        graph_prop_lambda_max=0.20,
+        graph_prop_lambda_max=0.10,
     ):
         super().__init__()
 

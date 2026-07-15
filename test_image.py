@@ -54,7 +54,13 @@ parser.add_argument(
 )
 parser.add_argument('--stage_topology_ratio', type=float, default=0.08)
 parser.add_argument('--stage_topology_topo_clip', type=float, default=4.0)
-parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'g2l2'], help='choose bottleneck implementation')
+parser.add_argument(
+    '--bottleneck_type',
+    type=str,
+    default='global_local',
+    choices=['global_local', 'legacy_global_local', 'g2l2'],
+    help='choose bottleneck implementation',
+)
 parser.add_argument(
     '--structure_profile',
     type=str,
