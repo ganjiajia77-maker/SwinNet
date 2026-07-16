@@ -284,7 +284,15 @@ def load_topology_checkpoint_state(
             "swin_unet.stage2_topology_source.",
             "swin_unet.guided_head.graph_propagation.",
             "swin_unet.encoder_road_attention_head.",
+            "swin_unet.encoder_stage1_road_attention_head.",
+            "swin_unet.encoder_stage2_road_attention_head.",
             "swin_unet.encoder_road_attention_alpha",
+            "swin_unet.layers.2.blocks.0.road_bias_scale_a1",
+            "swin_unet.layers.2.blocks.0.road_bias_scale_a2",
+            "swin_unet.layers.2.blocks.0.road_bias_scale",
+            "swin_unet.layers.2.blocks.1.road_bias_scale_a1",
+            "swin_unet.layers.2.blocks.1.road_bias_scale_a2",
+            "swin_unet.layers.2.blocks.1.road_bias_scale",
             "swin_unet.bottleneck_context_fusion.scale_projections.",
             "swin_unet.bottleneck_context_fusion.scale_attention.",
         )
@@ -335,7 +343,15 @@ def load_topology_checkpoint_state(
         return result
     road_attention_missing_prefixes = (
         "swin_unet.encoder_road_attention_head.",
+        "swin_unet.encoder_stage1_road_attention_head.",
+        "swin_unet.encoder_stage2_road_attention_head.",
         "swin_unet.encoder_road_attention_alpha",
+        "swin_unet.layers.2.blocks.0.road_bias_scale_a1",
+        "swin_unet.layers.2.blocks.0.road_bias_scale_a2",
+        "swin_unet.layers.2.blocks.0.road_bias_scale",
+        "swin_unet.layers.2.blocks.1.road_bias_scale_a1",
+        "swin_unet.layers.2.blocks.1.road_bias_scale_a2",
+        "swin_unet.layers.2.blocks.1.road_bias_scale",
     )
     msaf_missing_prefixes = (
         "swin_unet.bottleneck_context_fusion.scale_projections.",

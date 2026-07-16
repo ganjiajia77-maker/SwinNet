@@ -366,8 +366,12 @@ class SwinTransformerBlock(nn.Module):
         self.topology_ratio = DEFAULT_STAGE_TOPOLOGY_RATIO
         self.topology_topo_clip = DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP
         if self.use_road_bias:
+            self.road_bias_scale_a1 = nn.Parameter(torch.tensor(0.0))
+            self.road_bias_scale_a2 = nn.Parameter(torch.tensor(0.0))
             self.road_bias_scale = nn.Parameter(torch.tensor(0.0))
         else:
+            self.register_parameter("road_bias_scale_a1", None)
+            self.register_parameter("road_bias_scale_a2", None)
             self.register_parameter("road_bias_scale", None)
         self.gap_query_formula = GapQueryFormulaConfig()
         self._register_topology_buffers()
@@ -610,10 +614,8 @@ class SwinTransformerBlock(nn.Module):
             connectivity_windows,
         )
 
-    def _build_road_attention_bias(self, road_prior):
+    def _road_prior_to_pair_bias(self, road_prior):
         H, W = self.input_resolution
-        if road_prior is None or not self.use_road_bias:
-            return None
         if road_prior.dim() == 3:
             road_prior = road_prior.unsqueeze(1)
         if road_prior.shape[-2:] != (H, W):
@@ -635,8 +637,24 @@ class SwinTransformerBlock(nn.Module):
             self.window_size,
         ).view(-1, self.window_size * self.window_size, 1)
         road_windows = road_windows.clamp(0.0, 1.0)
-        road_pair_bias = road_windows * road_windows.transpose(1, 2)
-        return self.road_bias_scale * road_pair_bias
+        return road_windows * road_windows.transpose(1, 2)
+
+    def _build_road_attention_bias(self, road_prior):
+        if road_prior is None or not self.use_road_bias:
+            return None
+        if isinstance(road_prior, (tuple, list)):
+            road_priors = list(road_prior)
+        else:
+            road_priors = [road_prior]
+
+        bias = None
+        scales = (self.road_bias_scale_a1, self.road_bias_scale_a2)
+        for prior, scale in zip(road_priors, scales):
+            if prior is None:
+                continue
+            pair_bias = scale * self._road_prior_to_pair_bias(prior)
+            bias = pair_bias if bias is None else bias + pair_bias
+        return bias
 
     def forward(
         self,
@@ -1023,7 +1041,8 @@ class BasicLayer(nn.Module):
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
-                 road_attention_head=None, road_alpha_init=0.1, use_road_bias=False):
+                 road_attention_head=None, road_alpha_init=0.1, use_road_bias=False,
+                 road_attention_modulates_downsample=True):
 
         super().__init__()
         self.dim = dim
@@ -1034,6 +1053,7 @@ class BasicLayer(nn.Module):
         self.last_road_attention = None
         self.road_alpha_init = float(road_alpha_init)
         self.use_road_bias = bool(use_road_bias)
+        self.road_attention_modulates_downsample = bool(road_attention_modulates_downsample)
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -1073,7 +1093,14 @@ class BasicLayer(nn.Module):
                 x_map = token_to_map(x, H, W)
                 road_attention = self.road_attention_head(x_map)
                 self.last_road_attention = road_attention
-            x = self.downsample(x, road_attention=road_attention)
+            x = self.downsample(
+                x,
+                road_attention=(
+                    road_attention
+                    if self.road_attention_modulates_downsample
+                    else None
+                ),
+            )
         return x
 
     def extra_repr(self) -> str:
@@ -1636,10 +1663,13 @@ class SwinTransformerSys(nn.Module):
 
         # build encoder and bottleneck layers
         self.layers = nn.ModuleList()
+        self.encoder_stage1_road_attention_head = RoadAttentionHead(embed_dim)
         self.encoder_stage2_road_attention_head = RoadAttentionHead(embed_dim * 2)
         print(
-            "[INFO] Road-aware Stage2 PatchMerging: A2 channels={}, alpha2_init=0.1; "
-            "Stage3 road attention bias enabled with scale_init=0".format(
+            "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
+            "Stage3 attention bias with lambda_init=(0,0); "
+            "A2 also -> Stage2 PatchMerging alpha2_init=0.1".format(
+                embed_dim,
                 embed_dim * 2,
             )
         )
@@ -1658,14 +1688,17 @@ class SwinTransformerSys(nn.Module):
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                use_checkpoint=use_checkpoint,
                                road_attention_head=(
-                                   self.encoder_stage2_road_attention_head
+                                   self.encoder_stage1_road_attention_head
+                                   if i_layer == 0
+                                   else self.encoder_stage2_road_attention_head
                                    if i_layer == 1
                                    else None
                                ),
                                road_alpha_init=(
                                    0.1
                                ),
-                               use_road_bias=(i_layer == 2))
+                               use_road_bias=(i_layer == 2),
+                               road_attention_modulates_downsample=(i_layer == 1))
             self.layers.append(layer)
 
         # build decoder layers
@@ -1912,14 +1945,27 @@ class SwinTransformerSys(nn.Module):
         x = self.pos_drop(x)
         x_downsample = []
         road_attentions = []
+        stage1_road_attention = None
         stage2_road_attention = None
 
         for i_layer, layer in enumerate(self.layers):
             x_downsample.append(x)
             x = layer(
                 x,
-                road_prior=stage2_road_attention if i_layer == 2 else None,
+                road_prior=(
+                    (stage1_road_attention, stage2_road_attention)
+                    if i_layer == 2
+                    else None
+                ),
             )
+            if i_layer == 0 and layer.last_road_attention is not None:
+                stage1_road_attention = layer.last_road_attention
+                road_attentions.append(
+                    {
+                        "stage": "encoder_stage{}_road_attention".format(i_layer + 1),
+                        "road_attention": stage1_road_attention,
+                    }
+                )
             if i_layer == 1 and layer.last_road_attention is not None:
                 stage2_road_attention = layer.last_road_attention
                 road_attentions.append(
