@@ -20,7 +20,6 @@ from networks.vision_transformer import (
     load_topology_checkpoint_state,
     print_topology_coefficients,
 )
-from datasets.dataset_synapse import ImageDataset, RandomGenerator
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
