@@ -196,6 +196,7 @@ class WindowAttention(nn.Module):
         mask=None,
         topology_bias=None,
         road_attention_bias=None,
+        structure_attention_bias=None,
         topology_alpha=None,
         use_qk_relative_topology=True,
         topology_ratio=DEFAULT_STAGE_TOPOLOGY_RATIO,
@@ -252,6 +253,10 @@ class WindowAttention(nn.Module):
             if road_attention_bias.dim() == 3:
                 road_attention_bias = road_attention_bias.unsqueeze(1)
             attn = attn + road_attention_bias
+        if structure_attention_bias is not None:
+            if structure_attention_bias.dim() == 3:
+                structure_attention_bias = structure_attention_bias.unsqueeze(1)
+            attn = attn + structure_attention_bias
 
         if mask is not None:
             nW = mask.shape[0]
@@ -341,7 +346,8 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_road_bias=False):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_road_bias=False,
+                 use_decoder_structure_bias=False):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -350,6 +356,7 @@ class SwinTransformerBlock(nn.Module):
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
         self.use_road_bias = bool(use_road_bias)
+        self.use_decoder_structure_bias = bool(use_decoder_structure_bias)
         if min(self.input_resolution) <= self.window_size:
             # if window size is larger than input resolution, we don't partition windows
             self.shift_size = 0
@@ -373,6 +380,12 @@ class SwinTransformerBlock(nn.Module):
             self.register_parameter("road_bias_scale_a1", None)
             self.register_parameter("road_bias_scale_a2", None)
             self.register_parameter("road_bias_scale", None)
+        if self.use_decoder_structure_bias:
+            self.decoder_skeleton_bias_scale = nn.Parameter(torch.tensor(0.0))
+            self.decoder_connectivity_bias_scale = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.register_parameter("decoder_skeleton_bias_scale", None)
+            self.register_parameter("decoder_connectivity_bias_scale", None)
         self.gap_query_formula = GapQueryFormulaConfig()
         self._register_topology_buffers()
 
@@ -656,6 +669,55 @@ class SwinTransformerBlock(nn.Module):
             bias = pair_bias if bias is None else bias + pair_bias
         return bias
 
+    def _build_decoder_structure_attention_bias(
+        self,
+        skeleton_prob,
+        connectivity_prob,
+    ):
+        if (
+            skeleton_prob is None
+            or connectivity_prob is None
+            or not self.use_decoder_structure_bias
+        ):
+            return None
+
+        skeleton = skeleton_prob.detach().permute(0, 2, 3, 1).contiguous()
+        connectivity = connectivity_prob.detach().permute(0, 2, 3, 1).contiguous()
+        if self.shift_size > 0:
+            shifts = (-self.shift_size, -self.shift_size)
+            skeleton = torch.roll(skeleton, shifts=shifts, dims=(1, 2))
+            connectivity = torch.roll(connectivity, shifts=shifts, dims=(1, 2))
+
+        skeleton_windows = window_partition(
+            skeleton,
+            self.window_size,
+        ).view(-1, self.window_size * self.window_size, 1)
+        connectivity_windows = window_partition(
+            connectivity,
+            self.window_size,
+        ).view(-1, self.window_size * self.window_size, 8)
+
+        skeleton_pair = skeleton_windows * skeleton_windows.transpose(1, 2)
+        conn_forward = torch.einsum(
+            "bik,ijk->bij",
+            connectivity_windows,
+            self.topology_direction_one_hot,
+        )
+        conn_backward = torch.einsum(
+            "bjk,ijk->bij",
+            connectivity_windows,
+            self.topology_opposite_direction_one_hot,
+        )
+        directional_bias = (
+            0.5
+            * (conn_forward + conn_backward)
+            * self.topology_distance_decay.unsqueeze(0)
+        )
+        return (
+            self.decoder_skeleton_bias_scale * skeleton_pair
+            + self.decoder_connectivity_bias_scale * directional_bias
+        )
+
     def forward(
         self,
         x,
@@ -664,6 +726,8 @@ class SwinTransformerBlock(nn.Module):
         topology_alpha=None,
         roadness_prob=None,
         road_prior=None,
+        decoder_skeleton_prob=None,
+        decoder_connectivity_prob=None,
     ):
         H, W = self.input_resolution
         B, L, C = x.shape
@@ -723,11 +787,16 @@ class SwinTransformerBlock(nn.Module):
         if self.capture_topology_diagnostics and topology_bias is not None:
             self.attn.capture_logits = True
         road_attention_bias = self._build_road_attention_bias(road_prior)
+        structure_attention_bias = self._build_decoder_structure_attention_bias(
+            decoder_skeleton_prob,
+            decoder_connectivity_prob,
+        )
         attn_windows = self.attn(
             x_windows,
             mask=self.attn_mask,
             topology_bias=topology_bias,
             road_attention_bias=road_attention_bias,
+            structure_attention_bias=structure_attention_bias,
             topology_alpha=topology_alpha,
             use_qk_relative_topology=use_qk_relative,
             topology_ratio=self.topology_ratio,
@@ -1137,13 +1206,15 @@ class BasicLayer_up(nn.Module):
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False,
+                 use_decoder_structure_bias=False):
 
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
         self.use_checkpoint = use_checkpoint
+        self.use_decoder_structure_bias = bool(use_decoder_structure_bias)
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -1154,7 +1225,8 @@ class BasicLayer_up(nn.Module):
                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer)
+                                 norm_layer=norm_layer,
+                                 use_decoder_structure_bias=self.use_decoder_structure_bias)
             for i in range(depth)])
 
         # patch merging layer
@@ -1171,25 +1243,40 @@ class BasicLayer_up(nn.Module):
         topology_alpha=None,
         roadness_prob=None,
         topology_gate=None,
+        decoder_skeleton_prob=None,
+        decoder_connectivity_prob=None,
     ):
         for blk in self.blocks:
             if self.use_checkpoint:
                 if skeleton_prob is None:
-                    x = checkpoint.checkpoint(blk, x)
+                    x = checkpoint.checkpoint(
+                        lambda feature, dec_skeleton, dec_connectivity: blk(
+                            feature,
+                            decoder_skeleton_prob=dec_skeleton,
+                            decoder_connectivity_prob=dec_connectivity,
+                        ),
+                        x,
+                        decoder_skeleton_prob,
+                        decoder_connectivity_prob,
+                    )
                 else:
                     x = checkpoint.checkpoint(
-                        lambda feature, skeleton, connectivity, alpha, roadness: blk(
+                        lambda feature, skeleton, connectivity, alpha, roadness, dec_skeleton, dec_connectivity: blk(
                             feature,
                             skeleton,
                             connectivity,
                             alpha,
                             roadness,
+                            decoder_skeleton_prob=dec_skeleton,
+                            decoder_connectivity_prob=dec_connectivity,
                         ),
                         x,
                         skeleton_prob,
                         connectivity_prob,
                         topology_alpha,
                         roadness_prob,
+                        decoder_skeleton_prob,
+                        decoder_connectivity_prob,
                     )
             else:
                 x = blk(
@@ -1198,6 +1285,8 @@ class BasicLayer_up(nn.Module):
                     connectivity_prob,
                     topology_alpha,
                     roadness_prob,
+                    decoder_skeleton_prob=decoder_skeleton_prob,
+                    decoder_connectivity_prob=decoder_connectivity_prob,
                 )
         if topology_gate is not None:
             if skeleton_prob is None or connectivity_prob is None:
@@ -1728,7 +1817,8 @@ class SwinTransformerSys(nn.Module):
                                              depths[:(self.num_layers - 1 - i_layer) + 1])],
                                          norm_layer=norm_layer,
                                          upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
-                                         use_checkpoint=use_checkpoint)
+                                         use_checkpoint=use_checkpoint,
+                                         use_decoder_structure_bias=(i_layer in (2, 3)))
             self.layers_up.append(layer_up)
             self.concat_back_dim.append(concat_linear)
 
@@ -1840,6 +1930,7 @@ class SwinTransformerSys(nn.Module):
                         )
                         else None
                     ),
+                    enable_direct_feature_refinement=False,
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
@@ -1863,6 +1954,7 @@ class SwinTransformerSys(nn.Module):
             )
         self.stage2_topology_source = DecoderStructureRefinement(
             channels=embed_dim * 2,
+            enable_direct_feature_refinement=False,
         )
         self.stage_topology_scales = nn.ModuleDict(
             {
@@ -2085,17 +2177,24 @@ class SwinTransformerSys(nn.Module):
         )
         return context
 
-    def _run_decoder_structure_block(self, feature_map, stage, bottleneck_tokens):
+    def _run_decoder_structure_block(
+        self,
+        feature_map,
+        stage,
+        bottleneck_tokens,
+        block_stage=None,
+    ):
         if not self._decoder_structure_enabled(stage):
             return feature_map, *self._placeholder_structure_outputs(feature_map)
 
+        block_stage = stage if block_stage is None else block_stage
         global_context = None
         if self.use_stage3_global_context and stage == 3:
             global_context = self._build_stage3_global_context(
                 bottleneck_tokens,
                 feature_map.shape[-2:],
             )
-        return self.decoder_structure_blocks[stage](
+        return self.decoder_structure_blocks[block_stage](
             feature_map,
             global_context=global_context,
         )
@@ -2218,8 +2317,80 @@ class SwinTransformerSys(nn.Module):
                 x = torch.cat([x, skip_refined], -1)
                 x = self.concat_back_dim[inx](x)
 
+            decoder_structure_bias_enabled = (
+                self._decoder_structure_enabled(inx)
+                and isinstance(layer_up, BasicLayer_up)
+                and getattr(layer_up, "use_decoder_structure_bias", False)
+            )
             topology_enabled = self._stage_topology_enabled(inx)
-            if topology_enabled:
+            if decoder_structure_bias_enabled:
+                input_height, input_width = layer_up.input_resolution
+                x_map = token_to_map(x, input_height, input_width)
+                (
+                    x_map,
+                    skeleton_0,
+                    connectivity_0,
+                    structure_gate_0,
+                    roadness_0,
+                ) = self._run_decoder_structure_block(
+                    x_map,
+                    inx,
+                    bottleneck_tokens,
+                    block_stage=1 if inx == 2 else inx,
+                )
+                x = map_to_token(x_map)
+                skeleton_used, connectivity_used = self._mix_teacher_topology(
+                    skeleton_0,
+                    connectivity_0,
+                    gt_skeleton,
+                    teacher_forcing_ratio,
+                )
+                x = layer_up(
+                    x,
+                    decoder_skeleton_prob=skeleton_used,
+                    decoder_connectivity_prob=connectivity_used,
+                )
+                structure_outputs.append(
+                    {
+                        "stage": inx,
+                        "refinement_step": 0,
+                        "stage_loss_scale": 0.5,
+                        "skeleton": skeleton_0,
+                        "connectivity": connectivity_0,
+                        "structure_gate": structure_gate_0,
+                        "roadness": roadness_0,
+                    }
+                )
+
+                output_scale = 2 ** max(2 - inx, 0)
+                output_height = self.patches_resolution[0] // output_scale
+                output_width = self.patches_resolution[1] // output_scale
+                x_map = token_to_map(x, output_height, output_width)
+                (
+                    x_map,
+                    skeleton_i,
+                    connectivity_i,
+                    structure_gate_i,
+                    roadness_i,
+                ) = self._run_decoder_structure_block(
+                    x_map,
+                    inx,
+                    bottleneck_tokens,
+                )
+                x = map_to_token(x_map)
+                structure_outputs.append(
+                    {
+                        "stage": inx,
+                        "refinement_step": 1,
+                        "stage_loss_scale": 1.0,
+                        "skeleton": skeleton_i,
+                        "connectivity": connectivity_i,
+                        "structure_gate": structure_gate_i,
+                        "roadness": roadness_i,
+                    }
+                )
+                continue
+            elif topology_enabled:
                 topology_source = (
                     self.stage2_topology_source
                     if inx == 2

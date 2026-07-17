@@ -495,6 +495,7 @@ class DecoderStructureRefinement(nn.Module):
         context_channels=None,
         context_strength=0.03,
         enable_roadness_head=False,
+        enable_direct_feature_refinement=True,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -502,6 +503,7 @@ class DecoderStructureRefinement(nn.Module):
         self.gamma_limit = gamma_limit
         self.context_strength = float(context_strength)
         self.enable_roadness_head = bool(enable_roadness_head)
+        self.enable_direct_feature_refinement = bool(enable_direct_feature_refinement)
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
@@ -595,12 +597,17 @@ class DecoderStructureRefinement(nn.Module):
             structure_gate_logits = structure_gate_logits + context_bias
         structure_gate = torch.sigmoid(structure_gate_logits)
 
-        residual = structure_gate * self.feature_residual(x)
-        gate_residual = self.gamma1 * residual
-        refined = x + gate_residual
-        directional = self.directional_propagation(refined, connectivity_prob)
-        directional_residual = self.gamma2 * directional
-        out = refined + directional_residual
+        if self.enable_direct_feature_refinement:
+            residual = structure_gate * self.feature_residual(x)
+            gate_residual = self.gamma1 * residual
+            refined = x + gate_residual
+            directional = self.directional_propagation(refined, connectivity_prob)
+            directional_residual = self.gamma2 * directional
+            out = refined + directional_residual
+        else:
+            gate_residual = torch.zeros_like(x)
+            directional_residual = torch.zeros_like(x)
+            out = x
         if self.capture_diagnostics:
             with torch.no_grad():
                 feature_norm = torch.linalg.vector_norm(x)

@@ -545,10 +545,19 @@ class SurfaceStructureLoss(nn.Module):
 
         total = skeleton_gt.sum() * 0.0
         for idx, stage_output in enumerate(stage_outputs):
-            if idx >= len(self.stage_structure_weights):
-                break
+            if "skeleton" not in stage_output or "connectivity" not in stage_output:
+                continue
+            try:
+                stage_index = int(stage_output.get("stage", idx))
+            except (TypeError, ValueError):
+                continue
+            if stage_index >= len(self.stage_structure_weights):
+                continue
 
-            stage_weight = self.stage_structure_weights[idx]
+            stage_weight = (
+                self.stage_structure_weights[stage_index]
+                * float(stage_output.get("stage_loss_scale", 1.0))
+            )
             if stage_weight <= 0:
                 continue
 
