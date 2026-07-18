@@ -496,6 +496,7 @@ class DecoderStructureRefinement(nn.Module):
         context_strength=0.03,
         enable_roadness_head=False,
         enable_direct_feature_refinement=True,
+        enable_directional_feature_refinement=True,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -504,6 +505,9 @@ class DecoderStructureRefinement(nn.Module):
         self.context_strength = float(context_strength)
         self.enable_roadness_head = bool(enable_roadness_head)
         self.enable_direct_feature_refinement = bool(enable_direct_feature_refinement)
+        self.enable_directional_feature_refinement = bool(
+            enable_directional_feature_refinement
+        )
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
@@ -512,7 +516,7 @@ class DecoderStructureRefinement(nn.Module):
         self.skeleton_head = SkeletonSpatialHead(channels)
         self.connectivity_head = nn.Conv2d(channels, connectivity_channels, kernel_size=1)
         self.structure_gate = nn.Sequential(
-            nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(channels + 1, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
@@ -578,17 +582,15 @@ class DecoderStructureRefinement(nn.Module):
             propagated = propagated + connectivity_prob[:, idx:idx + 1] * shifted
         return propagated / float(len(directions))
 
-    def forward(self, x, global_context=None):
+    def forward(self, x, global_context=None, apply_feature_refinement=True):
         structure_feat = self.structure_branch(x)
         skeleton_logits = self.skeleton_head(structure_feat)
         connectivity_logits = self.connectivity_head(structure_feat)
 
         skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
-        topk = min(2, self.connectivity_channels)
-        conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
         structure_gate_logits = self.structure_gate(
-            torch.cat([structure_feat, skeleton_prob, conn_strength], dim=1)
+            torch.cat([structure_feat, skeleton_prob], dim=1)
         )
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
@@ -597,13 +599,17 @@ class DecoderStructureRefinement(nn.Module):
             structure_gate_logits = structure_gate_logits + context_bias
         structure_gate = torch.sigmoid(structure_gate_logits)
 
-        if self.enable_direct_feature_refinement:
+        if self.enable_direct_feature_refinement and apply_feature_refinement:
             residual = structure_gate * self.feature_residual(x)
             gate_residual = self.gamma1 * residual
             refined = x + gate_residual
-            directional = self.directional_propagation(refined, connectivity_prob)
-            directional_residual = self.gamma2 * directional
-            out = refined + directional_residual
+            if self.enable_directional_feature_refinement:
+                directional = self.directional_propagation(refined, connectivity_prob)
+                directional_residual = self.gamma2 * directional
+                out = refined + directional_residual
+            else:
+                directional_residual = torch.zeros_like(x)
+                out = refined
         else:
             gate_residual = torch.zeros_like(x)
             directional_residual = torch.zeros_like(x)
