@@ -277,18 +277,18 @@ def format_training_config_lines(args, loss_weights):
     ]
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
-            "  Structure head: decoder stage2/stage3 skeleton + top-2 connectivity residual attention",
+            "  Structure head: ske0/con0 -> gate feature; ske1/con1 prediction-only supervision",
             "  Final skeleton/connectivity heads: disabled",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
-            "  Stage loss: skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
+            "  Stage loss: 0.3*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
             "(corridor-weighted BCE + edge Dice + symmetry)",
             "  Encoder road attention: stage2 prior -> F*(1+alpha*A), loss weight {:.3f}".format(
                 args.road_attention_weight
             ),
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
-            "  Stage topology attention: none",
+            "  Decoder attention bias: disabled; structure guidance uses gates only",
         ])
         if args.enable_graph_prop:
             lines.extend([

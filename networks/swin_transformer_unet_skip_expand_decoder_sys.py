@@ -1818,7 +1818,7 @@ class SwinTransformerSys(nn.Module):
                                          norm_layer=norm_layer,
                                          upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
                                          use_checkpoint=use_checkpoint,
-                                         use_decoder_structure_bias=(i_layer in (2, 3)))
+                                         use_decoder_structure_bias=False)
             self.layers_up.append(layer_up)
             self.concat_back_dim.append(concat_linear)
 
@@ -1930,7 +1930,7 @@ class SwinTransformerSys(nn.Module):
                         )
                         else None
                     ),
-                    enable_direct_feature_refinement=False,
+                    enable_direct_feature_refinement=True,
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
@@ -2317,13 +2317,13 @@ class SwinTransformerSys(nn.Module):
                 x = torch.cat([x, skip_refined], -1)
                 x = self.concat_back_dim[inx](x)
 
-            decoder_structure_bias_enabled = (
+            decoder_structure_gate_enabled = (
                 self._decoder_structure_enabled(inx)
                 and isinstance(layer_up, BasicLayer_up)
-                and getattr(layer_up, "use_decoder_structure_bias", False)
+                and inx in (2, 3)
             )
             topology_enabled = self._stage_topology_enabled(inx)
-            if decoder_structure_bias_enabled:
+            if decoder_structure_gate_enabled:
                 input_height, input_width = layer_up.input_resolution
                 x_map = token_to_map(x, input_height, input_width)
                 (
@@ -2339,22 +2339,12 @@ class SwinTransformerSys(nn.Module):
                     block_stage=1 if inx == 2 else inx,
                 )
                 x = map_to_token(x_map)
-                skeleton_used, connectivity_used = self._mix_teacher_topology(
-                    skeleton_0,
-                    connectivity_0,
-                    gt_skeleton,
-                    teacher_forcing_ratio,
-                )
-                x = layer_up(
-                    x,
-                    decoder_skeleton_prob=skeleton_used,
-                    decoder_connectivity_prob=connectivity_used,
-                )
+                x = layer_up(x)
                 structure_outputs.append(
                     {
                         "stage": inx,
                         "refinement_step": 0,
-                        "stage_loss_scale": 0.5,
+                        "stage_loss_scale": 0.3,
                         "skeleton": skeleton_0,
                         "connectivity": connectivity_0,
                         "structure_gate": structure_gate_0,
@@ -2367,7 +2357,7 @@ class SwinTransformerSys(nn.Module):
                 output_width = self.patches_resolution[1] // output_scale
                 x_map = token_to_map(x, output_height, output_width)
                 (
-                    x_map,
+                    _,
                     skeleton_i,
                     connectivity_i,
                     structure_gate_i,
