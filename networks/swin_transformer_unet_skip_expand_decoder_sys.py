@@ -211,6 +211,8 @@ class WindowAttention(nn.Module):
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        structure_value_bias = None
+        structure_value_scale = None
 
         q = q * self.scale
         qk_logits = q @ k.transpose(-2, -1)
@@ -254,6 +256,12 @@ class WindowAttention(nn.Module):
                 road_attention_bias = road_attention_bias.unsqueeze(1)
             attn = attn + road_attention_bias
         if structure_attention_bias is not None:
+            if isinstance(structure_attention_bias, (tuple, list)):
+                (
+                    structure_attention_bias,
+                    structure_value_bias,
+                    structure_value_scale,
+                ) = structure_attention_bias
             if structure_attention_bias.dim() == 3:
                 structure_attention_bias = structure_attention_bias.unsqueeze(1)
             attn = attn + structure_attention_bias
@@ -267,6 +275,12 @@ class WindowAttention(nn.Module):
             attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
+        if structure_value_bias is not None and structure_value_scale is not None:
+            if structure_value_bias.dim() == 3:
+                structure_value_bias = structure_value_bias.unsqueeze(1)
+            value_confidence = (attn * structure_value_bias).sum(dim=-1)
+            value_gate = 1.0 + structure_value_scale * value_confidence
+            v = v * value_gate.unsqueeze(-1)
 
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
@@ -383,9 +397,11 @@ class SwinTransformerBlock(nn.Module):
         if self.use_decoder_structure_bias:
             self.decoder_skeleton_bias_scale = nn.Parameter(torch.tensor(0.0))
             self.decoder_connectivity_bias_scale = nn.Parameter(torch.tensor(0.1))
+            self.decoder_connectivity_value_scale = nn.Parameter(torch.tensor(0.1))
         else:
             self.register_parameter("decoder_skeleton_bias_scale", None)
             self.register_parameter("decoder_connectivity_bias_scale", None)
+            self.register_parameter("decoder_connectivity_value_scale", None)
         self.gap_query_formula = GapQueryFormulaConfig()
         self._register_topology_buffers()
 
@@ -707,20 +723,21 @@ class SwinTransformerBlock(nn.Module):
         adjacency = 0.5 * (conn_forward + conn_backward) * one_hop_mask.unsqueeze(0)
         adjacency = self._row_normalize_attention_graph(adjacency.clamp_min(0.0))
         adjacency_2 = self._row_normalize_attention_graph(torch.bmm(adjacency, adjacency))
-        adjacency_3 = self._row_normalize_attention_graph(torch.bmm(adjacency_2, adjacency))
 
         distance = self.topology_pair_distance.to(dtype=connectivity_windows.dtype)
-        distance_decay = 1.0 / (1.0 + 0.2 * distance)
-        connectivity_bias = (adjacency + 0.5 * adjacency_2 + 0.25 * adjacency_3)
+        distance_decay = torch.exp(-distance / 3.0)
+        connectivity_bias = adjacency + 0.5 * adjacency_2
         connectivity_bias = connectivity_bias * distance_decay.unsqueeze(0)
         connectivity_bias = connectivity_bias.masked_fill(
             self.topology_pair_distance.unsqueeze(0) == 0,
-            0.0,
+            float("-inf"),
         )
-        connectivity_bias = self._row_normalize_attention_graph(
-            connectivity_bias.clamp_min(0.0)
+        connectivity_bias = torch.softmax(connectivity_bias, dim=-1)
+        return (
+            self.decoder_connectivity_bias_scale * connectivity_bias,
+            connectivity_bias,
+            self.decoder_connectivity_value_scale,
         )
-        return self.decoder_connectivity_bias_scale * connectivity_bias
 
     def forward(
         self,
@@ -980,7 +997,14 @@ class PatchMerging(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm, road_alpha_init=0.1):
+    def __init__(
+        self,
+        input_resolution,
+        dim,
+        norm_layer=nn.LayerNorm,
+        road_alpha_init=0.1,
+        road_attention_merge_mode="residual",
+    ):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
@@ -992,7 +1016,26 @@ class PatchMerging(nn.Module):
         )
         self.alpha = nn.Parameter(torch.tensor(0.1))
         self.road_alpha = nn.Parameter(torch.tensor(float(road_alpha_init)))
+        self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
+        if self.road_attention_merge_mode not in {"residual", "merge_attention"}:
+            raise ValueError(
+                "road_attention_merge_mode must be residual or merge_attention"
+            )
         self.norm = norm_layer(4 * dim)
+
+    def compute_merge_score(self, feature, road_prior):
+        feature_norm = F.normalize(feature, dim=-1, eps=1e-6)
+        feature_score = torch.matmul(
+            feature_norm,
+            feature_norm.transpose(-1, -2),
+        )
+        road_score = road_prior * road_prior.transpose(-1, -2)
+        return feature_score + self.road_alpha * road_score
+
+    def _apply_road_merge_attention(self, patch_tokens, patch_road_prior):
+        merge_score = self.compute_merge_score(patch_tokens, patch_road_prior)
+        merge_weight = torch.softmax(merge_score, dim=-1)
+        return torch.matmul(merge_weight, patch_tokens)
 
     def forward(self, x, road_attention=None):
         """
@@ -1011,12 +1054,25 @@ class PatchMerging(nn.Module):
                 "road attention size must match patch merge input resolution"
             )
             road_attention = road_attention.permute(0, 2, 3, 1).contiguous()
-            x = x * (1.0 + self.road_alpha * road_attention)
+            if self.road_attention_merge_mode == "residual":
+                x = x * (1.0 + self.road_alpha * road_attention)
 
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        if road_attention is not None and self.road_attention_merge_mode == "merge_attention":
+            a0 = road_attention[:, 0::2, 0::2, :]
+            a1 = road_attention[:, 1::2, 0::2, :]
+            a2 = road_attention[:, 0::2, 1::2, :]
+            a3 = road_attention[:, 1::2, 1::2, :]
+            patch_tokens = torch.stack([x0, x1, x2, x3], dim=-2)
+            patch_road_prior = torch.stack([a0, a1, a2, a3], dim=-2)
+            patch_tokens = self._apply_road_merge_attention(
+                patch_tokens,
+                patch_road_prior,
+            )
+            x0, x1, x2, x3 = patch_tokens.unbind(dim=-2)
         x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
         x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
 
@@ -1115,7 +1171,8 @@ class BasicLayer(nn.Module):
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
                  road_attention_head=None, road_alpha_init=0.1, use_road_bias=False,
-                 road_attention_modulates_downsample=True):
+                 road_attention_modulates_downsample=True,
+                 road_attention_merge_mode="residual"):
 
         super().__init__()
         self.dim = dim
@@ -1127,6 +1184,7 @@ class BasicLayer(nn.Module):
         self.road_alpha_init = float(road_alpha_init)
         self.use_road_bias = bool(use_road_bias)
         self.road_attention_modulates_downsample = bool(road_attention_modulates_downsample)
+        self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -1148,6 +1206,7 @@ class BasicLayer(nn.Module):
                 dim=dim,
                 norm_layer=norm_layer,
                 road_alpha_init=self.road_alpha_init,
+                road_attention_merge_mode=self.road_attention_merge_mode,
             )
         else:
             self.downsample = None
@@ -1761,7 +1820,8 @@ class SwinTransformerSys(nn.Module):
         print(
             "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
             "Stage3 attention bias with lambda_init=(0,0); "
-            "A2 also -> Stage2 PatchMerging alpha2_init=0.1".format(
+            "A1 -> Stage1 merge attention; "
+            "A2 -> Stage2 PatchMerging alpha2_init=0.1".format(
                 embed_dim,
                 embed_dim * 2,
             )
@@ -1791,7 +1851,10 @@ class SwinTransformerSys(nn.Module):
                                    0.1
                                ),
                                use_road_bias=(i_layer == 2),
-                               road_attention_modulates_downsample=(i_layer == 1))
+                               road_attention_modulates_downsample=(i_layer in (0, 1)),
+                               road_attention_merge_mode=(
+                                   "merge_attention" if i_layer == 0 else "residual"
+                               ))
             self.layers.append(layer)
 
         # build decoder layers

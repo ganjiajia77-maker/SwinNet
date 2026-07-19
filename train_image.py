@@ -286,9 +286,11 @@ def format_training_config_lines(args, loss_weights):
             "  Encoder road attention: stage2 prior -> F*(1+alpha*A), loss weight {:.3f}".format(
                 args.road_attention_weight
             ),
+            "  Encoder stage1 road prior: merge attention uses cosine(Fi,Fj)+lambda*Ai*Aj before PatchMerging",
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
-            "  Decoder connectivity attention bias: enabled before skeleton gate, A + 0.5*A2 + 0.25*A3 with 1/(1+0.2d) decay, row-normalized, lambda_init=0.1",
+            "  Decoder connectivity attention bias: enabled before skeleton gate, A + 0.5*A2 with exp(-d/3) decay and softmax normalization, lambda_init=0.1",
+            "  Decoder connectivity value gating: V <- (1 + gamma * sum_j A_ij * Bc_ij) V, gamma_init=0.1",
             "  Decoder gate input: structure feature + skeleton probability only; old connectivity directional feature propagation is disabled",
         ])
         if args.enable_graph_prop:
