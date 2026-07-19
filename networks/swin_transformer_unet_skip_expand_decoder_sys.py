@@ -2066,7 +2066,7 @@ class SwinTransformerSys(nn.Module):
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
-                        "[INFO] Final 256 skeleton/connectivity heads: disabled "
+                        "[INFO] Final skeleton/connectivity heads: disabled "
                         "(0626 profile; surface + boundary only)"
                     )
                     if self.enable_final_graph_prop:

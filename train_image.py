@@ -39,8 +39,8 @@ parser.add_argument('--deterministic', type=int, default=1, help='whether use de
 parser.add_argument('--base_lr', type=float, default=5e-4, help='segmentation network learning rate')
 parser.add_argument('--min_lr', type=float, default=1e-5, help='minimum learning rate for cosine decay')
 parser.add_argument('--warmup_epochs', type=int, default=3, help='warmup epochs before cosine decay')
-parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
-parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
+parser.add_argument('--batch_size', type=int, default=2, help='batch_size per gpu')
+parser.add_argument('--img_size', type=int, default=512, help='network input size after downsampling from a 1024 patch')
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml', 
@@ -49,8 +49,8 @@ parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
-parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final 256x256 skeleton threshold for validation')
-parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help='initial final 256 topology repair coefficient')
+parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final skeleton threshold for validation')
+parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help='initial final topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
 parser.add_argument(
     '--stage_topology_stages',
@@ -309,7 +309,7 @@ def format_training_config_lines(args, loss_weights):
     else:
         lines.extend([
             "  Decoder structure gates: restored 0621 stages 0/1/2/3",
-            "  Final 256 structure-only topology refiner: "
+            "  Final structure-only topology refiner: "
             f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4",
             "  Localized gap repair: "
             f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap",
@@ -328,7 +328,7 @@ def format_training_config_lines(args, loss_weights):
         f"stage3={args.stage3_skeleton_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
-        "  Surface target resize: 1024 -> 256 nearest-neighbor",
+        f"  Surface target resize: {args.source_patch_size} -> {args.img_size} nearest-neighbor",
         "  Boundary-aware refinement: enabled",
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
         "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",

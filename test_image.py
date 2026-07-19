@@ -29,13 +29,13 @@ parser.add_argument('--root_path', type=str, default='./data1', help='root dir f
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--num_classes', type=int, default=1, help='output channel of network')
 parser.add_argument('--output_dir', type=str, default='./predictions', help='output dir')
-parser.add_argument('--batch_size', type=int, default=24, help='batch_size per gpu')
-parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
+parser.add_argument('--batch_size', type=int, default=2, help='batch_size per gpu')
+parser.add_argument('--img_size', type=int, default=512, help='network input size after downsampling from a 1024 patch')
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
-parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final 256x256 skeleton')
-parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final 256 topology repair coefficient')
+parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final skeleton')
+parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', type=float, default=0.005, help='initial localized gap-repair coefficient')
 parser.add_argument(
     '--stage_topology_stages',
@@ -504,7 +504,7 @@ if __name__ == "__main__":
     result_lines.append(f"  预测掩码保存位置: {pred_dir}")
     
     result_lines.append(f"  Surface mask save dir: {surface_dir}")
-    result_lines.append(f"  Final 256x256 skeleton save dir: {skeleton_dir}")
+    result_lines.append(f"  Final skeleton save dir: {skeleton_dir}")
     result_lines.append(
         f"  Topology attention version: {TOPOLOGY_ATTENTION_VERSION}"
     )
