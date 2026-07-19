@@ -291,7 +291,7 @@ def format_training_config_lines(args, loss_weights):
             "  Global context gate strength: 0.03",
             "  Decoder connectivity attention bias: enabled before skeleton gate, A + 0.5*A2 with exp(-d/3) decay and softmax normalization, lambda_init=0.1",
             "  Decoder connectivity value gating: V <- (1 + gamma * sum_j A_ij * Bc_ij) V, gamma_init=0.1",
-            "  Decoder gate input: structure feature + skeleton probability only; old connectivity directional feature propagation is disabled",
+            "  Decoder gate input: structure feature + skeleton probability + connectivity strength; old connectivity directional feature propagation is disabled",
         ])
         if args.enable_graph_prop:
             lines.extend([

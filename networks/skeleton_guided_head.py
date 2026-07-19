@@ -516,7 +516,7 @@ class DecoderStructureRefinement(nn.Module):
         self.skeleton_head = SkeletonSpatialHead(channels)
         self.connectivity_head = nn.Conv2d(channels, connectivity_channels, kernel_size=1)
         self.structure_gate = nn.Sequential(
-            nn.Conv2d(channels + 1, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
@@ -589,8 +589,10 @@ class DecoderStructureRefinement(nn.Module):
 
         skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
+        topk = min(2, self.connectivity_channels)
+        conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
         structure_gate_logits = self.structure_gate(
-            torch.cat([structure_feat, skeleton_prob], dim=1)
+            torch.cat([structure_feat, skeleton_prob, conn_strength], dim=1)
         )
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
