@@ -264,6 +264,40 @@ def load_topology_checkpoint_state(
     checkpoint_version,
     strict=True,
 ):
+    model_state = model.state_dict()
+    obsolete_unexpected_suffixes = (
+        "decoder_connectivity_value_scale",
+    )
+    filtered_state_dict = {}
+    skipped_obsolete_keys = []
+    skipped_shape_keys = []
+    for key, value in state_dict.items():
+        if key not in model_state and key.endswith(obsolete_unexpected_suffixes):
+            skipped_obsolete_keys.append(key)
+            continue
+        if (
+            key in model_state
+            and value.shape != model_state[key].shape
+            and key.endswith("structure_gate.0.weight")
+        ):
+            skipped_shape_keys.append(key)
+            continue
+        filtered_state_dict[key] = value
+    if skipped_obsolete_keys:
+        print(
+            "[TOPOLOGY] Ignored obsolete checkpoint keys not used by this model: "
+            + ", ".join(skipped_obsolete_keys),
+            flush=True,
+        )
+    if skipped_shape_keys:
+        print(
+            "[TOPOLOGY] Reinitialized direction-gate input weights: "
+            + ", ".join(skipped_shape_keys),
+            flush=True,
+        )
+    if skipped_obsolete_keys or skipped_shape_keys:
+        state_dict = filtered_state_dict
+
     missing_final_topology = not any(
         "final_topology_attention." in key for key in state_dict
     )
@@ -303,6 +337,16 @@ def load_topology_checkpoint_state(
             "swin_unet.layers_up.3.blocks.1.decoder_connectivity_bias_scale",
             "swin_unet.bottleneck_context_fusion.scale_projections.",
             "swin_unet.bottleneck_context_fusion.scale_attention.",
+            "swin_unet.decoder_structure_blocks.0.direction_head.",
+            "swin_unet.decoder_structure_blocks.1.direction_head.",
+            "swin_unet.decoder_structure_blocks.2.direction_head.",
+            "swin_unet.decoder_structure_blocks.3.direction_head.",
+            "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
+            "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
+            "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
+            "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+            "swin_unet.stage2_topology_source.direction_head.",
+            "swin_unet.stage2_topology_source.structure_gate.0.weight",
         )
         if is_0626_checkpoint:
             allowed_missing_prefixes = allowed_missing_prefixes + (
@@ -368,6 +412,16 @@ def load_topology_checkpoint_state(
         "swin_unet.layers_up.3.blocks.0.decoder_connectivity_bias_scale",
         "swin_unet.layers_up.3.blocks.1.decoder_skeleton_bias_scale",
         "swin_unet.layers_up.3.blocks.1.decoder_connectivity_bias_scale",
+        "swin_unet.decoder_structure_blocks.0.direction_head.",
+        "swin_unet.decoder_structure_blocks.1.direction_head.",
+        "swin_unet.decoder_structure_blocks.2.direction_head.",
+        "swin_unet.decoder_structure_blocks.3.direction_head.",
+        "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
+        "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
+        "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
+        "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+        "swin_unet.stage2_topology_source.direction_head.",
+        "swin_unet.stage2_topology_source.structure_gate.0.weight",
     )
     msaf_missing_prefixes = (
         "swin_unet.bottleneck_context_fusion.scale_projections.",

@@ -515,8 +515,12 @@ class DecoderStructureRefinement(nn.Module):
         )
         self.skeleton_head = SkeletonSpatialHead(channels)
         self.connectivity_head = nn.Conv2d(channels, connectivity_channels, kernel_size=1)
+        self.direction_head = nn.Sequential(
+            ConvBNReLU(channels, channels),
+            nn.Conv2d(channels, 2, kernel_size=1),
+        )
         self.structure_gate = nn.Sequential(
-            nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(channels + 4, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
@@ -586,13 +590,15 @@ class DecoderStructureRefinement(nn.Module):
         structure_feat = self.structure_branch(x)
         skeleton_logits = self.skeleton_head(structure_feat)
         connectivity_logits = self.connectivity_head(structure_feat)
+        direction_logits = self.direction_head(structure_feat)
 
         skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
+        direction_field = F.normalize(direction_logits, dim=1, eps=1e-6)
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
         structure_gate_logits = self.structure_gate(
-            torch.cat([structure_feat, skeleton_prob, conn_strength], dim=1)
+            torch.cat([structure_feat, skeleton_prob, conn_strength, direction_field], dim=1)
         )
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
@@ -646,7 +652,14 @@ class DecoderStructureRefinement(nn.Module):
         roadness_logits = None
         if self.stage_roadness_head is not None:
             roadness_logits = self.stage_roadness_head(structure_feat)
-        return out, skeleton_logits, connectivity_logits, structure_gate, roadness_logits
+        return (
+            out,
+            skeleton_logits,
+            connectivity_logits,
+            direction_logits,
+            structure_gate,
+            roadness_logits,
+        )
 
 
 class SoftSkeletonGraphPropagation(nn.Module):

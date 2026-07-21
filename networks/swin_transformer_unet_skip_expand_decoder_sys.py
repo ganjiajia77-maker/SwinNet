@@ -211,8 +211,6 @@ class WindowAttention(nn.Module):
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
-        structure_value_bias = None
-        structure_value_scale = None
 
         q = q * self.scale
         qk_logits = q @ k.transpose(-2, -1)
@@ -256,12 +254,6 @@ class WindowAttention(nn.Module):
                 road_attention_bias = road_attention_bias.unsqueeze(1)
             attn = attn + road_attention_bias
         if structure_attention_bias is not None:
-            if isinstance(structure_attention_bias, (tuple, list)):
-                (
-                    structure_attention_bias,
-                    structure_value_bias,
-                    structure_value_scale,
-                ) = structure_attention_bias
             if structure_attention_bias.dim() == 3:
                 structure_attention_bias = structure_attention_bias.unsqueeze(1)
             attn = attn + structure_attention_bias
@@ -275,12 +267,6 @@ class WindowAttention(nn.Module):
             attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
-        if structure_value_bias is not None and structure_value_scale is not None:
-            if structure_value_bias.dim() == 3:
-                structure_value_bias = structure_value_bias.unsqueeze(1)
-            value_confidence = (attn * structure_value_bias).sum(dim=-1)
-            value_gate = 1.0 + structure_value_scale * value_confidence
-            v = v * value_gate.unsqueeze(-1)
 
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
@@ -397,11 +383,9 @@ class SwinTransformerBlock(nn.Module):
         if self.use_decoder_structure_bias:
             self.decoder_skeleton_bias_scale = nn.Parameter(torch.tensor(0.0))
             self.decoder_connectivity_bias_scale = nn.Parameter(torch.tensor(0.1))
-            self.decoder_connectivity_value_scale = nn.Parameter(torch.tensor(0.1))
         else:
             self.register_parameter("decoder_skeleton_bias_scale", None)
             self.register_parameter("decoder_connectivity_bias_scale", None)
-            self.register_parameter("decoder_connectivity_value_scale", None)
         self.gap_query_formula = GapQueryFormulaConfig()
         self._register_topology_buffers()
 
@@ -723,21 +707,20 @@ class SwinTransformerBlock(nn.Module):
         adjacency = 0.5 * (conn_forward + conn_backward) * one_hop_mask.unsqueeze(0)
         adjacency = self._row_normalize_attention_graph(adjacency.clamp_min(0.0))
         adjacency_2 = self._row_normalize_attention_graph(torch.bmm(adjacency, adjacency))
+        adjacency_3 = self._row_normalize_attention_graph(torch.bmm(adjacency_2, adjacency))
 
         distance = self.topology_pair_distance.to(dtype=connectivity_windows.dtype)
-        distance_decay = torch.exp(-distance / 3.0)
-        connectivity_bias = adjacency + 0.5 * adjacency_2
+        distance_decay = 1.0 / (1.0 + 0.2 * distance)
+        connectivity_bias = adjacency + 0.5 * adjacency_2 + 0.25 * adjacency_3
         connectivity_bias = connectivity_bias * distance_decay.unsqueeze(0)
         connectivity_bias = connectivity_bias.masked_fill(
             self.topology_pair_distance.unsqueeze(0) == 0,
-            float("-inf"),
+            0.0,
         )
-        connectivity_bias = torch.softmax(connectivity_bias, dim=-1)
-        return (
-            self.decoder_connectivity_bias_scale * connectivity_bias,
-            connectivity_bias,
-            self.decoder_connectivity_value_scale,
+        connectivity_bias = self._row_normalize_attention_graph(
+            connectivity_bias.clamp_min(0.0)
         )
+        return self.decoder_connectivity_bias_scale * connectivity_bias
 
     def forward(
         self,
@@ -1819,9 +1802,7 @@ class SwinTransformerSys(nn.Module):
         self.encoder_stage2_road_attention_head = RoadAttentionHead(embed_dim * 2)
         print(
             "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
-            "Stage3 attention bias with lambda_init=(0,0); "
-            "A1 -> Stage1 merge attention; "
-            "A2 -> Stage2 PatchMerging alpha2_init=0.1".format(
+            "inactive for this gate-direction experiment".format(
                 embed_dim,
                 embed_dim * 2,
             )
@@ -1840,20 +1821,14 @@ class SwinTransformerSys(nn.Module):
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                use_checkpoint=use_checkpoint,
-                               road_attention_head=(
-                                   self.encoder_stage1_road_attention_head
-                                   if i_layer == 0
-                                   else self.encoder_stage2_road_attention_head
-                                   if i_layer == 1
-                                   else None
-                               ),
+                               road_attention_head=None,
                                road_alpha_init=(
                                    0.1
                                ),
-                               use_road_bias=(i_layer == 2),
-                               road_attention_modulates_downsample=(i_layer in (0, 1)),
+                               use_road_bias=False,
+                               road_attention_modulates_downsample=False,
                                road_attention_merge_mode=(
-                                   "merge_attention" if i_layer == 0 else "residual"
+                                   "residual"
                                ))
             self.layers.append(layer)
 
@@ -1885,7 +1860,7 @@ class SwinTransformerSys(nn.Module):
                                          norm_layer=norm_layer,
                                          upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
                                          use_checkpoint=use_checkpoint,
-                                         use_decoder_structure_bias=(i_layer in (2, 3)))
+                                         use_decoder_structure_bias=False)
             self.layers_up.append(layer_up)
             self.concat_back_dim.append(concat_linear)
 
@@ -1998,7 +1973,7 @@ class SwinTransformerSys(nn.Module):
                         else None
                     ),
                     enable_direct_feature_refinement=True,
-                    enable_directional_feature_refinement=False,
+                    enable_directional_feature_refinement=True,
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
@@ -2176,6 +2151,14 @@ class SwinTransformerSys(nn.Module):
             device=device,
             dtype=dtype,
         )
+        direction_logits = torch.zeros(
+            batch,
+            2,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+        )
         structure_gate = torch.zeros(
             batch,
             1,
@@ -2184,7 +2167,7 @@ class SwinTransformerSys(nn.Module):
             device=device,
             dtype=dtype,
         )
-        return skeleton_logits, connectivity_logits, structure_gate, None
+        return skeleton_logits, connectivity_logits, direction_logits, structure_gate, None
 
     @staticmethod
     def _fuse_stage_structure_to_fullres(
@@ -2400,6 +2383,7 @@ class SwinTransformerSys(nn.Module):
                     _,
                     skeleton_0,
                     connectivity_0,
+                    direction_0,
                     structure_gate_0,
                     roadness_0,
                 ) = self._run_decoder_structure_block(
@@ -2427,6 +2411,7 @@ class SwinTransformerSys(nn.Module):
                         "stage_loss_scale": 0.5,
                         "skeleton": skeleton_0,
                         "connectivity": connectivity_0,
+                        "direction": direction_0,
                         "structure_gate": structure_gate_0,
                         "roadness": roadness_0,
                     }
@@ -2440,6 +2425,7 @@ class SwinTransformerSys(nn.Module):
                     x_map,
                     skeleton_i,
                     connectivity_i,
+                    direction_i,
                     structure_gate_i,
                     roadness_i,
                 ) = self._run_decoder_structure_block(
@@ -2456,6 +2442,7 @@ class SwinTransformerSys(nn.Module):
                         "stage_loss_scale": 1.0,
                         "skeleton": skeleton_i,
                         "connectivity": connectivity_i,
+                        "direction": direction_i,
                         "structure_gate": structure_gate_i,
                         "roadness": roadness_i,
                     }
@@ -2473,6 +2460,7 @@ class SwinTransformerSys(nn.Module):
                     x_map,
                     skeleton_i,
                     connectivity_i,
+                    direction_i,
                     structure_gate_i,
                     roadness_i,
                 ) = self._run_decoder_structure_block(
@@ -2515,6 +2503,7 @@ class SwinTransformerSys(nn.Module):
                     x_map,
                     skeleton_i,
                     connectivity_i,
+                    direction_i,
                     structure_gate_i,
                     roadness_i,
                 ) = self._run_decoder_structure_block(
@@ -2528,6 +2517,7 @@ class SwinTransformerSys(nn.Module):
                     "stage": inx,
                     "skeleton": skeleton_i,
                     "connectivity": connectivity_i,
+                    "direction": direction_i,
                     "structure_gate": structure_gate_i,
                     "roadness": roadness_i,
                 }

@@ -39,8 +39,8 @@ parser.add_argument('--deterministic', type=int, default=1, help='whether use de
 parser.add_argument('--base_lr', type=float, default=5e-4, help='segmentation network learning rate')
 parser.add_argument('--min_lr', type=float, default=1e-5, help='minimum learning rate for cosine decay')
 parser.add_argument('--warmup_epochs', type=int, default=3, help='warmup epochs before cosine decay')
-parser.add_argument('--batch_size', type=int, default=2, help='batch_size per gpu')
-parser.add_argument('--img_size', type=int, default=512, help='network input size after downsampling from a 1024 patch')
+parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
+parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml', 
@@ -80,6 +80,7 @@ parser.add_argument(
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
+parser.add_argument('--stage_direction_factor', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
@@ -259,6 +260,7 @@ def build_criterion(args, loss_weights, device):
         stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
         road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
         stage_connectivity_factor=0.5,
+        stage_direction_factor=args.stage_direction_factor,
         stage_distill_weights=(0.0, 0.0),
         stage_distill_connectivity_factor=0.5,
         use_legacy_stage_connectivity_loss=(
@@ -282,16 +284,15 @@ def format_training_config_lines(args, loss_weights):
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
-            "(corridor-weighted BCE + edge Dice + symmetry)",
-            "  Encoder road attention: stage2 prior -> F*(1+alpha*A), loss weight {:.3f}".format(
-                args.road_attention_weight
+            "(BCE) + {:.3f} direction-field cosine loss on skeleton".format(
+                args.stage_direction_factor
             ),
-            "  Encoder stage1 road prior: merge attention uses cosine(Fi,Fj)+lambda*Ai*Aj before PatchMerging",
+            "  Encoder road attention: inactive for this gate-direction experiment",
+            "  Encoder stage1 road prior: inactive",
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
-            "  Decoder connectivity attention bias: enabled before skeleton gate, A + 0.5*A2 with exp(-d/3) decay and softmax normalization, lambda_init=0.1",
-            "  Decoder connectivity value gating: V <- (1 + gamma * sum_j A_ij * Bc_ij) V, gamma_init=0.1",
-            "  Decoder gate input: structure feature + skeleton probability + connectivity strength; old connectivity directional feature propagation is disabled",
+            "  Decoder connectivity attention bias: disabled",
+            "  Decoder gate input: structure feature + skeleton probability + connectivity strength + direction field; old connectivity directional feature propagation is enabled",
         ])
         if args.enable_graph_prop:
             lines.extend([
@@ -326,6 +327,7 @@ def format_training_config_lines(args, loss_weights):
         "  Stage structure weights: "
         f"stage2={args.stage2_skeleton_weight}, "
         f"stage3={args.stage3_skeleton_weight}, "
+        f"direction_factor={args.stage_direction_factor}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
         f"  Surface target resize: {args.source_patch_size} -> {args.img_size} nearest-neighbor",
@@ -759,25 +761,56 @@ if __name__ == "__main__":
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint_state = checkpoint["model_state_dict"]
+            if not args.freeze_0626_backbone:
+                model_state = model.state_dict()
+                filtered_checkpoint_state = {}
+                skipped_gate_keys = []
+                for key, value in checkpoint_state.items():
+                    if (
+                        key in model_state
+                        and value.shape != model_state[key].shape
+                        and key.endswith("structure_gate.0.weight")
+                    ):
+                        skipped_gate_keys.append(key)
+                        continue
+                    filtered_checkpoint_state[key] = value
+                if skipped_gate_keys:
+                    print(
+                        "[WARN] Reinitialized direction-gate input weights: "
+                        + ", ".join(skipped_gate_keys),
+                        flush=True,
+                    )
+                    checkpoint_state = filtered_checkpoint_state
             if args.freeze_0626_backbone:
                 load_topology_checkpoint_state(
                     model,
-                    checkpoint["model_state_dict"],
+                    checkpoint_state,
                     checkpoint.get("topology_attention_version", "legacy-unrecorded"),
                 )
             else:
                 strict_load = args.bottleneck_type == 'global_local'
                 try:
-                    model.load_state_dict(checkpoint['model_state_dict'], strict=strict_load)
+                    model.load_state_dict(checkpoint_state, strict=strict_load)
                 except RuntimeError as exc:
                     allowed_missing_prefixes = (
                         "swin_unet.stage2_topology_source.",
                         "swin_unet.stage_topology_scales.",
                         "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
                         "swin_unet.guided_head.graph_propagation.",
+                        "swin_unet.decoder_structure_blocks.0.direction_head.",
+                        "swin_unet.decoder_structure_blocks.1.direction_head.",
+                        "swin_unet.decoder_structure_blocks.2.direction_head.",
+                        "swin_unet.decoder_structure_blocks.3.direction_head.",
+                        "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
+                        "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
+                        "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
+                        "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+                        "swin_unet.stage2_topology_source.direction_head.",
+                        "swin_unet.stage2_topology_source.structure_gate.0.weight",
                     )
                     result = model.load_state_dict(
-                        checkpoint['model_state_dict'],
+                        checkpoint_state,
                         strict=False,
                     )
                     invalid_missing = [

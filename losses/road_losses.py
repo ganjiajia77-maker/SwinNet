@@ -311,6 +311,7 @@ class SurfaceStructureLoss(nn.Module):
         skeleton_stage_weights=(0.1, 0.2, 0.3, 0.3),
         stage_structure_weights=None,
         stage_connectivity_factor=0.5,
+        stage_direction_factor=0.2,
         stage_roadness_weights=None,
         road_attention_weight=0.0,
         stage_distill_weights=(0.004, 0.006),
@@ -354,6 +355,7 @@ class SurfaceStructureLoss(nn.Module):
             stage_structure_weights = (0.0, 0.0, 0.004, 0.006)
         self.stage_structure_weights = tuple(float(w) for w in stage_structure_weights)
         self.stage_connectivity_factor = float(stage_connectivity_factor)
+        self.stage_direction_factor = float(stage_direction_factor)
         self.use_legacy_stage_connectivity_loss = bool(
             use_legacy_stage_connectivity_loss
         )
@@ -605,11 +607,67 @@ class SurfaceStructureLoss(nn.Module):
                 connectivity_gt,
                 stage_skel_dilate,
             )
+            direction_logits = stage_output.get("direction")
+            if direction_logits is not None and self.stage_direction_factor > 0:
+                loss_direction_stage = self.direction_field_loss(
+                    direction_logits,
+                    stage_skel,
+                )
+            else:
+                loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
-                loss_skeleton_stage + self.stage_connectivity_factor * loss_connectivity_stage
+                loss_skeleton_stage
+                + self.stage_connectivity_factor * loss_connectivity_stage
+                + self.stage_direction_factor * loss_direction_stage
             )
 
         return total
+
+    def build_direction_target(self, skeleton):
+        skel = (skeleton > 0.5).to(dtype=skeleton.dtype)
+        directions = [
+            (0, 1, 1.0, 0.0),
+            (1, 0, -1.0, 0.0),
+            (1, 1, 0.0, 1.0),
+            (1, -1, 0.0, -1.0),
+        ]
+        scores = []
+        targets = []
+        for dy, dx, cos2, sin2 in directions:
+            forward = self._shift_map(skel, dy, dx)
+            backward = self._shift_map(skel, -dy, -dx)
+            support = forward + backward + 2.0 * forward * backward
+            scores.append(support)
+            targets.append(
+                torch.cat(
+                    [
+                        torch.full_like(skel, cos2),
+                        torch.full_like(skel, sin2),
+                    ],
+                    dim=1,
+                )
+            )
+        score_stack = torch.cat(scores, dim=1)
+        target_stack = torch.stack(targets, dim=1)
+        index = score_stack.argmax(dim=1, keepdim=True)
+        gather_index = index.unsqueeze(1).expand(-1, 1, 2, -1, -1)
+        target = torch.gather(target_stack, dim=1, index=gather_index).squeeze(1)
+        return target, skel
+
+    def direction_field_loss(self, direction_logits, skeleton_gt):
+        direction_target, skeleton_mask = self.build_direction_target(skeleton_gt)
+        direction_pred = F.normalize(direction_logits, dim=1, eps=1e-6)
+        direction_target = direction_target.to(
+            device=direction_pred.device,
+            dtype=direction_pred.dtype,
+        )
+        skeleton_mask = skeleton_mask.to(
+            device=direction_pred.device,
+            dtype=direction_pred.dtype,
+        )
+        cosine = (direction_pred * direction_target).sum(dim=1, keepdim=True)
+        loss_map = (1.0 - cosine) * skeleton_mask
+        return loss_map.sum() / skeleton_mask.sum().clamp_min(1.0)
 
     def stage_roadness_loss(self, stage_outputs, surface_gt):
         if not stage_outputs:

@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument("--split", default="val", choices=("val", "test"))
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--img_size", type=int, default=512)
+    parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--source_patch_size", type=int, default=1024)
     parser.add_argument(
         "--bottleneck_type",
