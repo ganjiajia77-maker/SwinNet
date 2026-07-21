@@ -1802,7 +1802,8 @@ class SwinTransformerSys(nn.Module):
         self.encoder_stage2_road_attention_head = RoadAttentionHead(embed_dim * 2)
         print(
             "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
-            "inactive for this gate-direction experiment".format(
+            "Stage3 attention bias with lambda_init=(0,0); "
+            "A1/A2 -> residual PatchMerging priors".format(
                 embed_dim,
                 embed_dim * 2,
             )
@@ -1821,12 +1822,18 @@ class SwinTransformerSys(nn.Module):
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                use_checkpoint=use_checkpoint,
-                               road_attention_head=None,
+                               road_attention_head=(
+                                   self.encoder_stage1_road_attention_head
+                                   if i_layer == 0
+                                   else self.encoder_stage2_road_attention_head
+                                   if i_layer == 1
+                                   else None
+                               ),
                                road_alpha_init=(
                                    0.1
                                ),
-                               use_road_bias=False,
-                               road_attention_modulates_downsample=False,
+                               use_road_bias=(i_layer == 2),
+                               road_attention_modulates_downsample=(i_layer in (0, 1)),
                                road_attention_merge_mode=(
                                    "residual"
                                ))

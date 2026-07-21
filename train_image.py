@@ -287,8 +287,8 @@ def format_training_config_lines(args, loss_weights):
             "(BCE) + {:.3f} direction-field cosine loss on skeleton".format(
                 args.stage_direction_factor
             ),
-            "  Encoder road attention: inactive for this gate-direction experiment",
-            "  Encoder stage1 road prior: inactive",
+            "  Encoder road attention: A1/A2 priors active for residual PatchMerging and Stage3 road attention bias",
+            "  Encoder stage1 road prior: residual PatchMerging path",
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
             "  Decoder connectivity attention bias: disabled",
