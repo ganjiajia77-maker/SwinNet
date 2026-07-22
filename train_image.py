@@ -291,8 +291,8 @@ def format_training_config_lines(args, loss_weights):
             "  Encoder stage1 road prior: residual PatchMerging path",
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
-            "  Decoder connectivity attention bias: disabled",
-            "  Decoder gate input: structure feature + skeleton probability + connectivity strength + direction field; old connectivity directional feature propagation is enabled",
+            "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
+            "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength, plus beta*direction_gate(direction), beta_init=0",
         ])
         if args.enable_graph_prop:
             lines.extend([
@@ -802,11 +802,21 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.direction_head.",
                         "swin_unet.decoder_structure_blocks.2.direction_head.",
                         "swin_unet.decoder_structure_blocks.3.direction_head.",
+                        "swin_unet.decoder_structure_blocks.0.direction_gate.",
+                        "swin_unet.decoder_structure_blocks.1.direction_gate.",
+                        "swin_unet.decoder_structure_blocks.2.direction_gate.",
+                        "swin_unet.decoder_structure_blocks.3.direction_gate.",
+                        "swin_unet.decoder_structure_blocks.0.direction_gate_beta",
+                        "swin_unet.decoder_structure_blocks.1.direction_gate_beta",
+                        "swin_unet.decoder_structure_blocks.2.direction_gate_beta",
+                        "swin_unet.decoder_structure_blocks.3.direction_gate_beta",
                         "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
                         "swin_unet.stage2_topology_source.direction_head.",
+                        "swin_unet.stage2_topology_source.direction_gate.",
+                        "swin_unet.stage2_topology_source.direction_gate_beta",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
                     )
                     result = model.load_state_dict(

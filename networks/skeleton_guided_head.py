@@ -520,11 +520,18 @@ class DecoderStructureRefinement(nn.Module):
             nn.Conv2d(channels, 2, kernel_size=1),
         )
         self.structure_gate = nn.Sequential(
-            nn.Conv2d(channels + 4, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
+        self.direction_gate = nn.Sequential(
+            nn.Conv2d(2, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(fusion_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(fusion_channels, 1, kernel_size=1),
+        )
+        self.direction_gate_beta = nn.Parameter(torch.tensor(0.0))
         if self.enable_roadness_head:
             self.stage_roadness_head = nn.Conv2d(channels, 1, kernel_size=1)
         else:
@@ -598,14 +605,16 @@ class DecoderStructureRefinement(nn.Module):
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
         structure_gate_logits = self.structure_gate(
-            torch.cat([structure_feat, skeleton_prob, conn_strength, direction_field], dim=1)
+            torch.cat([structure_feat, skeleton_prob, conn_strength], dim=1)
         )
+        direction_gate_delta = torch.tanh(self.direction_gate(direction_field))
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
                 self.context_to_gate(global_context)
             )
             structure_gate_logits = structure_gate_logits + context_bias
-        structure_gate = torch.sigmoid(structure_gate_logits)
+        structure_gate_base = torch.sigmoid(structure_gate_logits)
+        structure_gate = structure_gate_base + self.direction_gate_beta * direction_gate_delta
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
             residual = structure_gate * self.feature_residual(x)
@@ -628,8 +637,20 @@ class DecoderStructureRefinement(nn.Module):
                 self.last_diagnostics = {
                     "gamma1": float(self.gamma1.detach().cpu()),
                     "gamma2": float(self.gamma2.detach().cpu()),
+                    "direction_gate_beta": float(
+                        self.direction_gate_beta.detach().cpu()
+                    ),
                     "gate_mean": float(structure_gate.mean().detach().cpu()),
                     "gate_max": float(structure_gate.max().detach().cpu()),
+                    "gate_base_mean": float(
+                        structure_gate_base.mean().detach().cpu()
+                    ),
+                    "direction_gate_delta_mean": float(
+                        direction_gate_delta.mean().detach().cpu()
+                    ),
+                    "conn_strength_mean": float(
+                        conn_strength.mean().detach().cpu()
+                    ),
                     "gate_residual_relative_norm": float(
                         (
                             torch.linalg.vector_norm(gate_residual)
