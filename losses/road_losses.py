@@ -312,6 +312,8 @@ class SurfaceStructureLoss(nn.Module):
         stage_structure_weights=None,
         stage_connectivity_factor=0.5,
         stage_direction_factor=0.2,
+        stage_skeleton_connectivity_s2c_weight=1.0,
+        stage_skeleton_connectivity_c2s_weight=0.2,
         stage_roadness_weights=None,
         road_attention_weight=0.0,
         stage_distill_weights=(0.004, 0.006),
@@ -356,6 +358,12 @@ class SurfaceStructureLoss(nn.Module):
         self.stage_structure_weights = tuple(float(w) for w in stage_structure_weights)
         self.stage_connectivity_factor = float(stage_connectivity_factor)
         self.stage_direction_factor = float(stage_direction_factor)
+        self.stage_skeleton_connectivity_s2c_weight = float(
+            stage_skeleton_connectivity_s2c_weight
+        )
+        self.stage_skeleton_connectivity_c2s_weight = float(
+            stage_skeleton_connectivity_c2s_weight
+        )
         self.use_legacy_stage_connectivity_loss = bool(
             use_legacy_stage_connectivity_loss
         )
@@ -534,6 +542,44 @@ class SurfaceStructureLoss(nn.Module):
 
         return total
 
+    @staticmethod
+    def _connectivity_neighbor_skeleton(skeleton_prob):
+        padded = F.pad(skeleton_prob, (1, 1, 1, 1))
+        height, width = skeleton_prob.shape[-2:]
+        directions = [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (-1, 1),
+            (1, -1),
+            (1, 1),
+        ]
+        neighbors = []
+        for dy, dx in directions:
+            y0 = 1 + dy
+            x0 = 1 + dx
+            neighbors.append(padded[:, :, y0:y0 + height, x0:x0 + width])
+        return torch.cat(neighbors, dim=1)
+
+    def skeleton_connectivity_consistency_loss(
+        self,
+        skeleton_logits,
+        connectivity_logits,
+    ):
+        skeleton_prob = torch.sigmoid(skeleton_logits)
+        connectivity_prob = torch.sigmoid(connectivity_logits)
+        skeleton_pair = skeleton_prob * self._connectivity_neighbor_skeleton(
+            skeleton_prob
+        )
+        loss_s_to_c = (skeleton_pair * (1.0 - connectivity_prob)).mean()
+        loss_c_to_s = (connectivity_prob * (1.0 - skeleton_pair)).mean()
+        return (
+            self.stage_skeleton_connectivity_s2c_weight * loss_s_to_c
+            + self.stage_skeleton_connectivity_c2s_weight * loss_c_to_s
+        )
+
     def stage_structure_loss(
         self,
         stage_outputs,
@@ -607,6 +653,18 @@ class SurfaceStructureLoss(nn.Module):
                 connectivity_gt,
                 stage_skel_dilate,
             )
+            if (
+                self.stage_skeleton_connectivity_s2c_weight > 0
+                or self.stage_skeleton_connectivity_c2s_weight > 0
+            ):
+                loss_skeleton_connectivity_consistency = (
+                    self.skeleton_connectivity_consistency_loss(
+                        stage_skeleton_logits,
+                        stage_connectivity_logits,
+                    )
+                )
+            else:
+                loss_skeleton_connectivity_consistency = loss_skeleton_stage * 0.0
             direction_logits = stage_output.get("direction")
             if direction_logits is not None and self.stage_direction_factor > 0:
                 loss_direction_stage = self.direction_field_loss(
@@ -619,6 +677,7 @@ class SurfaceStructureLoss(nn.Module):
                 loss_skeleton_stage
                 + self.stage_connectivity_factor * loss_connectivity_stage
                 + self.stage_direction_factor * loss_direction_stage
+                + loss_skeleton_connectivity_consistency
             )
 
         return total
