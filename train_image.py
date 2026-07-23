@@ -107,6 +107,37 @@ parser.add_argument(
     help='final surface delta-logit soft graph propagation (stage2/3 priors)',
 )
 parser.add_argument(
+    '--enable_graph_diffusion',
+    action='store_true',
+    help='replace decoder structure gate with direction-aware graph diffusion',
+)
+parser.add_argument(
+    '--enable_structure_gate',
+    dest='enable_structure_gate',
+    action='store_true',
+    default=True,
+    help='apply decoder structure gate feature refinement',
+)
+parser.add_argument(
+    '--disable_structure_gate',
+    dest='enable_structure_gate',
+    action='store_false',
+    help='disable decoder structure gate (use with --enable_graph_diffusion)',
+)
+parser.add_argument(
+    '--enable_decoder_attention_bias',
+    dest='enable_decoder_attention_bias',
+    action='store_true',
+    default=True,
+    help='inject decoder skeleton/connectivity/direction attention bias',
+)
+parser.add_argument(
+    '--disable_decoder_attention_bias',
+    dest='enable_decoder_attention_bias',
+    action='store_false',
+    help='disable decoder attention bias before structure refinement',
+)
+parser.add_argument(
     '--freeze_0626_backbone',
     action='store_true',
     help='freeze 0626 encoder/decoder/heads; train graph_propagation only',
@@ -162,6 +193,10 @@ parser.add_argument(
 DEFAULT_0626_CHECKPOINT = (
     './model_out/train_stage23_structure_final_boundary_nw0_20260626/best.pth'
 )
+# best_20260723_072816 test baseline (IoU=0.5719, F1=0.7276 @ th=0.24)
+DEFAULT_GRAPH_DIFFUSION_BASE_CHECKPOINT = (
+    './model_out/train_0718_a123_dirfield_softdir_highorder_w01_d02_20260722/best.pth'
+)
 # Options expected by the original config updater
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
 parser.add_argument('--zip', action='store_true', help='use zipped dataset')
@@ -203,6 +238,25 @@ def apply_structure_profile_defaults(args):
 
 
 apply_structure_profile_defaults(args)
+
+if args.enable_graph_diffusion and args.enable_structure_gate:
+    print(
+        "[INFO] Graph diffusion experiment: disabling structure gate "
+        "and decoder attention bias.",
+        flush=True,
+    )
+    args.enable_structure_gate = False
+    args.enable_decoder_attention_bias = False
+
+if args.enable_graph_diffusion and not _cli_has("--structure_profile"):
+    args.structure_profile = STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
+if args.enable_graph_diffusion and not args.resume:
+    args.resume = DEFAULT_GRAPH_DIFFUSION_BASE_CHECKPOINT
+    print(
+        "[INFO] Graph diffusion base checkpoint: "
+        f"{DEFAULT_GRAPH_DIFFUSION_BASE_CHECKPOINT}",
+        flush=True,
+    )
 
 if args.freeze_0626_backbone and not args.enable_graph_prop:
     parser.error("--freeze_0626_backbone requires --enable_graph_prop")
@@ -317,7 +371,21 @@ def format_training_config_lines(args, loss_weights):
                 )
     else:
         lines.extend([
-            "  Decoder structure gates: restored 0621 stages 0/1/2/3",
+            "  Decoder structure blocks: restored 0621 stages 0/1/2/3",
+        ])
+        if args.enable_graph_diffusion:
+            lines.extend([
+                "  Decoder graph diffusion: enabled (structure_gate=off, attention_bias=off)",
+                "  Graph adjacency: C_ij * (1 + alpha*S_i*S_j) * (1 + beta*A_direction), row-normalized",
+                "  Graph diffusion: F_new = F + gamma * Message, gamma_init=0.05",
+            ])
+        elif args.enable_structure_gate:
+            lines.append("  Decoder structure gate refinement: enabled")
+        if args.enable_decoder_attention_bias and not args.enable_graph_diffusion:
+            lines.append(
+                "  Decoder direction-aware connectivity attention bias: enabled"
+            )
+        lines.extend([
             "  Final structure-only topology refiner: "
             f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4",
             "  Localized gap repair: "
@@ -740,7 +808,10 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    enable_final_graph_prop=args.enable_graph_prop).to(device)
+                    enable_final_graph_prop=args.enable_graph_prop,
+                    enable_graph_diffusion=args.enable_graph_diffusion,
+                    enable_structure_gate=args.enable_structure_gate,
+                    enable_decoder_attention_bias=args.enable_decoder_attention_bias).to(device)
 
     # 加载数据
     train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
@@ -792,7 +863,14 @@ if __name__ == "__main__":
                         flush=True,
                     )
                     checkpoint_state = filtered_checkpoint_state
-            if args.freeze_0626_backbone:
+            if args.enable_graph_diffusion:
+                load_topology_checkpoint_state(
+                    model,
+                    checkpoint_state,
+                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+                    strict=True,
+                )
+            elif args.freeze_0626_backbone:
                 load_topology_checkpoint_state(
                     model,
                     checkpoint_state,
@@ -816,9 +894,19 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+                        "swin_unet.decoder_structure_blocks.0.graph_diffusion.",
+                        "swin_unet.decoder_structure_blocks.1.graph_diffusion.",
+                        "swin_unet.decoder_structure_blocks.2.graph_diffusion.",
+                        "swin_unet.decoder_structure_blocks.3.graph_diffusion.",
                         "swin_unet.stage2_topology_source.direction_head.",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
                     )
+                    allowed_unexpected_suffixes = ()
+                    if not args.enable_decoder_attention_bias:
+                        allowed_unexpected_suffixes = (
+                            "decoder_skeleton_bias_scale",
+                            "decoder_connectivity_bias_scale",
+                        )
                     result = model.load_state_dict(
                         checkpoint_state,
                         strict=False,
@@ -828,10 +916,18 @@ if __name__ == "__main__":
                         for key in result.missing_keys
                         if not key.startswith(allowed_missing_prefixes)
                     ]
-                    if invalid_missing or result.unexpected_keys:
+                    invalid_unexpected = [
+                        key
+                        for key in result.unexpected_keys
+                        if not any(
+                            key.endswith(suffix)
+                            for suffix in allowed_unexpected_suffixes
+                        )
+                    ]
+                    if invalid_missing or invalid_unexpected:
                         raise RuntimeError(
                             "Checkpoint mismatch on resume: "
-                            f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+                            f"missing={invalid_missing}, unexpected={invalid_unexpected}"
                         ) from exc
                     print(
                         "[WARN] Loaded checkpoint with strict=False; "

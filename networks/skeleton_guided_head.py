@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .graph_diffusion import DirectionAwareGraphDiffusion
+
 
 class ConvBNReLU(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
@@ -497,6 +499,10 @@ class DecoderStructureRefinement(nn.Module):
         enable_roadness_head=False,
         enable_direct_feature_refinement=True,
         enable_directional_feature_refinement=True,
+        enable_structure_gate=True,
+        enable_graph_diffusion=False,
+        graph_diffusion_alpha=1.0,
+        graph_diffusion_beta=1.0,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -508,6 +514,8 @@ class DecoderStructureRefinement(nn.Module):
         self.enable_directional_feature_refinement = bool(
             enable_directional_feature_refinement
         )
+        self.enable_structure_gate = bool(enable_structure_gate)
+        self.enable_graph_diffusion = bool(enable_graph_diffusion)
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
@@ -542,6 +550,16 @@ class DecoderStructureRefinement(nn.Module):
         )
         self.raw_gamma1 = nn.Parameter(torch.tensor(float(init_gamma1)))
         self.raw_gamma2 = nn.Parameter(torch.tensor(float(init_gamma2)))
+        if self.enable_graph_diffusion:
+            self.graph_diffusion = DirectionAwareGraphDiffusion(
+                channels=channels,
+                alpha=graph_diffusion_alpha,
+                beta=graph_diffusion_beta,
+                gamma_init=0.05,
+                use_message_mlp=False,
+            )
+        else:
+            self.graph_diffusion = None
         self.capture_diagnostics = False
         self.last_diagnostics = None
 
@@ -606,7 +624,25 @@ class DecoderStructureRefinement(nn.Module):
             structure_gate_logits = structure_gate_logits + context_bias
         structure_gate = torch.sigmoid(structure_gate_logits)
 
-        if self.enable_direct_feature_refinement and apply_feature_refinement:
+        gate_residual = torch.zeros_like(x)
+        directional_residual = torch.zeros_like(x)
+        graph_message = torch.zeros_like(x)
+        if (
+            self.enable_graph_diffusion
+            and self.graph_diffusion is not None
+            and apply_feature_refinement
+        ):
+            out, graph_message = self.graph_diffusion.diffuse(
+                x,
+                skeleton_prob,
+                connectivity_prob,
+                direction_logits,
+            )
+        elif (
+            self.enable_structure_gate
+            and self.enable_direct_feature_refinement
+            and apply_feature_refinement
+        ):
             residual = structure_gate * self.feature_residual(x)
             gate_residual = self.gamma1 * residual
             refined = x + gate_residual
@@ -615,16 +651,13 @@ class DecoderStructureRefinement(nn.Module):
                 directional_residual = self.gamma2 * directional
                 out = refined + directional_residual
             else:
-                directional_residual = torch.zeros_like(x)
                 out = refined
         else:
-            gate_residual = torch.zeros_like(x)
-            directional_residual = torch.zeros_like(x)
             out = x
         if self.capture_diagnostics:
             with torch.no_grad():
                 feature_norm = torch.linalg.vector_norm(x)
-                self.last_diagnostics = {
+                diagnostics = {
                     "gamma1": float(self.gamma1.detach().cpu()),
                     "gamma2": float(self.gamma2.detach().cpu()),
                     "gate_mean": float(structure_gate.mean().detach().cpu()),
@@ -651,6 +684,17 @@ class DecoderStructureRefinement(nn.Module):
                         ).detach().cpu()
                     ),
                 }
+                if self.graph_diffusion is not None:
+                    diagnostics["graph_gamma"] = float(
+                        self.graph_diffusion.gamma.detach().cpu()
+                    )
+                    diagnostics["graph_message_relative_norm"] = float(
+                        (
+                            torch.linalg.vector_norm(graph_message)
+                            / (feature_norm + 1e-6)
+                        ).detach().cpu()
+                    )
+                self.last_diagnostics = diagnostics
         roadness_logits = None
         if self.stage_roadness_head is not None:
             roadness_logits = self.stage_roadness_head(structure_feat)

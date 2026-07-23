@@ -21,7 +21,7 @@ from .dilated_asterisk import DilatedAsteriskWithDirections
 
 logger = logging.getLogger(__name__)
 
-TOPOLOGY_ATTENTION_VERSION = "stage-topology-roadness-gap-v1"
+TOPOLOGY_ATTENTION_VERSION = "direction-graph-diffusion-v1"
 STRUCTURE_PROFILE_FULL = "full"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 = "stage23_boundary_0626"
 
@@ -99,6 +99,13 @@ def get_topology_coefficients(model):
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
         "graph_prop_enabled": bool(getattr(guided_head, "enable_graph_prop", False)),
+        "graph_diffusion_enabled": bool(
+            getattr(swin_unet, "enable_graph_diffusion", False)
+        ),
+        "structure_gate_enabled": bool(getattr(swin_unet, "enable_structure_gate", True)),
+        "decoder_attention_bias_enabled": bool(
+            getattr(swin_unet, "enable_decoder_attention_bias", True)
+        ),
         "stage_topology_stages": getattr(swin_unet, "stage_topology_stages", "none"),
         "stage_topology_active": {
             f"stage{stage}": bool(swin_unet._stage_topology_enabled(stage))
@@ -115,11 +122,19 @@ def get_topology_coefficients(model):
         }
 
     for stage, structure_block in enumerate(swin_unet.decoder_structure_blocks):
-        coefficients[f"decoder_stage{stage}"] = {
+        stage_values = {
             "gamma1": float(structure_block.gamma1.detach().cpu()),
             "gamma2": float(structure_block.gamma2.detach().cpu()),
             "structure_enabled": bool(swin_unet._decoder_structure_enabled(stage)),
+            "structure_gate_enabled": bool(structure_block.enable_structure_gate),
+            "graph_diffusion_enabled": bool(structure_block.enable_graph_diffusion),
         }
+        graph_diffusion = getattr(structure_block, "graph_diffusion", None)
+        if graph_diffusion is not None:
+            stage_values["graph_gamma"] = float(
+                graph_diffusion.gamma.detach().cpu()
+            )
+        coefficients[f"decoder_stage{stage}"] = stage_values
 
     if guided_head.enable_final_structure:
         topology_attention = guided_head.final_topology_attention
@@ -298,6 +313,52 @@ def load_topology_checkpoint_state(
     if skipped_obsolete_keys or skipped_shape_keys:
         state_dict = filtered_state_dict
 
+    module = model.module if hasattr(model, "module") else model
+    swin_unet = module.swin_unet
+    if getattr(swin_unet, "enable_graph_diffusion", False):
+        result = model.load_state_dict(state_dict, strict=False)
+        graph_diffusion_missing_prefixes = tuple(
+            "swin_unet.decoder_structure_blocks.{}.graph_diffusion.".format(stage)
+            for stage in range(len(swin_unet.decoder_structure_blocks))
+        )
+        allowed_missing_prefixes = graph_diffusion_missing_prefixes
+        allowed_unexpected_suffixes = ()
+        if not getattr(swin_unet, "enable_decoder_attention_bias", True):
+            allowed_unexpected_suffixes = (
+                "decoder_skeleton_bias_scale",
+                "decoder_connectivity_bias_scale",
+            )
+        invalid_missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith(allowed_missing_prefixes)
+        ]
+        invalid_unexpected = [
+            key
+            for key in result.unexpected_keys
+            if not any(key.endswith(suffix) for suffix in allowed_unexpected_suffixes)
+        ]
+        if invalid_missing or invalid_unexpected:
+            raise RuntimeError(
+                "Graph-diffusion checkpoint mismatch: "
+                f"missing={invalid_missing}, unexpected={invalid_unexpected}"
+            )
+        if result.missing_keys:
+            print(
+                "[TOPOLOGY] Loaded checkpoint with graph diffusion additions; "
+                "new parameters use runtime initialization: "
+                + ", ".join(result.missing_keys),
+                flush=True,
+            )
+        if result.unexpected_keys:
+            print(
+                "[TOPOLOGY] Ignored checkpoint keys unused by graph-diffusion runtime: "
+                + ", ".join(result.unexpected_keys),
+                flush=True,
+            )
+        apply_structure_profile_runtime(model)
+        return result
+
     missing_final_topology = not any(
         "final_topology_attention." in key for key in state_dict
     )
@@ -353,6 +414,10 @@ def load_topology_checkpoint_state(
             "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
             "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
             "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+            "swin_unet.decoder_structure_blocks.0.graph_diffusion.",
+            "swin_unet.decoder_structure_blocks.1.graph_diffusion.",
+            "swin_unet.decoder_structure_blocks.2.graph_diffusion.",
+            "swin_unet.decoder_structure_blocks.3.graph_diffusion.",
             "swin_unet.stage2_topology_source.direction_head.",
             "swin_unet.stage2_topology_source.direction_gate.",
             "swin_unet.stage2_topology_source.direction_gate_beta",
@@ -438,6 +503,10 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
         "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+        "swin_unet.decoder_structure_blocks.0.graph_diffusion.",
+        "swin_unet.decoder_structure_blocks.1.graph_diffusion.",
+        "swin_unet.decoder_structure_blocks.2.graph_diffusion.",
+        "swin_unet.decoder_structure_blocks.3.graph_diffusion.",
         "swin_unet.stage2_topology_source.direction_head.",
         "swin_unet.stage2_topology_source.direction_gate.",
         "swin_unet.stage2_topology_source.direction_gate_beta",
@@ -507,7 +576,10 @@ class SwinUnet(nn.Module):
                  stage_topology_ratio=0.08,
                  stage_topology_topo_clip=4.0,
                  structure_profile=STRUCTURE_PROFILE_FULL,
-                 enable_final_graph_prop=False):
+                 enable_final_graph_prop=False,
+                 enable_graph_diffusion=False,
+                 enable_structure_gate=True,
+                 enable_decoder_attention_bias=True):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -543,7 +615,10 @@ class SwinUnet(nn.Module):
                                 stage_topology_ratio=stage_topology_ratio,
                                 stage_topology_topo_clip=stage_topology_topo_clip,
                                 structure_profile=structure_profile,
-                                enable_final_graph_prop=enable_final_graph_prop)
+                                enable_final_graph_prop=enable_final_graph_prop,
+                                enable_graph_diffusion=enable_graph_diffusion,
+                                enable_structure_gate=enable_structure_gate,
+                                enable_decoder_attention_bias=enable_decoder_attention_bias)
         
         # Keep DilatedAsterisk in the graph, but turn off its residual effect.
         if self.use_asterisk:

@@ -71,6 +71,33 @@ parser.add_argument(
     action='store_true',
     help='enable final soft skeleton graph propagation (auto-read from checkpoint when omitted)',
 )
+parser.add_argument(
+    '--enable_graph_diffusion',
+    action='store_true',
+    help='enable decoder graph diffusion (auto-read from checkpoint when omitted)',
+)
+parser.add_argument(
+    '--enable_structure_gate',
+    dest='enable_structure_gate',
+    action='store_true',
+    default=True,
+)
+parser.add_argument(
+    '--disable_structure_gate',
+    dest='enable_structure_gate',
+    action='store_false',
+)
+parser.add_argument(
+    '--enable_decoder_attention_bias',
+    dest='enable_decoder_attention_bias',
+    action='store_true',
+    default=True,
+)
+parser.add_argument(
+    '--disable_decoder_attention_bias',
+    dest='enable_decoder_attention_bias',
+    action='store_false',
+)
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -207,12 +234,19 @@ if __name__ == "__main__":
                 "stage_topology_bias_mode",
                 "stage_topology_ratio",
                 "stage_topology_topo_clip",
+                "enable_graph_diffusion",
+                "enable_structure_gate",
+                "enable_decoder_attention_bias",
             ):
                 if name in saved_args:
                     setattr(args, name, saved_args[name])
             if not enable_graph_prop and saved_args:
                 enable_graph_prop = bool(
                     saved_args.get("enable_graph_prop", False)
+                )
+            if not args.enable_graph_diffusion and saved_args:
+                args.enable_graph_diffusion = bool(
+                    saved_args.get("enable_graph_diffusion", False)
                 )
 
     model = ViT_seg(config=config, img_size=args.img_size,
@@ -227,7 +261,10 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    enable_final_graph_prop=enable_graph_prop).cuda()
+                    enable_final_graph_prop=enable_graph_prop,
+                    enable_graph_diffusion=args.enable_graph_diffusion,
+                    enable_structure_gate=args.enable_structure_gate,
+                    enable_decoder_attention_bias=args.enable_decoder_attention_bias).cuda()
     
     # 加载模型
     if checkpoint is not None:

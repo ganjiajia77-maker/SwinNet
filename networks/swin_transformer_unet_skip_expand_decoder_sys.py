@@ -1811,6 +1811,9 @@ class SwinTransformerSys(nn.Module):
                  stage_topology_topo_clip=DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP,
                  structure_profile="full",
                  enable_final_graph_prop=False,
+                 enable_graph_diffusion=False,
+                 enable_structure_gate=True,
+                 enable_decoder_attention_bias=True,
                  **kwargs):
         super().__init__()
 
@@ -1851,6 +1854,9 @@ class SwinTransformerSys(nn.Module):
             self.structure_profile == "stage23_boundary_0626"
         )
         self.enable_final_graph_prop = bool(enable_final_graph_prop)
+        self.enable_graph_diffusion = bool(enable_graph_diffusion)
+        self.enable_structure_gate = bool(enable_structure_gate)
+        self.enable_decoder_attention_bias = bool(enable_decoder_attention_bias)
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -1941,7 +1947,10 @@ class SwinTransformerSys(nn.Module):
                                          norm_layer=norm_layer,
                                          upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
                                          use_checkpoint=use_checkpoint,
-                                         use_decoder_structure_bias=(i_layer in (2, 3)))
+                                         use_decoder_structure_bias=(
+                                             self.enable_decoder_attention_bias
+                                             and i_layer in (2, 3)
+                                         ))
             self.layers_up.append(layer_up)
             self.concat_back_dim.append(concat_linear)
 
@@ -2053,13 +2062,23 @@ class SwinTransformerSys(nn.Module):
                         )
                         else None
                     ),
-                    enable_direct_feature_refinement=True,
+                    enable_direct_feature_refinement=self.enable_structure_gate,
                     enable_directional_feature_refinement=False,
+                    enable_structure_gate=self.enable_structure_gate,
+                    enable_graph_diffusion=self.enable_graph_diffusion,
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
         )
-        if self.structure_profile == "stage23_boundary_0626":
+        if self.enable_graph_diffusion:
+            print(
+                "[INFO] Decoder graph diffusion: enabled on structure blocks "
+                "(structure_gate={}, decoder_attention_bias={})".format(
+                    self.enable_structure_gate,
+                    self.enable_decoder_attention_bias,
+                )
+            )
+        elif self.structure_profile == "stage23_boundary_0626":
             print(
                 "[INFO] Decoder structure gates: stage2/stage3 only "
                 "(0626 profile), channels={}".format(
@@ -2455,6 +2474,7 @@ class SwinTransformerSys(nn.Module):
                 self._decoder_structure_enabled(inx)
                 and isinstance(layer_up, BasicLayer_up)
                 and inx in (2, 3)
+                and self.enable_decoder_attention_bias
             )
             topology_enabled = self._stage_topology_enabled(inx)
             if decoder_structure_gate_enabled:
