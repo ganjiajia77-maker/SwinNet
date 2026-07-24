@@ -1813,6 +1813,7 @@ class SwinTransformerSys(nn.Module):
                  enable_final_graph_prop=False,
                  enable_graph_diffusion=False,
                  enable_simple_c_diffusion=False,
+                 enable_sc_graph_diffusion=False,
                  enable_structure_gate=True,
                  enable_decoder_attention_bias=True,
                  **kwargs):
@@ -1857,6 +1858,7 @@ class SwinTransformerSys(nn.Module):
         self.enable_final_graph_prop = bool(enable_final_graph_prop)
         self.enable_graph_diffusion = bool(enable_graph_diffusion)
         self.enable_simple_c_diffusion = bool(enable_simple_c_diffusion)
+        self.enable_sc_graph_diffusion = bool(enable_sc_graph_diffusion)
         self.enable_structure_gate = bool(enable_structure_gate)
         self.enable_decoder_attention_bias = bool(enable_decoder_attention_bias)
 
@@ -2069,6 +2071,7 @@ class SwinTransformerSys(nn.Module):
                     enable_structure_gate=self.enable_structure_gate,
                     enable_graph_diffusion=self.enable_graph_diffusion,
                     enable_simple_c_diffusion=self.enable_simple_c_diffusion,
+                    enable_sc_graph_diffusion=self.enable_sc_graph_diffusion,
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
@@ -2077,6 +2080,15 @@ class SwinTransformerSys(nn.Module):
             print(
                 "[INFO] Decoder graph diffusion: enabled on structure blocks "
                 "(structure_gate={}, decoder_attention_bias={})".format(
+                    self.enable_structure_gate,
+                    self.enable_decoder_attention_bias,
+                )
+            )
+        elif self.enable_sc_graph_diffusion:
+            print(
+                "[INFO] Decoder SC graph diffusion: enabled after structure gate "
+                "(A=C*(1+alpha*S_i*S_j), no direction; structure_gate={}, "
+                "decoder_attention_bias={})".format(
                     self.enable_structure_gate,
                     self.enable_decoder_attention_bias,
                 )

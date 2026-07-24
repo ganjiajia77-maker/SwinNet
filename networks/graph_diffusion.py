@@ -48,6 +48,45 @@ class SimpleConnectivityDiffusion(nn.Module):
         return self.diffuse(feature, connectivity_prob)[0]
 
 
+class SkeletonConnectivityGraphDiffusion(nn.Module):
+    """F' = F + gamma * (A @ F), A_ij = C_ij * (1 + alpha * S_i * S_j), row-normalized."""
+
+    def __init__(self, alpha=1.0, gamma_init=0.05):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+    def build_adjacency(self, skeleton_prob, connectivity_prob):
+        adjacency_weights = []
+        for channel_idx, (dy, dx) in enumerate(GRAPH_DIFFUSION_DIRECTIONS):
+            neighbor_skeleton = _shift_feature_map(skeleton_prob, dy, dx)
+            connectivity_ij = connectivity_prob[:, channel_idx:channel_idx + 1]
+            skeleton_factor = 1.0 + self.alpha * skeleton_prob * neighbor_skeleton
+            adjacency_weights.append(connectivity_ij * skeleton_factor)
+        return adjacency_weights
+
+    @staticmethod
+    def row_normalize_adjacency(adjacency_weights):
+        row_sum = sum(adjacency_weights)
+        return [
+            weight / row_sum.clamp_min(1e-6)
+            for weight in adjacency_weights
+        ]
+
+    def diffuse(self, feature, skeleton_prob, connectivity_prob):
+        normalized_weights = self.row_normalize_adjacency(
+            self.build_adjacency(skeleton_prob, connectivity_prob)
+        )
+        message = torch.zeros_like(feature)
+        for weight, (dy, dx) in zip(normalized_weights, GRAPH_DIFFUSION_DIRECTIONS):
+            neighbor_feature = _shift_feature_map(feature, dy, dx)
+            message = message + weight * neighbor_feature
+        return feature + self.gamma * message, message
+
+    def forward(self, feature, skeleton_prob, connectivity_prob):
+        return self.diffuse(feature, skeleton_prob, connectivity_prob)[0]
+
+
 class DirectionAwareGraphDiffusion(nn.Module):
     """Soft grid-graph message passing over predicted skeleton/connectivity/direction."""
 

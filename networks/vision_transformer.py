@@ -21,7 +21,7 @@ from .dilated_asterisk import DilatedAsteriskWithDirections
 
 logger = logging.getLogger(__name__)
 
-TOPOLOGY_ATTENTION_VERSION = "gate-simple-c-diffusion-v1"
+TOPOLOGY_ATTENTION_VERSION = "gate-sc-graph-diffusion-v1"
 STRUCTURE_PROFILE_FULL = "full"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 = "stage23_boundary_0626"
 
@@ -105,6 +105,9 @@ def get_topology_coefficients(model):
         "simple_c_diffusion_enabled": bool(
             getattr(swin_unet, "enable_simple_c_diffusion", False)
         ),
+        "sc_graph_diffusion_enabled": bool(
+            getattr(swin_unet, "enable_sc_graph_diffusion", False)
+        ),
         "structure_gate_enabled": bool(getattr(swin_unet, "enable_structure_gate", True)),
         "decoder_attention_bias_enabled": bool(
             getattr(swin_unet, "enable_decoder_attention_bias", True)
@@ -134,9 +137,13 @@ def get_topology_coefficients(model):
             "simple_c_diffusion_enabled": bool(
                 structure_block.enable_simple_c_diffusion
             ),
+            "sc_graph_diffusion_enabled": bool(
+                structure_block.enable_sc_graph_diffusion
+            ),
         }
         graph_diffusion = getattr(structure_block, "graph_diffusion", None)
         simple_c_diffusion = getattr(structure_block, "simple_c_diffusion", None)
+        sc_graph_diffusion = getattr(structure_block, "sc_graph_diffusion", None)
         if graph_diffusion is not None:
             stage_values["graph_gamma"] = float(
                 graph_diffusion.gamma.detach().cpu()
@@ -144,6 +151,10 @@ def get_topology_coefficients(model):
         if simple_c_diffusion is not None:
             stage_values["simple_c_gamma"] = float(
                 simple_c_diffusion.gamma.detach().cpu()
+            )
+        if sc_graph_diffusion is not None:
+            stage_values["sc_graph_gamma"] = float(
+                sc_graph_diffusion.gamma.detach().cpu()
             )
         coefficients[f"decoder_stage{stage}"] = stage_values
 
@@ -396,6 +407,32 @@ def load_topology_checkpoint_state(
         apply_structure_profile_runtime(model)
         return result
 
+    if getattr(swin_unet, "enable_sc_graph_diffusion", False):
+        result = model.load_state_dict(state_dict, strict=False)
+        sc_graph_missing_prefixes = tuple(
+            "swin_unet.decoder_structure_blocks.{}.sc_graph_diffusion.".format(stage)
+            for stage in range(len(swin_unet.decoder_structure_blocks))
+        )
+        invalid_missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith(sc_graph_missing_prefixes)
+        ]
+        if invalid_missing or result.unexpected_keys:
+            raise RuntimeError(
+                "SC-graph-diffusion checkpoint mismatch: "
+                f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+            )
+        if result.missing_keys:
+            print(
+                "[TOPOLOGY] Loaded checkpoint with SC graph diffusion additions; "
+                "new parameters use runtime initialization: "
+                + ", ".join(result.missing_keys),
+                flush=True,
+            )
+        apply_structure_profile_runtime(model)
+        return result
+
     missing_final_topology = not any(
         "final_topology_attention." in key for key in state_dict
     )
@@ -459,6 +496,10 @@ def load_topology_checkpoint_state(
             "swin_unet.decoder_structure_blocks.1.simple_c_diffusion.",
             "swin_unet.decoder_structure_blocks.2.simple_c_diffusion.",
             "swin_unet.decoder_structure_blocks.3.simple_c_diffusion.",
+            "swin_unet.decoder_structure_blocks.0.sc_graph_diffusion.",
+            "swin_unet.decoder_structure_blocks.1.sc_graph_diffusion.",
+            "swin_unet.decoder_structure_blocks.2.sc_graph_diffusion.",
+            "swin_unet.decoder_structure_blocks.3.sc_graph_diffusion.",
             "swin_unet.stage2_topology_source.direction_head.",
             "swin_unet.stage2_topology_source.direction_gate.",
             "swin_unet.stage2_topology_source.direction_gate_beta",
@@ -552,6 +593,10 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.1.simple_c_diffusion.",
         "swin_unet.decoder_structure_blocks.2.simple_c_diffusion.",
         "swin_unet.decoder_structure_blocks.3.simple_c_diffusion.",
+        "swin_unet.decoder_structure_blocks.0.sc_graph_diffusion.",
+        "swin_unet.decoder_structure_blocks.1.sc_graph_diffusion.",
+        "swin_unet.decoder_structure_blocks.2.sc_graph_diffusion.",
+        "swin_unet.decoder_structure_blocks.3.sc_graph_diffusion.",
         "swin_unet.stage2_topology_source.direction_head.",
         "swin_unet.stage2_topology_source.direction_gate.",
         "swin_unet.stage2_topology_source.direction_gate_beta",
@@ -624,6 +669,7 @@ class SwinUnet(nn.Module):
                  enable_final_graph_prop=False,
                  enable_graph_diffusion=False,
                  enable_simple_c_diffusion=False,
+                 enable_sc_graph_diffusion=False,
                  enable_structure_gate=True,
                  enable_decoder_attention_bias=True):
         super(SwinUnet, self).__init__()
@@ -664,6 +710,7 @@ class SwinUnet(nn.Module):
                                 enable_final_graph_prop=enable_final_graph_prop,
                                 enable_graph_diffusion=enable_graph_diffusion,
                                 enable_simple_c_diffusion=enable_simple_c_diffusion,
+                                enable_sc_graph_diffusion=enable_sc_graph_diffusion,
                                 enable_structure_gate=enable_structure_gate,
                                 enable_decoder_attention_bias=enable_decoder_attention_bias)
         

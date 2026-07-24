@@ -114,7 +114,12 @@ parser.add_argument(
 parser.add_argument(
     '--enable_simple_c_diffusion',
     action='store_true',
-    help='keep structure gate and add F + gamma*C*F connectivity diffusion',
+    help='keep structure gate and add F + gamma*mean(C_k*shift(F))',
+)
+parser.add_argument(
+    '--enable_sc_graph_diffusion',
+    action='store_true',
+    help='keep structure gate; add F + gamma*(A@F) with A=C*(1+alpha*S_i*S_j), no D',
 )
 parser.add_argument(
     '--enable_structure_gate',
@@ -244,9 +249,16 @@ def apply_structure_profile_defaults(args):
 
 apply_structure_profile_defaults(args)
 
-if args.enable_graph_diffusion and args.enable_simple_c_diffusion:
+if sum(
+    (
+        args.enable_graph_diffusion,
+        args.enable_simple_c_diffusion,
+        args.enable_sc_graph_diffusion,
+    )
+) > 1:
     parser.error(
-        "Use either --enable_graph_diffusion or --enable_simple_c_diffusion, not both."
+        "Use only one of --enable_graph_diffusion, "
+        "--enable_simple_c_diffusion, or --enable_sc_graph_diffusion."
     )
 
 if args.enable_graph_diffusion and args.enable_structure_gate:
@@ -274,6 +286,16 @@ if args.enable_simple_c_diffusion and not args.resume:
     args.resume = DEFAULT_GRAPH_DIFFUSION_BASE_CHECKPOINT
     print(
         "[INFO] Simple C diffusion base checkpoint: "
+        f"{DEFAULT_GRAPH_DIFFUSION_BASE_CHECKPOINT}",
+        flush=True,
+    )
+
+if args.enable_sc_graph_diffusion and not _cli_has("--structure_profile"):
+    args.structure_profile = STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
+if args.enable_sc_graph_diffusion and not args.resume:
+    args.resume = DEFAULT_GRAPH_DIFFUSION_BASE_CHECKPOINT
+    print(
+        "[INFO] SC graph diffusion base checkpoint: "
         f"{DEFAULT_GRAPH_DIFFUSION_BASE_CHECKPOINT}",
         flush=True,
     )
@@ -404,6 +426,12 @@ def format_training_config_lines(args, loss_weights):
                 "  Decoder structure gate: enabled",
                 "  Simple C diffusion: F' = F_gate + gamma * mean_k(C_k * shift(F_gate)), gamma_init=0.05",
                 "  No direction term in diffusion",
+            ])
+        elif args.enable_sc_graph_diffusion:
+            lines.extend([
+                "  Decoder structure gate: enabled",
+                "  SC graph diffusion: A_ij = C_ij * (1 + alpha * S_i * S_j), row-normalized",
+                "  F' = F_gate + gamma * (A @ F_gate), alpha=1.0, gamma_init=0.05, no D",
             ])
         elif args.enable_structure_gate:
             lines.append("  Decoder structure gate refinement: enabled")
@@ -837,6 +865,7 @@ if __name__ == "__main__":
                     enable_final_graph_prop=args.enable_graph_prop,
                     enable_graph_diffusion=args.enable_graph_diffusion,
                     enable_simple_c_diffusion=args.enable_simple_c_diffusion,
+                    enable_sc_graph_diffusion=args.enable_sc_graph_diffusion,
                     enable_structure_gate=args.enable_structure_gate,
                     enable_decoder_attention_bias=args.enable_decoder_attention_bias).to(device)
 
@@ -916,6 +945,19 @@ if __name__ == "__main__":
                     f"(loaded weights from checkpoint epoch={checkpoint.get('epoch', '?')})",
                     flush=True,
                 )
+            elif args.enable_sc_graph_diffusion:
+                load_topology_checkpoint_state(
+                    model,
+                    checkpoint_state,
+                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+                    strict=True,
+                )
+                start_epoch = 0
+                print(
+                    "[INFO] SC graph diffusion warm-start: reset start_epoch to 0 "
+                    f"(loaded weights from checkpoint epoch={checkpoint.get('epoch', '?')})",
+                    flush=True,
+                )
             elif args.freeze_0626_backbone:
                 load_topology_checkpoint_state(
                     model,
@@ -948,6 +990,10 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.simple_c_diffusion.",
                         "swin_unet.decoder_structure_blocks.2.simple_c_diffusion.",
                         "swin_unet.decoder_structure_blocks.3.simple_c_diffusion.",
+                        "swin_unet.decoder_structure_blocks.0.sc_graph_diffusion.",
+                        "swin_unet.decoder_structure_blocks.1.sc_graph_diffusion.",
+                        "swin_unet.decoder_structure_blocks.2.sc_graph_diffusion.",
+                        "swin_unet.decoder_structure_blocks.3.sc_graph_diffusion.",
                         "swin_unet.stage2_topology_source.direction_head.",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
                     )
@@ -997,7 +1043,11 @@ if __name__ == "__main__":
                     f"(checkpoint had epoch={checkpoint.get('epoch', '?')})",
                     flush=True,
                 )
-            elif not args.enable_graph_diffusion and not args.enable_simple_c_diffusion:
+            elif (
+                not args.enable_graph_diffusion
+                and not args.enable_simple_c_diffusion
+                and not args.enable_sc_graph_diffusion
+            ):
                 start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_0626_backbone:
                 try:
