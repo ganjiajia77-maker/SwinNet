@@ -77,6 +77,11 @@ parser.add_argument(
     help='enable decoder graph diffusion (auto-read from checkpoint when omitted)',
 )
 parser.add_argument(
+    '--enable_simple_c_diffusion',
+    action='store_true',
+    help='enable gate + simple C diffusion (auto-read from checkpoint when omitted)',
+)
+parser.add_argument(
     '--enable_structure_gate',
     dest='enable_structure_gate',
     action='store_true',
@@ -235,6 +240,7 @@ if __name__ == "__main__":
                 "stage_topology_ratio",
                 "stage_topology_topo_clip",
                 "enable_graph_diffusion",
+                "enable_simple_c_diffusion",
                 "enable_structure_gate",
                 "enable_decoder_attention_bias",
             ):
@@ -247,6 +253,10 @@ if __name__ == "__main__":
             if not args.enable_graph_diffusion and saved_args:
                 args.enable_graph_diffusion = bool(
                     saved_args.get("enable_graph_diffusion", False)
+                )
+            if not args.enable_simple_c_diffusion and saved_args:
+                args.enable_simple_c_diffusion = bool(
+                    saved_args.get("enable_simple_c_diffusion", False)
                 )
 
     model = ViT_seg(config=config, img_size=args.img_size,
@@ -263,6 +273,7 @@ if __name__ == "__main__":
                     structure_profile=args.structure_profile,
                     enable_final_graph_prop=enable_graph_prop,
                     enable_graph_diffusion=args.enable_graph_diffusion,
+                    enable_simple_c_diffusion=args.enable_simple_c_diffusion,
                     enable_structure_gate=args.enable_structure_gate,
                     enable_decoder_attention_bias=args.enable_decoder_attention_bias).cuda()
     

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .graph_diffusion import DirectionAwareGraphDiffusion
+from .graph_diffusion import DirectionAwareGraphDiffusion, SimpleConnectivityDiffusion
 
 
 class ConvBNReLU(nn.Module):
@@ -501,6 +501,7 @@ class DecoderStructureRefinement(nn.Module):
         enable_directional_feature_refinement=True,
         enable_structure_gate=True,
         enable_graph_diffusion=False,
+        enable_simple_c_diffusion=False,
         graph_diffusion_alpha=1.0,
         graph_diffusion_beta=1.0,
     ):
@@ -516,6 +517,7 @@ class DecoderStructureRefinement(nn.Module):
         )
         self.enable_structure_gate = bool(enable_structure_gate)
         self.enable_graph_diffusion = bool(enable_graph_diffusion)
+        self.enable_simple_c_diffusion = bool(enable_simple_c_diffusion)
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
@@ -560,6 +562,10 @@ class DecoderStructureRefinement(nn.Module):
             )
         else:
             self.graph_diffusion = None
+        if self.enable_simple_c_diffusion:
+            self.simple_c_diffusion = SimpleConnectivityDiffusion(gamma_init=0.05)
+        else:
+            self.simple_c_diffusion = None
         self.capture_diagnostics = False
         self.last_diagnostics = None
 
@@ -627,6 +633,7 @@ class DecoderStructureRefinement(nn.Module):
         gate_residual = torch.zeros_like(x)
         directional_residual = torch.zeros_like(x)
         graph_message = torch.zeros_like(x)
+        c_diff_message = torch.zeros_like(x)
         if (
             self.enable_graph_diffusion
             and self.graph_diffusion is not None
@@ -654,6 +661,15 @@ class DecoderStructureRefinement(nn.Module):
                 out = refined
         else:
             out = x
+        if (
+            self.enable_simple_c_diffusion
+            and self.simple_c_diffusion is not None
+            and apply_feature_refinement
+        ):
+            out, c_diff_message = self.simple_c_diffusion.diffuse(
+                out,
+                connectivity_prob,
+            )
         if self.capture_diagnostics:
             with torch.no_grad():
                 feature_norm = torch.linalg.vector_norm(x)
@@ -691,6 +707,16 @@ class DecoderStructureRefinement(nn.Module):
                     diagnostics["graph_message_relative_norm"] = float(
                         (
                             torch.linalg.vector_norm(graph_message)
+                            / (feature_norm + 1e-6)
+                        ).detach().cpu()
+                    )
+                if self.simple_c_diffusion is not None:
+                    diagnostics["simple_c_gamma"] = float(
+                        self.simple_c_diffusion.gamma.detach().cpu()
+                    )
+                    diagnostics["simple_c_message_relative_norm"] = float(
+                        (
+                            torch.linalg.vector_norm(c_diff_message)
                             / (feature_norm + 1e-6)
                         ).detach().cpu()
                     )

@@ -94,6 +94,9 @@ def _runtime_flags_from_checkpoint(checkpoint):
     saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
     return {
         "enable_graph_diffusion": bool(saved_args.get("enable_graph_diffusion", False)),
+        "enable_simple_c_diffusion": bool(
+            saved_args.get("enable_simple_c_diffusion", False)
+        ),
         "enable_structure_gate": bool(saved_args.get("enable_structure_gate", True)),
         "enable_decoder_attention_bias": bool(
             saved_args.get("enable_decoder_attention_bias", True)
@@ -120,6 +123,7 @@ def build_model(args, runtime_flags):
         structure_profile=runtime_flags["structure_profile"],
         enable_final_graph_prop=False,
         enable_graph_diffusion=runtime_flags["enable_graph_diffusion"],
+        enable_simple_c_diffusion=runtime_flags["enable_simple_c_diffusion"],
         enable_structure_gate=runtime_flags["enable_structure_gate"],
         enable_decoder_attention_bias=runtime_flags["enable_decoder_attention_bias"],
     )

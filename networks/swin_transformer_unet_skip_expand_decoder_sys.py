@@ -1812,6 +1812,7 @@ class SwinTransformerSys(nn.Module):
                  structure_profile="full",
                  enable_final_graph_prop=False,
                  enable_graph_diffusion=False,
+                 enable_simple_c_diffusion=False,
                  enable_structure_gate=True,
                  enable_decoder_attention_bias=True,
                  **kwargs):
@@ -1855,6 +1856,7 @@ class SwinTransformerSys(nn.Module):
         )
         self.enable_final_graph_prop = bool(enable_final_graph_prop)
         self.enable_graph_diffusion = bool(enable_graph_diffusion)
+        self.enable_simple_c_diffusion = bool(enable_simple_c_diffusion)
         self.enable_structure_gate = bool(enable_structure_gate)
         self.enable_decoder_attention_bias = bool(enable_decoder_attention_bias)
 
@@ -2066,6 +2068,7 @@ class SwinTransformerSys(nn.Module):
                     enable_directional_feature_refinement=False,
                     enable_structure_gate=self.enable_structure_gate,
                     enable_graph_diffusion=self.enable_graph_diffusion,
+                    enable_simple_c_diffusion=self.enable_simple_c_diffusion,
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
@@ -2073,6 +2076,14 @@ class SwinTransformerSys(nn.Module):
         if self.enable_graph_diffusion:
             print(
                 "[INFO] Decoder graph diffusion: enabled on structure blocks "
+                "(structure_gate={}, decoder_attention_bias={})".format(
+                    self.enable_structure_gate,
+                    self.enable_decoder_attention_bias,
+                )
+            )
+        elif self.enable_simple_c_diffusion:
+            print(
+                "[INFO] Decoder simple C diffusion: enabled after structure gate "
                 "(structure_gate={}, decoder_attention_bias={})".format(
                     self.enable_structure_gate,
                     self.enable_decoder_attention_bias,

@@ -14,6 +14,40 @@ GRAPH_DIFFUSION_DIRECTIONS = (
 )
 
 
+def _shift_feature_map(x, dy, dx):
+    _, _, height, width = x.shape
+    pad_left = max(dx, 0)
+    pad_right = max(-dx, 0)
+    pad_top = max(dy, 0)
+    pad_bottom = max(-dy, 0)
+    padded = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
+    y0 = max(-dy, 0)
+    x0 = max(-dx, 0)
+    return padded[:, :, y0:y0 + height, x0:x0 + width]
+
+
+class SimpleConnectivityDiffusion(nn.Module):
+    """F' = F + gamma * mean_k(C_k * shift(F)). Uses predicted connectivity only."""
+
+    def __init__(self, gamma_init=0.05):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+    def connectivity_message(self, feature, connectivity_prob):
+        message = torch.zeros_like(feature)
+        for channel_idx, (dy, dx) in enumerate(GRAPH_DIFFUSION_DIRECTIONS):
+            shifted = _shift_feature_map(feature, dy, dx)
+            message = message + connectivity_prob[:, channel_idx:channel_idx + 1] * shifted
+        return message / float(len(GRAPH_DIFFUSION_DIRECTIONS))
+
+    def diffuse(self, feature, connectivity_prob):
+        message = self.connectivity_message(feature, connectivity_prob)
+        return feature + self.gamma * message, message
+
+    def forward(self, feature, connectivity_prob):
+        return self.diffuse(feature, connectivity_prob)[0]
+
+
 class DirectionAwareGraphDiffusion(nn.Module):
     """Soft grid-graph message passing over predicted skeleton/connectivity/direction."""
 
@@ -41,15 +75,7 @@ class DirectionAwareGraphDiffusion(nn.Module):
 
     @staticmethod
     def _shift(x, dy, dx):
-        _, _, height, width = x.shape
-        pad_left = max(dx, 0)
-        pad_right = max(-dx, 0)
-        pad_top = max(dy, 0)
-        pad_bottom = max(-dy, 0)
-        padded = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
-        y0 = max(-dy, 0)
-        x0 = max(-dx, 0)
-        return padded[:, :, y0:y0 + height, x0:x0 + width]
+        return _shift_feature_map(x, dy, dx)
 
     @staticmethod
     def direction_similarity(direction_i, direction_j):
