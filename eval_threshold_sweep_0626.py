@@ -61,7 +61,51 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_model(args):
+def _resolve_checkpoint_path(checkpoint_path):
+    if os.path.isfile(checkpoint_path):
+        return checkpoint_path
+
+    parent = os.path.dirname(checkpoint_path)
+    run_prefix = os.path.basename(parent)
+    model_out = os.path.dirname(parent)
+    suggestions = []
+    if os.path.isdir(model_out):
+        for name in sorted(os.listdir(model_out)):
+            if not name.startswith(run_prefix):
+                continue
+            candidate = os.path.join(model_out, name, "best.pth")
+            if os.path.isfile(candidate):
+                suggestions.append(candidate)
+
+    message = f"Checkpoint not found: {checkpoint_path}"
+    if suggestions:
+        message += "\nDid you mean one of:\n  " + "\n  ".join(suggestions)
+    else:
+        message += (
+            "\nNo matching run directory with best.pth yet. "
+            "Check whether training finished:\n"
+            f"  ls -lt {model_out} | head\n"
+            f"  find {model_out} -name 'best.pth' | grep graph"
+        )
+    raise FileNotFoundError(message)
+
+
+def _runtime_flags_from_checkpoint(checkpoint):
+    saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
+    return {
+        "enable_graph_diffusion": bool(saved_args.get("enable_graph_diffusion", False)),
+        "enable_structure_gate": bool(saved_args.get("enable_structure_gate", True)),
+        "enable_decoder_attention_bias": bool(
+            saved_args.get("enable_decoder_attention_bias", True)
+        ),
+        "structure_profile": checkpoint.get(
+            "structure_profile",
+            saved_args.get("structure_profile", STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626),
+        ),
+    }
+
+
+def build_model(args, runtime_flags):
     config = get_config(args)
     model = SwinUnet(
         config=config,
@@ -73,8 +117,11 @@ def build_model(args):
         final_topology_eta_init=0.0,
         final_gap_rho_init=0.0,
         stage_topology_stages="none",
-        structure_profile=STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        structure_profile=runtime_flags["structure_profile"],
         enable_final_graph_prop=False,
+        enable_graph_diffusion=runtime_flags["enable_graph_diffusion"],
+        enable_structure_gate=runtime_flags["enable_structure_gate"],
+        enable_decoder_attention_bias=runtime_flags["enable_decoder_attention_bias"],
     )
     return model.cuda()
 
@@ -121,19 +168,19 @@ def global_metrics(logits_batches, target_batches, threshold):
 
 def main():
     args = parse_args()
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(args.checkpoint)
+    checkpoint_path = _resolve_checkpoint_path(args.checkpoint)
 
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    runtime_flags = _runtime_flags_from_checkpoint(checkpoint)
     thresholds = [float(x.strip()) for x in args.thresholds.split(",") if x.strip()]
-    model = build_model(args)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    model = build_model(args, runtime_flags)
     load_topology_checkpoint_state(
         model,
         checkpoint["model_state_dict"],
         checkpoint.get("topology_attention_version", "legacy-unrecorded"),
         strict=False,
     )
-    print("[LOAD]", args.checkpoint)
+    print("[LOAD]", checkpoint_path)
     print("[LOAD] epoch:", checkpoint.get("epoch"))
     print("[LOAD] saved val_iou:", checkpoint.get("val_iou"))
     print_topology_coefficients(model, prefix="[SWEEP]")

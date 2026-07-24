@@ -870,6 +870,12 @@ if __name__ == "__main__":
                     checkpoint.get("topology_attention_version", "legacy-unrecorded"),
                     strict=True,
                 )
+                start_epoch = 0
+                print(
+                    "[INFO] Graph diffusion warm-start: reset start_epoch to 0 "
+                    f"(loaded weights from checkpoint epoch={checkpoint.get('epoch', '?')})",
+                    flush=True,
+                )
             elif args.freeze_0626_backbone:
                 load_topology_checkpoint_state(
                     model,
@@ -941,14 +947,13 @@ if __name__ == "__main__":
                     f"{len(trainable)} tensors",
                     flush=True,
                 )
-                # 0626 ckpt epoch 可能 > max_epochs；graph-only 是新实验，从 0 开始
                 start_epoch = 0
                 print(
                     "[INFO] Graph-only fine-tune: reset start_epoch to 0 "
                     f"(checkpoint had epoch={checkpoint.get('epoch', '?')})",
                     flush=True,
                 )
-            else:
+            elif not args.enable_graph_diffusion:
                 start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_0626_backbone:
                 try:
