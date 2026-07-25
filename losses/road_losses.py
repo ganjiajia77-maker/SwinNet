@@ -819,6 +819,8 @@ class SurfaceStructureLoss(nn.Module):
 
         edge_logits = completion_aux.get("edge_logits")
         if edge_logits is not None and self.skeleton_edge_weight > 0:
+            if edge_logits.dim() == 5:
+                edge_logits = edge_logits.squeeze(2)
             num_edges = edge_logits.shape[1]
             edge_target = self.build_completion_edge_target(
                 skeleton_gt,
