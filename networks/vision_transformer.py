@@ -21,7 +21,7 @@ from .dilated_asterisk import DilatedAsteriskWithDirections
 
 logger = logging.getLogger(__name__)
 
-TOPOLOGY_ATTENTION_VERSION = "gate-sc-graph-diffusion-v1"
+TOPOLOGY_ATTENTION_VERSION = "skeleton-completion-v1"
 STRUCTURE_PROFILE_FULL = "full"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 = "stage23_boundary_0626"
 
@@ -343,7 +343,10 @@ def load_topology_checkpoint_state(
             "swin_unet.decoder_structure_blocks.{}.graph_diffusion.".format(stage)
             for stage in range(len(swin_unet.decoder_structure_blocks))
         )
-        allowed_missing_prefixes = graph_diffusion_missing_prefixes
+        allowed_missing_prefixes = graph_diffusion_missing_prefixes + (
+            "swin_unet.guided_head.final_skeleton_head.",
+            "swin_unet.structure_skeleton_head.",
+        )
         allowed_unexpected_suffixes = ()
         if not getattr(swin_unet, "enable_decoder_attention_bias", True):
             allowed_unexpected_suffixes = (
@@ -386,6 +389,8 @@ def load_topology_checkpoint_state(
         simple_c_missing_prefixes = tuple(
             "swin_unet.decoder_structure_blocks.{}.simple_c_diffusion.".format(stage)
             for stage in range(len(swin_unet.decoder_structure_blocks))
+        ) + (
+            "swin_unet.guided_head.final_skeleton_head.",
         )
         invalid_missing = [
             key
@@ -407,11 +412,45 @@ def load_topology_checkpoint_state(
         apply_structure_profile_runtime(model)
         return result
 
+    guided_head = swin_unet.guided_head
+    if getattr(guided_head, "enable_skeleton_completion", False):
+        result = model.load_state_dict(state_dict, strict=False)
+        completion_missing_prefixes = (
+            "swin_unet.guided_head.skeleton_completion.",
+            "swin_unet.guided_head.final_direction_head.",
+            "swin_unet.guided_head.final_embedding_head.",
+            "swin_unet.guided_head.final_quality_head.",
+            "swin_unet.guided_head.skeleton_to_surface.",
+            "swin_unet.guided_head.skeleton_surface_eta",
+            "swin_unet.guided_head.final_skeleton_head.",
+        )
+        invalid_missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith(completion_missing_prefixes)
+        ]
+        if invalid_missing or result.unexpected_keys:
+            raise RuntimeError(
+                "Skeleton-completion checkpoint mismatch: "
+                f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+            )
+        if result.missing_keys:
+            print(
+                "[TOPOLOGY] Loaded checkpoint with skeleton completion additions; "
+                "new parameters use runtime initialization: "
+                + ", ".join(result.missing_keys),
+                flush=True,
+            )
+        apply_structure_profile_runtime(model)
+        return result
+
     if getattr(swin_unet, "enable_sc_graph_diffusion", False):
         result = model.load_state_dict(state_dict, strict=False)
         sc_graph_missing_prefixes = tuple(
             "swin_unet.decoder_structure_blocks.{}.sc_graph_diffusion.".format(stage)
             for stage in range(len(swin_unet.decoder_structure_blocks))
+        ) + (
+            "swin_unet.guided_head.final_skeleton_head.",
         )
         invalid_missing = [
             key
@@ -513,6 +552,8 @@ def load_topology_checkpoint_state(
                 "swin_unet.guided_head.connectivity_head.",
                 "swin_unet.guided_head.structure_fusion.",
                 "swin_unet.guided_head.structure_residual.",
+                "swin_unet.guided_head.final_skeleton_head.",
+                "swin_unet.structure_skeleton_head.",
             )
         invalid_missing = [
             key
@@ -607,7 +648,12 @@ def load_topology_checkpoint_state(
         "swin_unet.bottleneck_context_fusion.scale_attention.",
     )
     allowed_new_missing_prefixes = (
-        road_attention_missing_prefixes + msaf_missing_prefixes
+        road_attention_missing_prefixes
+        + msaf_missing_prefixes
+        + (
+            "swin_unet.guided_head.final_skeleton_head.",
+            "swin_unet.structure_skeleton_head.",
+        )
     )
     if strict and not any(
         key.startswith(allowed_new_missing_prefixes)
@@ -630,7 +676,28 @@ def load_topology_checkpoint_state(
             flush=True,
         )
     else:
-        result = model.load_state_dict(state_dict, strict=strict)
+        # Allow newly added final_skeleton_head when loading older 0626/full ckpts.
+        result = model.load_state_dict(state_dict, strict=False)
+        invalid_missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith(allowed_new_missing_prefixes)
+        ]
+        if strict and (invalid_missing or result.unexpected_keys):
+            raise RuntimeError(
+                "Checkpoint mismatch: "
+                f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+            )
+        if any(
+            key.startswith("swin_unet.guided_head.final_skeleton_head.")
+            or key.startswith("swin_unet.structure_skeleton_head.")
+            for key in result.missing_keys
+        ):
+            print(
+                "[TOPOLOGY] Checkpoint has no final/structure skeleton head; "
+                "new head(s) use runtime initialization (needs fine-tune).",
+                flush=True,
+            )
     apply_structure_profile_runtime(model)
     return result
 

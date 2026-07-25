@@ -7,6 +7,7 @@ from .graph_diffusion import (
     SimpleConnectivityDiffusion,
     SkeletonConnectivityGraphDiffusion,
 )
+from .skeleton_completion import SkeletonCompletionBranch
 
 
 class ConvBNReLU(nn.Module):
@@ -496,7 +497,7 @@ class DecoderStructureRefinement(nn.Module):
         channels,
         connectivity_channels=8,
         init_gamma1=0.0,
-        init_gamma2=0.0,
+        init_gamma2=0.05,
         gamma_limit=None,
         context_channels=None,
         context_strength=0.03,
@@ -607,6 +608,7 @@ class DecoderStructureRefinement(nn.Module):
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
     def directional_propagation(self, feature, connectivity_prob):
+        """Legacy 8-neighbor connectivity-weighted shift (not used by default)."""
         directions = [
             (-1, 0),
             (1, 0),
@@ -622,6 +624,52 @@ class DecoderStructureRefinement(nn.Module):
             shifted = self._shift_feature(feature, dy, dx)
             propagated = propagated + connectivity_prob[:, idx:idx + 1] * shifted
         return propagated / float(len(directions))
+
+    @staticmethod
+    def direction_field_sample(feature, direction_logits, step=1.0):
+        """
+        Direction-guided feature sampling (not Attn+=D):
+          D = normalize(direction)
+          F_f = F(x+dx, y+dy),  F_b = F(x-dx, y-dy)
+          F_dir = (F_f + F_b) / 2
+        Then caller forms F' = F + γ F_dir.
+        direction channels: [dx (width), dy (height)], matching direction_field_loss.
+        """
+        batch, _, height, width = feature.shape
+        direction = F.normalize(direction_logits, dim=1, eps=1e-6)
+        dx = direction[:, 0] * float(step)
+        dy = direction[:, 1] * float(step)
+
+        ys = torch.linspace(
+            -1.0, 1.0, height, device=feature.device, dtype=feature.dtype
+        )
+        xs = torch.linspace(
+            -1.0, 1.0, width, device=feature.device, dtype=feature.dtype
+        )
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        base = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(
+            batch, -1, -1, -1
+        )
+
+        dx_norm = (2.0 * dx) / float(max(width - 1, 1))
+        dy_norm = (2.0 * dy) / float(max(height - 1, 1))
+        offset = torch.stack((dx_norm, dy_norm), dim=-1)
+
+        f_forward = F.grid_sample(
+            feature,
+            base + offset,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        f_backward = F.grid_sample(
+            feature,
+            base - offset,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        return 0.5 * (f_forward + f_backward)
 
     def forward(self, x, global_context=None, apply_feature_refinement=True):
         structure_feat = self.structure_branch(x)
@@ -648,13 +696,24 @@ class DecoderStructureRefinement(nn.Module):
         graph_message = torch.zeros_like(x)
         c_diff_message = torch.zeros_like(x)
         sc_graph_message = torch.zeros_like(x)
+        out = x
+        if (
+            self.enable_sc_graph_diffusion
+            and self.sc_graph_diffusion is not None
+            and apply_feature_refinement
+        ):
+            out, sc_graph_message = self.sc_graph_diffusion.diffuse(
+                x,
+                skeleton_prob,
+                connectivity_prob,
+            )
         if (
             self.enable_graph_diffusion
             and self.graph_diffusion is not None
             and apply_feature_refinement
         ):
             out, graph_message = self.graph_diffusion.diffuse(
-                x,
+                out,
                 skeleton_prob,
                 connectivity_prob,
                 direction_logits,
@@ -664,17 +723,16 @@ class DecoderStructureRefinement(nn.Module):
             and self.enable_direct_feature_refinement
             and apply_feature_refinement
         ):
-            residual = structure_gate * self.feature_residual(x)
+            residual = structure_gate * self.feature_residual(out)
             gate_residual = self.gamma1 * residual
-            refined = x + gate_residual
+            refined = out + gate_residual
             if self.enable_directional_feature_refinement:
-                directional = self.directional_propagation(refined, connectivity_prob)
-                directional_residual = self.gamma2 * directional
+                # F_dir from sampling along predicted D; F' = F + γ F_dir
+                f_dir = self.direction_field_sample(refined, direction_logits)
+                directional_residual = self.gamma2 * f_dir
                 out = refined + directional_residual
             else:
                 out = refined
-        else:
-            out = x
         if (
             self.enable_simple_c_diffusion
             and self.simple_c_diffusion is not None
@@ -682,16 +740,6 @@ class DecoderStructureRefinement(nn.Module):
         ):
             out, c_diff_message = self.simple_c_diffusion.diffuse(
                 out,
-                connectivity_prob,
-            )
-        if (
-            self.enable_sc_graph_diffusion
-            and self.sc_graph_diffusion is not None
-            and apply_feature_refinement
-        ):
-            out, sc_graph_message = self.sc_graph_diffusion.diffuse(
-                out,
-                skeleton_prob,
                 connectivity_prob,
             )
         if self.capture_diagnostics:
@@ -748,6 +796,10 @@ class DecoderStructureRefinement(nn.Module):
                     diagnostics["sc_graph_gamma"] = float(
                         self.sc_graph_diffusion.gamma.detach().cpu()
                     )
+                    diagnostics["sc_graph_thetas"] = [
+                        float(value.detach().cpu())
+                        for value in self.sc_graph_diffusion.thetas
+                    ]
                     diagnostics["sc_graph_message_relative_norm"] = float(
                         (
                             torch.linalg.vector_norm(sc_graph_message)
@@ -1093,6 +1145,10 @@ class SkeletonGuidedHead(nn.Module):
         enable_graph_prop=False,
         graph_prop_lambda_init=0.05,
         graph_prop_lambda_max=0.10,
+        enable_skeleton_completion=False,
+        skeleton_embed_channels=16,
+        skeleton_bridge_lambda_init=0.0,
+        skeleton_surface_eta_init=0.0,
     ):
         super().__init__()
 
@@ -1103,6 +1159,7 @@ class SkeletonGuidedHead(nn.Module):
         self.connectivity_channels = connectivity_channels
         self.enable_final_structure = bool(enable_final_structure)
         self.enable_graph_prop = bool(enable_graph_prop)
+        self.enable_skeleton_completion = bool(enable_skeleton_completion)
 
         self.shared_proj = ConvBNReLU(in_channels, hidden_channels, kernel_size=3, padding=1)
 
@@ -1115,6 +1172,7 @@ class SkeletonGuidedHead(nn.Module):
             ConvBNReLU(hidden_channels, hidden_channels),
             ConvBNReLU(hidden_channels, hidden_channels),
         )
+        self.skeleton_branch = self.structure_branch
         self.skeleton_head = SkeletonSpatialHead(hidden_channels)
         self.connectivity_head = nn.Conv2d(
             hidden_channels,
@@ -1163,6 +1221,45 @@ class SkeletonGuidedHead(nn.Module):
         )
 
         self.surface_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        # Lightweight final skeleton head on the final surface feature.
+        # Used by 0626 profile (enable_final_structure=False) so inference can
+        # emit S_final without re-enabling the heavy structure branch.
+        mid_channels = max(hidden_channels // 2, 16)
+        self.final_skeleton_head = nn.Sequential(
+            nn.Conv2d(hidden_channels, mid_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1),
+        )
+        if self.enable_skeleton_completion:
+            self.final_direction_head = nn.Sequential(
+                ConvBNReLU(hidden_channels, hidden_channels),
+                nn.Conv2d(hidden_channels, 2, kernel_size=1),
+            )
+            self.final_embedding_head = nn.Conv2d(
+                hidden_channels,
+                skeleton_embed_channels,
+                kernel_size=1,
+            )
+            self.final_quality_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+            self.skeleton_completion = SkeletonCompletionBranch(
+                embed_channels=skeleton_embed_channels,
+                bridge_lambda_init=skeleton_bridge_lambda_init,
+            )
+            self.skeleton_to_surface = nn.Sequential(
+                nn.Conv2d(1, hidden_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(hidden_channels),
+                nn.ReLU(inplace=True),
+            )
+            self.skeleton_surface_eta = nn.Parameter(
+                torch.tensor(float(skeleton_surface_eta_init))
+            )
+        else:
+            self.final_direction_head = None
+            self.final_embedding_head = None
+            self.final_quality_head = None
+            self.skeleton_completion = None
+            self.skeleton_to_surface = None
+            self.skeleton_surface_eta = None
         if self.enable_graph_prop:
             self.graph_propagation = SoftSkeletonGraphPropagation(
                 lambda_init=graph_prop_lambda_init,
@@ -1196,6 +1293,7 @@ class SkeletonGuidedHead(nn.Module):
         self.last_surface_pre_logits = None
         self.last_graph_delta = None
         self.last_delta_logit = None
+        self.last_completion_aux = None
 
         self._init_weights()
         self.alpha.requires_grad_(False)
@@ -1243,6 +1341,30 @@ class SkeletonGuidedHead(nn.Module):
         surface_feat = self.surface_branch(feat)
 
         if not self.enable_final_structure:
+            shared_feat = feat
+            skeleton_feat = self.skeleton_branch(shared_feat)
+            skeleton_logits_0 = self.skeleton_head(skeleton_feat)
+            connectivity_logits = self.connectivity_head(skeleton_feat)
+
+            if self.enable_skeleton_completion and self.skeleton_completion is not None:
+                direction_logits = self.final_direction_head(skeleton_feat)
+                embedding = self.final_embedding_head(skeleton_feat)
+                quality = torch.sigmoid(self.final_quality_head(skeleton_feat))
+                connected_skeleton_logits, completion_aux = self.skeleton_completion(
+                    skeleton_logits_0,
+                    direction_logits,
+                    embedding,
+                    quality,
+                    connectivity_logits=connectivity_logits,
+                    road_prob=None,
+                )
+                self.last_completion_aux = completion_aux
+                skeleton_output_logits = connected_skeleton_logits
+            else:
+                self.last_completion_aux = None
+                skeleton_output_logits = None
+
+            surface_feat = self.surface_branch(shared_feat)
             guided_surface_feat = self.surface_refine(surface_feat)
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
@@ -1253,6 +1375,19 @@ class SkeletonGuidedHead(nn.Module):
                 guided_surface_feat
                 + self.beta * boundary_attn * boundary_correction
             )
+
+            if (
+                self.enable_skeleton_completion
+                and self.skeleton_to_surface is not None
+            ):
+                skeleton_guidance = self.skeleton_to_surface(
+                    torch.sigmoid(skeleton_output_logits)
+                )
+                guided_surface_feat = (
+                    guided_surface_feat
+                    + self.skeleton_surface_eta * skeleton_guidance
+                )
+
             surface_pre_logits = self.surface_head(guided_surface_feat)
             self.last_surface_pre_logits = surface_pre_logits
             self.last_graph_delta = None
@@ -1327,7 +1462,15 @@ class SkeletonGuidedHead(nn.Module):
                             surface_logits.detach()
                         )
 
-            return surface_logits, boundary_logits, None, None
+            if skeleton_output_logits is None:
+                skeleton_output_logits = self.final_skeleton_head(guided_surface_feat)
+
+            return (
+                surface_logits,
+                boundary_logits,
+                skeleton_output_logits,
+                connectivity_logits if self.enable_skeleton_completion else None,
+            )
 
         structure_feat = self.structure_branch(feat)
 

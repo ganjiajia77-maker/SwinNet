@@ -2067,7 +2067,7 @@ class SwinTransformerSys(nn.Module):
                         else None
                     ),
                     enable_direct_feature_refinement=self.enable_structure_gate,
-                    enable_directional_feature_refinement=False,
+                    enable_directional_feature_refinement=True,
                     enable_structure_gate=self.enable_structure_gate,
                     enable_graph_diffusion=self.enable_graph_diffusion,
                     enable_simple_c_diffusion=self.enable_simple_c_diffusion,
@@ -2086,8 +2086,8 @@ class SwinTransformerSys(nn.Module):
             )
         elif self.enable_sc_graph_diffusion:
             print(
-                "[INFO] Decoder SC graph diffusion: enabled after structure gate "
-                "(A=C*(1+alpha*S_i*S_j), no direction; structure_gate={}, "
+                "[INFO] Decoder polynomial SC graph diffusion: enabled before structure gate "
+                "(T=D^-1/2 A D^-1/2, F_d=sum theta_k T^k X; structure_gate={}, "
                 "decoder_attention_bias={})".format(
                     self.enable_structure_gate,
                     self.enable_decoder_attention_bias,
@@ -2107,6 +2107,10 @@ class SwinTransformerSys(nn.Module):
                 "(0626 profile), channels={}".format(
                     decoder_structure_channels
                 )
+            )
+            print(
+                "[INFO] Direction-field residual propagation: enabled "
+                "(F' = F + γ * (F_f + F_b)/2 along predicted D; not Attn+=D)"
             )
             print(
                 "[INFO] Global context calibration: bottleneck GAP -> "
@@ -2161,11 +2165,21 @@ class SwinTransformerSys(nn.Module):
                         self.structure_profile != "stage23_boundary_0626"
                     ),
                     enable_graph_prop=self.enable_final_graph_prop,
+                    enable_skeleton_completion=(
+                        self.structure_profile == "stage23_boundary_0626"
+                    ),
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
-                        "[INFO] Final skeleton/connectivity heads: disabled "
-                        "(0626 profile; surface + boundary only)"
+                        "[INFO] Final structure branch: disabled "
+                        "(0626 profile; surface + boundary + final_skeleton_head)"
+                    )
+                    print(
+                        "[INFO] Final skeleton head: kept (surface feature path, unchanged)"
+                    )
+                    print(
+                        "[INFO] Skeleton completion branch: S0 -> multi-scale edges -> S1 "
+                        "(eta=0, lambda_bridge=0 init)"
                     )
                     if self.enable_final_graph_prop:
                         print(
@@ -2674,11 +2688,12 @@ class SwinTransformerSys(nn.Module):
                         target_hw,
                         stages=(2, 3),
                     )
-                x = self.guided_head(
+                guided_outputs = self.guided_head(
                     x,
                     stage_skeleton_logits=stage_skeleton_logits,
                     stage_connectivity_logits=stage_connectivity_logits,
                 )
+                x = guided_outputs
             else:
                 x = self.output(x)
 

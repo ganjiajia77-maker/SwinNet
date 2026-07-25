@@ -49,12 +49,23 @@ class SimpleConnectivityDiffusion(nn.Module):
 
 
 class SkeletonConnectivityGraphDiffusion(nn.Module):
-    """F' = F + gamma * (A @ F), A_ij = C_ij * (1 + alpha * S_i * S_j), row-normalized."""
+    """Polynomial symmetric graph diffusion before structure gate.
 
-    def __init__(self, alpha=1.0, gamma_init=0.05):
+    A_ij = C_ij * (1 + alpha * S_i * S_j)
+    T = D^{-1/2} A D^{-1/2}
+    F_d = sum_{k=0..K} theta_k * T^k X
+    F' = X + gamma * F_d
+    """
+
+    def __init__(self, alpha=1.0, gamma_init=0.05, poly_order=3):
         super().__init__()
         self.alpha = float(alpha)
+        self.poly_order = int(poly_order)
         self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        thetas = torch.zeros(self.poly_order + 1)
+        if self.poly_order >= 1:
+            thetas[1] = 1.0
+        self.thetas = nn.Parameter(thetas)
 
     def build_adjacency(self, skeleton_prob, connectivity_prob):
         adjacency_weights = []
@@ -66,22 +77,35 @@ class SkeletonConnectivityGraphDiffusion(nn.Module):
         return adjacency_weights
 
     @staticmethod
-    def row_normalize_adjacency(adjacency_weights):
-        row_sum = sum(adjacency_weights)
-        return [
-            weight / row_sum.clamp_min(1e-6)
-            for weight in adjacency_weights
-        ]
+    def node_degree(adjacency_weights):
+        return sum(adjacency_weights)
+
+    def apply_normalized_adjacency(self, feature, adjacency_weights, degree):
+        message = torch.zeros_like(feature)
+        for weight, (dy, dx) in zip(adjacency_weights, GRAPH_DIFFUSION_DIRECTIONS):
+            neighbor_degree = _shift_feature_map(degree, dy, dx)
+            norm = (degree * neighbor_degree).clamp_min(1e-6).sqrt()
+            t_weight = weight / norm
+            message = message + t_weight * _shift_feature_map(feature, dy, dx)
+        return message
+
+    def polynomial_diffusion(self, feature, adjacency_weights, degree):
+        t_power = feature
+        f_diff = self.thetas[0] * feature
+        for order in range(1, self.poly_order + 1):
+            t_power = self.apply_normalized_adjacency(
+                t_power,
+                adjacency_weights,
+                degree,
+            )
+            f_diff = f_diff + self.thetas[order] * t_power
+        return f_diff
 
     def diffuse(self, feature, skeleton_prob, connectivity_prob):
-        normalized_weights = self.row_normalize_adjacency(
-            self.build_adjacency(skeleton_prob, connectivity_prob)
-        )
-        message = torch.zeros_like(feature)
-        for weight, (dy, dx) in zip(normalized_weights, GRAPH_DIFFUSION_DIRECTIONS):
-            neighbor_feature = _shift_feature_map(feature, dy, dx)
-            message = message + weight * neighbor_feature
-        return feature + self.gamma * message, message
+        adjacency_weights = self.build_adjacency(skeleton_prob, connectivity_prob)
+        degree = self.node_degree(adjacency_weights)
+        f_diff = self.polynomial_diffusion(feature, adjacency_weights, degree)
+        return feature + self.gamma * f_diff, f_diff
 
     def forward(self, feature, skeleton_prob, connectivity_prob):
         return self.diffuse(feature, skeleton_prob, connectivity_prob)[0]

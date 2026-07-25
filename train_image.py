@@ -309,7 +309,8 @@ if args.freeze_0626_backbone and not args.resume:
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         return {
-            "skeleton_weight": 0.0,
+            # λ_f for structure_skeleton_head vs skeleton GT (0626 profile)
+            "skeleton_weight": 0.1,
             "connectivity_weight": 0.0,
             "skeleton_cldice_weight": 0.0,
             "boundary_weight": 0.01,
@@ -329,6 +330,11 @@ def get_graph_outputs_from_model(model):
         head.last_delta_logit,
         head.last_graph_delta,
     )
+
+
+def get_completion_aux_from_model(model):
+    module = model.module if hasattr(model, "module") else model
+    return getattr(module.swin_unet.guided_head, "last_completion_aux", None)
 
 
 def build_criterion(args, loss_weights, device):
@@ -370,6 +376,10 @@ def build_criterion(args, loss_weights, device):
         graph_corr_k=args.graph_corr_k,
         graph_corr_m_pos=args.graph_corr_m_pos,
         graph_corr_m_neg=args.graph_corr_m_neg,
+        skeleton_s0_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
+        skeleton_edge_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
+        skeleton_path_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
+        final_direction_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
     ).to(device)
 
 
@@ -380,7 +390,12 @@ def format_training_config_lines(args, loss_weights):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final skeleton/connectivity heads: disabled",
+            "  Final structure branch (topology/connectivity): disabled",
+            "  Final skeleton head: kept on surface feature (unchanged module)",
+            "  Final skeleton output: connected S1 from skeleton completion branch",
+            "  Skeleton completion: S0 + multi-scale edges + soft path bridge (lambda_bridge=0, eta=0 init)",
+            "  Structure fields on skeleton branch: S0, D(cos2θ,sin2θ), E, Q",
+            "  Final skeleton loss weight (S1): {:.2f}".format(loss_weights["skeleton_weight"]),
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
@@ -397,6 +412,7 @@ def format_training_config_lines(args, loss_weights):
             "  Global context gate strength: 0.03",
             "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
             "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength",
+            "  Direction-field residual: F' = F + γ2 * (F_f+F_b)/2 with F_f=F(x+D), F_b=F(x-D); not Attn+=D",
         ])
         if args.enable_graph_prop:
             lines.extend([
@@ -429,9 +445,11 @@ def format_training_config_lines(args, loss_weights):
             ])
         elif args.enable_sc_graph_diffusion:
             lines.extend([
-                "  Decoder structure gate: enabled",
-                "  SC graph diffusion: A_ij = C_ij * (1 + alpha * S_i * S_j), row-normalized",
-                "  F' = F_gate + gamma * (A @ F_gate), alpha=1.0, gamma_init=0.05, no D",
+                "  Polynomial SC graph diffusion: before structure gate",
+                "  A_ij = C_ij * (1 + alpha * S_i * S_j), T = D^{-1/2} A D^{-1/2}",
+                "  F_d = theta0*X + theta1*T*X + theta2*T^2*X + theta3*T^3*X",
+                "  F' = X + gamma * F_d, then structure gate; alpha=1.0, gamma_init=0.05, no D",
+                "  Structure skeleton head: S = f_ske(F_structure) before guided_head",
             ])
         elif args.enable_structure_gate:
             lines.append("  Decoder structure gate refinement: enabled")
@@ -750,6 +768,8 @@ def evaluate_skeleton(
             if graph_delta_logit is not None:
                 graph_delta_logit = crop_to_shape(graph_delta_logit, orig_shape)
 
+            completion_aux = get_completion_aux_from_model(model)
+
             loss, _ = criterion(
                 surface_logits,
                 surface_gt=masks_padded,
@@ -762,6 +782,7 @@ def evaluate_skeleton(
                 stage_distill_scale=stage_distill_scale,
                 graph_base_logits=graph_base_logits,
                 graph_delta_logit=graph_delta_logit,
+                completion_aux=completion_aux,
             )
             total_loss += loss.item()
 
@@ -899,6 +920,7 @@ if __name__ == "__main__":
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
             checkpoint_state = checkpoint["model_state_dict"]
+            warm_start_final_skel = False
             if not args.freeze_0626_backbone:
                 model_state = model.state_dict()
                 filtered_checkpoint_state = {}
@@ -958,6 +980,24 @@ if __name__ == "__main__":
                     f"(loaded weights from checkpoint epoch={checkpoint.get('epoch', '?')})",
                     flush=True,
                 )
+            elif (
+                args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
+                and not args.enable_graph_diffusion
+                and not args.enable_simple_c_diffusion
+                and not args.enable_sc_graph_diffusion
+            ):
+                load_topology_checkpoint_state(
+                    model,
+                    checkpoint_state,
+                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+                    strict=True,
+                )
+                start_epoch = 0
+                print(
+                    "[INFO] Skeleton completion warm-start: reset start_epoch to 0 "
+                    f"(loaded weights from checkpoint epoch={checkpoint.get('epoch', '?')})",
+                    flush=True,
+                )
             elif args.freeze_0626_backbone:
                 load_topology_checkpoint_state(
                     model,
@@ -966,6 +1006,7 @@ if __name__ == "__main__":
                 )
             else:
                 strict_load = args.bottleneck_type == 'global_local'
+                warm_start_final_skel = False
                 try:
                     model.load_state_dict(checkpoint_state, strict=strict_load)
                 except RuntimeError as exc:
@@ -974,6 +1015,13 @@ if __name__ == "__main__":
                         "swin_unet.stage_topology_scales.",
                         "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
                         "swin_unet.guided_head.graph_propagation.",
+                        "swin_unet.guided_head.final_skeleton_head.",
+                        "swin_unet.guided_head.skeleton_completion.",
+                        "swin_unet.guided_head.final_direction_head.",
+                        "swin_unet.guided_head.final_embedding_head.",
+                        "swin_unet.guided_head.final_quality_head.",
+                        "swin_unet.guided_head.skeleton_to_surface.",
+                        "swin_unet.guided_head.skeleton_surface_eta",
                         "swin_unet.decoder_structure_blocks.0.direction_head.",
                         "swin_unet.decoder_structure_blocks.1.direction_head.",
                         "swin_unet.decoder_structure_blocks.2.direction_head.",
@@ -1030,6 +1078,18 @@ if __name__ == "__main__":
                         "some modules use fresh initialization.",
                         flush=True,
                     )
+                    if any(
+                        key.startswith("swin_unet.guided_head.final_skeleton_head.")
+                        for key in result.missing_keys
+                    ):
+                        warm_start_final_skel = True
+                        print(
+                            "[INFO] final_skeleton_head missing in checkpoint; "
+                            "warm-start fine-tune from epoch 0 "
+                            f"(loaded weights from checkpoint epoch="
+                            f"{checkpoint.get('epoch', '?')}).",
+                            flush=True,
+                        )
             if args.freeze_0626_backbone:
                 trainable = freeze_backbone_train_graph_only(model)
                 print(
@@ -1043,6 +1103,8 @@ if __name__ == "__main__":
                     f"(checkpoint had epoch={checkpoint.get('epoch', '?')})",
                     flush=True,
                 )
+            elif warm_start_final_skel:
+                start_epoch = 0
             elif (
                 not args.enable_graph_diffusion
                 and not args.enable_simple_c_diffusion
@@ -1067,6 +1129,26 @@ if __name__ == "__main__":
             print(f"从epoch {start_epoch} 继续训练...")
         else:
             print(f"Warning: checkpoint未找到 {args.resume}")
+
+    # Warm-start γ2 for newly enabled direction-field residual (old 0626 ckpts
+    # had enable_directional_feature_refinement=False and gamma2≈0).
+    if args.resume and os.path.isfile(args.resume):
+        module = model.module if hasattr(model, "module") else model
+        warmed = []
+        for stage_idx, block in enumerate(module.swin_unet.decoder_structure_blocks):
+            if not getattr(block, "enable_directional_feature_refinement", False):
+                continue
+            with torch.no_grad():
+                if float(block.raw_gamma2.abs().item()) < 1e-4:
+                    block.raw_gamma2.fill_(0.05)
+                    warmed.append(stage_idx)
+        if warmed:
+            start_epoch = 0
+            print(
+                "[INFO] Direction-field residual warm-start: set raw_gamma2=0.05 "
+                f"on decoder stages {warmed}; fine-tune from epoch 0.",
+                flush=True,
+            )
 
     if optimizer is None:
         if args.freeze_0626_backbone:
@@ -1206,6 +1288,7 @@ if __name__ == "__main__":
                 graph_base_logits, graph_delta_logit, graph_delta = (
                     get_graph_outputs_from_model(model)
                 )
+                completion_aux = get_completion_aux_from_model(model)
                 loss, loss_dict = criterion(
                     surface_logits,
                     surface_gt=masks_padded,
@@ -1218,6 +1301,7 @@ if __name__ == "__main__":
                     stage_distill_scale=stage_distill_scale,
                     graph_base_logits=graph_base_logits,
                     graph_delta_logit=graph_delta_logit,
+                    completion_aux=completion_aux,
                 )
 
                 if not torch.isfinite(loss):

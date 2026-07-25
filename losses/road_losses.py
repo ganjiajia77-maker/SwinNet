@@ -326,6 +326,10 @@ class SurfaceStructureLoss(nn.Module):
         graph_fn_push_weight=0.0,
         graph_fp_suppress_weight=0.0,
         graph_delta_sparse_weight=0.0,
+        skeleton_s0_weight=0.05,
+        skeleton_edge_weight=0.05,
+        skeleton_path_weight=0.05,
+        final_direction_weight=0.05,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -382,6 +386,10 @@ class SurfaceStructureLoss(nn.Module):
         self.graph_fn_push_weight = float(graph_fn_push_weight)
         self.graph_fp_suppress_weight = float(graph_fp_suppress_weight)
         self.graph_delta_sparse_weight = float(graph_delta_sparse_weight)
+        self.skeleton_s0_weight = float(skeleton_s0_weight)
+        self.skeleton_edge_weight = float(skeleton_edge_weight)
+        self.skeleton_path_weight = float(skeleton_path_weight)
+        self.final_direction_weight = float(final_direction_weight)
 
     def graph_correction_loss(self, base_logits, delta_logit, surface_gt):
         zero = surface_gt.sum() * 0.0
@@ -728,6 +736,116 @@ class SurfaceStructureLoss(nn.Module):
         loss_map = (1.0 - cosine) * skeleton_mask
         return loss_map.sum() / skeleton_mask.sum().clamp_min(1.0)
 
+    @staticmethod
+    def _shift_binary_map(x, dy, dx):
+        _, _, height, width = x.shape
+        padded = F.pad(x, (max(dx, 0), max(-dx, 0), max(dy, 0), max(-dy, 0)))
+        y0 = max(-dy, 0)
+        x0 = max(-dx, 0)
+        return padded[:, :, y0:y0 + height, x0:x0 + width]
+
+    def build_completion_edge_target(self, skeleton_gt, num_edges, offsets):
+        if skeleton_gt.dim() == 3:
+            skeleton_gt = skeleton_gt.unsqueeze(1)
+        skel = (skeleton_gt > 0.5).float()
+        targets = []
+        for edge_idx in range(num_edges):
+            dy, dx = offsets[edge_idx]
+            neighbor = self._shift_binary_map(skel, dy, dx)
+            endpoint = skel * neighbor
+            if edge_idx < 8:
+                conn_gt = build_connectivity_target(
+                    skeleton_gt,
+                    erode_kernel_size=self.connectivity_erode_kernel_size,
+                )
+                path_target = conn_gt[:, edge_idx:edge_idx + 1]
+            else:
+                path_sum = torch.zeros_like(skel)
+                steps = max(abs(dy), abs(dx), 1)
+                for step in range(1, steps):
+                    sy = int(round(dy * step / steps))
+                    sx = int(round(dx * step / steps))
+                    if sy == 0 and sx == 0:
+                        continue
+                    path_sum = path_sum + self._shift_binary_map(skel, sy, sx)
+                path_target = (path_sum / float(max(steps - 1, 1))).clamp(0.0, 1.0)
+            targets.append(torch.maximum(endpoint, path_target))
+        return torch.cat(targets, dim=1)
+
+    def skeleton_completion_loss(self, completion_aux, skeleton_gt, skeleton_dilate_gt):
+        zero = skeleton_gt.sum() * 0.0
+        if not completion_aux:
+            return {
+                "loss_s0": zero,
+                "loss_edge": zero,
+                "loss_path": zero,
+                "loss_direction": zero,
+                "total": zero,
+            }
+
+        from networks.skeleton_completion import build_candidate_offsets
+
+        offsets = build_candidate_offsets()
+        s0_logits = completion_aux["s0_logits"]
+        loss_s0, _, _ = self.skeleton_pixel_loss(
+            s0_logits,
+            skeleton_gt,
+            skeleton_dilate_gt,
+        )
+
+        direction_logits = completion_aux.get("direction_logits")
+        if direction_logits is not None and self.final_direction_weight > 0:
+            loss_direction = self.direction_field_loss(direction_logits, skeleton_gt)
+        else:
+            loss_direction = zero
+
+        path_delta = completion_aux.get("path_delta")
+        if path_delta is not None and self.skeleton_path_weight > 0:
+            if skeleton_gt.dim() == 3:
+                skel = skeleton_gt.unsqueeze(1)
+            else:
+                skel = skeleton_gt
+            skel_bin = (skel > 0.5).float()
+            dilated = self._shift_binary_map(skel_bin, 0, 0)
+            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                dilated = torch.maximum(dilated, self._shift_binary_map(skel_bin, dy, dx))
+            gap_gt = (dilated - skel_bin).clamp(0.0, 1.0)
+            loss_path = F.binary_cross_entropy_with_logits(
+                path_delta,
+                gap_gt.to(path_delta.dtype),
+            )
+        else:
+            loss_path = zero
+
+        edge_logits = completion_aux.get("edge_logits")
+        if edge_logits is not None and self.skeleton_edge_weight > 0:
+            num_edges = edge_logits.shape[1]
+            edge_target = self.build_completion_edge_target(
+                skeleton_gt,
+                num_edges,
+                offsets,
+            ).to(edge_logits.dtype)
+            loss_edge = F.binary_cross_entropy_with_logits(
+                edge_logits,
+                edge_target,
+            )
+        else:
+            loss_edge = zero
+
+        total = (
+            self.skeleton_s0_weight * loss_s0
+            + self.skeleton_edge_weight * loss_edge
+            + self.skeleton_path_weight * loss_path
+            + self.final_direction_weight * loss_direction
+        )
+        return {
+            "loss_s0": loss_s0,
+            "loss_edge": loss_edge,
+            "loss_path": loss_path,
+            "loss_direction": loss_direction,
+            "total": total,
+        }
+
     def stage_roadness_loss(self, stage_outputs, surface_gt):
         if not stage_outputs:
             return surface_gt.sum() * 0.0
@@ -873,6 +991,7 @@ class SurfaceStructureLoss(nn.Module):
         stage_distill_scale=1.0,
         graph_base_logits=None,
         graph_delta_logit=None,
+        completion_aux=None,
     ):
         if surface_gt is None or skeleton_gt is None:
             raise ValueError("surface_gt and skeleton_gt are required.")
@@ -963,6 +1082,12 @@ class SurfaceStructureLoss(nn.Module):
             graph_delta_logit,
             surface_gt,
         )
+        completion_losses = self.skeleton_completion_loss(
+            completion_aux,
+            skeleton_gt,
+            skeleton_dilate_gt,
+        )
+        loss_completion = completion_losses["total"]
 
         total_loss = (
             loss_surface
@@ -976,6 +1101,7 @@ class SurfaceStructureLoss(nn.Module):
             + loss_road_attention
             + float(stage_distill_scale) * loss_stage_distill
             + self.graph_corr_weight * loss_graph_corr
+            + loss_completion
         )
 
         loss_dict = {
@@ -991,6 +1117,11 @@ class SurfaceStructureLoss(nn.Module):
             "road_attention_loss": loss_road_attention.detach(),
             "stage_distill_loss": loss_stage_distill.detach(),
             "graph_corr_loss": graph_loss_dict["graph_corr_loss"],
+            "completion_loss": loss_completion.detach(),
+            "completion_s0_loss": completion_losses["loss_s0"].detach(),
+            "completion_edge_loss": completion_losses["loss_edge"].detach(),
+            "completion_path_loss": completion_losses["loss_path"].detach(),
+            "completion_direction_loss": completion_losses["loss_direction"].detach(),
             "stage_distill_scale": torch.as_tensor(
                 stage_distill_scale,
                 device=surface_logits.device,

@@ -23,6 +23,54 @@ from networks.vision_transformer import (
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
+from skimage.morphology import skeletonize
+
+
+def _resize_float_map(arr, size_hw):
+    """Bilinear-resize a HxW float map to (H, W)=size_hw."""
+    height, width = size_hw
+    return np.array(
+        Image.fromarray(arr.astype(np.float32), mode='F').resize(
+            (width, height),
+            Image.BILINEAR,
+        ),
+        dtype=np.float32,
+    )
+
+
+def save_road_skeleton_visualizations(
+    case_name,
+    road_binary_uint8,
+    skeleton_head_prob,
+    surface_dir,
+    skeleton_dir,
+    save_surface_skeletonize=False,
+):
+    """
+    Save test-time visualizations:
+      1) road_prediction.png              - final segmentation binary mask
+      2) road_prediction_skeleton.png     - optional skimage skeletonize of (1)
+      3) skeleton_head_prediction.png     - structure skeleton head probability
+    """
+    road_path = os.path.join(surface_dir, f'{case_name}_road_prediction.png')
+    Image.fromarray(road_binary_uint8, mode='L').save(road_path)
+
+    if save_surface_skeletonize:
+        road_bool = road_binary_uint8 > 0
+        road_skel = skeletonize(road_bool).astype(np.uint8) * 255
+        road_skel_path = os.path.join(
+            surface_dir, f'{case_name}_road_prediction_skeleton.png'
+        )
+        Image.fromarray(road_skel, mode='L').save(road_skel_path)
+
+    if skeleton_head_prob is not None:
+        head_u8 = np.clip(skeleton_head_prob * 255.0, 0, 255).astype(np.uint8)
+        head_path = os.path.join(
+            skeleton_dir, f'{case_name}_skeleton_head_prediction.png'
+        )
+        Image.fromarray(head_u8, mode='L').save(head_path)
+        return True
+    return False
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
@@ -204,17 +252,28 @@ def dice_loss(pred, target, threshold=0.5):
 
 
 if __name__ == "__main__":
-    if not args.deterministic:
-        cudnn.benchmark = True
-        cudnn.deterministic = False
-    else:
-        cudnn.benchmark = False
-        cudnn.deterministic = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}", flush=True)
+    if device.type == "cpu":
+        print(
+            "[WARN] CUDA unavailable in this Python. "
+            "Use the CUDA env (e.g. D:\\torch-cu128) if you need GPU.",
+            flush=True,
+        )
+
+    if device.type == "cuda":
+        if not args.deterministic:
+            cudnn.benchmark = True
+            cudnn.deterministic = False
+        else:
+            cudnn.benchmark = False
+            cudnn.deterministic = True
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(args.seed)
     
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -286,7 +345,7 @@ if __name__ == "__main__":
                     enable_simple_c_diffusion=args.enable_simple_c_diffusion,
                     enable_sc_graph_diffusion=args.enable_sc_graph_diffusion,
                     enable_structure_gate=args.enable_structure_gate,
-                    enable_decoder_attention_bias=args.enable_decoder_attention_bias).cuda()
+                    enable_decoder_attention_bias=args.enable_decoder_attention_bias).to(device)
     
     # 加载模型
     if checkpoint is not None:
@@ -342,7 +401,11 @@ if __name__ == "__main__":
         pred_dir = make_unique_dir(args.output_dir, f'{model_basename}_{timestamp}_overlap')
         os.makedirs(pred_dir, exist_ok=True)
         surface_dir = os.path.join(pred_dir, 'surface')
+        skeleton_dir = os.path.join(pred_dir, 'skeleton')
         os.makedirs(surface_dir, exist_ok=True)
+        os.makedirs(skeleton_dir, exist_ok=True)
+        skeleton_head_saved = 0
+        skeleton_head_missing = 0
 
         stride = args.img_size // 2
         image_list = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'))])
@@ -357,7 +420,9 @@ if __name__ == "__main__":
 
                 # canvas to accumulate probabilities and counts
                 prob_canvas = np.zeros((h, w), dtype=np.float32)
+                skeleton_canvas = np.zeros((h, w), dtype=np.float32)
                 count_canvas = np.zeros((h, w), dtype=np.float32)
+                has_skeleton_head = False
 
                 # sliding
                 for y in range(0, max(1, h - args.img_size + 1), stride):
@@ -380,10 +445,15 @@ if __name__ == "__main__":
                         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
                         crop_f = (crop_f - mean) / std
                         crop_f = crop_f.transpose(2, 0, 1)
-                        inp = torch.from_numpy(crop_f).unsqueeze(0).cuda()
+                        inp = torch.from_numpy(crop_f).unsqueeze(0).to(device)
 
                         outputs = model(inp)
-                        surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                        if isinstance(outputs, tuple):
+                            surface_logits = outputs[0]
+                            skeleton_logits = outputs[2] if len(outputs) > 2 else None
+                        else:
+                            surface_logits = outputs
+                            skeleton_logits = None
                         prob = torch.sigmoid(surface_logits)[0, 0].cpu().numpy()
 
                         # crop to original size if padded
@@ -392,17 +462,41 @@ if __name__ == "__main__":
                         prob_canvas[y1:y2, x1:x2] += prob
                         count_canvas[y1:y2, x1:x2] += 1.0
 
+                        if skeleton_logits is not None:
+                            has_skeleton_head = True
+                            ske_prob = torch.sigmoid(skeleton_logits)[0, 0].cpu().numpy()
+                            ske_prob = ske_prob[:(y2 - y1), :(x2 - x1)]
+                            skeleton_canvas[y1:y2, x1:x2] += ske_prob
+
                 avg_prob = prob_canvas / (count_canvas + 1e-7)
                 pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
+                skeleton_head_prob = None
+                if has_skeleton_head:
+                    skeleton_head_prob = skeleton_canvas / (count_canvas + 1e-7)
 
-                # save
                 case_name = os.path.splitext(image_name)[0]
-                png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
-                cv2.imwrite(png_save_path, pred)
+                saved_head = save_road_skeleton_visualizations(
+                    case_name,
+                    pred,
+                    skeleton_head_prob,
+                    surface_dir,
+                    skeleton_dir,
+                )
+                if saved_head:
+                    skeleton_head_saved += 1
+                else:
+                    skeleton_head_missing += 1
 
                 total_samples += 1
 
         print(f"滑窗推理完成，结果保存在: {pred_dir}")
+        print(f"  road_prediction dir: {surface_dir}")
+        print(f"  structure skeleton head dir: {skeleton_dir}")
+        if skeleton_head_missing:
+            print(
+                f"  [WARN] {skeleton_head_missing} cases had no final skeleton head "
+                f"(e.g. 0626 profile); only mask skeletonize was saved."
+            )
         # exit after sliding infer
         sys.exit(0)
 
@@ -429,6 +523,8 @@ if __name__ == "__main__":
     skeleton_dir = os.path.join(pred_dir, 'skeleton')
     os.makedirs(surface_dir, exist_ok=True)
     os.makedirs(skeleton_dir, exist_ok=True)
+    skeleton_head_saved = 0
+    skeleton_head_missing = 0
     
     criterion = SurfaceStructureLoss(
         surface_dice_weight=0.5,
@@ -444,14 +540,14 @@ if __name__ == "__main__":
         stage_connectivity_factor=0.5,
         stage_distill_weights=(0.0, 0.0),
         stage_distill_connectivity_factor=0.5,
-    ).cuda()
+    ).to(device)
     
     with torch.no_grad():
         for batch in tqdm(test_loader, total=len(test_loader)):
-            images = batch['image'].cuda()
-            masks = batch['mask'].cuda()
-            skeletons = batch['skeleton'].cuda()
-            skeletons_dilate = batch['skeleton_dilate'].cuda()
+            images = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+            skeletons = batch['skeleton'].to(device)
+            skeletons_dilate = batch['skeleton_dilate'].to(device)
             
             outputs = model(images)
             if isinstance(outputs, tuple):
@@ -489,7 +585,7 @@ if __name__ == "__main__":
             
             total_samples += 1
             
-            # 自动保存预测结果（NPY 格式用于计算，PNG 格式便于查看）
+            # 自动保存预测结果（PNG 便于查看）
             case_name = batch['case_name'][0]
             
             # 仅保存 PNG：最多保留 30 张代表性预测（按前 30 个 case）
@@ -505,42 +601,29 @@ if __name__ == "__main__":
             else:
                 skeleton_prob = None
             if args.source_patch_size and args.source_patch_size != args.img_size:
-                prob_resized = np.array(
-                    Image.fromarray(prob_numpy.astype(np.float32), mode='F').resize(
-                        (args.source_patch_size, args.source_patch_size),
-                        Image.BILINEAR,
-                    ),
-                    dtype=np.float32,
-                )
+                target_hw = (args.source_patch_size, args.source_patch_size)
+                prob_resized = _resize_float_map(prob_numpy, target_hw)
                 pred_numpy = (prob_resized >= args.threshold).astype(np.uint8) * 255
                 if skeleton_prob is not None:
-                    skeleton_prob_resized = np.array(
-                        Image.fromarray(skeleton_prob.astype(np.float32), mode='F').resize(
-                            (args.source_patch_size, args.source_patch_size),
-                            Image.BILINEAR,
-                        ),
-                        dtype=np.float32,
-                    )
+                    skeleton_prob_resized = _resize_float_map(skeleton_prob, target_hw)
                 else:
                     skeleton_prob_resized = None
             else:
                 pred_numpy = (prob_numpy >= args.threshold).astype(np.uint8) * 255
                 skeleton_prob_resized = skeleton_prob
-            pred_img = Image.fromarray(pred_numpy, mode='L')
-            # 只保存前 30 张到 surface_dir
+
             if total_samples <= 30:
-                png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
-                pred_img.save(png_save_path)
-                if skeleton_prob_resized is not None:
-                    skeleton_pred_img = Image.fromarray(
-                        (skeleton_prob_resized >= args.skeleton_threshold).astype(np.uint8) * 255,
-                        mode='L',
-                    )
-                    skeleton_pred_path = os.path.join(
-                        skeleton_dir,
-                        f'{case_name}_skeleton_pred.png',
-                    )
-                    skeleton_pred_img.save(skeleton_pred_path)
+                saved_head = save_road_skeleton_visualizations(
+                    case_name,
+                    pred_numpy,
+                    skeleton_prob_resized,
+                    surface_dir,
+                    skeleton_dir,
+                )
+                if saved_head:
+                    skeleton_head_saved += 1
+                else:
+                    skeleton_head_missing += 1
     
     print(f"预测结果已保存到: {pred_dir}")
     
@@ -562,8 +645,16 @@ if __name__ == "__main__":
     result_lines.append(f"  总测试样本: {len(test_loader)}")
     result_lines.append(f"  预测掩码保存位置: {pred_dir}")
     
-    result_lines.append(f"  Surface mask save dir: {surface_dir}")
-    result_lines.append(f"  Final skeleton save dir: {skeleton_dir}")
+    result_lines.append(f"  road_prediction dir: {surface_dir}")
+    result_lines.append(f"  structure skeleton head dir: {skeleton_dir}")
+    result_lines.append(
+        f"  skeleton_head saved/missing (first 30): {skeleton_head_saved}/{skeleton_head_missing}"
+    )
+    if skeleton_head_missing:
+        result_lines.append(
+            "  [WARN] Some cases have no final skeleton head output "
+            "(unexpected; check model forward / checkpoint)."
+        )
     result_lines.append(
         f"  Topology attention version: {TOPOLOGY_ATTENTION_VERSION}"
     )
