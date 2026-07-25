@@ -376,10 +376,10 @@ def build_criterion(args, loss_weights, device):
         graph_corr_k=args.graph_corr_k,
         graph_corr_m_pos=args.graph_corr_m_pos,
         graph_corr_m_neg=args.graph_corr_m_neg,
-        skeleton_s0_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
-        skeleton_edge_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
-        skeleton_path_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
-        final_direction_weight=0.05 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
+        skeleton_s0_weight=0.02 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
+        skeleton_edge_weight=0.02 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
+        skeleton_path_weight=0.02 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
+        final_direction_weight=0.02 if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 else 0.0,
     ).to(device)
 
 

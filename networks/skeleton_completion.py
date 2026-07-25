@@ -89,6 +89,8 @@ class SkeletonCompletionBranch(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(32, 1),
         )
+        nn.init.zeros_(self.edge_mlp[-1].weight)
+        nn.init.zeros_(self.edge_mlp[-1].bias)
 
     def _sample_line_mean(self, field, dy, dx):
         if self.path_samples <= 1:
@@ -159,7 +161,7 @@ class SkeletonCompletionBranch(nn.Module):
                 + neighbor_cos2sin2[:, 0:1] * cos2phi_back
                 + neighbor_cos2sin2[:, 1:2] * sin2phi_back
             ).mul(0.5).clamp(0.0, 1.0)
-            g_dir = torch.sqrt(align_i * align_j).clamp(0.0, 1.0)
+            g_dir = (align_i * align_j).clamp_min(1e-6).sqrt()
 
             g_app = self._appearance_similarity(embed_norm, dy, dx)
             path_field = road_prob if road_prob is not None else s0_prob
@@ -203,6 +205,9 @@ class SkeletonCompletionBranch(nn.Module):
                     * local_conn[:, idx:idx + 1]
                     * (1.0 - s0_prob)
                 )
+
+        num_offsets = float(len(self.candidate_offsets))
+        path_delta = path_delta / num_offsets
 
         connected_logits = skeleton_logits_0 + self.lambda_bridge * path_delta
         aux = {

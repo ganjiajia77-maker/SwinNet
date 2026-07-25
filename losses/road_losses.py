@@ -810,8 +810,9 @@ class SurfaceStructureLoss(nn.Module):
             for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
                 dilated = torch.maximum(dilated, self._shift_binary_map(skel_bin, dy, dx))
             gap_gt = (dilated - skel_bin).clamp(0.0, 1.0)
-            loss_path = F.binary_cross_entropy_with_logits(
-                path_delta,
+            bridge_pred = path_delta.clamp(1e-6, 1.0 - 1e-6)
+            loss_path = F.binary_cross_entropy(
+                bridge_pred,
                 gap_gt.to(path_delta.dtype),
             )
         else:
@@ -828,7 +829,7 @@ class SurfaceStructureLoss(nn.Module):
                 offsets,
             ).to(edge_logits.dtype)
             loss_edge = F.binary_cross_entropy_with_logits(
-                edge_logits,
+                edge_logits.clamp(-20.0, 20.0),
                 edge_target,
             )
         else:

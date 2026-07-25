@@ -1250,6 +1250,7 @@ class SkeletonGuidedHead(nn.Module):
                 nn.BatchNorm2d(hidden_channels),
                 nn.ReLU(inplace=True),
             )
+            nn.init.zeros_(self.skeleton_to_surface[0].weight)
             self.skeleton_surface_eta = nn.Parameter(
                 torch.tensor(float(skeleton_surface_eta_init))
             )
