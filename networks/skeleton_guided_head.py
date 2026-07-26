@@ -1028,7 +1028,7 @@ class FinalSkeletonBridge(nn.Module):
             direction_j = self._shift(direction, dy, dx)
             align_i = (direction_i * direction_unit).sum(dim=1, keepdim=True).abs()
             align_j = (direction_j * direction_unit).sum(dim=1, keepdim=True).abs()
-            alignment = torch.sqrt((align_i * align_j).clamp_min(0.0))
+            alignment = torch.sqrt((align_i * align_j).clamp_min(1e-6))
             alignment = self.direction_floor + (1.0 - self.direction_floor) * alignment
             endpoint_confidence = 0.5 * (
                 self._shift(confidence, -dy, -dx) + self._shift(confidence, dy, dx)
