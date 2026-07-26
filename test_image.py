@@ -283,7 +283,9 @@ if __name__ == "__main__":
         pred_dir = make_unique_dir(args.output_dir, f'{model_basename}_{timestamp}_overlap')
         os.makedirs(pred_dir, exist_ok=True)
         surface_dir = os.path.join(pred_dir, 'surface')
+        skeleton_dir = os.path.join(pred_dir, 'skeleton')
         os.makedirs(surface_dir, exist_ok=True)
+        os.makedirs(skeleton_dir, exist_ok=True)
 
         stride = args.img_size // 2
         image_list = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'))])
@@ -298,7 +300,9 @@ if __name__ == "__main__":
 
                 # canvas to accumulate probabilities and counts
                 prob_canvas = np.zeros((h, w), dtype=np.float32)
+                skeleton_canvas = np.zeros((h, w), dtype=np.float32)
                 count_canvas = np.zeros((h, w), dtype=np.float32)
+                has_skeleton_head = False
 
                 # sliding
                 for y in range(0, max(1, h - args.img_size + 1), stride):
@@ -325,6 +329,11 @@ if __name__ == "__main__":
 
                         outputs = model(inp)
                         surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                        skeleton_logits = (
+                            outputs[2]
+                            if isinstance(outputs, tuple) and len(outputs) > 2
+                            else None
+                        )
                         prob = torch.sigmoid(surface_logits)[0, 0].cpu().numpy()
 
                         # crop to original size if padded
@@ -332,6 +341,11 @@ if __name__ == "__main__":
 
                         prob_canvas[y1:y2, x1:x2] += prob
                         count_canvas[y1:y2, x1:x2] += 1.0
+                        if skeleton_logits is not None:
+                            skeleton_prob = torch.sigmoid(skeleton_logits)[0, 0].cpu().numpy()
+                            skeleton_prob = skeleton_prob[:(y2 - y1), :(x2 - x1)]
+                            skeleton_canvas[y1:y2, x1:x2] += skeleton_prob
+                            has_skeleton_head = True
 
                 avg_prob = prob_canvas / (count_canvas + 1e-7)
                 pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
@@ -340,6 +354,24 @@ if __name__ == "__main__":
                 case_name = os.path.splitext(image_name)[0]
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
                 cv2.imwrite(png_save_path, pred)
+                if has_skeleton_head:
+                    skeleton_prob = skeleton_canvas / (count_canvas + 1e-7)
+                    skeleton_prob_path = os.path.join(
+                        skeleton_dir,
+                        f'{case_name}_skeleton_probability.png',
+                    )
+                    cv2.imwrite(
+                        skeleton_prob_path,
+                        np.clip(skeleton_prob * 255.0, 0, 255).astype(np.uint8),
+                    )
+                    skeleton_pred_path = os.path.join(
+                        skeleton_dir,
+                        f'{case_name}_skeleton_pred.png',
+                    )
+                    cv2.imwrite(
+                        skeleton_pred_path,
+                        (skeleton_prob >= args.skeleton_threshold).astype(np.uint8) * 255,
+                    )
 
                 total_samples += 1
 
@@ -473,6 +505,15 @@ if __name__ == "__main__":
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
                 pred_img.save(png_save_path)
                 if skeleton_prob_resized is not None:
+                    skeleton_prob_img = Image.fromarray(
+                        np.clip(skeleton_prob_resized * 255.0, 0, 255).astype(np.uint8),
+                        mode='L',
+                    )
+                    skeleton_prob_path = os.path.join(
+                        skeleton_dir,
+                        f'{case_name}_skeleton_probability.png',
+                    )
+                    skeleton_prob_img.save(skeleton_prob_path)
                     skeleton_pred_img = Image.fromarray(
                         (skeleton_prob_resized >= args.skeleton_threshold).astype(np.uint8) * 255,
                         mode='L',

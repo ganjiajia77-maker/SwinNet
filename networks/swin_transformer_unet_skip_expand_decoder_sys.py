@@ -2041,6 +2041,7 @@ class SwinTransformerSys(nn.Module):
             [
                 DecoderStructureRefinement(
                     channels=channels,
+                    connectivity_channels=(24 if stage_index == 3 else 8),
                     enable_roadness_head=(
                         stage_index == 3
                         and self.structure_profile != "stage23_boundary_0626"
@@ -2122,8 +2123,8 @@ class SwinTransformerSys(nn.Module):
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
-                        "[INFO] Final skeleton/connectivity heads: disabled "
-                        "(0626 profile; surface + boundary only)"
+                        "[INFO] Final skeleton: shared-feature S0 + r2 bridge -> S1; "
+                        "only ReLU(S1-S0) guides final surface"
                     )
                     if self.enable_final_graph_prop:
                         print(
@@ -2362,9 +2363,7 @@ class SwinTransformerSys(nn.Module):
         teacher_forcing_ratio,
     ):
         predicted_skeleton = torch.sigmoid(predicted_skeleton).detach()
-        predicted_connectivity = torch.sigmoid(
-            predicted_connectivity
-        ).detach()
+        predicted_connectivity = torch.sigmoid(predicted_connectivity).detach()[:, :8]
         ratio = float(teacher_forcing_ratio)
         if ratio <= 0.0:
             return predicted_skeleton, predicted_connectivity

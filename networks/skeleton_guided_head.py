@@ -594,8 +594,12 @@ class DecoderStructureRefinement(nn.Module):
 
         skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
-        topk = min(2, self.connectivity_channels)
-        conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
+        local_connectivity_prob = connectivity_prob[:, :8]
+        topk = min(2, local_connectivity_prob.shape[1])
+        conn_strength = local_connectivity_prob.topk(
+            k=topk,
+            dim=1,
+        ).values.mean(dim=1, keepdim=True)
         structure_gate_logits = self.structure_gate(
             torch.cat([structure_feat, skeleton_prob, conn_strength], dim=1)
         )
@@ -611,7 +615,10 @@ class DecoderStructureRefinement(nn.Module):
             gate_residual = self.gamma1 * residual
             refined = x + gate_residual
             if self.enable_directional_feature_refinement:
-                directional = self.directional_propagation(refined, connectivity_prob)
+                directional = self.directional_propagation(
+                    refined,
+                    local_connectivity_prob,
+                )
                 directional_residual = self.gamma2 * directional
                 out = refined + directional_residual
             else:
@@ -976,6 +983,68 @@ class SoftSkeletonGraphPropagation(nn.Module):
         return graph_correction, delta_logit, G
 
 
+class FinalSkeletonBridge(nn.Module):
+    """Bridge missing centerline pixels from two-sided final structure evidence."""
+
+    DIRECTIONS = (
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1),
+    )
+
+    def __init__(self, direction_floor=0.2):
+        super().__init__()
+        self.direction_floor = float(direction_floor)
+        self.bridge_lambda = nn.Parameter(torch.tensor(0.0))
+
+    @staticmethod
+    def _shift(x, dy, dx):
+        _, _, height, width = x.shape
+        padded = F.pad(x, (max(dx, 0), max(-dx, 0), max(dy, 0), max(-dy, 0)))
+        return padded[:, :, max(-dy, 0):max(-dy, 0) + height, max(-dx, 0):max(-dx, 0) + width]
+
+    def forward(self, skeleton_logits_0, direction_logits, confidence_logits, connectivity_logits):
+        skeleton_prob = torch.sigmoid(skeleton_logits_0)
+        direction = F.normalize(direction_logits, dim=1, eps=1e-6)
+        confidence = torch.sigmoid(confidence_logits)
+        connectivity = torch.sigmoid(connectivity_logits)
+        bridge_parts = []
+
+        for index, (dy, dx) in enumerate(self.DIRECTIONS):
+            # i=m-d and j=m+d are the two candidate bridge endpoints.
+            skeleton_i = self._shift(skeleton_prob, -dy, -dx)
+            skeleton_j = self._shift(skeleton_prob, dy, dx)
+            endpoint_evidence = skeleton_i * skeleton_j
+            # r=2 occupies channels 8..15; r=1 stays local and r=3 is
+            # supervised for the final refinement but not used by this bridge.
+            connection_prob = self._shift(
+                connectivity[:, 8 + index:8 + index + 1], -dy, -dx
+            )
+
+            direction_unit = F.normalize(
+                direction.new_tensor((float(dx), float(dy))).view(1, 2, 1, 1),
+                dim=1,
+            )
+            direction_i = self._shift(direction, -dy, -dx)
+            direction_j = self._shift(direction, dy, dx)
+            align_i = (direction_i * direction_unit).sum(dim=1, keepdim=True).abs()
+            align_j = (direction_j * direction_unit).sum(dim=1, keepdim=True).abs()
+            alignment = torch.sqrt((align_i * align_j).clamp_min(0.0))
+            alignment = self.direction_floor + (1.0 - self.direction_floor) * alignment
+            endpoint_confidence = 0.5 * (
+                self._shift(confidence, -dy, -dx) + self._shift(confidence, dy, dx)
+            )
+            direction_gate = (1.0 - endpoint_confidence) + endpoint_confidence * alignment
+            gap_gate = 1.0 - skeleton_prob
+            bridge_parts.append(
+                connection_prob * endpoint_evidence * direction_gate * gap_gate
+            )
+
+        bridge_evidence = 1.0 - torch.prod(
+            1.0 - torch.stack(bridge_parts, dim=0).clamp(0.0, 1.0), dim=0
+        )
+        return skeleton_logits_0 + self.bridge_lambda * bridge_evidence, bridge_evidence
+
+
 class SkeletonGuidedHead(nn.Module):
     def __init__(
         self,
@@ -1059,6 +1128,35 @@ class SkeletonGuidedHead(nn.Module):
         )
 
         self.surface_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        # Final structure branch reads only shared_final_feat and never feeds
+        # surface, boundary, decoder gate, or attention refinement.
+        final_skeleton_mid_channels = max(hidden_channels // 2, 16)
+        self.final_skeleton_head = nn.Sequential(
+            nn.Conv2d(
+                hidden_channels,
+                final_skeleton_mid_channels,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(final_skeleton_mid_channels, 1, kernel_size=1),
+        )
+        self.final_direction_head = nn.Sequential(
+            ConvBNReLU(hidden_channels, hidden_channels),
+            nn.Conv2d(hidden_channels, 2, kernel_size=1),
+        )
+        self.final_direction_confidence_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        self.final_long_range_connectivity_head = nn.Sequential(
+            ConvBNReLU(hidden_channels, hidden_channels),
+            nn.Conv2d(hidden_channels, 24, kernel_size=1),
+        )
+        self.final_skeleton_bridge = FinalSkeletonBridge(direction_floor=0.2)
+        self.bridge_to_surface = nn.Sequential(
+            nn.Conv2d(1, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.bridge_surface_eta = nn.Parameter(torch.tensor(0.0))
         if self.enable_graph_prop:
             self.graph_propagation = SoftSkeletonGraphPropagation(
                 lambda_init=graph_prop_lambda_init,
@@ -1134,12 +1232,28 @@ class SkeletonGuidedHead(nn.Module):
         stage_skeleton_logits=None,
         stage_connectivity_logits=None,
     ):
-        feat = self.shared_proj(x)
-
-        surface_feat = self.surface_branch(feat)
+        shared_final_feat = self.shared_proj(x)
 
         if not self.enable_final_structure:
+            skeleton_logits_0 = self.final_skeleton_head(shared_final_feat)
+            direction_logits = self.final_direction_head(shared_final_feat)
+            direction_confidence_logits = self.final_direction_confidence_head(shared_final_feat)
+            long_range_connectivity_logits = self.final_long_range_connectivity_head(shared_final_feat)
+            final_skeleton_logits, _bridge_evidence = self.final_skeleton_bridge(
+                skeleton_logits_0,
+                direction_logits,
+                direction_confidence_logits,
+                long_range_connectivity_logits,
+            )
+
+            surface_feat = self.surface_branch(shared_final_feat)
             guided_surface_feat = self.surface_refine(surface_feat)
+
+            # Only newly bridged skeleton evidence guides surface; S0 does not.
+            bridge_delta = F.relu(final_skeleton_logits - skeleton_logits_0)
+            guided_surface_feat = guided_surface_feat + (
+                self.bridge_surface_eta * self.bridge_to_surface(bridge_delta)
+            )
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
             boundary_logits = self.boundary_head(boundary_feat)
@@ -1223,9 +1337,15 @@ class SkeletonGuidedHead(nn.Module):
                             surface_logits.detach()
                         )
 
-            return surface_logits, boundary_logits, None, None
+            return (
+                surface_logits,
+                boundary_logits,
+                final_skeleton_logits,
+                long_range_connectivity_logits,
+            )
 
-        structure_feat = self.structure_branch(feat)
+        surface_feat = self.surface_branch(shared_final_feat)
+        structure_feat = self.structure_branch(shared_final_feat)
 
         # First predict a topology seed, then use it to refine only the
         # structure feature. Surface features never receive this attention

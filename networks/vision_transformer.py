@@ -271,9 +271,22 @@ def load_topology_checkpoint_state(
     filtered_state_dict = {}
     skipped_obsolete_keys = []
     skipped_shape_keys = []
+    expanded_connectivity_keys = []
     for key, value in state_dict.items():
         if key not in model_state and key.endswith(obsolete_unexpected_suffixes):
             skipped_obsolete_keys.append(key)
+            continue
+        if (
+            key in model_state
+            and value.shape != model_state[key].shape
+            and key.startswith("swin_unet.decoder_structure_blocks.3.connectivity_head.")
+            and value.shape[0] == 8
+            and model_state[key].shape[0] == 24
+        ):
+            expanded = model_state[key].clone()
+            expanded[:8].copy_(value)
+            filtered_state_dict[key] = expanded
+            expanded_connectivity_keys.append(key)
             continue
         if (
             key in model_state
@@ -295,7 +308,14 @@ def load_topology_checkpoint_state(
             + ", ".join(skipped_shape_keys),
             flush=True,
         )
-    if skipped_obsolete_keys or skipped_shape_keys:
+    if expanded_connectivity_keys:
+        print(
+            "[TOPOLOGY] Expanded stage3 connectivity heads from r1 (8) to "
+            "r1/r2/r3 (24); preserved the first 8 channels: "
+            + ", ".join(expanded_connectivity_keys),
+            flush=True,
+        )
+    if skipped_obsolete_keys or skipped_shape_keys or expanded_connectivity_keys:
         state_dict = filtered_state_dict
 
     missing_final_topology = not any(
@@ -448,12 +468,18 @@ def load_topology_checkpoint_state(
         "swin_unet.bottleneck_context_fusion.scale_attention.",
     )
     allowed_new_missing_prefixes = (
-        road_attention_missing_prefixes + msaf_missing_prefixes
+        road_attention_missing_prefixes
+        + msaf_missing_prefixes
+        + ("swin_unet.guided_head.final_skeleton_head.",)
+        + ("swin_unet.guided_head.final_direction_head.",)
+        + ("swin_unet.guided_head.final_direction_confidence_head.",)
+        + ("swin_unet.guided_head.final_long_range_connectivity_head.",)
+        + ("swin_unet.guided_head.final_skeleton_bridge.",)
+        + ("swin_unet.guided_head.bridge_to_surface.",)
+        + ("swin_unet.guided_head.bridge_surface_eta",)
+        + ("swin_unet.decoder_structure_blocks.3.connectivity_head.",)
     )
-    if strict and not any(
-        key.startswith(allowed_new_missing_prefixes)
-        for key in state_dict
-    ):
+    if strict:
         result = model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
             key
@@ -466,7 +492,7 @@ def load_topology_checkpoint_state(
                 f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
             )
         print(
-            "[TOPOLOGY] Loaded checkpoint without new encoder additions; "
+            "[TOPOLOGY] Loaded checkpoint with compatible new parameters; "
             "new parameters use runtime initialization.",
             flush=True,
         )

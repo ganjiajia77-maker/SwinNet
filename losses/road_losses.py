@@ -265,34 +265,70 @@ def build_boundary_target(surface_gt, radius=1):
     return (dilated - eroded).clamp(0.0, 1.0)
 
 
+CONNECTIVITY_DIRECTIONS = (
+    (-1, 0), (1, 0), (0, -1), (0, 1),
+    (-1, -1), (-1, 1), (1, -1), (1, 1),
+)
+
+
+def shift_binary_map(x, dy, dx):
+    """Sample x[y + dy, x + dx] with zero padding outside the image."""
+    _, _, height, width = x.shape
+    padded = F.pad(
+        x,
+        (max(-dx, 0), max(dx, 0), max(-dy, 0), max(dy, 0)),
+        mode="constant",
+        value=0.0,
+    )
+    return padded[
+        :,
+        :,
+        max(dy, 0):max(dy, 0) + height,
+        max(dx, 0):max(dx, 0) + width,
+    ]
+
+
+def build_multiradius_connectivity_target(
+    surface_gt,
+    radii=(1, 2, 3),
+    erode_kernel_size=1,
+):
+    """Eight-direction targets with tolerant intermediate path samples only."""
+    if surface_gt.dim() == 3:
+        surface_gt = surface_gt.unsqueeze(1)
+    road = erode_binary_mask(
+        (surface_gt > 0.5).float(),
+        kernel_size=erode_kernel_size,
+    )
+    road_tolerance = F.max_pool2d(road, kernel_size=3, stride=1, padding=1)
+    outputs = []
+    for radius in radii:
+        if radius < 1:
+            raise ValueError(f"radius must be >= 1, got {radius}")
+        for dy, dx in CONNECTIVITY_DIRECTIONS:
+            connected = road.clone()
+            for step in range(1, radius + 1):
+                # Endpoints remain strict. Only intermediate samples receive
+                # one-pixel tolerance for non-cardinal diagonal road paths.
+                path_road = road if step == radius else road_tolerance
+                connected = connected * shift_binary_map(
+                    path_road,
+                    dy=step * dy,
+                    dx=step * dx,
+                )
+            outputs.append(connected)
+    return torch.cat(outputs, dim=1)
+
+
 def build_connectivity_target(surface_gt, erode_kernel_size=1):
     if surface_gt.dim() == 3:
         surface_gt = surface_gt.unsqueeze(1)
 
-    road = (surface_gt > 0.5).float()
-    road = erode_binary_mask(road, kernel_size=erode_kernel_size)
-
-    padded = F.pad(road, (1, 1, 1, 1))
-    height, width = road.shape[-2:]
-    directions = [
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
-        (-1, -1),
-        (-1, 1),
-        (1, -1),
-        (1, 1),
-    ]
-
-    targets = []
-    for dy, dx in directions:
-        y0 = 1 + dy
-        x0 = 1 + dx
-        neighbor = padded[:, :, y0:y0 + height, x0:x0 + width]
-        targets.append(road * neighbor)
-
-    return torch.cat(targets, dim=1)
+    return build_multiradius_connectivity_target(
+        surface_gt,
+        radii=(1,),
+        erode_kernel_size=erode_kernel_size,
+    )
 
 
 class SurfaceStructureLoss(nn.Module):
@@ -311,6 +347,7 @@ class SurfaceStructureLoss(nn.Module):
         skeleton_stage_weights=(0.1, 0.2, 0.3, 0.3),
         stage_structure_weights=None,
         stage_connectivity_factor=0.5,
+        stage_long_range_connectivity_weight=0.4,
         stage_direction_factor=0.2,
         stage_skeleton_connectivity_s2c_weight=1.0,
         stage_skeleton_connectivity_c2s_weight=0.2,
@@ -357,6 +394,9 @@ class SurfaceStructureLoss(nn.Module):
             stage_structure_weights = (0.0, 0.0, 0.004, 0.006)
         self.stage_structure_weights = tuple(float(w) for w in stage_structure_weights)
         self.stage_connectivity_factor = float(stage_connectivity_factor)
+        self.stage_long_range_connectivity_weight = float(
+            stage_long_range_connectivity_weight
+        )
         self.stage_direction_factor = float(stage_direction_factor)
         self.stage_skeleton_connectivity_s2c_weight = float(
             stage_skeleton_connectivity_s2c_weight
@@ -513,6 +553,35 @@ class SurfaceStructureLoss(nn.Module):
             + 0.20 * loss_symmetry
         )
 
+    def multiradius_connectivity_loss(
+        self,
+        connectivity_logits,
+        connectivity_gt,
+        skeleton_dilate_gt,
+    ):
+        if connectivity_logits.shape[1] == 8:
+            return self.stage_connectivity_loss(
+                connectivity_logits,
+                connectivity_gt,
+                skeleton_dilate_gt,
+            )
+        if connectivity_logits.shape[1] != 24:
+            raise ValueError(
+                "connectivity logits must have 8 or 24 channels, got "
+                f"{connectivity_logits.shape[1]}"
+            )
+        losses = [
+            self.stage_connectivity_loss(
+                connectivity_logits[:, offset:offset + 8],
+                connectivity_gt[:, offset:offset + 8],
+                skeleton_dilate_gt,
+            )
+            for offset in (0, 8, 16)
+        ]
+        return losses[0] + self.stage_long_range_connectivity_weight * (
+            0.6 * losses[1] + 0.3 * losses[2]
+        )
+
     def stage_skeleton_loss(self, stage_outputs, skeleton_gt, skeleton_dilate_gt):
         if not stage_outputs:
             return skeleton_gt.sum() * 0.0
@@ -641,14 +710,15 @@ class SurfaceStructureLoss(nn.Module):
                 stage_skel,
                 stage_skel_dilate,
             )
-            connectivity_gt = build_connectivity_target(
+            connectivity_gt = build_multiradius_connectivity_target(
                 stage_skel,
+                radii=(1, 2, 3) if stage_connectivity_logits.shape[1] == 24 else (1,),
                 erode_kernel_size=self.connectivity_erode_kernel_size,
             ).to(
                 device=stage_connectivity_logits.device,
                 dtype=stage_connectivity_logits.dtype,
             )
-            loss_connectivity_stage = self.stage_connectivity_loss(
+            loss_connectivity_stage = self.multiradius_connectivity_loss(
                 stage_connectivity_logits,
                 connectivity_gt,
                 stage_skel_dilate,
@@ -660,7 +730,7 @@ class SurfaceStructureLoss(nn.Module):
                 loss_skeleton_connectivity_consistency = (
                     self.skeleton_connectivity_consistency_loss(
                         stage_skeleton_logits,
-                        stage_connectivity_logits,
+                        stage_connectivity_logits[:, :8],
                     )
                 )
             else:
@@ -898,16 +968,18 @@ class SurfaceStructureLoss(nn.Module):
             dice_skeleton = loss_skeleton.detach()
 
         if connectivity_logits is not None:
-            connectivity_gt = build_connectivity_target(
+            connectivity_gt = build_multiradius_connectivity_target(
                 skeleton_gt,
+                radii=(1, 2, 3) if connectivity_logits.shape[1] == 24 else (1,),
                 erode_kernel_size=self.connectivity_erode_kernel_size,
             ).to(
                 device=connectivity_logits.device,
                 dtype=connectivity_logits.dtype,
             )
-            loss_connectivity = F.binary_cross_entropy_with_logits(
+            loss_connectivity = self.multiradius_connectivity_loss(
                 connectivity_logits,
                 connectivity_gt,
+                skeleton_dilate_gt,
             )
         else:
             loss_connectivity = surface_logits.sum() * 0.0

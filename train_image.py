@@ -50,6 +50,12 @@ parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
 parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final skeleton threshold for validation')
+parser.add_argument(
+    '--final_skeleton_weight',
+    default=0.002,
+    type=float,
+    help='auxiliary final skeleton loss weight for the 0626 final visualization head',
+)
 parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help='initial final topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
 parser.add_argument(
@@ -81,8 +87,20 @@ parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage_direction_factor', type=float, default=0.2)
-parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
-parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
+parser.add_argument(
+    '--stage_long_connectivity_weight',
+    type=float,
+    default=0.4,
+    help='overall r=2/r=3 connectivity loss weight relative to local r=1',
+)
+parser.add_argument(
+    '--final_long_connectivity_weight',
+    type=float,
+    default=0.02,
+    help='final 24-channel connectivity auxiliary loss weight',
+)
+parser.add_argument('--stage_sc_s2c_weight', type=float, default=0.0)
+parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.0)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
@@ -167,6 +185,12 @@ parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modi
 parser.add_argument('--zip', action='store_true', help='use zipped dataset')
 parser.add_argument('--cache_mode', type=str, default='', help='cache mode for dataset')
 parser.add_argument('--resume', type=str, default='', help='resume from checkpoint')
+parser.add_argument(
+    '--init_checkpoint',
+    type=str,
+    default='',
+    help='initialize model weights only; do not restore optimizer or epoch',
+)
 parser.add_argument('--accumulation_steps', type=int, default=0, help='gradient accumulation steps')
 parser.add_argument('--use_checkpoint', action='store_true', help='use gradient checkpointing')
 parser.add_argument('--amp_opt_level', type=str, default='', help='AMP opt level')
@@ -208,13 +232,15 @@ if args.freeze_0626_backbone and not args.enable_graph_prop:
     parser.error("--freeze_0626_backbone requires --enable_graph_prop")
 if args.freeze_0626_backbone and not args.resume:
     args.resume = DEFAULT_0626_CHECKPOINT
+if args.resume and args.init_checkpoint:
+    parser.error('--resume and --init_checkpoint cannot be used together')
 
 
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         return {
-            "skeleton_weight": 0.0,
-            "connectivity_weight": 0.0,
+            "skeleton_weight": args.final_skeleton_weight,
+            "connectivity_weight": args.final_long_connectivity_weight,
             "skeleton_cldice_weight": 0.0,
             "boundary_weight": 0.01,
         }
@@ -262,6 +288,7 @@ def build_criterion(args, loss_weights, device):
         stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
         road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
         stage_connectivity_factor=0.5,
+        stage_long_range_connectivity_weight=args.stage_long_connectivity_weight,
         stage_direction_factor=args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
         stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
@@ -284,7 +311,11 @@ def format_training_config_lines(args, loss_weights):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final skeleton/connectivity heads: disabled",
+            "  Final skeleton: shared feature S0 + r2 bridge -> S1; only ReLU(S1-S0) guides final surface",
+            "  Connectivity: stage3/final use r1,r2,r3 (8+8+8); r1 + {:.2f}*(0.6*r2 + 0.3*r3)".format(
+                args.stage_long_connectivity_weight
+            ),
+            "  Final connectivity head: disabled",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
@@ -336,6 +367,7 @@ def format_training_config_lines(args, loss_weights):
         f"stage2={args.stage2_skeleton_weight}, "
         f"stage3={args.stage3_skeleton_weight}, "
         f"direction_factor={args.stage_direction_factor}, "
+        f"long_connectivity={args.stage_long_connectivity_weight}, "
         f"sc_s2c={args.stage_sc_s2c_weight}, "
         f"sc_c2s={args.stage_sc_c2s_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
@@ -765,6 +797,35 @@ if __name__ == "__main__":
     criterion = build_criterion(args, loss_weights, device)
     optimizer = None
 
+    if args.init_checkpoint:
+        if not os.path.isfile(args.init_checkpoint):
+            raise FileNotFoundError(
+                f"Initialization checkpoint not found: {args.init_checkpoint}"
+            )
+        print(f"Initializing model weights from: {args.init_checkpoint}")
+        init_checkpoint = torch.load(args.init_checkpoint, map_location=device)
+        init_state = (
+            init_checkpoint["model_state_dict"]
+            if isinstance(init_checkpoint, dict) and "model_state_dict" in init_checkpoint
+            else init_checkpoint
+        )
+        init_version = (
+            init_checkpoint.get("topology_attention_version", "legacy-unrecorded")
+            if isinstance(init_checkpoint, dict)
+            else "legacy-unrecorded"
+        )
+        load_topology_checkpoint_state(
+            model,
+            init_state,
+            init_version,
+            strict=(args.bottleneck_type == 'global_local'),
+        )
+        print(
+            "[INFO] Model initialized from checkpoint; optimizer and epoch start fresh "
+            "for final_skeleton_head training.",
+            flush=True,
+        )
+
     # 检查是否恢复训练
     start_epoch = 0
     if args.resume:
@@ -780,7 +841,12 @@ if __name__ == "__main__":
                     if (
                         key in model_state
                         and value.shape != model_state[key].shape
-                        and key.endswith("structure_gate.0.weight")
+                        and (
+                            key.endswith("structure_gate.0.weight")
+                            or key.startswith(
+                                "swin_unet.decoder_structure_blocks.3.connectivity_head."
+                            )
+                        )
                     ):
                         skipped_gate_keys.append(key)
                         continue
@@ -804,9 +870,17 @@ if __name__ == "__main__":
                     model.load_state_dict(checkpoint_state, strict=strict_load)
                 except RuntimeError as exc:
                     allowed_missing_prefixes = (
+                        "swin_unet.guided_head.final_skeleton_head.",
+                        "swin_unet.guided_head.final_direction_head.",
+                        "swin_unet.guided_head.final_direction_confidence_head.",
+                        "swin_unet.guided_head.final_long_range_connectivity_head.",
+                        "swin_unet.guided_head.final_skeleton_bridge.",
+                        "swin_unet.guided_head.bridge_to_surface.",
+                        "swin_unet.guided_head.bridge_surface_eta",
                         "swin_unet.stage2_topology_source.",
                         "swin_unet.stage_topology_scales.",
                         "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
+                        "swin_unet.decoder_structure_blocks.3.connectivity_head.",
                         "swin_unet.guided_head.graph_propagation.",
                         "swin_unet.decoder_structure_blocks.0.direction_head.",
                         "swin_unet.decoder_structure_blocks.1.direction_head.",
