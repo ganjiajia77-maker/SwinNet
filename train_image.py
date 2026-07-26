@@ -38,6 +38,11 @@ parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--base_lr', type=float, default=5e-4, help='segmentation network learning rate')
 parser.add_argument('--min_lr', type=float, default=1e-5, help='minimum learning rate for cosine decay')
+parser.add_argument('--encoder_lr', type=float, default=1e-5, help='learning rate for pretrained Swin encoder')
+parser.add_argument('--encoder_min_lr', type=float, default=1e-6, help='cosine minimum learning rate for pretrained encoder')
+parser.add_argument('--head_lr', type=float, default=1e-4, help='learning rate for decoder and new structure heads')
+parser.add_argument('--head_min_lr', type=float, default=1e-5, help='cosine minimum learning rate for decoder and heads')
+parser.add_argument('--pretrain_ckpt', type=str, default='', help='override Swin pretrained checkpoint path')
 parser.add_argument('--warmup_epochs', type=int, default=3, help='warmup epochs before cosine decay')
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
 parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
@@ -397,6 +402,36 @@ def get_cosine_warmup_lr(epoch, max_epochs, base_lr, min_lr, warmup_epochs):
     return min_lr + (base_lr - min_lr) * cosine
 
 
+def build_layerwise_optimizer(model, args):
+    """Keep pretrained Swin encoder stable while new decoder/heads adapt faster."""
+    encoder_prefixes = (
+        "swin_unet.patch_embed.",
+        "swin_unet.layers.",
+        "swin_unet.norm.",
+        "swin_unet.absolute_pos_embed",
+    )
+    encoder_params = []
+    head_params = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith(encoder_prefixes):
+            encoder_params.append(parameter)
+        else:
+            head_params.append(parameter)
+    if not encoder_params or not head_params:
+        raise RuntimeError(
+            "Layerwise optimizer requires non-empty encoder and head parameter groups."
+        )
+    return torch.optim.AdamW(
+        [
+            {"params": encoder_params, "lr": args.encoder_lr, "group_name": "encoder"},
+            {"params": head_params, "lr": args.head_lr, "group_name": "decoder_head"},
+        ],
+        weight_decay=0.0001,
+    )
+
+
 def get_stage_distill_scale(epoch):
     epoch_number = epoch + 1
     if epoch_number <= 5:
@@ -714,6 +749,10 @@ if __name__ == "__main__":
     
     # 加载配置
     config = get_config(args)
+    if args.pretrain_ckpt:
+        config.defrost()
+        config.MODEL.PRETRAIN_CKPT = args.pretrain_ckpt
+        config.freeze()
     
     # 对齐 img_size 到 window_size=8 的倍数（模型初始化时需要）
     window_size = 8
@@ -741,6 +780,17 @@ if __name__ == "__main__":
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
                     enable_final_graph_prop=args.enable_graph_prop).to(device)
+    if args.no_pretrain:
+        print("[INFO] Swin pretrained initialization: disabled")
+    else:
+        pretrained_path = config.MODEL.PRETRAIN_CKPT
+        if not pretrained_path or not os.path.isfile(pretrained_path):
+            raise FileNotFoundError(
+                "Swin pretrained checkpoint not found: "
+                f"{pretrained_path}. Set --pretrain_ckpt or use --no_pretrain."
+            )
+        print(f"[INFO] Loading Swin pretrained weights: {pretrained_path}")
+        model.load_from(config)
 
     # 加载数据
     train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
@@ -856,11 +906,7 @@ if __name__ == "__main__":
                 start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_0626_backbone:
                 try:
-                    optimizer = torch.optim.AdamW(
-                        model.parameters(),
-                        lr=args.base_lr,
-                        weight_decay=0.0001,
-                    )
+                    optimizer = build_layerwise_optimizer(model, args)
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 except (ValueError, RuntimeError) as exc:
                     print(
@@ -882,19 +928,15 @@ if __name__ == "__main__":
                 weight_decay=0.0001,
             )
         else:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.base_lr,
-                weight_decay=0.0001,
-            )
+            optimizer = build_layerwise_optimizer(model, args)
 
     # 训练循环
     print("\n开始训练...")
     print(f"配置:")
     print(f"  最大轮数: {args.max_epochs}")
     print(f"  批大小: {args.batch_size}")
-    print(f"  学习率: {args.base_lr}")
-    print(f"  最小学习率: {args.min_lr}")
+    print(f"  Encoder 学习率: {args.encoder_lr} -> {args.encoder_min_lr}")
+    print(f"  Decoder/head 学习率: {args.head_lr} -> {args.head_min_lr}")
     print(f"  Warmup轮数: {args.warmup_epochs}")
     for line in format_training_config_lines(args, loss_weights):
         print(line)
@@ -920,8 +962,8 @@ if __name__ == "__main__":
         log_f.write(f"训练配置:\n")
         log_f.write(f"  最大轮数: {args.max_epochs}\n")
         log_f.write(f"  批大小: {args.batch_size}\n")
-        log_f.write(f"  学习率: {args.base_lr}\n")
-        log_f.write(f"  最小学习率: {args.min_lr}\n")
+        log_f.write(f"  Encoder 学习率: {args.encoder_lr} -> {args.encoder_min_lr}\n")
+        log_f.write(f"  Decoder/head 学习率: {args.head_lr} -> {args.head_min_lr}\n")
         log_f.write(f"  Warmup轮数: {args.warmup_epochs}\n")
         for line in format_training_config_lines(args, loss_weights):
             log_f.write(line + "\n")
@@ -936,22 +978,32 @@ if __name__ == "__main__":
         loss_writer = csv.writer(loss_log_file)
         batch_loss_writer = csv.writer(batch_loss_log_file)
         loss_writer.writerow([
-            'epoch', 'lr', 'train_avg_loss', 'val_loss',
+            'epoch', 'encoder_lr', 'head_lr', 'train_avg_loss', 'val_loss',
             'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
             'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
         ])
         batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
 
         for epoch in range(start_epoch, args.max_epochs):
-            current_lr = get_cosine_warmup_lr(
+            encoder_current_lr = get_cosine_warmup_lr(
                 epoch,
                 args.max_epochs,
-                args.base_lr,
-                args.min_lr,
+                args.encoder_lr,
+                args.encoder_min_lr,
+                args.warmup_epochs,
+            )
+            head_current_lr = get_cosine_warmup_lr(
+                epoch,
+                args.max_epochs,
+                args.head_lr,
+                args.head_min_lr,
                 args.warmup_epochs,
             )
             for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
+                if param_group.get('group_name') == 'encoder':
+                    param_group['lr'] = encoder_current_lr
+                elif param_group.get('group_name') == 'decoder_head':
+                    param_group['lr'] = head_current_lr
 
             model.train()
             total_loss = 0
@@ -1095,7 +1147,7 @@ if __name__ == "__main__":
             
             # 打印到控制台
             epoch_msg = (
-                f"Epoch {epoch+1}/{args.max_epochs}, LR: {current_lr:.6g}, Train Loss: {train_avg_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                f"Epoch {epoch+1}/{args.max_epochs}, LR encoder/head: {encoder_current_lr:.6g}/{head_current_lr:.6g}, Train Loss: {train_avg_loss:.4f}, Val Loss: {val_loss:.4f}, "
                 f"Surface IoU: {val_iou:.4f}, Surface F1: {val_f1:.4f}, "
                 f"Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, "
                 f"Skeleton IoU: {skeleton_iou:.4f}, Skeleton F1: {skeleton_f1:.4f}"
@@ -1110,7 +1162,7 @@ if __name__ == "__main__":
             
             # 写入 CSV
             loss_writer.writerow([
-                epoch + 1, f'{current_lr:.8f}', f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
+                epoch + 1, f'{encoder_current_lr:.8f}', f'{head_current_lr:.8f}', f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
                 f'{val_iou:.6f}', f'{val_f1:.6f}', f'{val_precision:.6f}', f'{val_recall:.6f}',
                 f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}'
             ])
