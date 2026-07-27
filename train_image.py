@@ -215,7 +215,7 @@ def apply_structure_profile_defaults(args):
     args.final_gap_rho_init = 0.0
     if not _cli_has("--final_skeleton_weight"):
         args.final_skeleton_weight = 0.10
-    if args.warmup_epochs == 3:
+    if not _cli_has("--warmup_epochs"):
         args.warmup_epochs = 10
     if args.max_epochs == 100:
         args.max_epochs = 60
