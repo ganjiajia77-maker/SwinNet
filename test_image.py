@@ -33,6 +33,8 @@ parser.add_argument('--batch_size', type=int, default=24, help='batch_size per g
 parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
+parser.add_argument('--overlap_tile_size', type=int, default=0, help='tile size for overlapping inference; 0 uses img_size')
+parser.add_argument('--overlap_stride', type=int, default=0, help='stride for overlapping inference; 0 uses half tile')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
 parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final skeleton')
 parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final topology repair coefficient')
@@ -104,6 +106,32 @@ def make_unique_dir(base_dir, run_name):
         if not os.path.exists(candidate):
             return candidate
         index += 1
+
+
+def sliding_positions(length, tile_size, stride):
+    if length <= tile_size:
+        return [0]
+    positions = list(range(0, length - tile_size + 1, stride))
+    last = length - tile_size
+    if positions[-1] != last:
+        positions.append(last)
+    return positions
+
+
+def find_label_path(label_dir, image_name):
+    base = os.path.splitext(image_name)[0]
+    candidates = [
+        image_name,
+        base + ".png",
+        base.replace("_sat", "_mask") + ".png",
+        base.replace("_image", "_mask") + ".png",
+        base.replace("_img", "_mask") + ".png",
+    ]
+    for name in candidates:
+        path = os.path.join(label_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
 
 # 模块级别定义
 class ResizeToTensor:
@@ -285,9 +313,10 @@ if __name__ == "__main__":
         surface_dir = os.path.join(pred_dir, 'surface')
         os.makedirs(surface_dir, exist_ok=True)
 
-        stride = args.img_size // 2
+        tile_size = args.overlap_tile_size if args.overlap_tile_size > 0 else args.img_size
+        stride = args.overlap_stride if args.overlap_stride > 0 else tile_size // 2
         image_list = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'))])
-        print(f"使用滑窗推理: tile={args.img_size}, stride={stride}, cases={len(image_list)}")
+        print(f"使用滑窗推理: tile={tile_size}, stride={stride}, cases={len(image_list)}")
 
         with torch.no_grad():
             for image_name in tqdm(image_list):
@@ -301,17 +330,17 @@ if __name__ == "__main__":
                 count_canvas = np.zeros((h, w), dtype=np.float32)
 
                 # sliding
-                for y in range(0, max(1, h - args.img_size + 1), stride):
-                    for x in range(0, max(1, w - args.img_size + 1), stride):
+                for y in sliding_positions(h, tile_size, stride):
+                    for x in sliding_positions(w, tile_size, stride):
                         y1 = y
                         x1 = x
-                        y2 = min(y1 + args.img_size, h)
-                        x2 = min(x1 + args.img_size, w)
+                        y2 = min(y1 + tile_size, h)
+                        x2 = min(x1 + tile_size, w)
                         crop = img[y1:y2, x1:x2]
 
                         # pad if needed
-                        ph = args.img_size - crop.shape[0]
-                        pw = args.img_size - crop.shape[1]
+                        ph = tile_size - crop.shape[0]
+                        pw = tile_size - crop.shape[1]
                         if ph > 0 or pw > 0:
                             crop = np.pad(crop, ((0, ph), (0, pw), (0, 0)), mode='constant', constant_values=0)
 
@@ -341,9 +370,35 @@ if __name__ == "__main__":
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
                 cv2.imwrite(png_save_path, pred)
 
+                label_path = find_label_path(test_label_dir, image_name)
+                if label_path is not None:
+                    label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+                    if label is not None:
+                        if label.shape[:2] != pred.shape[:2]:
+                            label = cv2.resize(
+                                label,
+                                (pred.shape[1], pred.shape[0]),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                        pred_bin = pred > 127
+                        label_bin = label > 127
+                        tp += int(np.logical_and(pred_bin, label_bin).sum())
+                        fp += int(np.logical_and(pred_bin, np.logical_not(label_bin)).sum())
+                        fn += int(np.logical_and(np.logical_not(pred_bin), label_bin).sum())
+
                 total_samples += 1
 
         print(f"滑窗推理完成，结果保存在: {pred_dir}")
+        if tp + fp + fn > 0:
+            precision = tp / (tp + fp + 1e-8)
+            recall = tp / (tp + fn + 1e-8)
+            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            iou = tp / (tp + fp + fn + 1e-8)
+            print(
+                f"Overlap Test Metrics: IoU={iou:.4f}, F1={f1:.4f}, "
+                f"Precision={precision:.4f}, Recall={recall:.4f}",
+                flush=True,
+            )
         # exit after sliding infer
         sys.exit(0)
 
