@@ -94,6 +94,8 @@ parser.add_argument('--stage_direction_factor', type=float, default=0.2)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
+parser.add_argument('--final_skeleton_weight', type=float, default=0.0)
+parser.add_argument('--final_skeleton_cldice_weight', type=float, default=0.0)
 parser.add_argument('--surface_focal_weight', type=float, default=0.0)
 parser.add_argument('--focal_alpha', type=float, default=0.25)
 parser.add_argument('--focal_gamma', type=float, default=2.0)
@@ -228,9 +230,9 @@ if args.freeze_0626_backbone and not args.resume:
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         return {
-            "skeleton_weight": 0.0,
+            "skeleton_weight": args.final_skeleton_weight,
             "connectivity_weight": 0.0,
-            "skeleton_cldice_weight": 0.0,
+            "skeleton_cldice_weight": args.final_skeleton_cldice_weight,
             "boundary_weight": 0.01,
         }
     return {

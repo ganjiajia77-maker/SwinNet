@@ -311,7 +311,9 @@ if __name__ == "__main__":
         pred_dir = make_unique_dir(args.output_dir, f'{model_basename}_{timestamp}_overlap')
         os.makedirs(pred_dir, exist_ok=True)
         surface_dir = os.path.join(pred_dir, 'surface')
+        skeleton_dir = os.path.join(pred_dir, 'skeleton')
         os.makedirs(surface_dir, exist_ok=True)
+        os.makedirs(skeleton_dir, exist_ok=True)
 
         tile_size = args.overlap_tile_size if args.overlap_tile_size > 0 else args.img_size
         stride = args.overlap_stride if args.overlap_stride > 0 else tile_size // 2
@@ -327,6 +329,7 @@ if __name__ == "__main__":
 
                 # canvas to accumulate probabilities and counts
                 prob_canvas = np.zeros((h, w), dtype=np.float32)
+                skeleton_prob_canvas = np.zeros((h, w), dtype=np.float32)
                 count_canvas = np.zeros((h, w), dtype=np.float32)
 
                 # sliding
@@ -354,21 +357,41 @@ if __name__ == "__main__":
 
                         outputs = model(inp)
                         surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                        skeleton_logits = (
+                            outputs[2]
+                            if isinstance(outputs, tuple) and len(outputs) > 2
+                            else None
+                        )
                         prob = torch.sigmoid(surface_logits)[0, 0].cpu().numpy()
+                        if skeleton_logits is not None:
+                            skeleton_prob = torch.sigmoid(skeleton_logits)[0, 0].cpu().numpy()
+                        else:
+                            skeleton_prob = np.zeros_like(prob)
 
                         # crop to original size if padded
                         prob = prob[:(y2 - y1), :(x2 - x1)]
+                        skeleton_prob = skeleton_prob[:(y2 - y1), :(x2 - x1)]
 
                         prob_canvas[y1:y2, x1:x2] += prob
+                        skeleton_prob_canvas[y1:y2, x1:x2] += skeleton_prob
                         count_canvas[y1:y2, x1:x2] += 1.0
 
                 avg_prob = prob_canvas / (count_canvas + 1e-7)
+                avg_skeleton_prob = skeleton_prob_canvas / (count_canvas + 1e-7)
                 pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
+                skeleton_pred = (
+                    avg_skeleton_prob >= args.skeleton_threshold
+                ).astype(np.uint8) * 255
 
                 # save
                 case_name = os.path.splitext(image_name)[0]
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
                 cv2.imwrite(png_save_path, pred)
+                skeleton_save_path = os.path.join(
+                    skeleton_dir,
+                    f'{case_name}_skeleton_pred.png',
+                )
+                cv2.imwrite(skeleton_save_path, skeleton_pred)
 
                 label_path = find_label_path(test_label_dir, image_name)
                 if label_path is not None:
@@ -389,6 +412,7 @@ if __name__ == "__main__":
                 total_samples += 1
 
         print(f"滑窗推理完成，结果保存在: {pred_dir}")
+        print(f"Final skeleton save dir: {skeleton_dir}")
         if tp + fp + fn > 0:
             precision = tp / (tp + fp + 1e-8)
             recall = tp / (tp + fn + 1e-8)

@@ -1139,6 +1139,9 @@ class SkeletonGuidedHead(nn.Module):
         surface_feat = self.surface_branch(feat)
 
         if not self.enable_final_structure:
+            structure_feat = self.structure_branch(feat)
+            skeleton_logits = self.skeleton_head(structure_feat)
+
             guided_surface_feat = self.surface_refine(surface_feat)
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
@@ -1223,7 +1226,7 @@ class SkeletonGuidedHead(nn.Module):
                             surface_logits.detach()
                         )
 
-            return surface_logits, boundary_logits, None, None
+            return surface_logits, boundary_logits, skeleton_logits, None
 
         structure_feat = self.structure_branch(feat)
 
