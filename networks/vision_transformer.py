@@ -11,6 +11,7 @@ from os.path import join as pjoin
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
@@ -493,7 +494,7 @@ def load_state_dict_ignore_mismatch(model, state_dict, prefix=""):
     print(f"{prefix}skipped keys: {len(skipped_keys)}")
     for key in skipped_keys[:20]:
         print(f"{prefix}skipped: {key}")
-    return msg
+    return msg, set(filtered_dict.keys())
 
 
 class SwinUnet(nn.Module):
@@ -609,32 +610,38 @@ class SwinUnet(nn.Module):
                     if "output" in k:
                         print("delete key:{}".format(k))
                         del pretrained_dict[k]
-                msg = load_state_dict_ignore_mismatch(self.swin_unet, pretrained_dict)
-                # print(msg)
-                return
+                _, loaded_keys = load_state_dict_ignore_mismatch(self.swin_unet, pretrained_dict)
+                return {f"swin_unet.{key}" for key in loaded_keys}
             pretrained_dict = pretrained_dict['model']
             print("---start load pretrained modle of swin encoder---")
 
             model_dict = self.swin_unet.state_dict()
+            # ImageNet initializes the encoder only. Decoder and task heads remain random.
             full_dict = copy.deepcopy(pretrained_dict)
-            for k, v in pretrained_dict.items():
-                if "layers." in k:
-                    current_layer_num = 3-int(k[7:8])
-                    current_k = "layers_up." + str(current_layer_num) + k[8:]
-                    full_dict.update({current_k:v})
-            for k in list(full_dict.keys()):
-                if ".reduction.weight" in k and ".linear_reduction.weight" not in k:
-                    linear_key = k.replace(".reduction.weight", ".linear_reduction.weight")
-                    if linear_key not in full_dict:
-                        full_dict[linear_key] = full_dict[k]
             for k in list(full_dict.keys()):
                 if k in model_dict:
                     if full_dict[k].shape != model_dict[k].shape:
+                        if (
+                            k.endswith("relative_position_bias_table")
+                            and full_dict[k].ndim == 2
+                            and model_dict[k].ndim == 2
+                            and full_dict[k].shape[1] == model_dict[k].shape[1]
+                        ):
+                            source_size = int(math.isqrt(full_dict[k].shape[0]))
+                            target_size = int(math.isqrt(model_dict[k].shape[0]))
+                            if source_size * source_size == full_dict[k].shape[0] and target_size * target_size == model_dict[k].shape[0]:
+                                heads = full_dict[k].shape[1]
+                                table = full_dict[k].transpose(0, 1).reshape(1, heads, source_size, source_size)
+                                table = F.interpolate(table.float(), size=(target_size, target_size), mode="bicubic", align_corners=False)
+                                full_dict[k] = table.reshape(heads, -1).transpose(0, 1).to(dtype=model_dict[k].dtype)
+                                print("interpolate:{};relative bias {}x{} -> {}x{}".format(k, source_size, source_size, target_size, target_size))
+                                continue
                         print("delete:{};shape pretrain:{};shape model:{}".format(k, full_dict[k].shape, model_dict[k].shape))
                         del full_dict[k]
 
-            msg = load_state_dict_ignore_mismatch(self.swin_unet, full_dict)
-            # print(msg)
+            _, loaded_keys = load_state_dict_ignore_mismatch(self.swin_unet, full_dict)
+            return {f"swin_unet.{key}" for key in loaded_keys}
         else:
             print("none pretrain")
+            return set()
  

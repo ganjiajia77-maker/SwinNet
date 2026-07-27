@@ -213,6 +213,8 @@ def apply_structure_profile_defaults(args):
     args.stage3_roadness_weight = 0.0
     args.final_topology_eta_init = 0.0
     args.final_gap_rho_init = 0.0
+    if not _cli_has("--final_skeleton_weight"):
+        args.final_skeleton_weight = 0.10
     if args.warmup_epochs == 3:
         args.warmup_epochs = 10
     if args.max_epochs == 100:
@@ -304,7 +306,7 @@ def format_training_config_lines(args, loss_weights):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final skeleton/connectivity heads: disabled",
+            "  Final skeleton head: supervised prediction only; stage2/3 connectivity guides residual surface diffusion",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "

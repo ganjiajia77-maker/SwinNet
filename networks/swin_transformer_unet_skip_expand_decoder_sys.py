@@ -2122,8 +2122,8 @@ class SwinTransformerSys(nn.Module):
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
-                        "[INFO] Final skeleton/connectivity heads: disabled "
-                        "(0626 profile; surface + boundary only)"
+                        "[INFO] Final skeleton: supervised prediction only; "
+                        "stage2/3 connectivity -> residual surface diffusion"
                     )
                     if self.enable_final_graph_prop:
                         print(
@@ -2621,7 +2621,7 @@ class SwinTransformerSys(nn.Module):
             if self.return_skeleton:
                 stage_skeleton_logits = None
                 stage_connectivity_logits = None
-                if self.enable_final_graph_prop and structure_outputs:
+                if structure_outputs:
                     target_hw = (x.shape[2], x.shape[3])
                     (
                         stage_skeleton_logits,

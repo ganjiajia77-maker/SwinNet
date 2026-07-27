@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -976,6 +978,118 @@ class SoftSkeletonGraphPropagation(nn.Module):
         return graph_correction, delta_logit, G
 
 
+class SurfaceStructureGate(nn.Module):
+    """Residual surface gate conditioned on final skeleton and stage connectivity."""
+
+    def __init__(self, channels):
+        super().__init__()
+        hidden = max(channels // 2, 16)
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels + 2, hidden, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.scale = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, surface_feat, skeleton_logits, connectivity_logits):
+        skeleton_prob = torch.sigmoid(skeleton_logits)
+        connectivity_prob = torch.sigmoid(connectivity_logits)
+        connectivity_strength = connectivity_prob.topk(
+            k=min(2, connectivity_prob.shape[1]), dim=1
+        ).values.mean(dim=1, keepdim=True)
+        attention = self.gate(torch.cat([
+            surface_feat, skeleton_prob, connectivity_strength
+        ], dim=1))
+        return surface_feat + self.scale * attention * surface_feat
+
+
+class VEDRoadDiffusion(nn.Module):
+    """Connectivity-oriented residual diffusion in a compact structure subspace."""
+
+    DIRECTIONS = (
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1),
+    )
+    OPPOSITE = (1, 0, 3, 2, 7, 6, 5, 4)
+
+    def __init__(self, channels, diffusion_channels=32, epsilon=0.05, omega=1.0):
+        super().__init__()
+        self.epsilon = float(epsilon)
+        self.omega = float(omega)
+        self.project_in = nn.Conv2d(channels, diffusion_channels, kernel_size=1, bias=False)
+        self.confidence = nn.Conv2d(3, 1, kernel_size=1)
+        self.project_out = nn.Conv2d(diffusion_channels, channels, kernel_size=1, bias=False)
+        nn.init.zeros_(self.project_out.weight)
+
+        vectors = []
+        for dy, dx in self.DIRECTIONS:
+            norm = math.sqrt(float(dy * dy + dx * dx))
+            vectors.append((dy / norm, dx / norm))
+        self.register_buffer("direction_vectors", torch.tensor(vectors, dtype=torch.float32))
+
+    @staticmethod
+    def _neighbor(x, dy, dx):
+        """Return x[i + (dy, dx)] with zero padding outside the image."""
+        shifted = torch.roll(x, shifts=(-dy, -dx), dims=(-2, -1))
+        if dy > 0:
+            shifted[..., -dy:, :] = 0
+        elif dy < 0:
+            shifted[..., :(-dy), :] = 0
+        if dx > 0:
+            shifted[..., :, -dx:] = 0
+        elif dx < 0:
+            shifted[..., :, :(-dx)] = 0
+        return shifted
+
+    def _directional_alignment(self, connectivity_prob):
+        vectors = self.direction_vectors.to(dtype=connectivity_prob.dtype)
+        dy = vectors[:, 0].view(1, 8, 1, 1)
+        dx = vectors[:, 1].view(1, 8, 1, 1)
+        normalizer = connectivity_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        tyy = (connectivity_prob * dy.square()).sum(dim=1, keepdim=True) / normalizer
+        txx = (connectivity_prob * dx.square()).sum(dim=1, keepdim=True) / normalizer
+        tyx = (connectivity_prob * dy * dx).sum(dim=1, keepdim=True) / normalizer
+        alignment = (
+            dy.square() * tyy
+            + 2.0 * dy * dx * tyx
+            + dx.square() * txx
+        ).clamp(0.0, 1.0)
+        coherence = torch.sqrt((tyy - txx).square() + 4.0 * tyx.square())
+        return alignment, coherence.clamp(0.0, 1.0)
+
+    def forward(self, surface_feat, skeleton_logits, connectivity_logits):
+        skeleton_support = F.max_pool2d(torch.sigmoid(skeleton_logits), 3, 1, 1)
+        connectivity_prob = torch.sigmoid(connectivity_logits)
+        connectivity_strength = connectivity_prob.topk(
+            k=min(2, connectivity_prob.shape[1]), dim=1
+        ).values.mean(dim=1, keepdim=True)
+        alignment, coherence = self._directional_alignment(connectivity_prob)
+        confidence = torch.sigmoid(self.confidence(torch.cat([
+            skeleton_support, connectivity_strength, coherence
+        ], dim=1)))
+        weights = confidence * (
+            self.epsilon + (self.omega - self.epsilon) * alignment
+        )
+
+        symmetric_weights = []
+        for index, (dy, dx) in enumerate(self.DIRECTIONS):
+            neighbor_reverse = self._neighbor(
+                weights[:, self.OPPOSITE[index]:self.OPPOSITE[index] + 1], dy, dx
+            )
+            symmetric_weights.append(0.5 * (weights[:, index:index + 1] + neighbor_reverse))
+        symmetric_weights = torch.cat(symmetric_weights, dim=1)
+
+        structure_feat = self.project_in(surface_feat)
+        delta = torch.zeros_like(structure_feat)
+        for index, (dy, dx) in enumerate(self.DIRECTIONS):
+            neighbor = self._neighbor(structure_feat, dy, dx)
+            delta = delta + symmetric_weights[:, index:index + 1] * (neighbor - structure_feat)
+        delta = delta / (1.0 + symmetric_weights.sum(dim=1, keepdim=True))
+        return surface_feat + self.project_out(delta)
+
+
 class SkeletonGuidedHead(nn.Module):
     def __init__(
         self,
@@ -1039,6 +1153,9 @@ class SkeletonGuidedHead(nn.Module):
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
         )
+        self.surface_structure_alpha = nn.Parameter(torch.tensor(0.0))
+        self.surface_structure_gate = SurfaceStructureGate(hidden_channels)
+        self.road_diffusion = VEDRoadDiffusion(hidden_channels, diffusion_channels=32)
 
         self.surface_refine = nn.Sequential(
             ConvBNReLU(hidden_channels, hidden_channels),
@@ -1142,7 +1259,21 @@ class SkeletonGuidedHead(nn.Module):
             structure_feat = self.structure_branch(feat)
             skeleton_logits = self.skeleton_head(structure_feat)
 
-            guided_surface_feat = self.surface_refine(surface_feat)
+            guided_surface_feat = surface_feat + self.surface_structure_alpha * self.structure_residual(
+                torch.cat([structure_feat, torch.sigmoid(skeleton_logits)], dim=1)
+            )
+            if stage_connectivity_logits is not None:
+                guided_surface_feat = self.surface_structure_gate(
+                    guided_surface_feat,
+                    skeleton_logits,
+                    stage_connectivity_logits,
+                )
+                guided_surface_feat = self.road_diffusion(
+                    guided_surface_feat,
+                    skeleton_logits,
+                    stage_connectivity_logits,
+                )
+            guided_surface_feat = self.surface_refine(guided_surface_feat)
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
             boundary_logits = self.boundary_head(boundary_feat)
