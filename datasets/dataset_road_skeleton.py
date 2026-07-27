@@ -7,7 +7,18 @@ from torch.utils.data import Dataset
 
 
 class RoadSkeletonDataset(Dataset):
-    def __init__(self, root_dir, split="train", image_size=512, source_patch_size=1024, transform=None):
+    def __init__(
+        self,
+        root_dir,
+        split="train",
+        image_size=512,
+        source_patch_size=1024,
+        transform=None,
+        train_crop_size=None,
+        min_road_pixels=64,
+        positive_crop_tries=10,
+        augment=False,
+    ):
         super().__init__()
 
         self.root_dir = root_dir
@@ -15,6 +26,10 @@ class RoadSkeletonDataset(Dataset):
         self.image_size = image_size
         self.source_patch_size = source_patch_size
         self.transform = transform
+        self.train_crop_size = train_crop_size if split == "train" else None
+        self.min_road_pixels = min_road_pixels
+        self.positive_crop_tries = max(1, positive_crop_tries)
+        self.augment = augment and split == "train"
 
         self.image_dir = os.path.join(root_dir, split, "image")
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -84,6 +99,89 @@ class RoadSkeletonDataset(Dataset):
             array = np.pad(array, pad_width, mode='constant', constant_values=0)
 
         return array
+
+    @staticmethod
+    def _pad_to_min_size(array, target_size):
+        height, width = array.shape[:2]
+        target_height, target_width = target_size
+        pad_bottom = max(target_height - height, 0)
+        pad_right = max(target_width - width, 0)
+        if pad_bottom == 0 and pad_right == 0:
+            return array
+        pad_width = (
+            ((0, pad_bottom), (0, pad_right))
+            if array.ndim == 2
+            else ((0, pad_bottom), (0, pad_right), (0, 0))
+        )
+        return np.pad(array, pad_width, mode="constant", constant_values=0)
+
+    def _random_crop_with_road(self, image, mask, crop_size):
+        crop_height, crop_width = crop_size
+        image = self._pad_to_min_size(image, crop_size)
+        mask = self._pad_to_min_size(mask, crop_size)
+        height, width = mask.shape[:2]
+        max_top = height - crop_height
+        max_left = width - crop_width
+
+        best_top = np.random.randint(0, max_top + 1) if max_top > 0 else 0
+        best_left = np.random.randint(0, max_left + 1) if max_left > 0 else 0
+        best_score = -1
+        for _ in range(self.positive_crop_tries):
+            top = np.random.randint(0, max_top + 1) if max_top > 0 else 0
+            left = np.random.randint(0, max_left + 1) if max_left > 0 else 0
+            crop_mask = mask[top:top + crop_height, left:left + crop_width]
+            road_pixels = int((crop_mask > 127).sum())
+            if road_pixels > best_score:
+                best_score = road_pixels
+                best_top = top
+                best_left = left
+            if road_pixels >= self.min_road_pixels:
+                break
+
+        image = image[best_top:best_top + crop_height, best_left:best_left + crop_width]
+        mask = mask[best_top:best_top + crop_height, best_left:best_left + crop_width]
+        return image, mask
+
+    @staticmethod
+    def _augment_geometry(image, mask):
+        if np.random.rand() < 0.5:
+            image = np.flip(image, axis=1)
+            mask = np.flip(mask, axis=1)
+        if np.random.rand() < 0.5:
+            image = np.flip(image, axis=0)
+            mask = np.flip(mask, axis=0)
+        if np.random.rand() < 0.5:
+            k = np.random.randint(0, 4)
+            image = np.rot90(image, k, axes=(0, 1))
+            mask = np.rot90(mask, k, axes=(0, 1))
+        return image.copy(), mask.copy()
+
+    @staticmethod
+    def _augment_color_degrade(image):
+        image = image.astype(np.float32)
+
+        brightness = np.random.uniform(0.9, 1.1)
+        image = image * brightness
+
+        contrast = np.random.uniform(0.9, 1.1)
+        mean = image.mean(axis=(0, 1), keepdims=True)
+        image = (image - mean) * contrast + mean
+
+        saturation = np.random.uniform(0.9, 1.1)
+        gray = (
+            0.299 * image[..., 0:1]
+            + 0.587 * image[..., 1:2]
+            + 0.114 * image[..., 2:3]
+        )
+        image = gray + (image - gray) * saturation
+
+        image = np.clip(image, 0.0, 255.0).astype(np.uint8)
+        if np.random.rand() < 0.15:
+            image = cv2.GaussianBlur(image, (3, 3), sigmaX=0.6)
+        if np.random.rand() < 0.15:
+            noise = np.random.normal(0.0, np.random.uniform(3.0, 8.0), image.shape)
+            image = np.clip(image.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
+        return image
 
     @staticmethod
     def _zhang_suen_fallback(mask):
@@ -176,6 +274,14 @@ class RoadSkeletonDataset(Dataset):
             source_size = (self.source_patch_size, self.source_patch_size)
             image = self._center_crop_or_pad(image, source_size)
             mask = self._center_crop_or_pad(mask, source_size)
+
+        if self.train_crop_size is not None:
+            crop_size = (self.train_crop_size, self.train_crop_size)
+            image, mask = self._random_crop_with_road(image, mask, crop_size)
+
+        if self.augment:
+            image, mask = self._augment_geometry(image, mask)
+            image = self._augment_color_degrade(image)
 
         if self.image_size is not None:
             size = (self.image_size, self.image_size)

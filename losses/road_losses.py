@@ -53,6 +53,22 @@ class BCEDiceLoss(nn.Module):
         return loss, bce.detach(), dice.detach()
 
 
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+
+    def forward(self, logits, targets):
+        targets = targets.float()
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        loss = alpha_t * (1.0 - p_t).clamp_min(1e-6).pow(self.gamma) * bce
+        return loss.mean()
+
+
 class CenterlineResponseLoss(nn.Module):
     """
     Centerline coverage loss.
@@ -328,6 +344,9 @@ class SurfaceStructureLoss(nn.Module):
         graph_delta_sparse_weight=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
+        surface_focal_weight=0.0,
+        focal_alpha=0.25,
+        focal_gamma=2.0,
     ):
         super().__init__()
 
@@ -336,6 +355,11 @@ class SurfaceStructureLoss(nn.Module):
             bce_weight=1.0,
             pos_weight=surface_pos_weight,
         )
+        self.surface_focal_loss = BinaryFocalLoss(
+            alpha=focal_alpha,
+            gamma=focal_gamma,
+        )
+        self.surface_focal_weight = float(surface_focal_weight)
         self.skeleton_loss = BCEDiceLoss(
             dice_weight=skeleton_dice_weight,
             bce_weight=1.0,
@@ -878,6 +902,10 @@ class SurfaceStructureLoss(nn.Module):
             raise ValueError("surface_gt and skeleton_gt are required.")
 
         loss_surface, bce_surface, dice_surface = self.surface_loss(surface_logits, surface_gt)
+        if self.surface_focal_weight > 0:
+            loss_surface_focal = self.surface_focal_loss(surface_logits, surface_gt)
+        else:
+            loss_surface_focal = loss_surface * 0.0
         if skeleton_dilate_gt is None:
             skeleton_dilate_gt = skeleton_gt
 
@@ -966,6 +994,7 @@ class SurfaceStructureLoss(nn.Module):
 
         total_loss = (
             loss_surface
+            + self.surface_focal_weight * loss_surface_focal
             + self.skeleton_weight * loss_skeleton
             + self.connectivity_weight * loss_connectivity
             + self.skeleton_cldice_weight * loss_skeleton_cldice
@@ -981,6 +1010,7 @@ class SurfaceStructureLoss(nn.Module):
         loss_dict = {
             "total_loss": total_loss.detach(),
             "surface_loss": loss_surface.detach(),
+            "surface_focal_loss": loss_surface_focal.detach(),
             "skeleton_loss": loss_skeleton.detach(),
             "connectivity_loss": loss_connectivity.detach(),
             "skeleton_cldice_loss": loss_skeleton_cldice.detach(),

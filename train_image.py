@@ -1,4 +1,5 @@
 import argparse
+import copy
 import csv
 import math
 import os
@@ -40,13 +41,17 @@ parser.add_argument('--base_lr', type=float, default=5e-4, help='segmentation ne
 parser.add_argument('--min_lr', type=float, default=1e-5, help='minimum learning rate for cosine decay')
 parser.add_argument('--encoder_lr', type=float, default=1e-5, help='learning rate for pretrained Swin encoder')
 parser.add_argument('--encoder_min_lr', type=float, default=1e-6, help='cosine minimum learning rate for pretrained encoder')
-parser.add_argument('--head_lr', type=float, default=1e-4, help='learning rate for decoder and new structure heads')
+parser.add_argument('--head_lr', type=float, default=3e-4, help='learning rate for randomly initialized parameters')
 parser.add_argument('--head_min_lr', type=float, default=1e-5, help='cosine minimum learning rate for decoder and heads')
 parser.add_argument('--pretrain_ckpt', type=str, default='', help='override Swin pretrained checkpoint path')
 parser.add_argument('--warmup_epochs', type=int, default=3, help='warmup epochs before cosine decay')
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
 parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
+parser.add_argument('--train_crop_size', type=int, default=0, help='random training crop size before resizing; 0 disables it')
+parser.add_argument('--min_crop_road_pixels', type=int, default=64, help='minimum road pixels preferred in a random training crop')
+parser.add_argument('--positive_crop_tries', type=int, default=10, help='number of tries to find a crop containing road pixels')
+parser.add_argument('--augment', action='store_true', help='enable train-time geometry/color/degradation augmentation')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml', 
                     help='path to config file')
@@ -89,6 +94,11 @@ parser.add_argument('--stage_direction_factor', type=float, default=0.2)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
+parser.add_argument('--surface_focal_weight', type=float, default=0.0)
+parser.add_argument('--focal_alpha', type=float, default=0.25)
+parser.add_argument('--focal_gamma', type=float, default=2.0)
+parser.add_argument('--use_ema', action='store_true', help='validate and save an EMA copy of the model')
+parser.add_argument('--ema_decay', type=float, default=0.999)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
@@ -279,6 +289,9 @@ def build_criterion(args, loss_weights, device):
         graph_corr_k=args.graph_corr_k,
         graph_corr_m_pos=args.graph_corr_m_pos,
         graph_corr_m_neg=args.graph_corr_m_neg,
+        surface_focal_weight=args.surface_focal_weight,
+        focal_alpha=args.focal_alpha,
+        focal_gamma=args.focal_gamma,
     ).to(device)
 
 
@@ -346,6 +359,27 @@ def format_training_config_lines(args, loss_weights):
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
         f"  Surface target resize: {args.source_patch_size} -> {args.img_size} nearest-neighbor",
+        (
+            "  Train crop: "
+            f"{args.source_patch_size} -> {args.train_crop_size} random positive crop -> {args.img_size}"
+            if args.train_crop_size > 0
+            else "  Train crop: disabled"
+        ),
+        (
+            "  Train augmentation: hflip/vflip/rot90 + light color/degradation"
+            if args.augment
+            else "  Train augmentation: disabled"
+        ),
+        (
+            "  EMA: enabled decay={:.5f}".format(args.ema_decay)
+            if args.use_ema
+            else "  EMA: disabled"
+        ),
+        "  Surface focal loss: weight={:.3f}, alpha={:.3f}, gamma={:.3f}".format(
+            args.surface_focal_weight,
+            args.focal_alpha,
+            args.focal_gamma,
+        ),
         "  Boundary-aware refinement: enabled",
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
         "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
@@ -385,6 +419,28 @@ def model_state_is_finite(model):
     return True
 
 
+class ModelEMA:
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = float(decay)
+        for param in self.ema.parameters():
+            param.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        source_state = model.state_dict()
+        ema_state = self.ema.state_dict()
+        for key, ema_value in ema_state.items():
+            source_value = source_state[key].detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.mul_(self.decay).add_(
+                    source_value.to(dtype=ema_value.dtype),
+                    alpha=1.0 - self.decay,
+                )
+            else:
+                ema_value.copy_(source_value)
+
+
 def get_cosine_warmup_lr(epoch, max_epochs, base_lr, min_lr, warmup_epochs):
     if max_epochs <= 0:
         return base_lr
@@ -402,32 +458,37 @@ def get_cosine_warmup_lr(epoch, max_epochs, base_lr, min_lr, warmup_epochs):
     return min_lr + (base_lr - min_lr) * cosine
 
 
-def build_layerwise_optimizer(model, args):
-    """Keep pretrained Swin encoder stable while new decoder/heads adapt faster."""
-    encoder_prefixes = (
-        "swin_unet.patch_embed.",
-        "swin_unet.layers.",
-        "swin_unet.norm.",
-        "swin_unet.absolute_pos_embed",
-    )
-    encoder_params = []
-    head_params = []
+def build_layerwise_optimizer(model, args, pretrained_parameter_names):
+    """Use a small LR only for tensors actually initialized from ImageNet."""
+    pretrained_params = []
+    random_params = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith(encoder_prefixes):
-            encoder_params.append(parameter)
+        if name in pretrained_parameter_names:
+            pretrained_params.append(parameter)
         else:
-            head_params.append(parameter)
-    if not encoder_params or not head_params:
+            random_params.append(parameter)
+    if not random_params:
         raise RuntimeError(
-            "Layerwise optimizer requires non-empty encoder and head parameter groups."
+            "Layerwise optimizer requires randomly initialized trainable parameters."
         )
+    parameter_groups = [
+        {"params": random_params, "lr": args.head_lr, "group_name": "random"},
+    ]
+    if pretrained_params:
+        parameter_groups.insert(0, {
+            "params": pretrained_params,
+            "lr": args.encoder_lr,
+            "group_name": "imagenet_pretrained",
+        })
+    print(
+        "[INFO] Optimizer parameter groups: "
+        f"ImageNet initialized={len(pretrained_params)}, random initialized={len(random_params)}",
+        flush=True,
+    )
     return torch.optim.AdamW(
-        [
-            {"params": encoder_params, "lr": args.encoder_lr, "group_name": "encoder"},
-            {"params": head_params, "lr": args.head_lr, "group_name": "decoder_head"},
-        ],
+        parameter_groups,
         weight_decay=0.0001,
     )
 
@@ -790,10 +851,25 @@ if __name__ == "__main__":
                 f"{pretrained_path}. Set --pretrain_ckpt or use --no_pretrain."
             )
         print(f"[INFO] Loading Swin pretrained weights: {pretrained_path}")
-        model.load_from(config)
+        pretrained_parameter_names = model.load_from(config)
+        print(
+            f"[INFO] ImageNet-initialized trainable tensors: {len(pretrained_parameter_names)}",
+            flush=True,
+        )
+    if args.no_pretrain:
+        pretrained_parameter_names = set()
 
     # 加载数据
-    train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
+    train_dataset = RoadSkeletonDataset(
+        root_dir=args.root_path,
+        split='train',
+        image_size=args.img_size,
+        source_patch_size=args.source_patch_size,
+        train_crop_size=args.train_crop_size if args.train_crop_size > 0 else None,
+        min_road_pixels=args.min_crop_road_pixels,
+        positive_crop_tries=args.positive_crop_tries,
+        augment=args.augment,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -802,7 +878,12 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-    val_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='val', image_size=args.img_size, source_patch_size=args.source_patch_size)
+    val_dataset = RoadSkeletonDataset(
+        root_dir=args.root_path,
+        split='val',
+        image_size=args.img_size,
+        source_patch_size=args.source_patch_size,
+    )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
@@ -906,7 +987,7 @@ if __name__ == "__main__":
                 start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_0626_backbone:
                 try:
-                    optimizer = build_layerwise_optimizer(model, args)
+                    optimizer = build_layerwise_optimizer(model, args, pretrained_parameter_names)
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 except (ValueError, RuntimeError) as exc:
                     print(
@@ -928,7 +1009,9 @@ if __name__ == "__main__":
                 weight_decay=0.0001,
             )
         else:
-            optimizer = build_layerwise_optimizer(model, args)
+            optimizer = build_layerwise_optimizer(model, args, pretrained_parameter_names)
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
 
     # 训练循环
     print("\n开始训练...")
@@ -1000,9 +1083,9 @@ if __name__ == "__main__":
                 args.warmup_epochs,
             )
             for param_group in optimizer.param_groups:
-                if param_group.get('group_name') == 'encoder':
+                if param_group.get('group_name') == 'imagenet_pretrained':
                     param_group['lr'] = encoder_current_lr
-                elif param_group.get('group_name') == 'decoder_head':
+                elif param_group.get('group_name') == 'random':
                     param_group['lr'] = head_current_lr
 
             model.train()
@@ -1100,6 +1183,8 @@ if __name__ == "__main__":
                     continue
 
                 optimizer.step()
+                if ema is not None:
+                    ema.update(model)
 
                 total_loss += loss.item()
                 train_batches += 1
@@ -1110,6 +1195,7 @@ if __name__ == "__main__":
                     print(
                         f"Epoch [{epoch+1}/{args.max_epochs}], Batch [{i+1}/{len(train_loader)}], "
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
+                        f"Focal: {loss_dict['surface_focal_loss'].item():.4f}, "
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                         f"ClDice: {loss_dict['skeleton_cldice_loss'].item():.4f}, "
@@ -1126,8 +1212,9 @@ if __name__ == "__main__":
                     )
 
             train_avg_loss = total_loss / max(train_batches, 1)
+            eval_model = ema.ema if ema is not None else model
             val_metrics = evaluate_skeleton(
-                model,
+                eval_model,
                 val_loader,
                 criterion,
                 args.threshold,
@@ -1154,7 +1241,7 @@ if __name__ == "__main__":
             )
             print(epoch_msg, flush=True)
             topology_msg = print_topology_coefficients(
-                model,
+                eval_model,
                 prefix=f"[TOPOLOGY][Epoch {epoch + 1}]",
             )
             if skipped_batches > 0:
@@ -1193,7 +1280,13 @@ if __name__ == "__main__":
                 log_f.write(topology_msg + "\n")
                 log_f.write("-"*100 + "\n")
 
-            if not np.isfinite(train_avg_loss) or not np.isfinite(val_loss) or not model_state_is_finite(model):
+            checkpoint_model = ema.ema if ema is not None else model
+            if (
+                not np.isfinite(train_avg_loss)
+                or not np.isfinite(val_loss)
+                or not model_state_is_finite(model)
+                or (ema is not None and not model_state_is_finite(ema.ema))
+            ):
                 print(
                     f"[WARN] Non-finite epoch state at epoch {epoch+1}; checkpoint not saved.",
                     flush=True,
@@ -1202,7 +1295,8 @@ if __name__ == "__main__":
 
             checkpoint = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': checkpoint_model.state_dict(),
+                'raw_model_state_dict': model.state_dict() if ema is not None else None,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_avg_loss': train_avg_loss,
                 'val_loss': val_loss,
@@ -1220,6 +1314,8 @@ if __name__ == "__main__":
                 'stage_topology_alpha_scale': stage_topology_alpha_scale,
                 'stage_topology_teacher_forcing_ratio': teacher_forcing_ratio,
                 'args': vars(args),
+                'ema_enabled': ema is not None,
+                'ema_decay': args.ema_decay,
             }
             # 保存 last.pth（总是覆盖）
             save_checkpoint_safely(checkpoint, os.path.join(args.output_dir, 'last.pth'))
