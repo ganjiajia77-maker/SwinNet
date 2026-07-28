@@ -1153,9 +1153,6 @@ class SkeletonGuidedHead(nn.Module):
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
         )
-        self.surface_structure_alpha = nn.Parameter(torch.tensor(0.0))
-        self.surface_structure_gate = SurfaceStructureGate(hidden_channels)
-        self.road_diffusion = VEDRoadDiffusion(hidden_channels, diffusion_channels=32)
 
         self.surface_refine = nn.Sequential(
             ConvBNReLU(hidden_channels, hidden_channels),
@@ -1256,24 +1253,11 @@ class SkeletonGuidedHead(nn.Module):
         surface_feat = self.surface_branch(feat)
 
         if not self.enable_final_structure:
-            structure_feat = self.structure_branch(feat)
+            # Auxiliary final skeleton loss must not update the surface pathway.
+            structure_feat = self.structure_branch(feat.detach())
             skeleton_logits = self.skeleton_head(structure_feat)
 
-            guided_surface_feat = surface_feat + self.surface_structure_alpha * self.structure_residual(
-                torch.cat([structure_feat, torch.sigmoid(skeleton_logits)], dim=1)
-            )
-            if stage_connectivity_logits is not None:
-                guided_surface_feat = self.surface_structure_gate(
-                    guided_surface_feat,
-                    skeleton_logits,
-                    stage_connectivity_logits,
-                )
-                guided_surface_feat = self.road_diffusion(
-                    guided_surface_feat,
-                    skeleton_logits,
-                    stage_connectivity_logits,
-                )
-            guided_surface_feat = self.surface_refine(guided_surface_feat)
+            guided_surface_feat = self.surface_refine(surface_feat)
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
             boundary_logits = self.boundary_head(boundary_feat)

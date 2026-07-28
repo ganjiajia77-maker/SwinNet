@@ -347,6 +347,9 @@ class SurfaceStructureLoss(nn.Module):
         surface_focal_weight=0.0,
         focal_alpha=0.25,
         focal_gamma=2.0,
+        skeleton_focal_weight=0.0,
+        skeleton_focal_alpha=0.75,
+        skeleton_focal_gamma=2.0,
     ):
         super().__init__()
 
@@ -365,6 +368,11 @@ class SurfaceStructureLoss(nn.Module):
             bce_weight=1.0,
             pos_weight=skeleton_pos_weight,
         )
+        self.skeleton_focal_loss = BinaryFocalLoss(
+            alpha=skeleton_focal_alpha,
+            gamma=skeleton_focal_gamma,
+        )
+        self.skeleton_focal_weight = float(skeleton_focal_weight)
         self.skeleton_weight = skeleton_weight
         self.connectivity_weight = connectivity_weight
         self.connectivity_erode_kernel_size = connectivity_erode_kernel_size
@@ -919,11 +927,16 @@ class SurfaceStructureLoss(nn.Module):
                 torch.sigmoid(skeleton_logits),
                 skeleton_gt,
             )
+            loss_skeleton_focal = self.skeleton_focal_loss(
+                skeleton_logits,
+                skeleton_dilate_gt,
+            )
         else:
             loss_skeleton = surface_logits.sum() * 0.0
             loss_skeleton_cldice = loss_skeleton
             bce_skeleton = loss_skeleton.detach()
             dice_skeleton = loss_skeleton.detach()
+            loss_skeleton_focal = loss_skeleton
 
         if connectivity_logits is not None:
             connectivity_gt = build_connectivity_target(
@@ -995,7 +1008,9 @@ class SurfaceStructureLoss(nn.Module):
         total_loss = (
             loss_surface
             + self.surface_focal_weight * loss_surface_focal
-            + self.skeleton_weight * loss_skeleton
+            + self.skeleton_weight * (
+                loss_skeleton + self.skeleton_focal_weight * loss_skeleton_focal
+            )
             + self.connectivity_weight * loss_connectivity
             + self.skeleton_cldice_weight * loss_skeleton_cldice
             + self.boundary_weight * loss_boundary
@@ -1012,6 +1027,7 @@ class SurfaceStructureLoss(nn.Module):
             "surface_loss": loss_surface.detach(),
             "surface_focal_loss": loss_surface_focal.detach(),
             "skeleton_loss": loss_skeleton.detach(),
+            "skeleton_focal_loss": loss_skeleton_focal.detach(),
             "connectivity_loss": loss_connectivity.detach(),
             "skeleton_cldice_loss": loss_skeleton_cldice.detach(),
             "boundary_loss": loss_boundary.detach(),

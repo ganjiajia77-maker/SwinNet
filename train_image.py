@@ -96,6 +96,9 @@ parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--final_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--final_skeleton_cldice_weight', type=float, default=0.0)
+parser.add_argument('--final_skeleton_focal_weight', type=float, default=0.0)
+parser.add_argument('--final_skeleton_focal_alpha', type=float, default=0.75)
+parser.add_argument('--final_skeleton_focal_gamma', type=float, default=2.0)
 parser.add_argument('--surface_focal_weight', type=float, default=0.0)
 parser.add_argument('--focal_alpha', type=float, default=0.25)
 parser.add_argument('--focal_gamma', type=float, default=2.0)
@@ -215,6 +218,8 @@ def apply_structure_profile_defaults(args):
     args.final_gap_rho_init = 0.0
     if not _cli_has("--final_skeleton_weight"):
         args.final_skeleton_weight = 0.10
+    if not _cli_has("--final_skeleton_focal_weight"):
+        args.final_skeleton_focal_weight = 0.50
     if not _cli_has("--warmup_epochs"):
         args.warmup_epochs = 10
     if args.max_epochs == 100:
@@ -269,6 +274,9 @@ def build_criterion(args, loss_weights, device):
         connectivity_weight=loss_weights["connectivity_weight"],
         connectivity_erode_kernel_size=1,
         skeleton_cldice_weight=loss_weights["skeleton_cldice_weight"],
+        skeleton_focal_weight=args.final_skeleton_focal_weight,
+        skeleton_focal_alpha=args.final_skeleton_focal_alpha,
+        skeleton_focal_gamma=args.final_skeleton_focal_gamma,
         skeleton_cldice_iterations=10,
         boundary_weight=boundary_weight,
         boundary_radius=1,
@@ -306,7 +314,7 @@ def format_training_config_lines(args, loss_weights):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final skeleton head: supervised prediction only; stage2/3 connectivity guides residual surface diffusion",
+            "  Final skeleton head: detached auxiliary prediction only; surface pathway unchanged",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
@@ -388,6 +396,11 @@ def format_training_config_lines(args, loss_weights):
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
         "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
         "  Final skeleton loss weight: {:.2f}".format(loss_weights["skeleton_weight"]),
+        "  Final skeleton focal weight: {:.2f} (alpha={:.2f}, gamma={:.1f})".format(
+            args.final_skeleton_focal_weight,
+            args.final_skeleton_focal_alpha,
+            args.final_skeleton_focal_gamma,
+        ),
         "  Final connectivity loss weight: {:.2f}".format(loss_weights["connectivity_weight"]),
         "  Final skeleton clDice weight: {:.2f}".format(loss_weights["skeleton_cldice_weight"]),
         "  Edge loss: disabled",

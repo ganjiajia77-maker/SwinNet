@@ -2621,7 +2621,7 @@ class SwinTransformerSys(nn.Module):
             if self.return_skeleton:
                 stage_skeleton_logits = None
                 stage_connectivity_logits = None
-                if structure_outputs:
+                if self.enable_final_graph_prop and structure_outputs:
                     target_hw = (x.shape[2], x.shape[3])
                     (
                         stage_skeleton_logits,
