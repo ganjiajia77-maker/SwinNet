@@ -155,6 +155,11 @@ def collect_overlap_probs(model, args):
     model.eval()
     tile_size = args.overlap_tile_size if args.overlap_tile_size > 0 else args.source_patch_size
     stride = args.overlap_stride if args.overlap_stride > 0 else tile_size // 2
+    if tile_size != args.img_size:
+        raise ValueError(
+            "Direct overlap sweep requires --img_size == --overlap_tile_size. "
+            f"Got img_size={args.img_size}, overlap_tile_size={tile_size}."
+        )
     image_dir = os.path.join(args.root_path, args.split, "image")
     label_dir = os.path.join(args.root_path, args.split, "mask")
     if not os.path.exists(label_dir):
@@ -206,24 +211,12 @@ def collect_overlap_probs(model, args):
                         mode="constant",
                         constant_values=0,
                     )
-                if crop.shape[0] != args.img_size or crop.shape[1] != args.img_size:
-                    crop = cv2.resize(
-                        crop,
-                        (args.img_size, args.img_size),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
                 crop = (crop.astype(np.float32) / 255.0 - mean) / std
                 crop = crop.transpose(2, 0, 1)
                 inputs = torch.from_numpy(crop).unsqueeze(0).cuda()
                 outputs = model(inputs)
                 logits = outputs[0] if isinstance(outputs, tuple) else outputs
                 prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
-                if prob.shape[0] != tile_size or prob.shape[1] != tile_size:
-                    prob = cv2.resize(
-                        prob,
-                        (tile_size, tile_size),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
                 prob = prob[:(y2 - y), :(x2 - x)]
                 prob_canvas[y:y2, x:x2] += prob
                 count_canvas[y:y2, x:x2] += 1.0

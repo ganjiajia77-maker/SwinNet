@@ -370,7 +370,7 @@ def format_training_config_lines(args, loss_weights):
         f"sc_c2s={args.stage_sc_c2s_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
-        f"  Surface target resize: {args.source_patch_size} -> {args.img_size} nearest-neighbor",
+        f"  Surface target size: {args.source_patch_size} -> {args.img_size} nearest-neighbor",
         (
             "  Train crop: "
             f"{args.source_patch_size} -> {args.train_crop_size} random positive crop -> {args.img_size}"
