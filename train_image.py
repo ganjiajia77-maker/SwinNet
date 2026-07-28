@@ -222,7 +222,7 @@ def apply_structure_profile_defaults(args):
         args.final_skeleton_focal_weight = 0.50
     if not _cli_has("--warmup_epochs"):
         args.warmup_epochs = 10
-    if args.max_epochs == 100:
+    if not _cli_has("--max_epochs") and args.max_epochs == 100:
         args.max_epochs = 60
 
 
