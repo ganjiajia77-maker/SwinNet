@@ -348,7 +348,15 @@ if __name__ == "__main__":
                             crop = np.pad(crop, ((0, ph), (0, pw), (0, 0)), mode='constant', constant_values=0)
 
                         # preprocess
-                        crop_f = crop.astype(np.float32) / 255.0
+                        if crop.shape[0] != args.img_size or crop.shape[1] != args.img_size:
+                            crop_for_model = cv2.resize(
+                                crop,
+                                (args.img_size, args.img_size),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+                        else:
+                            crop_for_model = crop
+                        crop_f = crop_for_model.astype(np.float32) / 255.0
                         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
                         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
                         crop_f = (crop_f - mean) / std
@@ -367,6 +375,18 @@ if __name__ == "__main__":
                             skeleton_prob = torch.sigmoid(skeleton_logits)[0, 0].cpu().numpy()
                         else:
                             skeleton_prob = np.zeros_like(prob)
+
+                        if prob.shape[0] != tile_size or prob.shape[1] != tile_size:
+                            prob = cv2.resize(
+                                prob,
+                                (tile_size, tile_size),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+                            skeleton_prob = cv2.resize(
+                                skeleton_prob,
+                                (tile_size, tile_size),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
 
                         # crop to original size if padded
                         prob = prob[:(y2 - y1), :(x2 - x1)]
