@@ -392,6 +392,7 @@ def format_training_config_lines(args, loss_weights):
             args.focal_alpha,
             args.focal_gamma,
         ),
+        f"  Gradient accumulation steps: {max(1, args.accumulation_steps)}",
         "  Boundary-aware refinement: enabled",
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
         "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
@@ -1109,6 +1110,8 @@ if __name__ == "__main__":
             total_loss = 0
             train_batches = 0
             skipped_batches = 0
+            accumulation_steps = max(1, args.accumulation_steps)
+            accumulation_counter = 0
             stage_distill_scale = get_stage_distill_scale(epoch)
             stage_topology_alpha_scale = get_stage_topology_alpha_scale(
                 epoch,
@@ -1119,6 +1122,8 @@ if __name__ == "__main__":
                 tf_start=0,
                 tf_end=args.stage_topology_teacher_forcing_end,
             )
+
+            optimizer.zero_grad(set_to_none=True)
 
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
@@ -1184,27 +1189,43 @@ if __name__ == "__main__":
                         flush=True,
                     )
                     optimizer.zero_grad(set_to_none=True)
+                    accumulation_counter = 0
                     continue
 
-                optimizer.zero_grad()
-                loss.backward()
-
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if not torch.isfinite(grad_norm):
-                    skipped_batches += 1
-                    print(
-                        f"[WARN] Non-finite gradients skipped at epoch {epoch+1}, batch {i+1}: {grad_norm}",
-                        flush=True,
+                (loss / accumulation_steps).backward()
+                accumulation_counter += 1
+                valid_batch_index = train_batches + 1
+                should_step = (
+                    accumulation_counter >= accumulation_steps
+                    or (i + 1) >= len(train_loader)
+                    or (
+                        args.max_train_batches > 0
+                        and valid_batch_index >= args.max_train_batches
                     )
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+                )
+                if should_step:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=1.0,
+                    )
+                    if not torch.isfinite(grad_norm):
+                        skipped_batches += accumulation_counter
+                        print(
+                            f"[WARN] Non-finite gradients skipped at epoch {epoch+1}, batch {i+1}: {grad_norm}",
+                            flush=True,
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        accumulation_counter = 0
+                        continue
 
-                optimizer.step()
-                if ema is not None:
-                    ema.update(model)
+                    optimizer.step()
+                    if ema is not None:
+                        ema.update(model)
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulation_counter = 0
 
                 total_loss += loss.item()
-                train_batches += 1
+                train_batches = valid_batch_index
                 batch_loss_writer.writerow([epoch + 1, i + 1, f'{loss.item():.6f}'])
                 batch_loss_log_file.flush()
 
