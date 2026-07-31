@@ -86,6 +86,11 @@ parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
+parser.add_argument('--pretrain_ckpt', type=str, default='', help='optional ImageNet Swin checkpoint path')
+parser.add_argument('--pretrained_lr', type=float, default=5e-5, help='LR for tensors actually loaded from ImageNet')
+parser.add_argument('--pretrained_min_lr', type=float, default=5e-6)
+parser.add_argument('--new_lr', type=float, default=2e-4, help='LR for all randomly initialized tensors')
+parser.add_argument('--new_min_lr', type=float, default=1e-5)
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
 parser.add_argument(
     '--bottleneck_type',
@@ -590,10 +595,10 @@ def evaluate_skeleton(
             skeletons = batch['skeleton'].to(device)
             skeletons_dilate = batch['skeleton_dilate'].to(device)
 
-            images_padded, orig_shape = pad_to_window_multiple(images, window_size=8)
-            masks_padded, _ = pad_to_window_multiple(masks, window_size=8)
-            skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=8)
-            skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=8)
+            images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
+            masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
+            skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=1)
+            skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=1)
             
             outputs = model(
                 images_padded,
@@ -714,10 +719,15 @@ if __name__ == "__main__":
     
     # 加载配置
     config = get_config(args)
+    if args.pretrain_ckpt:
+        config.defrost()
+        config.MODEL.PRETRAIN_CKPT = args.pretrain_ckpt
+        config.freeze()
     
     # 对齐 img_size 到 window_size=8 的倍数（模型初始化时需要）
-    window_size = 8
-    aligned_img_size = ((args.img_size + window_size - 1) // window_size) * window_size
+    # Swin blocks pad their own feature maps for window=7 attention.
+    window_size = int(config.MODEL.SWIN.WINDOW_SIZE)
+    aligned_img_size = args.img_size
     if aligned_img_size != args.img_size:
         print(f"[INFO] 对齐 img_size: {args.img_size} -> {aligned_img_size} (window_size={window_size})")
         config.defrost()
@@ -741,6 +751,30 @@ if __name__ == "__main__":
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
                     enable_final_graph_prop=args.enable_graph_prop).to(device)
+
+    loaded_pretrained_names = set()
+    if not args.resume and not args.no_pretrain:
+        pretrain_path = config.MODEL.PRETRAIN_CKPT
+        if not os.path.isfile(pretrain_path):
+            raise FileNotFoundError(
+                f"Swin pretrained checkpoint not found: {pretrain_path}. "
+                "Set --pretrain_ckpt or use --no_pretrain."
+            )
+        loaded_pretrained_names = model.load_from(config)
+
+    def build_layerwise_optimizer():
+        loaded_params, new_params = [], []
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            (loaded_params if name in loaded_pretrained_names else new_params).append(parameter)
+        groups = []
+        if loaded_params:
+            groups.append({'params': loaded_params, 'lr': args.pretrained_lr, 'initial_lr': args.pretrained_lr, 'group_name': 'imagenet_loaded'})
+        if new_params:
+            groups.append({'params': new_params, 'lr': args.new_lr, 'initial_lr': args.new_lr, 'group_name': 'random_or_custom'})
+        print(f"[INFO] LR groups: ImageNet-loaded={len(loaded_params)} tensors at {args.pretrained_lr:g}; new/custom={len(new_params)} tensors at {args.new_lr:g}", flush=True)
+        return torch.optim.AdamW(groups, weight_decay=0.0001)
 
     # 加载数据
     train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
@@ -856,11 +890,7 @@ if __name__ == "__main__":
                 start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_0626_backbone:
                 try:
-                    optimizer = torch.optim.AdamW(
-                        model.parameters(),
-                        lr=args.base_lr,
-                        weight_decay=0.0001,
-                    )
+                    optimizer = build_layerwise_optimizer()
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 except (ValueError, RuntimeError) as exc:
                     print(
@@ -882,11 +912,7 @@ if __name__ == "__main__":
                 weight_decay=0.0001,
             )
         else:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.base_lr,
-                weight_decay=0.0001,
-            )
+            optimizer = build_layerwise_optimizer()
 
     # 训练循环
     print("\n开始训练...")
@@ -944,14 +970,16 @@ if __name__ == "__main__":
 
         for epoch in range(start_epoch, args.max_epochs):
             current_lr = get_cosine_warmup_lr(
-                epoch,
-                args.max_epochs,
-                args.base_lr,
-                args.min_lr,
-                args.warmup_epochs,
+                epoch, args.max_epochs, args.new_lr, args.new_min_lr, args.warmup_epochs
             )
             for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
+                if param_group.get('group_name') == 'imagenet_loaded':
+                    param_group['lr'] = get_cosine_warmup_lr(
+                        epoch, args.max_epochs, args.pretrained_lr,
+                        args.pretrained_min_lr, args.warmup_epochs
+                    )
+                else:
+                    param_group['lr'] = current_lr
 
             model.train()
             total_loss = 0
@@ -977,10 +1005,10 @@ if __name__ == "__main__":
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
 
-                images_padded, orig_shape = pad_to_window_multiple(images, window_size=8)
-                masks_padded, _ = pad_to_window_multiple(masks, window_size=8)
-                skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=8)
-                skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=8)
+                images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
+                masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
+                skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=1)
+                skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=1)
 
                 outputs = model(
                     images_padded,

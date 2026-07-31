@@ -87,6 +87,16 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
+def pad_nhwc_to_window(x, window_size):
+    """Pad an NHWC feature map on its bottom/right edges to full windows."""
+    H, W = x.shape[1:3]
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h or pad_w:
+        x = F.pad(x.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h)).permute(0, 2, 3, 1)
+    return x, H + pad_h, W + pad_w
+
+
 TOPOLOGY_QK_RELATIVE_EPS = 1e-6
 DEFAULT_STAGE_TOPOLOGY_RATIO = 0.08
 DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP = 4.0
@@ -394,30 +404,40 @@ class SwinTransformerBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-        if self.shift_size > 0:
-            # calculate attention mask for SW-MSA
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
+        # Input sizes at successive Swin stages are not necessarily divisible by
+        # window=7. Build the shift mask after runtime padding in forward().
+        self.register_buffer("attn_mask", None)
 
-            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-        else:
-            attn_mask = None
+    def _get_attention_mask(self, H, W, device):
+        if self.shift_size == 0:
+            return None
+        img_mask = torch.zeros((1, H, W, 1), device=device)
+        h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in h_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+        mask_windows = window_partition(img_mask, self.window_size).view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        return attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
 
-        self.register_buffer("attn_mask", attn_mask)
+    @staticmethod
+    def _pad_probability_map(x, H, W, Hp, Wp):
+        if x is None:
+            return None
+        if x.shape[-2:] != (H, W):
+            x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
+        if (Hp, Wp) != (H, W):
+            x = F.pad(x, (0, Wp - W, 0, Hp - H))
+        return x
+
+    def _pad_road_prior(self, road_prior, H, W, Hp, Wp):
+        if road_prior is None:
+            return None
+        if isinstance(road_prior, (tuple, list)):
+            return tuple(self._pad_road_prior(item, H, W, Hp, Wp) for item in road_prior)
+        return self._pad_probability_map(road_prior, H, W, Hp, Wp)
 
     def _register_topology_buffers(self):
         coords_h = torch.arange(self.window_size)
@@ -647,7 +667,7 @@ class SwinTransformerBlock(nn.Module):
         )
 
     def _road_prior_to_pair_bias(self, road_prior):
-        H, W = self.input_resolution
+        H, W = road_prior.shape[-2:]
         if road_prior.dim() == 3:
             road_prior = road_prior.unsqueeze(1)
         if road_prior.shape[-2:] != (H, W):
@@ -805,8 +825,9 @@ class SwinTransformerBlock(nn.Module):
         assert L == H * W, "input feature has wrong size"
 
         shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
+        x = self.norm1(x).view(B, H, W, C)
+        x, Hp, Wp = pad_nhwc_to_window(x, self.window_size)
+        attention_mask = self._get_attention_mask(Hp, Wp, x.device)
 
         # cyclic shift
         if self.shift_size > 0:
@@ -825,15 +846,15 @@ class SwinTransformerBlock(nn.Module):
                 raise ValueError(
                     "topology_alpha is required for pairwise_skeleton topology bias"
                 )
-            skeleton = torch.sigmoid(skeleton_prob).detach().permute(
+            skeleton = torch.sigmoid(self._pad_probability_map(skeleton_prob, H, W, Hp, Wp)).detach().permute(
                 0, 2, 3, 1
             ).contiguous()
-            connectivity = torch.sigmoid(connectivity_prob).detach().permute(
+            connectivity = torch.sigmoid(self._pad_probability_map(connectivity_prob, H, W, Hp, Wp)).detach().permute(
                 0, 2, 3, 1
             ).contiguous()
             roadness = None
             if roadness_prob is not None:
-                roadness = roadness_prob.permute(0, 2, 3, 1).contiguous()
+                roadness = self._pad_probability_map(roadness_prob, H, W, Hp, Wp).permute(0, 2, 3, 1).contiguous()
             if self.shift_size > 0:
                 shifts = (-self.shift_size, -self.shift_size)
                 skeleton = torch.roll(skeleton, shifts=shifts, dims=(1, 2))
@@ -857,15 +878,17 @@ class SwinTransformerBlock(nn.Module):
         # W-MSA/SW-MSA
         if self.capture_topology_diagnostics and topology_bias is not None:
             self.attn.capture_logits = True
-        road_attention_bias = self._build_road_attention_bias(road_prior)
+        road_attention_bias = self._build_road_attention_bias(
+            self._pad_road_prior(road_prior, H, W, Hp, Wp)
+        )
         structure_attention_bias = self._build_decoder_structure_attention_bias(
-            decoder_skeleton_prob,
-            decoder_connectivity_prob,
-            decoder_direction_prob,
+            self._pad_probability_map(decoder_skeleton_prob, H, W, Hp, Wp),
+            self._pad_probability_map(decoder_connectivity_prob, H, W, Hp, Wp),
+            self._pad_probability_map(decoder_direction_prob, H, W, Hp, Wp),
         )
         attn_windows = self.attn(
             x_windows,
-            mask=self.attn_mask,
+            mask=attention_mask,
             topology_bias=topology_bias,
             road_attention_bias=road_attention_bias,
             structure_attention_bias=structure_attention_bias,
@@ -903,7 +926,7 @@ class SwinTransformerBlock(nn.Module):
                     topology_term = topology_alpha * topology_bias
                 baseline_windows = self.attn(
                     x_windows,
-                    mask=self.attn_mask,
+                    mask=attention_mask,
                     topology_bias=topology_bias,
                     topology_alpha=(
                         topology_alpha.new_zeros(())
@@ -927,8 +950,8 @@ class SwinTransformerBlock(nn.Module):
                     shifted = window_reverse(
                         attn_out,
                         self.window_size,
-                        H,
-                        W,
+                        Hp,
+                        Wp,
                     )
                     if self.shift_size > 0:
                         shifted = torch.roll(
@@ -936,7 +959,7 @@ class SwinTransformerBlock(nn.Module):
                             shifts=(self.shift_size, self.shift_size),
                             dims=(1, 2),
                         )
-                    return shifted.view(B, H * W, C)
+                    return shifted[:, :H, :W, :].contiguous().view(B, H * W, C)
 
                 tokens_with = shortcut + self.drop_path(_attn_to_tokens(attn_windows))
                 tokens_baseline = shortcut + self.drop_path(
@@ -1005,14 +1028,14 @@ class SwinTransformerBlock(nn.Module):
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
 
         # reverse cyclic shift
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
-        x = x.view(B, H * W, C)
+        x = x[:, :H, :W, :].contiguous().view(B, H * W, C)
 
         # FFN
         x = shortcut + self.drop_path(x)
@@ -1445,13 +1468,18 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_chans, embed_dim, kernel_size=3, stride=1, padding=1, bias=False),
+        # Preserve official Swin names so patch_embed.proj weights load directly.
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.edge_stem = nn.Sequential(
+            nn.Conv2d(in_chans, 32, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 32),
             nn.GELU(),
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=2, dilation=2, bias=False),
+            nn.Conv2d(32, 32, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(8, 32),
             nn.GELU(),
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=7, stride=patch_size, padding=3),
+            nn.Conv2d(32, embed_dim, kernel_size=7, stride=patch_size, padding=3, bias=False),
         )
+        self.edge_scale = nn.Parameter(torch.tensor(0.01))
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -1461,7 +1489,8 @@ class PatchEmbed(nn.Module):
         B, C, H, W = x.shape
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
+        x = self.proj(x) + self.edge_scale * self.edge_stem(x)
+        x = x.flatten(2).transpose(1, 2)  # B Ph*Pw C
         if self.norm is not None:
             x = self.norm(x)
         return x
@@ -1469,9 +1498,10 @@ class PatchEmbed(nn.Module):
     def flops(self):
         Ho, Wo = self.patches_resolution
         H, W = self.img_size
-        flops = H * W * self.embed_dim * self.in_chans * 3 * 3
-        flops += H * W * self.embed_dim * self.embed_dim * 3 * 3
-        flops += Ho * Wo * self.embed_dim * self.embed_dim * 7 * 7
+        flops = Ho * Wo * self.embed_dim * self.in_chans * 4 * 4
+        flops += H * W * self.in_chans * 32 * 3 * 3
+        flops += H * W * 32 * 32 * 3 * 3
+        flops += Ho * Wo * 32 * self.embed_dim * 7 * 7
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
