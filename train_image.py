@@ -437,6 +437,33 @@ def model_state_is_finite(model):
     return True
 
 
+def clip_main_and_final_skeleton_gradients(model, max_norm=1.0):
+    """Keep detached final-skeleton gradients out of the surface clip norm."""
+    module = model.module if hasattr(model, "module") else model
+    guided_head = module.swin_unet.guided_head
+    auxiliary_params = []
+    if not guided_head.enable_final_structure:
+        auxiliary_params.extend(guided_head.structure_branch.parameters())
+        auxiliary_params.extend(guided_head.skeleton_head.parameters())
+
+    auxiliary_ids = {id(parameter) for parameter in auxiliary_params}
+    main_params = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in auxiliary_ids
+    ]
+    main_norm = torch.nn.utils.clip_grad_norm_(main_params, max_norm=max_norm)
+    auxiliary_norm = None
+    if auxiliary_params:
+        auxiliary_norm = torch.nn.utils.clip_grad_norm_(
+            auxiliary_params,
+            max_norm=max_norm,
+        )
+    if auxiliary_norm is None:
+        return main_norm
+    return torch.maximum(main_norm, auxiliary_norm)
+
+
 class ModelEMA:
     def __init__(self, model, decay=0.999):
         self.ema = copy.deepcopy(model).eval()
@@ -1204,8 +1231,8 @@ if __name__ == "__main__":
                     )
                 )
                 if should_step:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
+                    grad_norm = clip_main_and_final_skeleton_gradients(
+                        model,
                         max_norm=1.0,
                     )
                     if not torch.isfinite(grad_norm):
