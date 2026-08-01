@@ -2317,6 +2317,21 @@ class SwinTransformerSys(nn.Module):
         connectivity_logits = torch.stack(connectivities, dim=0).max(dim=0).values
         return skeleton_logits, connectivity_logits
 
+    @staticmethod
+    def _stage3_refinement_to_fullres(structure_outputs, target_hw):
+        """Export only the final Stage3 decoder refinement prediction."""
+        candidates = [
+            item for item in structure_outputs
+            if item.get("stage") == 3 and item.get("refinement_step") == 1
+        ]
+        if not candidates:
+            return None, None
+        stage3 = candidates[-1]
+        return (
+            F.interpolate(stage3["skeleton"], size=target_hw, mode="bilinear", align_corners=False),
+            F.interpolate(stage3["connectivity"], size=target_hw, mode="bilinear", align_corners=False),
+        )
+
     def _build_stage3_global_context(self, bottleneck_tokens, target_hw):
         batch, length, channels = bottleneck_tokens.shape
         bottleneck_height, bottleneck_width = self.bottleneck_resolution
@@ -2651,8 +2666,14 @@ class SwinTransformerSys(nn.Module):
             if self.return_skeleton:
                 stage_skeleton_logits = None
                 stage_connectivity_logits = None
-                if self.enable_final_graph_prop and structure_outputs:
+                if structure_outputs:
                     target_hw = (x.shape[2], x.shape[3])
+                    stage_skeleton_logits, stage_connectivity_logits = (
+                        self._stage3_refinement_to_fullres(
+                            structure_outputs, target_hw
+                        )
+                    )
+                if self.enable_final_graph_prop and structure_outputs:
                     (
                         stage_skeleton_logits,
                         stage_connectivity_logits,

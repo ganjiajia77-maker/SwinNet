@@ -1223,7 +1223,14 @@ class SkeletonGuidedHead(nn.Module):
                             surface_logits.detach()
                         )
 
-            return surface_logits, boundary_logits, None, None
+            # Stage3 skeleton is an auxiliary decoder prediction. Returning it
+            # here exports a full-resolution map without changing surface flow.
+            return (
+                surface_logits,
+                boundary_logits,
+                stage_skeleton_logits,
+                stage_connectivity_logits,
+            )
 
         structure_feat = self.structure_branch(feat)
 

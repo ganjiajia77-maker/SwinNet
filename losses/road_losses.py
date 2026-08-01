@@ -21,6 +21,16 @@ class DiceLoss(nn.Module):
         return (1.0 - dice).mean()
 
 
+def binary_focal_loss_with_logits(logits, targets, alpha=0.75, gamma=2.0):
+    """Class-balanced binary focal loss for sparse skeleton pixels."""
+    targets = targets.float()
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    probabilities = torch.sigmoid(logits)
+    pt = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
+    alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    return (alpha_t * (1.0 - pt).pow(gamma) * bce).mean()
+
+
 class BCEDiceLoss(nn.Module):
     def __init__(self, dice_weight=1.0, bce_weight=1.0, pos_weight=None):
         super().__init__()
@@ -328,6 +338,9 @@ class SurfaceStructureLoss(nn.Module):
         graph_delta_sparse_weight=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
+        stage_skeleton_focal_weight=0.5,
+        stage_skeleton_focal_alpha=0.75,
+        stage_skeleton_focal_gamma=2.0,
     ):
         super().__init__()
 
@@ -352,6 +365,9 @@ class SurfaceStructureLoss(nn.Module):
         )
         self.boundary_loss = BCEDiceLoss(dice_weight=1.0, bce_weight=1.0)
         self.skeleton_stage_weight = skeleton_stage_weight
+        self.stage_skeleton_focal_weight = float(stage_skeleton_focal_weight)
+        self.stage_skeleton_focal_alpha = float(stage_skeleton_focal_alpha)
+        self.stage_skeleton_focal_gamma = float(stage_skeleton_focal_gamma)
         self.skeleton_stage_weights = tuple(float(w) for w in skeleton_stage_weights)
         if stage_structure_weights is None:
             stage_structure_weights = (0.0, 0.0, 0.004, 0.006)
@@ -626,20 +642,28 @@ class SurfaceStructureLoss(nn.Module):
                 stage_skel = source_stage_skel
                 stage_skel_dilate = source_stage_skel_dilate
             else:
-                stage_skel = F.interpolate(
+                # Max pooling preserves thin positive skeleton pixels when a
+                # 256px target is supervised at decoder Stage2/Stage3 scales.
+                stage_skel = F.adaptive_max_pool2d(
                     source_stage_skel,
-                    size=target_size,
-                    mode="nearest",
+                    output_size=target_size,
                 )
-                stage_skel_dilate = F.interpolate(
+                stage_skel_dilate = F.adaptive_max_pool2d(
                     source_stage_skel_dilate,
-                    size=target_size,
-                    mode="nearest",
+                    output_size=target_size,
                 )
             loss_skeleton_stage, _, _ = self.skeleton_pixel_loss(
                 stage_skeleton_logits,
                 stage_skel,
                 stage_skel_dilate,
+            )
+            # The original BCE(dilated) + Dice(strict) supervision stays intact.
+            # Focal adds sparse hard-positive emphasis without rescaling surface loss.
+            loss_skeleton_focal = binary_focal_loss_with_logits(
+                stage_skeleton_logits,
+                stage_skel,
+                alpha=self.stage_skeleton_focal_alpha,
+                gamma=self.stage_skeleton_focal_gamma,
             )
             connectivity_gt = build_connectivity_target(
                 stage_skel,
@@ -675,6 +699,7 @@ class SurfaceStructureLoss(nn.Module):
                 loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
                 loss_skeleton_stage
+                + self.stage_skeleton_focal_weight * loss_skeleton_focal
                 + self.stage_connectivity_factor * loss_connectivity_stage
                 + self.stage_direction_factor * loss_direction_stage
                 + loss_skeleton_connectivity_consistency
