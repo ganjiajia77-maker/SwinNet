@@ -618,6 +618,84 @@ class SwinUnet(nn.Module):
 
         result = self.swin_unet.load_state_dict(compatible, strict=False)
         loaded = set(compatible)
+
+        # Count parameter elements, not state-dict keys. This separates official
+        # Swin tensors from deliberately new edge and custom merging branches.
+        named_parameters = dict(self.swin_unet.named_parameters())
+
+        def coverage(label, predicate):
+            names = [name for name in named_parameters if predicate(name)]
+            total = sum(named_parameters[name].numel() for name in names)
+            restored = sum(
+                named_parameters[name].numel() for name in names if name in loaded
+            )
+            ratio = 100.0 * restored / max(total, 1)
+            print(
+                "[PRETRAIN] {:<30} {:>10,}/{:>10,} params ({:6.2f}%)".format(
+                    label, restored, total, ratio
+                ),
+                flush=True,
+            )
+            return names
+
+        patch_main = coverage(
+            "Patch Embed main",
+            lambda name: name.startswith("patch_embed.proj.")
+            or name.startswith("patch_embed.norm."),
+        )
+        coverage(
+            "Patch Embed edge branch (new)",
+            lambda name: name.startswith("patch_embed.edge_stem.")
+            or name == "patch_embed.edge_scale",
+        )
+        stage_names = []
+        for stage_index in range(4):
+            stage_names.extend(
+                coverage(
+                    "Stage{} blocks".format(stage_index + 1),
+                    lambda name, index=stage_index: name.startswith(
+                        "layers.{}.blocks.".format(index)
+                    ) and "road_bias_scale" not in name,
+                )
+            )
+        patch_merging_standard = coverage(
+            "Patch Merging official core",
+            lambda name: name.startswith("layers.")
+            and ".downsample." in name
+            and (
+                name.endswith(".linear_reduction.weight")
+                or name.endswith(".norm.weight")
+                or name.endswith(".norm.bias")
+            ),
+        )
+        coverage(
+            "Patch Merging all (incl. custom)",
+            lambda name: name.startswith("layers.") and ".downsample." in name,
+        )
+        encoder_names = coverage(
+            "Encoder total (all)",
+            lambda name: name.startswith("patch_embed.") or name.startswith("layers."),
+        )
+        core_names = patch_main + stage_names + patch_merging_standard
+        core_name_set = set(core_names)
+        coverage(
+            "Encoder official Swin core",
+            lambda name: name in core_name_set,
+        )
+        missing_core = [name for name in core_names if name not in loaded]
+        if missing_core:
+            print(
+                "[WARN] Expected official encoder parameters not loaded: {}".format(
+                    ", ".join(missing_core[:12])
+                    + (" ..." if len(missing_core) > 12 else "")
+                ),
+                flush=True,
+            )
+        else:
+            print(
+                "[PRETRAIN] Official Patch Embed/blocks/Patch Merging core: complete",
+                flush=True,
+            )
         print(
             "[INFO] Loaded {} compatible ImageNet tensors; {} skipped/missing. "
             "Decoder mirror weights are intentionally not loaded.".format(
