@@ -80,7 +80,6 @@ parser.add_argument(
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
-parser.add_argument('--stage_skeleton_focal_weight', type=float, default=0.5)
 parser.add_argument('--stage_skeleton_focal_alpha', type=float, default=0.75)
 parser.add_argument('--stage_skeleton_focal_gamma', type=float, default=2.0)
 parser.add_argument('--stage_direction_factor', type=float, default=0.2)
@@ -270,7 +269,6 @@ def build_criterion(args, loss_weights, device):
         stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
         road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
         stage_connectivity_factor=0.5,
-        stage_skeleton_focal_weight=args.stage_skeleton_focal_weight,
         stage_skeleton_focal_alpha=args.stage_skeleton_focal_alpha,
         stage_skeleton_focal_gamma=args.stage_skeleton_focal_gamma,
         stage_direction_factor=args.stage_direction_factor,
@@ -298,12 +296,11 @@ def format_training_config_lines(args, loss_weights):
             "  Final skeleton/connectivity heads: disabled",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
-            "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
+            "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton Dice(strict) + Focal(strict) + 0.5 connectivity "
             "(BCE) + {:.3f} direction-field cosine loss on skeleton".format(
                 args.stage_direction_factor
             ),
-            "  Stage2/3 skeleton focal: {:.3f} * Focal(alpha={:.2f}, gamma={:.1f}) on strict adaptive-max skeleton GT".format(
-                args.stage_skeleton_focal_weight,
+            "  Stage2/3 skeleton focal: Focal(alpha={:.2f}, gamma={:.1f}) on strict adaptive-max skeleton GT".format(
                 args.stage_skeleton_focal_alpha,
                 args.stage_skeleton_focal_gamma,
             ),

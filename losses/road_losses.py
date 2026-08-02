@@ -338,7 +338,6 @@ class SurfaceStructureLoss(nn.Module):
         graph_delta_sparse_weight=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
-        stage_skeleton_focal_weight=0.5,
         stage_skeleton_focal_alpha=0.75,
         stage_skeleton_focal_gamma=2.0,
     ):
@@ -365,7 +364,6 @@ class SurfaceStructureLoss(nn.Module):
         )
         self.boundary_loss = BCEDiceLoss(dice_weight=1.0, bce_weight=1.0)
         self.skeleton_stage_weight = skeleton_stage_weight
-        self.stage_skeleton_focal_weight = float(stage_skeleton_focal_weight)
         self.stage_skeleton_focal_alpha = float(stage_skeleton_focal_alpha)
         self.stage_skeleton_focal_gamma = float(stage_skeleton_focal_gamma)
         self.skeleton_stage_weights = tuple(float(w) for w in skeleton_stage_weights)
@@ -652,19 +650,19 @@ class SurfaceStructureLoss(nn.Module):
                     source_stage_skel_dilate,
                     output_size=target_size,
                 )
-            loss_skeleton_stage, _, _ = self.skeleton_pixel_loss(
+            # Stage2/3 skeleton supervision is deliberately strict: Dice and
+            # Focal see the skeleton target, while the dilated BCE is not used.
+            loss_skeleton_dice = self.skeleton_loss.dice(
                 stage_skeleton_logits,
                 stage_skel,
-                stage_skel_dilate,
             )
-            # The original BCE(dilated) + Dice(strict) supervision stays intact.
-            # Focal adds sparse hard-positive emphasis without rescaling surface loss.
             loss_skeleton_focal = binary_focal_loss_with_logits(
                 stage_skeleton_logits,
                 stage_skel,
                 alpha=self.stage_skeleton_focal_alpha,
                 gamma=self.stage_skeleton_focal_gamma,
             )
+            loss_skeleton_stage = loss_skeleton_dice + loss_skeleton_focal
             connectivity_gt = build_connectivity_target(
                 stage_skel,
                 erode_kernel_size=self.connectivity_erode_kernel_size,
@@ -699,7 +697,6 @@ class SurfaceStructureLoss(nn.Module):
                 loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
                 loss_skeleton_stage
-                + self.stage_skeleton_focal_weight * loss_skeleton_focal
                 + self.stage_connectivity_factor * loss_connectivity_stage
                 + self.stage_direction_factor * loss_direction_stage
                 + loss_skeleton_connectivity_consistency
