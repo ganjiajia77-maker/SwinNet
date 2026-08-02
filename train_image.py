@@ -86,6 +86,7 @@ parser.add_argument('--stage_direction_factor', type=float, default=0.2)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
+parser.add_argument('--skeleton_gradient_ratio', type=float, default=0.1)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--pretrain_ckpt', type=str, default='', help='optional ImageNet Swin checkpoint path')
@@ -352,7 +353,8 @@ def format_training_config_lines(args, loss_weights):
         f"sc_s2c={args.stage_sc_s2c_weight}, "
         f"sc_c2s={args.stage_sc_c2s_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
-        f"road_attention={args.road_attention_weight}",
+        f"road_attention={args.road_attention_weight}, "
+        f"skeleton_gradient_ratio={args.skeleton_gradient_ratio}",
         f"  Surface target resize: {args.source_patch_size} -> {args.img_size} nearest-neighbor",
         "  Boundary-aware refinement: enabled",
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
@@ -758,7 +760,8 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    enable_final_graph_prop=args.enable_graph_prop).to(device)
+                    enable_final_graph_prop=args.enable_graph_prop,
+                    skeleton_gradient_ratio=args.skeleton_gradient_ratio).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.no_pretrain:

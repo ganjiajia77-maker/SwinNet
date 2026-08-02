@@ -1841,6 +1841,7 @@ class SwinTransformerSys(nn.Module):
                  stage_topology_topo_clip=DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP,
                  structure_profile="full",
                  enable_final_graph_prop=False,
+                 skeleton_gradient_ratio=0.1,
                  **kwargs):
         super().__init__()
 
@@ -1881,6 +1882,7 @@ class SwinTransformerSys(nn.Module):
             self.structure_profile == "stage23_boundary_0626"
         )
         self.enable_final_graph_prop = bool(enable_final_graph_prop)
+        self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -2085,6 +2087,7 @@ class SwinTransformerSys(nn.Module):
                     ),
                     enable_direct_feature_refinement=True,
                     enable_directional_feature_refinement=False,
+                    skeleton_gradient_ratio=self.skeleton_gradient_ratio,
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
@@ -2109,6 +2112,7 @@ class SwinTransformerSys(nn.Module):
         self.stage2_topology_source = DecoderStructureRefinement(
             channels=embed_dim * 2,
             enable_direct_feature_refinement=False,
+            skeleton_gradient_ratio=self.skeleton_gradient_ratio,
         )
         self.stage_topology_scales = nn.ModuleDict(
             {
@@ -2149,6 +2153,7 @@ class SwinTransformerSys(nn.Module):
                         self.structure_profile != "stage23_boundary_0626"
                     ),
                     enable_graph_prop=self.enable_final_graph_prop,
+                    skeleton_gradient_ratio=self.skeleton_gradient_ratio,
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(

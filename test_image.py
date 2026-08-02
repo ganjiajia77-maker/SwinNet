@@ -53,6 +53,7 @@ parser.add_argument(
 )
 parser.add_argument('--stage_topology_ratio', type=float, default=0.08)
 parser.add_argument('--stage_topology_topo_clip', type=float, default=4.0)
+parser.add_argument('--skeleton_gradient_ratio', type=float, default=0.1)
 parser.add_argument(
     '--bottleneck_type',
     type=str,
@@ -207,6 +208,7 @@ if __name__ == "__main__":
                 "stage_topology_bias_mode",
                 "stage_topology_ratio",
                 "stage_topology_topo_clip",
+                "skeleton_gradient_ratio",
             ):
                 if name in saved_args:
                     setattr(args, name, saved_args[name])
@@ -227,7 +229,8 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    enable_final_graph_prop=enable_graph_prop).cuda()
+                    enable_final_graph_prop=enable_graph_prop,
+                    skeleton_gradient_ratio=args.skeleton_gradient_ratio).cuda()
     
     # 加载模型
     if checkpoint is not None:

@@ -507,7 +507,8 @@ class SwinUnet(nn.Module):
                  stage_topology_ratio=0.08,
                  stage_topology_topo_clip=4.0,
                  structure_profile=STRUCTURE_PROFILE_FULL,
-                 enable_final_graph_prop=False):
+                 enable_final_graph_prop=False,
+                 skeleton_gradient_ratio=0.1):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -543,7 +544,8 @@ class SwinUnet(nn.Module):
                                 stage_topology_ratio=stage_topology_ratio,
                                 stage_topology_topo_clip=stage_topology_topo_clip,
                                 structure_profile=structure_profile,
-                                enable_final_graph_prop=enable_final_graph_prop)
+                                enable_final_graph_prop=enable_final_graph_prop,
+                                skeleton_gradient_ratio=skeleton_gradient_ratio)
         
         # Keep DilatedAsterisk in the graph, but turn off its residual effect.
         if self.use_asterisk:
@@ -603,7 +605,7 @@ class SwinUnet(nn.Module):
             return set()
 
         print("[INFO] Loading encoder-only ImageNet checkpoint: {}".format(pretrained_path))
-        checkpoint = torch.load(pretrained_path, map_location="cpu")
+        checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=False)
         pretrained_dict = checkpoint.get("model", checkpoint)
         model_dict = self.swin_unet.state_dict()
         compatible = {}

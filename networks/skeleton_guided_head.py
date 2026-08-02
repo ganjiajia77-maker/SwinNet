@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def scale_gradient(x, ratio):
+    return x.detach() + float(ratio) * (x - x.detach())
+
+
 class ConvBNReLU(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
         super().__init__()
@@ -497,6 +501,7 @@ class DecoderStructureRefinement(nn.Module):
         enable_roadness_head=False,
         enable_direct_feature_refinement=True,
         enable_directional_feature_refinement=True,
+        skeleton_gradient_ratio=0.1,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -508,8 +513,13 @@ class DecoderStructureRefinement(nn.Module):
         self.enable_directional_feature_refinement = bool(
             enable_directional_feature_refinement
         )
+        self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
 
         self.structure_branch = nn.Sequential(
+            ConvBNReLU(channels, channels),
+            ConvBNReLU(channels, channels),
+        )
+        self.gate_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
         )
@@ -587,7 +597,8 @@ class DecoderStructureRefinement(nn.Module):
         return propagated / float(len(directions))
 
     def forward(self, x, global_context=None, apply_feature_refinement=True):
-        structure_feat = self.structure_branch(x)
+        skeleton_input = scale_gradient(x, self.skeleton_gradient_ratio)
+        structure_feat = self.structure_branch(skeleton_input)
         skeleton_logits = self.skeleton_head(structure_feat)
         connectivity_logits = self.connectivity_head(structure_feat)
         direction_logits = self.direction_head(structure_feat)
@@ -596,8 +607,16 @@ class DecoderStructureRefinement(nn.Module):
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
+        gate_feat = self.gate_branch(x)
         structure_gate_logits = self.structure_gate(
-            torch.cat([structure_feat, skeleton_prob, conn_strength], dim=1)
+            torch.cat(
+                [
+                    gate_feat,
+                    skeleton_prob.detach(),
+                    conn_strength.detach(),
+                ],
+                dim=1,
+            )
         )
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
@@ -989,6 +1008,7 @@ class SkeletonGuidedHead(nn.Module):
         enable_graph_prop=False,
         graph_prop_lambda_init=0.05,
         graph_prop_lambda_max=0.10,
+        skeleton_gradient_ratio=0.1,
     ):
         super().__init__()
 
@@ -999,6 +1019,7 @@ class SkeletonGuidedHead(nn.Module):
         self.connectivity_channels = connectivity_channels
         self.enable_final_structure = bool(enable_final_structure)
         self.enable_graph_prop = bool(enable_graph_prop)
+        self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
 
         self.shared_proj = ConvBNReLU(in_channels, hidden_channels, kernel_size=3, padding=1)
 
@@ -1223,12 +1244,16 @@ class SkeletonGuidedHead(nn.Module):
                             surface_logits.detach()
                         )
 
-            # Stage3 skeleton is an auxiliary decoder prediction. Returning it
-            # here exports a full-resolution map without changing surface flow.
+            skeleton_input = scale_gradient(feat, self.skeleton_gradient_ratio)
+            final_structure_feat = self.structure_branch(skeleton_input)
+            final_skeleton_logits = self.skeleton_head(final_structure_feat)
+
+            # Final skeleton is an auxiliary prediction. It exports a
+            # full-resolution map without changing surface flow.
             return (
                 surface_logits,
                 boundary_logits,
-                stage_skeleton_logits,
+                final_skeleton_logits,
                 stage_connectivity_logits,
             )
 

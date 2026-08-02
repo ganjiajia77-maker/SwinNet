@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--source_patch_size", type=int, default=1024)
+    parser.add_argument("--skeleton_gradient_ratio", type=float, default=0.1)
     parser.add_argument(
         "--bottleneck_type",
         type=str,
@@ -75,6 +76,7 @@ def build_model(args):
         stage_topology_stages="none",
         structure_profile=STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
         enable_final_graph_prop=False,
+        skeleton_gradient_ratio=args.skeleton_gradient_ratio,
     )
     return model.cuda()
 
