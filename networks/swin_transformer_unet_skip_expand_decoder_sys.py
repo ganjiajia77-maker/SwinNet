@@ -836,7 +836,7 @@ class SwinTransformerBlock(nn.Module):
         assert L == H * W, "input feature has wrong size"
 
         shortcut = x
-        x = self.norm1(x).view(B, H, W, C)
+        x = x.view(B, H, W, C)
         x, Hp, Wp = pad_nhwc_to_window(x, self.window_size)
         attention_mask = self._get_attention_mask(Hp, Wp, x.device)
 
@@ -1049,8 +1049,9 @@ class SwinTransformerBlock(nn.Module):
         x = x[:, :H, :W, :].contiguous().view(B, H * W, C)
 
         # FFN
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        # Swin-V2 post-norm residual formulation.
+        x = shortcut + self.drop_path(self.norm1(x))
+        x = x + self.drop_path(self.norm2(self.mlp(x)))
 
         return x
 
