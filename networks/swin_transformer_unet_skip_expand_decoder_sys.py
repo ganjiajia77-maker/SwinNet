@@ -172,12 +172,20 @@ class WindowAttention(nn.Module):
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.logit_scale = nn.Parameter(torch.log(10 * torch.ones((num_heads, 1, 1))) )
+        self.cpb_mlp = nn.Sequential(
+            nn.Linear(2, 512, bias=True), nn.ReLU(inplace=True),
+            nn.Linear(512, num_heads, bias=False),
+        )
 
-        # define a parameter table of relative position bias
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+        relative_coords_h = torch.arange(-(window_size[0] - 1), window_size[0], dtype=torch.float32)
+        relative_coords_w = torch.arange(-(window_size[1] - 1), window_size[1], dtype=torch.float32)
+        relative_coords_table = torch.stack(torch.meshgrid(relative_coords_h, relative_coords_w, indexing="ij"), dim=-1).unsqueeze(0)
+        relative_coords_table[:, :, :, 0] /= max(window_size[0] - 1, 1)
+        relative_coords_table[:, :, :, 1] /= max(window_size[1] - 1, 1)
+        relative_coords_table = relative_coords_table * 8
+        relative_coords_table = torch.sign(relative_coords_table) * torch.log2(torch.abs(relative_coords_table) + 1.0) / 3.0
+        self.register_buffer("relative_coords_table", relative_coords_table)
 
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
@@ -192,12 +200,13 @@ class WindowAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.q_bias = nn.Parameter(torch.zeros(dim)) if qkv_bias else None
+        self.v_bias = nn.Parameter(torch.zeros(dim)) if qkv_bias else None
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(
@@ -219,15 +228,17 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv_bias = None
+        if self.q_bias is not None:
+            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias), self.v_bias))
+        qkv = F.linear(x, self.qkv.weight, qkv_bias).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
-        q = q * self.scale
-        qk_logits = q @ k.transpose(-2, -1)
-
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        qk_logits = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
+        qk_logits = qk_logits * torch.clamp(self.logit_scale, max=torch.log(torch.tensor(100.0, device=x.device))).exp()
+        relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
+        relative_position_bias = relative_position_bias_table[self.relative_position_index.view(-1)].view(N, N, -1)
+        relative_position_bias = 16 * torch.sigmoid(relative_position_bias.permute(2, 0, 1).contiguous())
         attn = qk_logits + relative_position_bias.unsqueeze(0)
         if getattr(self, "capture_logits", False):
             with torch.no_grad():
