@@ -719,7 +719,12 @@ if __name__ == "__main__":
     base_output_dir = args.output_dir
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name.strip() if args.run_name.strip() else f"train_skeleton_{timestamp}"
-    args.output_dir = make_unique_dir(base_output_dir, run_name)
+    if args.resume:
+        args.resume = os.path.abspath(args.resume)
+        args.output_dir = os.path.dirname(args.resume)
+        print(f"[INFO] Resume output directory: {args.output_dir}")
+    else:
+        args.output_dir = make_unique_dir(base_output_dir, run_name)
     os.makedirs(args.output_dir, exist_ok=True)
     checkpoints_dir = os.path.join(args.output_dir, 'checkpoints')
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -764,7 +769,7 @@ if __name__ == "__main__":
                     skeleton_gradient_ratio=args.skeleton_gradient_ratio).to(device)
 
     loaded_pretrained_names = set()
-    if not args.resume and not args.no_pretrain:
+    if not args.no_pretrain:
         pretrain_path = config.MODEL.PRETRAIN_CKPT
         if not os.path.isfile(pretrain_path):
             raise FileNotFoundError(
@@ -948,9 +953,15 @@ if __name__ == "__main__":
     print_topology_coefficients(model)
 
     best_val_f1 = -1.0
+    existing_best_path = os.path.join(args.output_dir, 'best.pth')
+    if args.resume and os.path.isfile(existing_best_path):
+        existing_best = torch.load(existing_best_path, map_location='cpu')
+        best_val_f1 = float(existing_best.get('val_f1', -1.0))
+        print(f"[INFO] Preserved best validation F1: {best_val_f1:.4f}")
     
     # 写入训练日志头
-    with open(training_log_path, 'w', encoding='utf-8') as log_f:
+    log_mode = 'a' if args.resume else 'w'
+    with open(training_log_path, log_mode, encoding='utf-8') as log_f:
         log_f.write("="*100 + "\n")
         log_f.write("Swin-UNet 训练日志\n")
         log_f.write("="*100 + "\n")
@@ -968,16 +979,19 @@ if __name__ == "__main__":
             log_f.write(f"  每轮最多训练batch数: {args.max_train_batches}\n")
         log_f.write("="*100 + "\n\n")
     
-    with open(loss_log_path, 'w', newline='', encoding='utf-8') as loss_log_file, \
-         open(batch_loss_log_path, 'w', newline='', encoding='utf-8') as batch_loss_log_file:
+    csv_mode = 'a' if args.resume else 'w'
+    write_csv_header = not args.resume or not os.path.isfile(loss_log_path) or os.path.getsize(loss_log_path) == 0
+    with open(loss_log_path, csv_mode, newline='', encoding='utf-8') as loss_log_file, \
+         open(batch_loss_log_path, csv_mode, newline='', encoding='utf-8') as batch_loss_log_file:
         loss_writer = csv.writer(loss_log_file)
         batch_loss_writer = csv.writer(batch_loss_log_file)
-        loss_writer.writerow([
-            'epoch', 'lr', 'train_avg_loss', 'val_loss',
-            'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
-            'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
-        ])
-        batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
+        if write_csv_header:
+            loss_writer.writerow([
+                'epoch', 'lr', 'train_avg_loss', 'val_loss',
+                'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
+                'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
+            ])
+            batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
 
         for epoch in range(start_epoch, args.max_epochs):
             current_lr = get_cosine_warmup_lr(
@@ -1206,6 +1220,7 @@ if __name__ == "__main__":
                 'topology_coefficients': get_topology_coefficients(model),
                 'stage_topology_alpha_scale': stage_topology_alpha_scale,
                 'stage_topology_teacher_forcing_ratio': teacher_forcing_ratio,
+                'pretrained_parameter_names': sorted(loaded_pretrained_names),
                 'args': vars(args),
             }
             # 保存 last.pth（总是覆盖）
