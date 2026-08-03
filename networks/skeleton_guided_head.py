@@ -519,10 +519,6 @@ class DecoderStructureRefinement(nn.Module):
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
         )
-        self.gate_branch = nn.Sequential(
-            ConvBNReLU(channels, channels),
-            ConvBNReLU(channels, channels),
-        )
         self.skeleton_head = SkeletonSpatialHead(channels)
         self.connectivity_head = nn.Conv2d(channels, connectivity_channels, kernel_size=1)
         self.direction_head = nn.Sequential(
@@ -607,11 +603,10 @@ class DecoderStructureRefinement(nn.Module):
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
-        gate_feat = self.gate_branch(x)
         structure_gate_logits = self.structure_gate(
             torch.cat(
                 [
-                    gate_feat,
+                    structure_feat,
                     skeleton_prob.detach(),
                     conn_strength.detach(),
                 ],

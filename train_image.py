@@ -873,10 +873,48 @@ if __name__ == "__main__":
                         checkpoint_state,
                         strict=False,
                     )
+
+                    # Gradient-scaling added a separate gate branch after this
+                    # checkpoint was written. Seed it from the loaded structure
+                    # branch so the resumed forward pass starts equivalent to
+                    # the earlier shared-branch gate.
+                    missing_gate_branch_keys = [
+                        key for key in result.missing_keys if ".gate_branch." in key
+                    ]
+                    if missing_gate_branch_keys:
+                        current_state = model.state_dict()
+                        gate_branch_state = {}
+                        for key in missing_gate_branch_keys:
+                            source_key = key.replace(
+                                ".gate_branch.", ".structure_branch."
+                            )
+                            if (
+                                source_key in current_state
+                                and current_state[source_key].shape
+                                == current_state[key].shape
+                            ):
+                                gate_branch_state[key] = current_state[source_key]
+                        model.load_state_dict(gate_branch_state, strict=False)
+                        print(
+                            "[WARN] Initialized missing gate_branch tensors from "
+                            "the checkpoint-loaded structure_branch for resume.",
+                            flush=True,
+                        )
                     invalid_missing = [
                         key
                         for key in result.missing_keys
                         if not key.startswith(allowed_missing_prefixes)
+                        and not (
+                            ".gate_branch." in key
+                            and (
+                                key.startswith(
+                                    "swin_unet.decoder_structure_blocks."
+                                )
+                                or key.startswith(
+                                    "swin_unet.stage2_topology_source."
+                                )
+                            )
+                        )
                     ]
                     if invalid_missing or result.unexpected_keys:
                         raise RuntimeError(
