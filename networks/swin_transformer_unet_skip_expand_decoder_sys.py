@@ -1853,6 +1853,9 @@ class SwinTransformerSys(nn.Module):
                  stage_topology_topo_clip=DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP,
                  structure_profile="full",
                  enable_final_graph_prop=False,
+                 stage2_skeleton_gradient_ratio=0.5,
+                 stage3_skeleton_gradient_ratio=0.5,
+                 final_skeleton_gradient_ratio=0.0,
                  **kwargs):
         super().__init__()
 
@@ -1893,6 +1896,9 @@ class SwinTransformerSys(nn.Module):
             self.structure_profile == "stage23_boundary_0626"
         )
         self.enable_final_graph_prop = bool(enable_final_graph_prop)
+        self.stage2_skeleton_gradient_ratio = float(stage2_skeleton_gradient_ratio)
+        self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
+        self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -2097,6 +2103,13 @@ class SwinTransformerSys(nn.Module):
                     ),
                     enable_direct_feature_refinement=True,
                     enable_directional_feature_refinement=False,
+                    skeleton_gradient_ratio=(
+                        self.stage2_skeleton_gradient_ratio
+                        if stage_index == 2
+                        else self.stage3_skeleton_gradient_ratio
+                        if stage_index == 3
+                        else 0.0
+                    ),
                 )
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
@@ -2121,6 +2134,7 @@ class SwinTransformerSys(nn.Module):
         self.stage2_topology_source = DecoderStructureRefinement(
             channels=embed_dim * 2,
             enable_direct_feature_refinement=False,
+            skeleton_gradient_ratio=self.stage2_skeleton_gradient_ratio,
         )
         self.stage_topology_scales = nn.ModuleDict(
             {
@@ -2161,11 +2175,12 @@ class SwinTransformerSys(nn.Module):
                         self.structure_profile != "stage23_boundary_0626"
                     ),
                     enable_graph_prop=self.enable_final_graph_prop,
+                    final_skeleton_gradient_ratio=self.final_skeleton_gradient_ratio,
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
-                        "[INFO] Final skeleton/connectivity heads: disabled "
-                        "(0626 profile; surface + boundary only)"
+                        "[INFO] Final skeleton head: enabled as detached auxiliary "
+                        "(0626 profile; final connectivity disabled)"
                     )
                     if self.enable_final_graph_prop:
                         print(
@@ -2663,7 +2678,7 @@ class SwinTransformerSys(nn.Module):
             if self.return_skeleton:
                 stage_skeleton_logits = None
                 stage_connectivity_logits = None
-                if self.enable_final_graph_prop and structure_outputs:
+                if structure_outputs:
                     target_hw = (x.shape[2], x.shape[3])
                     (
                         stage_skeleton_logits,

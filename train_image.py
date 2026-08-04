@@ -80,6 +80,9 @@ parser.add_argument(
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
+parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
+parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
+parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
 parser.add_argument('--stage_direction_factor', type=float, default=0.2)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
@@ -195,9 +198,9 @@ def apply_structure_profile_defaults(args):
 
     args.stage_topology_stages = "none"
     if not _cli_has("--stage2_skeleton_weight"):
-        args.stage2_skeleton_weight = 0.004
+        args.stage2_skeleton_weight = 0.008
     if not _cli_has("--stage3_skeleton_weight"):
-        args.stage3_skeleton_weight = 0.006
+        args.stage3_skeleton_weight = 0.012
     args.stage3_roadness_weight = 0.0
     args.final_topology_eta_init = 0.0
     args.final_gap_rho_init = 0.0
@@ -218,7 +221,7 @@ if args.freeze_0626_backbone and not args.resume:
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         return {
-            "skeleton_weight": 0.0,
+            "skeleton_weight": 0.10,
             "connectivity_weight": 0.0,
             "skeleton_cldice_weight": 0.0,
             "boundary_weight": 0.01,
@@ -289,9 +292,16 @@ def format_training_config_lines(args, loss_weights):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final skeleton/connectivity heads: disabled",
+            "  Final skeleton head: enabled and detached; final connectivity disabled",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
+            "  Stage2/Stage3 skeleton gradient ratio: {:.3f}/{:.3f}".format(
+                args.stage2_skeleton_gradient_ratio,
+                args.stage3_skeleton_gradient_ratio,
+            ),
+            "  Final skeleton head: detached feature + detached stage skeleton seed, gradient ratio={:.3f}".format(
+                args.final_skeleton_gradient_ratio,
+            ),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
             "(BCE) + {:.3f} direction-field cosine loss on skeleton".format(
                 args.stage_direction_factor
@@ -340,6 +350,9 @@ def format_training_config_lines(args, loss_weights):
         "  Stage structure weights: "
         f"stage2={args.stage2_skeleton_weight}, "
         f"stage3={args.stage3_skeleton_weight}, "
+        f"stage2_grad_ratio={args.stage2_skeleton_gradient_ratio}, "
+        f"stage3_grad_ratio={args.stage3_skeleton_gradient_ratio}, "
+        f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
         f"direction_factor={args.stage_direction_factor}, "
         f"sc_s2c={args.stage_sc_s2c_weight}, "
         f"sc_c2s={args.stage_sc_c2s_weight}, "
@@ -750,7 +763,10 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    enable_final_graph_prop=args.enable_graph_prop).to(device)
+                    enable_final_graph_prop=args.enable_graph_prop,
+                    stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
+                    stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
+                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.no_pretrain:
@@ -850,8 +866,15 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+                        "swin_unet.decoder_structure_blocks.0.gate_branch.",
+                        "swin_unet.decoder_structure_blocks.1.gate_branch.",
+                        "swin_unet.decoder_structure_blocks.2.gate_branch.",
+                        "swin_unet.decoder_structure_blocks.3.gate_branch.",
                         "swin_unet.stage2_topology_source.direction_head.",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
+                        "swin_unet.stage2_topology_source.gate_branch.",
+                        "swin_unet.guided_head.detached_skeleton_refine.",
+                        "swin_unet.guided_head.detached_skeleton_head.",
                     )
                     result = model.load_state_dict(
                         checkpoint_state,

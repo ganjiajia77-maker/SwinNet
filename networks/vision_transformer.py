@@ -438,10 +438,17 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
         "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+        "swin_unet.decoder_structure_blocks.0.gate_branch.",
+        "swin_unet.decoder_structure_blocks.1.gate_branch.",
+        "swin_unet.decoder_structure_blocks.2.gate_branch.",
+        "swin_unet.decoder_structure_blocks.3.gate_branch.",
         "swin_unet.stage2_topology_source.direction_head.",
         "swin_unet.stage2_topology_source.direction_gate.",
         "swin_unet.stage2_topology_source.direction_gate_beta",
         "swin_unet.stage2_topology_source.structure_gate.0.weight",
+        "swin_unet.stage2_topology_source.gate_branch.",
+        "swin_unet.guided_head.detached_skeleton_refine.",
+        "swin_unet.guided_head.detached_skeleton_head.",
     )
     msaf_missing_prefixes = (
         "swin_unet.bottleneck_context_fusion.scale_projections.",
@@ -507,7 +514,10 @@ class SwinUnet(nn.Module):
                  stage_topology_ratio=0.08,
                  stage_topology_topo_clip=4.0,
                  structure_profile=STRUCTURE_PROFILE_FULL,
-                 enable_final_graph_prop=False):
+                 enable_final_graph_prop=False,
+                 stage2_skeleton_gradient_ratio=0.5,
+                 stage3_skeleton_gradient_ratio=0.5,
+                 final_skeleton_gradient_ratio=0.0):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -543,7 +553,10 @@ class SwinUnet(nn.Module):
                                 stage_topology_ratio=stage_topology_ratio,
                                 stage_topology_topo_clip=stage_topology_topo_clip,
                                 structure_profile=structure_profile,
-                                enable_final_graph_prop=enable_final_graph_prop)
+                                enable_final_graph_prop=enable_final_graph_prop,
+                                stage2_skeleton_gradient_ratio=stage2_skeleton_gradient_ratio,
+                                stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
+                                final_skeleton_gradient_ratio=final_skeleton_gradient_ratio)
         
         # Keep DilatedAsterisk in the graph, but turn off its residual effect.
         if self.use_asterisk:
@@ -603,7 +616,11 @@ class SwinUnet(nn.Module):
             return set()
 
         print("[INFO] Loading encoder-only ImageNet checkpoint: {}".format(pretrained_path))
-        checkpoint = torch.load(pretrained_path, map_location="cpu")
+        checkpoint = torch.load(
+            pretrained_path,
+            map_location="cpu",
+            weights_only=False,
+        )
         pretrained_dict = checkpoint.get("model", checkpoint)
         model_dict = self.swin_unet.state_dict()
         compatible = {}
