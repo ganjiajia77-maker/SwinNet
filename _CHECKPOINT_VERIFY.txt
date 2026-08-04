@@ -1,0 +1,13 @@
+﻿repo path: D:\Code\Swin-Unet-main
+git already present: yes (not newly initialized)
+HEAD sha: 4f45553a8835ced930cbe6040e75f4e26a98946f
+tag name: checkpoint/pre-skeleton-viz-20260724
+branch: codex/centerline-connectivity-attention-v1
+working tree clean after checkpoint: yes
+commit message at HEAD: Add gate-preserving SC graph diffusion without direction.
+short summary of what was included: Working tree was already clean; no new commit was created. Annotated tag checkpoint/pre-skeleton-viz-20260724 was created on existing HEAD 4f45553 (full: 4f45553a8835ced930cbe6040e75f4e26a98946f), which includes the current codebase state on branch codex/centerline-connectivity-attention-v1.
+excluded large files/dirs: N/A (no staging/commit performed; nothing excluded for this checkpoint step)
+tag verification: git rev-parse checkpoint/pre-skeleton-viz-20260724^{} == 4f45553a8835ced930cbe6040e75f4e26a98946f (matches HEAD)
+existing related tags also present: checkpoint/best-20260723-072816-base, checkpoint/pre-graph-diffusion-20260723
+push: not performed
+source code modifications: none
