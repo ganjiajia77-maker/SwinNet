@@ -1021,7 +1021,18 @@ class SkeletonGuidedHead(nn.Module):
         self.enable_graph_prop = bool(enable_graph_prop)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
 
-        self.shared_proj = ConvBNReLU(in_channels, hidden_channels, kernel_size=3, padding=1)
+        self.surface_proj = ConvBNReLU(
+            in_channels,
+            hidden_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        self.skeleton_proj = ConvBNReLU(
+            in_channels,
+            hidden_channels,
+            kernel_size=3,
+            padding=1,
+        )
 
         self.surface_branch = nn.Sequential(
             ConvBNReLU(hidden_channels, hidden_channels),
@@ -1165,12 +1176,11 @@ class SkeletonGuidedHead(nn.Module):
         stage_skeleton_logits=None,
         stage_connectivity_logits=None,
     ):
-        feat = self.shared_proj(x)
-
-        surface_feat = self.surface_branch(feat)
+        surface_feat = self.surface_branch(self.surface_proj(x))
+        skeleton_feat = self.skeleton_proj(x)
 
         if not self.enable_final_structure:
-            final_structure_feat = self.structure_branch(feat)
+            final_structure_feat = self.structure_branch(skeleton_feat)
             final_skeleton_logits = self.skeleton_head(final_structure_feat)
             final_connectivity_logits = self.connectivity_head(final_structure_feat)
             # A direction field derived from the supervised 8-way connectivity
@@ -1188,18 +1198,6 @@ class SkeletonGuidedHead(nn.Module):
                 ],
                 dim=1,
             )
-            final_guide = torch.cat(
-                [
-                    torch.sigmoid(final_skeleton_logits),
-                    final_connectivity_prob,
-                    final_direction_logits,
-                ],
-                dim=1,
-            ).detach()
-            surface_delta = self.structure_to_surface(
-                torch.cat([surface_feat, final_guide], dim=1)
-            )
-            surface_feat = surface_feat + self.structure_to_surface_gamma * surface_delta
             guided_surface_feat = self.surface_refine(surface_feat)
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
@@ -1215,13 +1213,7 @@ class SkeletonGuidedHead(nn.Module):
             self.last_graph_delta = None
             self.last_delta_logit = None
 
-            use_graph = (
-                self.enable_graph_prop
-                and self.graph_propagation is not None
-                and self.eval_use_soft_graph
-                and stage_skeleton_logits is not None
-                and stage_connectivity_logits is not None
-            )
+            use_graph = False
             if use_graph:
                 if self.capture_graph_diagnostics:
                     self.graph_propagation.capture_diagnostics = True
@@ -1287,7 +1279,7 @@ class SkeletonGuidedHead(nn.Module):
             self.last_final_direction_logits = final_direction_logits
             return surface_logits, boundary_logits, final_skeleton_logits, final_connectivity_logits
 
-        structure_feat = self.structure_branch(feat)
+        structure_feat = self.structure_branch(skeleton_feat)
 
         # First predict a topology seed, then use it to refine only the
         # structure feature. Surface features never receive this attention
@@ -1304,51 +1296,7 @@ class SkeletonGuidedHead(nn.Module):
         skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
 
-        if self.use_legacy_surface_residual:
-            topk = min(2, self.connectivity_channels)
-            conn_strength = connectivity_prob.topk(
-                k=topk,
-                dim=1,
-            ).values.mean(dim=1, keepdim=True)
-            structure_attn = self.structure_fusion(
-                torch.cat(
-                    [structure_feat, skeleton_prob, conn_strength],
-                    dim=1,
-                )
-            )
-            structure_residual = self.structure_residual(
-                torch.cat([surface_feat, structure_attn], dim=1)
-            )
-            guided_surface_feat = surface_feat + self.alpha * structure_residual
-            guided_surface_feat = self.surface_refine(guided_surface_feat)
-        else:
-            base_surface_feat = self.surface_refine(surface_feat)
-            surface_pre_logits = self.surface_head(base_surface_feat)
-            gap_mask = self.build_gap_mask(
-                surface_pre_logits,
-                skeleton_prob,
-                connectivity_prob,
-            )
-            topk = min(2, self.connectivity_channels)
-            conn_strength = connectivity_prob.topk(
-                k=topk,
-                dim=1,
-            ).values.mean(dim=1, keepdim=True)
-            structure_attn = self.structure_fusion(
-                torch.cat(
-                    [structure_feat, skeleton_prob, conn_strength],
-                    dim=1,
-                )
-            )
-            structure_residual = self.structure_residual(
-                torch.cat([base_surface_feat, structure_attn], dim=1)
-            )
-            gap_residual = (
-                self.effective_rho_gap()
-                * gap_mask
-                * structure_residual
-            )
-            guided_surface_feat = base_surface_feat + gap_residual
+        guided_surface_feat = self.surface_refine(surface_feat)
 
         boundary_feat = self.boundary_branch(guided_surface_feat)
         boundary_logits = self.boundary_head(boundary_feat)
@@ -1375,45 +1323,6 @@ class SkeletonGuidedHead(nn.Module):
                         ).detach().cpu()
                     ),
                 }
-                if not self.use_legacy_surface_residual:
-                    self.last_surface_diagnostics.update(
-                        {
-                            "rho_gap_eff": float(
-                                self.effective_rho_gap().detach().cpu()
-                            ),
-                            "gap_mask_mean": float(
-                                gap_mask.mean().detach().cpu()
-                            ),
-                            "gap_mask_max": float(
-                                gap_mask.max().detach().cpu()
-                            ),
-                            "gap_mask_gt_0_1_ratio": float(
-                                (gap_mask > 0.1)
-                                .float()
-                                .mean()
-                                .detach()
-                                .cpu()
-                            ),
-                            "gap_mask_gt_0_3_ratio": float(
-                                (gap_mask > 0.3)
-                                .float()
-                                .mean()
-                                .detach()
-                                .cpu()
-                            ),
-                            "gap_residual_relative_norm": float(
-                                (
-                                    torch.linalg.vector_norm(gap_residual)
-                                    / (
-                                        torch.linalg.vector_norm(
-                                            base_surface_feat
-                                        )
-                                        + 1e-6
-                                    )
-                                ).detach().cpu()
-                            ),
-                        }
-                    )
         guided_surface_feat = guided_surface_feat + boundary_residual
 
         surface_logits = self.surface_head(guided_surface_feat)
