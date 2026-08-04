@@ -1043,6 +1043,11 @@ class SkeletonGuidedHead(nn.Module):
             connectivity_channels,
             kernel_size=1,
         )
+        self.structure_to_surface = nn.Sequential(
+            ConvBNReLU(hidden_channels + connectivity_channels + 3, hidden_channels),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+        )
+        self.structure_to_surface_gamma = nn.Parameter(torch.tensor(0.0))
         self.final_topology_attention = FinalTopologyRepairAttention(
             channels=hidden_channels,
             window_size=8,
@@ -1165,6 +1170,36 @@ class SkeletonGuidedHead(nn.Module):
         surface_feat = self.surface_branch(feat)
 
         if not self.enable_final_structure:
+            final_structure_feat = self.structure_branch(feat)
+            final_skeleton_logits = self.skeleton_head(final_structure_feat)
+            final_connectivity_logits = self.connectivity_head(final_structure_feat)
+            # A direction field derived from the supervised 8-way connectivity
+            # head keeps the detached guide structurally meaningful without a
+            # separate unsupervised direction head.
+            final_connectivity_prob = torch.sigmoid(final_connectivity_logits)
+            final_direction_logits = torch.cat(
+                [
+                    final_connectivity_prob[:, 3:4] - final_connectivity_prob[:, 2:3]
+                    + final_connectivity_prob[:, 5:6] - final_connectivity_prob[:, 4:5]
+                    + final_connectivity_prob[:, 7:8] - final_connectivity_prob[:, 6:7],
+                    final_connectivity_prob[:, 1:2] - final_connectivity_prob[:, 0:1]
+                    + final_connectivity_prob[:, 6:7] - final_connectivity_prob[:, 4:5]
+                    + final_connectivity_prob[:, 7:8] - final_connectivity_prob[:, 5:6],
+                ],
+                dim=1,
+            )
+            final_guide = torch.cat(
+                [
+                    torch.sigmoid(final_skeleton_logits),
+                    final_connectivity_prob,
+                    final_direction_logits,
+                ],
+                dim=1,
+            ).detach()
+            surface_delta = self.structure_to_surface(
+                torch.cat([surface_feat, final_guide], dim=1)
+            )
+            surface_feat = surface_feat + self.structure_to_surface_gamma * surface_delta
             guided_surface_feat = self.surface_refine(surface_feat)
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
@@ -1249,32 +1284,8 @@ class SkeletonGuidedHead(nn.Module):
                             surface_logits.detach()
                         )
 
-            skeleton_seed = torch.zeros_like(surface_logits)
-            if stage_skeleton_logits is not None:
-                skeleton_seed = F.interpolate(
-                    stage_skeleton_logits.detach(),
-                    size=feat.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            final_skeleton_input = torch.cat(
-                [
-                    scale_gradient(
-                        feat,
-                        self.final_skeleton_gradient_ratio,
-                    ),
-                    skeleton_seed,
-                ],
-                dim=1,
-            )
-            final_skeleton_feat = self.detached_skeleton_refine(
-                final_skeleton_input
-            )
-            final_skeleton_logits = self.detached_skeleton_head(
-                final_skeleton_feat
-            )
-
-            return surface_logits, boundary_logits, final_skeleton_logits, None
+            self.last_final_direction_logits = final_direction_logits
+            return surface_logits, boundary_logits, final_skeleton_logits, final_connectivity_logits
 
         structure_feat = self.structure_branch(feat)
 

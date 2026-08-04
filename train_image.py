@@ -222,7 +222,7 @@ def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         return {
             "skeleton_weight": 0.10,
-            "connectivity_weight": 0.0,
+            "connectivity_weight": 0.03,
             "skeleton_cldice_weight": 0.0,
             "boundary_weight": 0.01,
         }
