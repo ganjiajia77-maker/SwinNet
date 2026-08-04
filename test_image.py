@@ -305,8 +305,8 @@ if __name__ == "__main__":
                 img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 h, w, _ = img.shape
 
-                # canvas to accumulate probabilities and counts
-                prob_canvas = np.zeros((h, w), dtype=np.float32)
+                # Accumulate logits, then apply sigmoid once on the full image.
+                logit_canvas = np.zeros((h, w), dtype=np.float32)
                 count_canvas = np.zeros((h, w), dtype=np.float32)
 
                 # sliding
@@ -334,16 +334,17 @@ if __name__ == "__main__":
 
                         outputs = model(inp)
                         surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                        prob = torch.sigmoid(surface_logits)[0, 0].cpu().numpy()
+                        tile_logits = surface_logits[0, 0].cpu().numpy()
 
                         # crop to original size if padded
-                        prob = prob[:(y2 - y1), :(x2 - x1)]
+                        tile_logits = tile_logits[:(y2 - y1), :(x2 - x1)]
 
-                        prob_canvas[y1:y2, x1:x2] += prob
+                        logit_canvas[y1:y2, x1:x2] += tile_logits
                         count_canvas[y1:y2, x1:x2] += 1.0
 
-                avg_prob = prob_canvas / (count_canvas + 1e-7)
-                pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
+                full_logits = logit_canvas / np.maximum(count_canvas, 1.0)
+                full_prob = 1.0 / (1.0 + np.exp(-full_logits))
+                pred = (full_prob >= args.threshold).astype(np.uint8) * 255
 
                 # save
                 case_name = os.path.splitext(image_name)[0]

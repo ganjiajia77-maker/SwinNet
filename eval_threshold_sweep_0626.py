@@ -28,10 +28,11 @@ def parse_args():
     )
     parser.add_argument("--root_path", default="./data1")
     parser.add_argument("--split", default="val", choices=("val", "test"))
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--source_patch_size", type=int, default=1024)
+    parser.add_argument("--overlap_stride", type=int, default=256)
     parser.add_argument("--stage2_skeleton_gradient_ratio", type=float, default=0.5)
     parser.add_argument("--stage3_skeleton_gradient_ratio", type=float, default=0.5)
     parser.add_argument("--final_skeleton_gradient_ratio", type=float, default=0.0)
@@ -86,16 +87,28 @@ def build_model(args):
 
 
 @torch.no_grad()
-def collect_logits(model, loader):
+def collect_logits(model, loader, tile_size, stride):
     model.eval()
     logits_batches = []
     target_batches = []
     for batch in tqdm(loader, desc="inference"):
         images = batch["image"].cuda(non_blocking=True)
         labels = batch["mask"].cuda(non_blocking=True)
-        outputs = model(images)
-        logits = outputs[0] if isinstance(outputs, tuple) else outputs
-        logits_batches.append(logits.detach().cpu())
+        height, width = images.shape[-2:]
+        logit_canvas = torch.zeros((1, 1, height, width), device=images.device)
+        weight_canvas = torch.zeros_like(logit_canvas)
+        rows = RoadSkeletonDataset.sliding_positions(height, tile_size, stride)
+        cols = RoadSkeletonDataset.sliding_positions(width, tile_size, stride)
+        for top in rows:
+            for left in cols:
+                tile = images[:, :, top:top + tile_size, left:left + tile_size]
+                outputs = model(tile)
+                tile_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                logit_canvas[:, :, top:top + tile_size, left:left + tile_size] += tile_logits
+                weight_canvas[:, :, top:top + tile_size, left:left + tile_size] += 1.0
+        if weight_canvas.min().item() <= 0:
+            raise RuntimeError("Overlap sweep left uncovered full-image pixels.")
+        logits_batches.append((logit_canvas / weight_canvas).cpu())
         target_batches.append(labels.detach().cpu())
     return logits_batches, target_batches
 
@@ -147,8 +160,9 @@ def main():
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split=args.split,
-        image_size=args.img_size,
+        image_size=None,
         source_patch_size=args.source_patch_size,
+        return_full_image=True,
     )
     loader = DataLoader(
         dataset,
@@ -157,7 +171,12 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    logits_batches, target_batches = collect_logits(model, loader)
+    logits_batches, target_batches = collect_logits(
+        model,
+        loader,
+        args.img_size,
+        args.overlap_stride,
+    )
 
     print("=" * 80)
     print(f"SURFACE THRESHOLD SWEEP | split={args.split} | samples={len(dataset)}")
