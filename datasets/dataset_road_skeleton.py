@@ -4,10 +4,22 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from losses.road_losses import build_boundary_target, build_connectivity_target
 
 
 class RoadSkeletonDataset(Dataset):
-    def __init__(self, root_dir, split="train", image_size=512, source_patch_size=1024, transform=None):
+    def __init__(
+        self,
+        root_dir,
+        split="train",
+        image_size=512,
+        source_patch_size=1024,
+        transform=None,
+        tile_size=None,
+        tile_stride=None,
+        augment=False,
+        return_full_image=False,
+    ):
         super().__init__()
 
         self.root_dir = root_dir
@@ -15,6 +27,10 @@ class RoadSkeletonDataset(Dataset):
         self.image_size = image_size
         self.source_patch_size = source_patch_size
         self.transform = transform
+        self.tile_size = tile_size
+        self.tile_stride = tile_stride if tile_stride is not None else tile_size
+        self.augment = bool(augment and split == "train")
+        self.return_full_image = return_full_image
 
         self.image_dir = os.path.join(root_dir, split, "image")
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -31,8 +47,30 @@ class RoadSkeletonDataset(Dataset):
         if len(self.image_files) == 0:
             raise RuntimeError(f"No image files found in {self.image_dir}")
 
+        self.tile_positions = self._build_tile_positions()
+
     def __len__(self):
-        return len(self.image_files)
+        if self.tile_positions is None:
+            return len(self.image_files)
+        return len(self.image_files) * len(self.tile_positions)
+
+    @staticmethod
+    def sliding_positions(length, tile_size, stride):
+        if length <= tile_size:
+            return [0]
+        positions = list(range(0, length - tile_size + 1, stride))
+        last = length - tile_size
+        if positions[-1] != last:
+            positions.append(last)
+        return positions
+
+    def _build_tile_positions(self):
+        if self.tile_size is None or self.return_full_image:
+            return None
+        source_size = self.source_patch_size or self.tile_size
+        rows = self.sliding_positions(source_size, self.tile_size, self.tile_stride)
+        cols = self.sliding_positions(source_size, self.tile_size, self.tile_stride)
+        return [(top, left) for top in rows for left in cols]
 
     @staticmethod
     def _resolve_label_dir(root_dir, split, candidates):
@@ -156,8 +194,71 @@ class RoadSkeletonDataset(Dataset):
         kernel = np.ones((3, 3), dtype=np.uint8)
         return cv2.dilate(skeleton, kernel, iterations=iterations)
 
+    @staticmethod
+    def _augment_geometry(image, mask):
+        if np.random.rand() < 0.5:
+            image = np.flip(image, axis=1)
+            mask = np.flip(mask, axis=1)
+        if np.random.rand() < 0.5:
+            image = np.flip(image, axis=0)
+            mask = np.flip(mask, axis=0)
+        if np.random.rand() < 0.5:
+            rotations = np.random.randint(0, 4)
+            image = np.rot90(image, rotations, axes=(0, 1))
+            mask = np.rot90(mask, rotations, axes=(0, 1))
+        return image.copy(), mask.copy()
+
+    @staticmethod
+    def _augment_color_degrade(image):
+        image = image.astype(np.float32)
+        image *= np.random.uniform(0.9, 1.1)
+        mean = image.mean(axis=(0, 1), keepdims=True)
+        image = (image - mean) * np.random.uniform(0.9, 1.1) + mean
+        gray = (
+            0.299 * image[..., 0:1]
+            + 0.587 * image[..., 1:2]
+            + 0.114 * image[..., 2:3]
+        )
+        image = gray + (image - gray) * np.random.uniform(0.9, 1.1)
+        image = np.clip(image, 0.0, 255.0).astype(np.uint8)
+        if np.random.rand() < 0.15:
+            image = cv2.GaussianBlur(image, (3, 3), sigmaX=0.6)
+        if np.random.rand() < 0.15:
+            noise = np.random.normal(0.0, np.random.uniform(3.0, 8.0), image.shape)
+            image = np.clip(image.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
+        return image
+
+    @staticmethod
+    def _build_direction_target(skeleton):
+        skeleton = (skeleton > 0.5).float()
+        padded = torch.nn.functional.pad(skeleton, (1, 1, 1, 1))
+        height, width = skeleton.shape[-2:]
+        definitions = (
+            (0, 1, 1.0, 0.0),
+            (1, 0, -1.0, 0.0),
+            (1, 1, 0.0, 1.0),
+            (1, -1, 0.0, -1.0),
+        )
+        scores = []
+        targets = []
+        for dy, dx, cos2, sin2 in definitions:
+            forward = padded[:, :, 1 + dy:1 + dy + height, 1 + dx:1 + dx + width]
+            backward = padded[:, :, 1 - dy:1 - dy + height, 1 - dx:1 - dx + width]
+            scores.append(forward + backward + 2.0 * forward * backward)
+            targets.append(torch.cat((torch.full_like(skeleton, cos2), torch.full_like(skeleton, sin2)), dim=1))
+        direction_index = torch.cat(scores, dim=1).argmax(dim=1, keepdim=True)
+        target_stack = torch.stack(targets, dim=1)
+        gather_index = direction_index.unsqueeze(1).expand(-1, 1, 2, -1, -1)
+        return torch.gather(target_stack, 1, gather_index).squeeze(1)
+
     def __getitem__(self, idx):
-        image_name = self.image_files[idx]
+        if self.tile_positions is None:
+            image_index = idx
+            tile_position = None
+        else:
+            image_index = idx // len(self.tile_positions)
+            tile_position = self.tile_positions[idx % len(self.tile_positions)]
+        image_name = self.image_files[image_index]
         label_name = self._find_label_name(image_name, self.mask_dir)
 
         image_path = os.path.join(self.image_dir, image_name)
@@ -177,7 +278,34 @@ class RoadSkeletonDataset(Dataset):
             image = self._center_crop_or_pad(image, source_size)
             mask = self._center_crop_or_pad(mask, source_size)
 
-        if self.image_size is not None:
+        if self.augment:
+            image, mask = self._augment_geometry(image, mask)
+            image = self._augment_color_degrade(image)
+
+        mask = (mask > 127).astype(np.float32)
+        skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
+        skeleton_dilate = (self._dilate_skeleton(skeleton_hard * 255, iterations=1) > 127).astype(np.float32)
+        full_surface = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)
+        full_skeleton = torch.from_numpy(skeleton_hard).float().unsqueeze(0).unsqueeze(0)
+        connectivity_gt = build_connectivity_target(full_skeleton).squeeze(0)
+        direction_gt = self._build_direction_target(full_skeleton).squeeze(0)
+        boundary_gt = build_boundary_target(full_surface).squeeze(0)
+        valid_mask = torch.ones_like(full_skeleton).squeeze(0)
+
+        if tile_position is not None:
+            top, left = tile_position
+            bottom = top + self.tile_size
+            right = left + self.tile_size
+            image = image[top:bottom, left:right]
+            mask = mask[top:bottom, left:right]
+            skeleton_hard = skeleton_hard[top:bottom, left:right]
+            skeleton_dilate = skeleton_dilate[top:bottom, left:right]
+            connectivity_gt = connectivity_gt[:, top:bottom, left:right]
+            direction_gt = direction_gt[:, top:bottom, left:right]
+            boundary_gt = boundary_gt[:, top:bottom, left:right]
+            valid_mask = valid_mask[:, top:bottom, left:right]
+
+        if self.image_size is not None and image.shape[:2] != (self.image_size, self.image_size):
             size = (self.image_size, self.image_size)
             image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
             mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
@@ -186,13 +314,6 @@ class RoadSkeletonDataset(Dataset):
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         image = (image - mean) / std
-
-        mask = (mask > 127).astype(np.float32)
-        skeleton_hard = self._skeletonize_binary(mask)
-        skeleton_dilate = self._dilate_skeleton(skeleton_hard, iterations=1)
-
-        skeleton_hard = (skeleton_hard > 127).astype(np.float32)
-        skeleton_dilate = (skeleton_dilate > 127).astype(np.float32)
 
         image = np.transpose(image, (2, 0, 1))
         mask = np.expand_dims(mask, axis=0)
@@ -204,9 +325,17 @@ class RoadSkeletonDataset(Dataset):
             "mask": torch.from_numpy(mask).float(),
             "skeleton": torch.from_numpy(skeleton_hard).float(),
             "skeleton_dilate": torch.from_numpy(skeleton_dilate).float(),
+            "connectivity_gt": connectivity_gt.float(),
+            "direction_gt": direction_gt.float(),
+            "boundary_gt": boundary_gt.float(),
+            "valid_mask": valid_mask.float(),
             "image_name": image_name,
             "case_name": os.path.splitext(image_name)[0].replace("_sat", ""),
         }
+
+        if tile_position is not None:
+            sample["tile_top"] = tile_position[0]
+            sample["tile_left"] = tile_position[1]
 
         if self.transform:
             sample = self.transform(sample)

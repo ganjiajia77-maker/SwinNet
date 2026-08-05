@@ -587,6 +587,9 @@ class SurfaceStructureLoss(nn.Module):
         skeleton_dilate_gt,
         stage_skeleton_gt=None,
         stage_skeleton_dilate_gt=None,
+        connectivity_gt=None,
+        direction_gt=None,
+        valid_mask=None,
     ):
         if not stage_outputs:
             return skeleton_gt.sum() * 0.0
@@ -641,16 +644,24 @@ class SurfaceStructureLoss(nn.Module):
                 stage_skel,
                 stage_skel_dilate,
             )
-            connectivity_gt = build_connectivity_target(
-                stage_skel,
-                erode_kernel_size=self.connectivity_erode_kernel_size,
-            ).to(
+            if connectivity_gt is None:
+                stage_connectivity_gt = build_connectivity_target(
+                    stage_skel,
+                    erode_kernel_size=self.connectivity_erode_kernel_size,
+                )
+            else:
+                stage_connectivity_gt = F.interpolate(
+                    connectivity_gt,
+                    size=target_size,
+                    mode="nearest",
+                )
+            stage_connectivity_gt = stage_connectivity_gt.to(
                 device=stage_connectivity_logits.device,
                 dtype=stage_connectivity_logits.dtype,
             )
             loss_connectivity_stage = self.stage_connectivity_loss(
                 stage_connectivity_logits,
-                connectivity_gt,
+                stage_connectivity_gt,
                 stage_skel_dilate,
             )
             if (
@@ -667,10 +678,17 @@ class SurfaceStructureLoss(nn.Module):
                 loss_skeleton_connectivity_consistency = loss_skeleton_stage * 0.0
             direction_logits = stage_output.get("direction")
             if direction_logits is not None and self.stage_direction_factor > 0:
-                loss_direction_stage = self.direction_field_loss(
-                    direction_logits,
-                    stage_skel,
-                )
+                if direction_gt is None:
+                    loss_direction_stage = self.direction_field_loss(direction_logits, stage_skel)
+                else:
+                    stage_direction_gt = F.interpolate(direction_gt, size=target_size, mode="nearest")
+                    stage_direction_gt = F.normalize(stage_direction_gt, dim=1, eps=1e-6)
+                    stage_valid = stage_skel
+                    if valid_mask is not None:
+                        stage_valid = stage_valid * F.interpolate(valid_mask, size=target_size, mode="nearest")
+                    direction_pred = F.normalize(direction_logits, dim=1, eps=1e-6)
+                    direction_cosine = (direction_pred * stage_direction_gt).sum(dim=1, keepdim=True)
+                    loss_direction_stage = ((1.0 - direction_cosine) * stage_valid).sum() / stage_valid.sum().clamp_min(1.0)
             else:
                 loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
@@ -873,6 +891,10 @@ class SurfaceStructureLoss(nn.Module):
         stage_distill_scale=1.0,
         graph_base_logits=None,
         graph_delta_logit=None,
+        connectivity_gt=None,
+        direction_gt=None,
+        boundary_gt=None,
+        valid_mask=None,
     ):
         if surface_gt is None or skeleton_gt is None:
             raise ValueError("surface_gt and skeleton_gt are required.")
@@ -898,10 +920,12 @@ class SurfaceStructureLoss(nn.Module):
             dice_skeleton = loss_skeleton.detach()
 
         if connectivity_logits is not None:
-            connectivity_gt = build_connectivity_target(
-                skeleton_gt,
-                erode_kernel_size=self.connectivity_erode_kernel_size,
-            ).to(
+            if connectivity_gt is None:
+                connectivity_gt = build_connectivity_target(
+                    skeleton_gt,
+                    erode_kernel_size=self.connectivity_erode_kernel_size,
+                )
+            connectivity_gt = connectivity_gt.to(
                 device=connectivity_logits.device,
                 dtype=connectivity_logits.dtype,
             )
@@ -912,10 +936,12 @@ class SurfaceStructureLoss(nn.Module):
         else:
             loss_connectivity = surface_logits.sum() * 0.0
         if boundary_logits is not None and self.boundary_weight > 0:
-            boundary_gt = build_boundary_target(
-                surface_gt,
-                radius=self.boundary_radius,
-            ).to(
+            if boundary_gt is None:
+                boundary_gt = build_boundary_target(
+                    surface_gt,
+                    radius=self.boundary_radius,
+                )
+            boundary_gt = boundary_gt.to(
                 device=boundary_logits.device,
                 dtype=boundary_logits.dtype,
             )
@@ -943,6 +969,9 @@ class SurfaceStructureLoss(nn.Module):
             skeleton_dilate_gt,
             stage_skeleton_gt=stage_skeleton_gt,
             stage_skeleton_dilate_gt=stage_skeleton_dilate_gt,
+            connectivity_gt=connectivity_gt,
+            direction_gt=direction_gt,
+            valid_mask=valid_mask,
         )
         loss_stage_roadness = self.stage_roadness_loss(
             stage_outputs,

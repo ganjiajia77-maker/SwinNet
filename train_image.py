@@ -1,4 +1,5 @@
 import argparse
+import copy
 import csv
 import math
 import os
@@ -40,8 +41,13 @@ parser.add_argument('--base_lr', type=float, default=5e-4, help='segmentation ne
 parser.add_argument('--min_lr', type=float, default=1e-5, help='minimum learning rate for cosine decay')
 parser.add_argument('--warmup_epochs', type=int, default=3, help='warmup epochs before cosine decay')
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
-parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
-parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
+parser.add_argument('--img_size', type=int, default=512, help='model input tile size')
+parser.add_argument('--source_patch_size', type=int, default=1024, help='full source image size')
+parser.add_argument('--overlap_stride', type=int, default=256, help='fixed training/validation tile stride')
+parser.add_argument('--min_crop_road_pixels', type=int, default=0, help='retained for run metadata; fixed tiles are never filtered')
+parser.add_argument('--augment', action=argparse.BooleanOptionalAction, default=True, help='synchronized geometry and image-only appearance augmentation')
+parser.add_argument('--use_ema', action=argparse.BooleanOptionalAction, default=True, help='validate and save an EMA copy of the model')
+parser.add_argument('--ema_decay', type=float, default=0.999)
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml', 
                     help='path to config file')
@@ -358,7 +364,11 @@ def format_training_config_lines(args, loss_weights):
         f"sc_c2s={args.stage_sc_c2s_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
-        f"  Surface target resize: {args.source_patch_size} -> {args.img_size} nearest-neighbor",
+        f"  Fixed overlap tiles: {args.source_patch_size} -> {args.img_size}, stride={args.overlap_stride}",
+        f"  Minimum crop road pixels: {args.min_crop_road_pixels} (no tile filtering)",
+        f"  Train augmentation: {'enabled' if args.augment else 'disabled'}",
+        f"  EMA: {'enabled' if args.use_ema else 'disabled'}, decay={args.ema_decay}",
+        "  Validation: stitch logits -> sigmoid -> one threshold -> global TP/FP/FN",
         "  Boundary-aware refinement: enabled",
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
         "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
@@ -396,6 +406,24 @@ def model_state_is_finite(model):
         if torch.is_tensor(param) and not torch.isfinite(param).all():
             return False
     return True
+
+
+class ModelEMA:
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = float(decay)
+        for parameter in self.ema.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        model_state = model.state_dict()
+        for name, ema_value in self.ema.state_dict().items():
+            source_value = model_state[name].detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.mul_(self.decay).add_(source_value.to(ema_value.dtype), alpha=1.0 - self.decay)
+            else:
+                ema_value.copy_(source_value)
 
 
 def get_cosine_warmup_lr(epoch, max_epochs, base_lr, min_lr, warmup_epochs):
@@ -700,6 +728,91 @@ def evaluate_skeleton(
         'skeleton_recall': skeleton_recall,
     }
 
+
+def evaluate_overlap_full_images(
+    model,
+    loader,
+    threshold=0.2,
+    skeleton_threshold=0.5,
+    tile_size=512,
+    stride=256,
+    stage_topology_alpha_scale=1.0,
+):
+    model.eval()
+    surface_tp = surface_fp = surface_fn = 0
+    skeleton_tp = skeleton_fp = skeleton_fn = 0
+    image_count = 0
+    positions = RoadSkeletonDataset.sliding_positions
+    weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
+    weight_1d = (1.0 - weight_1d).clamp_min(0.1)
+    tile_weight = (weight_1d[:, None] * weight_1d[None, :]).view(1, 1, tile_size, tile_size)
+
+    with torch.no_grad():
+        for batch in loader:
+            full_images = batch['image'].to(device)
+            full_masks = batch['mask'].to(device)
+            full_skeletons = batch['skeleton'].to(device)
+            for image_index in range(full_images.shape[0]):
+                image = full_images[image_index:image_index + 1]
+                mask = full_masks[image_index:image_index + 1]
+                skeleton = full_skeletons[image_index:image_index + 1]
+                height, width = image.shape[-2:]
+                logit_canvas = torch.zeros((1, 1, height, width), device=device)
+                skeleton_logit_canvas = torch.zeros_like(logit_canvas)
+                weight_canvas = torch.zeros_like(logit_canvas)
+
+                for top in positions(height, tile_size, stride):
+                    for left in positions(width, tile_size, stride):
+                        tile = image[:, :, top:top + tile_size, left:left + tile_size]
+                        outputs = model(
+                            tile,
+                            topology_alpha_scale=stage_topology_alpha_scale,
+                            teacher_forcing_ratio=0.0,
+                        )
+                        surface_logits = outputs[0]
+                        skeleton_logits = outputs[2]
+                        tile_height, tile_width = surface_logits.shape[-2:]
+                        weight = tile_weight[:, :, :tile_height, :tile_width]
+                        logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += surface_logits * weight
+                        if skeleton_logits is not None:
+                            skeleton_logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += skeleton_logits * weight
+                        weight_canvas[:, :, top:top + tile_height, left:left + tile_width] += weight
+
+                full_logits = logit_canvas / weight_canvas.clamp_min(1.0)
+                surface_pred = (torch.sigmoid(full_logits) >= threshold).float()
+                mask_bin = (mask > 0.5).float()
+                surface_tp += int((surface_pred * mask_bin).sum().item())
+                surface_fp += int((surface_pred * (1.0 - mask_bin)).sum().item())
+                surface_fn += int(((1.0 - surface_pred) * mask_bin).sum().item())
+
+                if weight_canvas.min().item() <= 0:
+                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
+                if skeleton_logits is not None:
+                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas
+                    skeleton_pred = (torch.sigmoid(full_skeleton_logits) >= skeleton_threshold).float()
+                    skeleton_bin = (skeleton > 0.5).float()
+                    skeleton_tp += int((skeleton_pred * skeleton_bin).sum().item())
+                    skeleton_fp += int((skeleton_pred * (1.0 - skeleton_bin)).sum().item())
+                    skeleton_fn += int(((1.0 - skeleton_pred) * skeleton_bin).sum().item())
+                image_count += 1
+
+    surface_precision = surface_tp / (surface_tp + surface_fp + 1e-8)
+    surface_recall = surface_tp / (surface_tp + surface_fn + 1e-8)
+    skeleton_precision = skeleton_tp / (skeleton_tp + skeleton_fp + 1e-8)
+    skeleton_recall = skeleton_tp / (skeleton_tp + skeleton_fn + 1e-8)
+    return {
+        'loss': 0.0,
+        'surface_iou': surface_tp / (surface_tp + surface_fp + surface_fn + 1e-8),
+        'surface_f1': 2 * surface_precision * surface_recall / (surface_precision + surface_recall + 1e-8),
+        'surface_precision': surface_precision,
+        'surface_recall': surface_recall,
+        'skeleton_iou': skeleton_tp / (skeleton_tp + skeleton_fp + skeleton_fn + 1e-8),
+        'skeleton_f1': 2 * skeleton_precision * skeleton_recall / (skeleton_precision + skeleton_recall + 1e-8),
+        'skeleton_precision': skeleton_precision,
+        'skeleton_recall': skeleton_recall,
+        'image_count': image_count,
+    }
+
 if __name__ == "__main__":
     # 自动检测可用设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -793,7 +906,15 @@ if __name__ == "__main__":
         return torch.optim.AdamW(groups, weight_decay=0.0001)
 
     # 加载数据
-    train_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='train', image_size=args.img_size, source_patch_size=args.source_patch_size)
+    train_dataset = RoadSkeletonDataset(
+        root_dir=args.root_path,
+        split='train',
+        image_size=args.img_size,
+        source_patch_size=args.source_patch_size,
+        tile_size=args.img_size,
+        tile_stride=args.overlap_stride,
+        augment=args.augment,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -802,10 +923,16 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-    val_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='val', image_size=args.img_size, source_patch_size=args.source_patch_size)
+    val_dataset = RoadSkeletonDataset(
+        root_dir=args.root_path,
+        split='val',
+        image_size=None,
+        source_patch_size=args.source_patch_size,
+        return_full_image=True,
+    )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True
@@ -937,6 +1064,12 @@ if __name__ == "__main__":
         else:
             optimizer = build_layerwise_optimizer()
 
+    ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
+    if ema is not None and args.resume and 'checkpoint' in locals():
+        ema_state = checkpoint.get('ema_state_dict')
+        if ema_state is not None:
+            ema.ema.load_state_dict(ema_state)
+
     # 训练循环
     print("\n开始训练...")
     print(f"配置:")
@@ -1027,6 +1160,10 @@ if __name__ == "__main__":
                 masks = batch['mask'].to(device)
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
+                connectivity_gt = batch['connectivity_gt'].to(device)
+                direction_gt = batch['direction_gt'].to(device)
+                boundary_gt = batch['boundary_gt'].to(device)
+                valid_mask = batch['valid_mask'].to(device)
 
                 images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
                 masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -1074,6 +1211,10 @@ if __name__ == "__main__":
                     stage_distill_scale=stage_distill_scale,
                     graph_base_logits=graph_base_logits,
                     graph_delta_logit=graph_delta_logit,
+                    connectivity_gt=connectivity_gt,
+                    direction_gt=direction_gt,
+                    boundary_gt=boundary_gt,
+                    valid_mask=valid_mask,
                 )
 
                 if not torch.isfinite(loss):
@@ -1099,6 +1240,8 @@ if __name__ == "__main__":
                     continue
 
                 optimizer.step()
+                if ema is not None:
+                    ema.update(model)
 
                 total_loss += loss.item()
                 train_batches += 1
@@ -1125,14 +1268,15 @@ if __name__ == "__main__":
                     )
 
             train_avg_loss = total_loss / max(train_batches, 1)
-            val_metrics = evaluate_skeleton(
-                model,
+            eval_model = ema.ema if ema is not None else model
+            val_metrics = evaluate_overlap_full_images(
+                eval_model,
                 val_loader,
-                criterion,
-                args.threshold,
-                args.skeleton_threshold,
-                stage_distill_scale,
-                stage_topology_alpha_scale,
+                threshold=args.threshold,
+                skeleton_threshold=args.skeleton_threshold,
+                tile_size=args.img_size,
+                stride=args.overlap_stride,
+                stage_topology_alpha_scale=stage_topology_alpha_scale,
             )
             val_loss = val_metrics['loss']
             val_iou = val_metrics['surface_iou']
@@ -1199,9 +1343,12 @@ if __name__ == "__main__":
                 )
                 continue
 
+            checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': checkpoint_model.state_dict(),
+                'training_model_state_dict': model.state_dict(),
+                'ema_state_dict': ema.ema.state_dict() if ema is not None else None,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_avg_loss': train_avg_loss,
                 'val_loss': val_loss,
@@ -1244,13 +1391,14 @@ if __name__ == "__main__":
     if os.path.isfile(best_path):
         best_checkpoint = torch.load(best_path, map_location='cuda')
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
-        best_val_metrics = evaluate_skeleton(
+        best_val_metrics = evaluate_overlap_full_images(
             model,
             val_loader,
-            criterion,
-            args.threshold,
-            args.skeleton_threshold,
-            1.0,
+            threshold=args.threshold,
+            skeleton_threshold=args.skeleton_threshold,
+            tile_size=args.img_size,
+            stride=args.overlap_stride,
+            stage_topology_alpha_scale=1.0,
         )
 
         best_eval_msg = (
