@@ -88,6 +88,11 @@ def main():
     parser.add_argument("--stage_topology_alpha_init", type=float, default=0.1)
     parser.add_argument("--structure_profile", type=str, default=STRUCTURE_PROFILE_FULL, choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626])
     parser.add_argument("--enable_graph_prop", action="store_true")
+    parser.add_argument(
+        "--disable_msfe_skip",
+        action="store_true",
+        help="ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when present",
+    )
     args = parser.parse_args()
 
     thresholds = parse_thresholds(args.thresholds)
@@ -95,6 +100,7 @@ def main():
     if isinstance(checkpoint.get("args"), dict):
         args.structure_profile = checkpoint["args"].get("structure_profile", args.structure_profile)
         args.enable_graph_prop = bool(checkpoint["args"].get("enable_graph_prop", args.enable_graph_prop))
+        args.disable_msfe_skip = bool(checkpoint["args"].get("disable_msfe_skip", args.disable_msfe_skip))
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     config = get_config(args)
@@ -111,6 +117,7 @@ def main():
         stage_topology_alpha_init=args.stage_topology_alpha_init,
         structure_profile=args.structure_profile,
         enable_final_graph_prop=args.enable_graph_prop,
+        use_msfe_skip=not args.disable_msfe_skip,
     )
     load_topology_checkpoint_state(
         model,

@@ -515,6 +515,7 @@ class SwinUnet(nn.Module):
                  stage_topology_topo_clip=4.0,
                  structure_profile=STRUCTURE_PROFILE_FULL,
                  enable_final_graph_prop=False,
+                 use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
                  final_skeleton_gradient_ratio=0.0):
@@ -554,6 +555,7 @@ class SwinUnet(nn.Module):
                                 stage_topology_topo_clip=stage_topology_topo_clip,
                                 structure_profile=structure_profile,
                                 enable_final_graph_prop=enable_final_graph_prop,
+                                use_msfe_skip=use_msfe_skip,
                                 stage2_skeleton_gradient_ratio=stage2_skeleton_gradient_ratio,
                                 stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
                                 final_skeleton_gradient_ratio=final_skeleton_gradient_ratio)

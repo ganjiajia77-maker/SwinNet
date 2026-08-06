@@ -6,6 +6,7 @@ import random
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from PIL import Image
@@ -73,6 +74,11 @@ parser.add_argument(
     '--enable_graph_prop',
     action='store_true',
     help='enable final soft skeleton graph propagation (auto-read from checkpoint when omitted)',
+)
+parser.add_argument(
+    '--disable_msfe_skip',
+    action='store_true',
+    help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
 )
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
@@ -220,6 +226,8 @@ if __name__ == "__main__":
                 enable_graph_prop = bool(
                     saved_args.get("enable_graph_prop", False)
                 )
+            if saved_args and "disable_msfe_skip" in saved_args:
+                args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
 
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes, use_asterisk=True,
@@ -234,6 +242,7 @@ if __name__ == "__main__":
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
                     enable_final_graph_prop=enable_graph_prop,
+                    use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio).cuda()
@@ -414,12 +423,27 @@ if __name__ == "__main__":
                 ) = outputs[:5]
             else:
                 raise RuntimeError("Structure-guided test requires auxiliary model outputs.")
+
+            if skeleton_logits is not None and skeletons.shape[-2:] != skeleton_logits.shape[-2:]:
+                skeletons_for_loss = F.interpolate(
+                    skeletons.float(),
+                    size=skeleton_logits.shape[-2:],
+                    mode='nearest',
+                )
+                skeletons_dilate_for_loss = F.interpolate(
+                    skeletons_dilate.float(),
+                    size=skeleton_logits.shape[-2:],
+                    mode='nearest',
+                )
+            else:
+                skeletons_for_loss = skeletons
+                skeletons_dilate_for_loss = skeletons_dilate
             
             loss, _ = criterion(
                 surface_logits,
                 surface_gt=masks,
-                skeleton_gt=skeletons,
-                skeleton_dilate_gt=skeletons_dilate,
+                skeleton_gt=skeletons_for_loss,
+                skeleton_dilate_gt=skeletons_dilate_for_loss,
                 stage_outputs=stage_outputs,
                 boundary_logits=boundary_logits,
                 skeleton_logits=skeleton_logits,

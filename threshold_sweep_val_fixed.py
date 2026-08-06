@@ -3,6 +3,7 @@ import sys
 import argparse
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
@@ -29,6 +30,12 @@ def compute_metrics_all_samples(logits_list, targets_list, threshold):
     }
     
     for logits, targets in zip(logits_list, targets_list):
+        if targets.shape[-2:] != logits.shape[-2:]:
+            targets = F.interpolate(
+                targets.float(),
+                size=logits.shape[-2:],
+                mode='nearest',
+            )
         metrics = binary_metrics_from_logits(logits, targets, threshold=threshold)
         all_metrics['iou'].append(metrics['iou'])
         all_metrics['f1'].append(metrics['f1'])
@@ -86,6 +93,11 @@ def main():
         action='store_true',
         help='enable final soft skeleton graph propagation',
     )
+    parser.add_argument(
+        '--disable_msfe_skip',
+        action='store_true',
+        help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
+    )
     
     args = parser.parse_args()
     
@@ -106,6 +118,8 @@ def main():
                 enable_graph_prop = bool(
                     checkpoint["args"].get("enable_graph_prop", False)
                 )
+            if isinstance(checkpoint.get("args"), dict) and "disable_msfe_skip" in checkpoint["args"]:
+                args.disable_msfe_skip = bool(checkpoint["args"]["disable_msfe_skip"])
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device: {}'.format(device))
@@ -125,6 +139,7 @@ def main():
         stage_topology_alpha_init=args.stage_topology_alpha_init,
         structure_profile=args.structure_profile,
         enable_final_graph_prop=enable_graph_prop,
+        use_msfe_skip=not args.disable_msfe_skip,
     )
     if checkpoint is None:
         checkpoint = torch.load(args.model_path, map_location=device)

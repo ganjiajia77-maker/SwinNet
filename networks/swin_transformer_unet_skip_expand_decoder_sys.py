@@ -1853,6 +1853,7 @@ class SwinTransformerSys(nn.Module):
                  stage_topology_topo_clip=DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP,
                  structure_profile="full",
                  enable_final_graph_prop=False,
+                 use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
                  final_skeleton_gradient_ratio=0.0,
@@ -1896,6 +1897,7 @@ class SwinTransformerSys(nn.Module):
             self.structure_profile == "stage23_boundary_0626"
         )
         self.enable_final_graph_prop = bool(enable_final_graph_prop)
+        self.use_msfe_skip = bool(use_msfe_skip)
         self.stage2_skeleton_gradient_ratio = float(stage2_skeleton_gradient_ratio)
         self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
@@ -2054,7 +2056,7 @@ class SwinTransformerSys(nn.Module):
             skip_channels = int(embed_dim * 2 ** (self.num_layers - 1 - skip_idx))
             
             # MSFE 模块（多尺度特征增强）
-            msce_block = MSFEBlock(channel=skip_channels)
+            msce_block = MSFEBlock(channel=skip_channels) if self.use_msfe_skip else nn.Identity()
             self.msce_blocks.append(msce_block)
             
             # DCA-FPN-Lite 模块（轻量级可变形交叉注意）
@@ -2067,7 +2069,7 @@ class SwinTransformerSys(nn.Module):
             self.dca_blocks.append(dca_block)
             
             layer_name = "Layer 2" if skip_idx == 2 else "Layer 1"
-            print(f"[INFO] MSFE Block {layer_name} (inx={skip_idx}): {skip_channels} channels")
+            print(f"[INFO] MSFE Block {layer_name} (inx={skip_idx}): {'enabled' if self.use_msfe_skip else 'disabled'} ({skip_channels} channels)")
             print(f"[INFO] DCA-FPN-Lite {layer_name} (inx={skip_idx}): {skip_channels} channels")
 
         decoder_structure_channels = (

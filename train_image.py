@@ -121,6 +121,11 @@ parser.add_argument(
     help='final surface delta-logit soft graph propagation (stage2/3 priors)',
 )
 parser.add_argument(
+    '--disable_msfe_skip',
+    action='store_true',
+    help='ablate MSFE blocks on decoder skip stages inx=2,3; DCA-FPN remains enabled',
+)
+parser.add_argument(
     '--freeze_0626_backbone',
     action='store_true',
     help='freeze 0626 encoder/decoder/heads; train graph_propagation only',
@@ -377,6 +382,7 @@ def format_training_config_lines(args, loss_weights):
         "  Final skeleton clDice weight: {:.2f}".format(loss_weights["skeleton_cldice_weight"]),
         "  Edge loss: disabled",
         "  Edge skip enhance: disabled",
+        f"  Decoder skip MSFE: {'disabled' if args.disable_msfe_skip else 'enabled'}",
     ])
     return lines
 
@@ -877,6 +883,7 @@ if __name__ == "__main__":
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
                     enable_final_graph_prop=args.enable_graph_prop,
+                    use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio).to(device)
