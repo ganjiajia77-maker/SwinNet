@@ -3,6 +3,7 @@ import os
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from losses.road_losses import build_boundary_target, build_connectivity_target
 
@@ -195,6 +196,14 @@ class RoadSkeletonDataset(Dataset):
         return cv2.dilate(skeleton, kernel, iterations=iterations)
 
     @staticmethod
+    def _resize_tensor_nearest(tensor, size):
+        return F.interpolate(
+            tensor.unsqueeze(0).float(),
+            size=size,
+            mode="nearest",
+        ).squeeze(0)
+
+    @staticmethod
     def _augment_geometry(image, mask):
         if np.random.rand() < 0.5:
             image = np.flip(image, axis=1)
@@ -309,6 +318,13 @@ class RoadSkeletonDataset(Dataset):
             size = (self.image_size, self.image_size)
             image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
             mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+            skeleton_hard = cv2.resize(skeleton_hard, size, interpolation=cv2.INTER_NEAREST)
+            skeleton_dilate = cv2.resize(skeleton_dilate, size, interpolation=cv2.INTER_NEAREST)
+            connectivity_gt = self._resize_tensor_nearest(connectivity_gt, size)
+            direction_gt = self._resize_tensor_nearest(direction_gt, size)
+            direction_gt = F.normalize(direction_gt, dim=0, eps=1e-6)
+            boundary_gt = self._resize_tensor_nearest(boundary_gt, size)
+            valid_mask = self._resize_tensor_nearest(valid_mask, size)
 
         image = image.astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)

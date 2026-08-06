@@ -411,7 +411,19 @@ class SurfaceStructureLoss(nn.Module):
         loss_corr = (weight * per_pixel).sum() / weight.sum().clamp_min(1e-6)
         return loss_corr, {"graph_corr_loss": loss_corr.detach()}
 
+    @staticmethod
+    def _match_spatial_size(target, reference, mode="nearest"):
+        if target is None or target.shape[-2:] == reference.shape[-2:]:
+            return target
+        return F.interpolate(
+            target.float(),
+            size=reference.shape[-2:],
+            mode=mode,
+        )
+
     def skeleton_pixel_loss(self, skeleton_logits, skeleton_gt, skeleton_dilate_gt):
+        skeleton_gt = self._match_spatial_size(skeleton_gt, skeleton_logits)
+        skeleton_dilate_gt = self._match_spatial_size(skeleton_dilate_gt, skeleton_logits)
         skeleton_pos_weight = (
             self.skeleton_loss.pos_weight.to(skeleton_logits.device)
             if self.skeleton_loss.pos_weight is not None
@@ -929,6 +941,7 @@ class SurfaceStructureLoss(nn.Module):
                 device=connectivity_logits.device,
                 dtype=connectivity_logits.dtype,
             )
+            connectivity_gt = self._match_spatial_size(connectivity_gt, connectivity_logits)
             loss_connectivity = F.binary_cross_entropy_with_logits(
                 connectivity_logits,
                 connectivity_gt,
@@ -945,6 +958,7 @@ class SurfaceStructureLoss(nn.Module):
                 device=boundary_logits.device,
                 dtype=boundary_logits.dtype,
             )
+            boundary_gt = self._match_spatial_size(boundary_gt, boundary_logits)
             loss_boundary, bce_boundary, dice_boundary = self.boundary_loss(
                 boundary_logits,
                 boundary_gt,
