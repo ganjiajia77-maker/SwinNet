@@ -738,6 +738,7 @@ def evaluate_skeleton(
 def evaluate_overlap_full_images(
     model,
     loader,
+    criterion=None,
     threshold=0.2,
     skeleton_threshold=0.5,
     tile_size=512,
@@ -745,6 +746,7 @@ def evaluate_overlap_full_images(
     stage_topology_alpha_scale=1.0,
 ):
     model.eval()
+    total_loss = 0.0
     surface_tp = surface_fp = surface_fn = 0
     skeleton_tp = skeleton_fp = skeleton_fn = 0
     image_count = 0
@@ -758,10 +760,12 @@ def evaluate_overlap_full_images(
             full_images = batch['image'].to(device)
             full_masks = batch['mask'].to(device)
             full_skeletons = batch['skeleton'].to(device)
+            full_skeletons_dilate = batch['skeleton_dilate'].to(device)
             for image_index in range(full_images.shape[0]):
                 image = full_images[image_index:image_index + 1]
                 mask = full_masks[image_index:image_index + 1]
                 skeleton = full_skeletons[image_index:image_index + 1]
+                skeleton_dilate = full_skeletons_dilate[image_index:image_index + 1]
                 height, width = image.shape[-2:]
                 logit_canvas = torch.zeros((1, 1, height, width), device=device)
                 skeleton_logit_canvas = torch.zeros_like(logit_canvas)
@@ -784,22 +788,39 @@ def evaluate_overlap_full_images(
                             skeleton_logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += skeleton_logits * weight
                         weight_canvas[:, :, top:top + tile_height, left:left + tile_width] += weight
 
-                full_logits = logit_canvas / weight_canvas.clamp_min(1.0)
+                if weight_canvas.min().item() <= 0:
+                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
+                full_logits = logit_canvas / weight_canvas.clamp_min(1e-8)
                 surface_pred = (torch.sigmoid(full_logits) >= threshold).float()
                 mask_bin = (mask > 0.5).float()
                 surface_tp += int((surface_pred * mask_bin).sum().item())
                 surface_fp += int((surface_pred * (1.0 - mask_bin)).sum().item())
                 surface_fn += int(((1.0 - surface_pred) * mask_bin).sum().item())
 
-                if weight_canvas.min().item() <= 0:
-                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
                 if skeleton_logits is not None:
-                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas
+                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas.clamp_min(1e-8)
+                    if criterion is not None:
+                        loss, _ = criterion(
+                            full_logits,
+                            surface_gt=mask,
+                            skeleton_gt=skeleton,
+                            skeleton_dilate_gt=skeleton_dilate,
+                            skeleton_logits=full_skeleton_logits,
+                        )
+                        total_loss += float(loss.item())
                     skeleton_pred = (torch.sigmoid(full_skeleton_logits) >= skeleton_threshold).float()
                     skeleton_bin = (skeleton > 0.5).float()
                     skeleton_tp += int((skeleton_pred * skeleton_bin).sum().item())
                     skeleton_fp += int((skeleton_pred * (1.0 - skeleton_bin)).sum().item())
                     skeleton_fn += int(((1.0 - skeleton_pred) * skeleton_bin).sum().item())
+                elif criterion is not None:
+                    loss, _ = criterion(
+                        full_logits,
+                        surface_gt=mask,
+                        skeleton_gt=skeleton,
+                        skeleton_dilate_gt=skeleton_dilate,
+                    )
+                    total_loss += float(loss.item())
                 image_count += 1
 
     surface_precision = surface_tp / (surface_tp + surface_fp + 1e-8)
@@ -807,7 +828,7 @@ def evaluate_overlap_full_images(
     skeleton_precision = skeleton_tp / (skeleton_tp + skeleton_fp + 1e-8)
     skeleton_recall = skeleton_tp / (skeleton_tp + skeleton_fn + 1e-8)
     return {
-        'loss': 0.0,
+        'loss': total_loss / max(image_count, 1) if criterion is not None else 0.0,
         'surface_iou': surface_tp / (surface_tp + surface_fp + surface_fn + 1e-8),
         'surface_f1': 2 * surface_precision * surface_recall / (surface_precision + surface_recall + 1e-8),
         'surface_precision': surface_precision,
@@ -911,6 +932,44 @@ if __name__ == "__main__":
             groups.append({'params': new_params, 'lr': args.new_lr, 'initial_lr': args.new_lr, 'group_name': 'random_or_custom'})
         print(f"[INFO] LR groups: ImageNet-loaded={len(loaded_params)} tensors at {args.pretrained_lr:g}; new/custom={len(new_params)} tensors at {args.new_lr:g}", flush=True)
         return torch.optim.AdamW(groups, weight_decay=0.0001)
+
+    def restore_loaded_pretrained_names_from_checkpoint(checkpoint):
+        restored_names = checkpoint.get('loaded_pretrained_names')
+        if restored_names is not None:
+            return set(restored_names)
+
+        checkpoint_args = checkpoint.get('args', {})
+        pretrain_path = checkpoint_args.get('pretrain_ckpt') or config.MODEL.PRETRAIN_CKPT
+        if args.no_pretrain or not pretrain_path or not os.path.isfile(pretrain_path):
+            print(
+                "[WARN] Cannot restore ImageNet-loaded parameter group metadata; "
+                "resume optimizer may not match the original training groups.",
+                flush=True,
+            )
+            return set()
+
+        pretrain_checkpoint = torch.load(
+            pretrain_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        pretrained_dict = pretrain_checkpoint.get("model", pretrain_checkpoint)
+        model_dict = model.swin_unet.state_dict()
+        restored = set()
+        for key, value in pretrained_dict.items():
+            if key.startswith("head.") or "relative_position_index" in key or "attn_mask" in key:
+                continue
+            target_key = key
+            if ".downsample.reduction.weight" in key:
+                target_key = key.replace(".downsample.reduction.weight", ".downsample.linear_reduction.weight")
+            if target_key in model_dict and model_dict[target_key].shape == value.shape:
+                restored.add("swin_unet." + target_key)
+        print(
+            "[INFO] Restored ImageNet-loaded parameter group metadata from "
+            f"{len(restored)} compatible pretrain tensors.",
+            flush=True,
+        )
+        return restored
 
     # 加载数据
     train_dataset = RoadSkeletonDataset(
@@ -1047,6 +1106,7 @@ if __name__ == "__main__":
                 start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_0626_backbone:
                 try:
+                    loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
                     optimizer = build_layerwise_optimizer()
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 except (ValueError, RuntimeError) as exc:
@@ -1279,6 +1339,7 @@ if __name__ == "__main__":
             val_metrics = evaluate_overlap_full_images(
                 eval_model,
                 val_loader,
+                criterion,
                 threshold=args.threshold,
                 skeleton_threshold=args.skeleton_threshold,
                 tile_size=args.img_size,
@@ -1372,6 +1433,7 @@ if __name__ == "__main__":
                 'topology_coefficients': get_topology_coefficients(model),
                 'stage_topology_alpha_scale': stage_topology_alpha_scale,
                 'stage_topology_teacher_forcing_ratio': teacher_forcing_ratio,
+                'loaded_pretrained_names': sorted(loaded_pretrained_names),
                 'args': vars(args),
             }
             # 保存 last.pth（总是覆盖）
@@ -1401,6 +1463,7 @@ if __name__ == "__main__":
         best_val_metrics = evaluate_overlap_full_images(
             model,
             val_loader,
+            criterion,
             threshold=args.threshold,
             skeleton_threshold=args.skeleton_threshold,
             tile_size=args.img_size,
