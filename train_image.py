@@ -18,6 +18,7 @@ from networks.vision_transformer import (
     STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet as ViT_seg,
+    freeze_backbone_train_graph_only,
     get_topology_coefficients,
     load_topology_checkpoint_state,
     print_topology_coefficients,
@@ -33,7 +34,6 @@ parser.add_argument('--list_dir', type=str, default='./lists/lists_Synapse', hel
 parser.add_argument('--num_classes', type=int, default=2, help='output channel of network')
 parser.add_argument('--output_dir', type=str, default='./model_out', help='output dir')
 parser.add_argument('--run_name', type=str, default='', help='optional run folder name under output_dir')
-parser.add_argument('--resume_output_dir', type=str, default='', help='reuse this existing run directory and append logs when resuming')
 parser.add_argument('--max_epochs', type=int, default=100, help='maximum epoch number to train')
 parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
@@ -43,11 +43,10 @@ parser.add_argument('--warmup_epochs', type=int, default=3, help='warmup epochs 
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
 parser.add_argument('--img_size', type=int, default=512, help='model input tile size')
 parser.add_argument('--source_patch_size', type=int, default=1024, help='full source image size')
-parser.add_argument('--overlap_stride', type=int, default=512, help='fixed training/validation tile stride; 512 gives non-overlap 4-patch tiling on 1024 source tiles')
+parser.add_argument('--overlap_stride', type=int, default=256, help='fixed training/validation tile stride')
 parser.add_argument('--min_crop_road_pixels', type=int, default=0, help='retained for run metadata; fixed tiles are never filtered')
 parser.add_argument('--augment', action=argparse.BooleanOptionalAction, default=True, help='synchronized geometry and image-only appearance augmentation')
 parser.add_argument('--use_ema', action=argparse.BooleanOptionalAction, default=True, help='validate and save an EMA copy of the model')
-parser.add_argument('--direct_resize_train', action='store_true', help='train/validate by resizing each full source patch to img_size instead of tiling')
 parser.add_argument('--ema_decay', type=float, default=0.999)
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml', 
@@ -117,9 +116,67 @@ parser.add_argument(
     help='0626 profile: stage2/3 structure only, final skeleton/connectivity off',
 )
 parser.add_argument(
+    '--enable_graph_prop',
+    action='store_true',
+    help='final surface delta-logit soft graph propagation (stage2/3 priors)',
+)
+parser.add_argument(
     '--disable_msfe_skip',
     action='store_true',
     help='ablate MSFE blocks on decoder skip stages inx=2,3; DCA-FPN remains enabled',
+)
+parser.add_argument(
+    '--freeze_0626_backbone',
+    action='store_true',
+    help='freeze 0626 encoder/decoder/heads; train graph_propagation only',
+)
+parser.add_argument(
+    '--graph_corr_weight',
+    type=float,
+    default=0.05,
+    help='continuous baseline-error correction loss weight',
+)
+parser.add_argument(
+    '--graph_corr_k',
+    type=float,
+    default=1.0,
+    help='scale for target_delta = k * (GT - P_base)',
+)
+parser.add_argument(
+    '--graph_corr_m_pos',
+    type=float,
+    default=0.15,
+    help='max positive target delta for graph residual',
+)
+parser.add_argument(
+    '--graph_corr_m_neg',
+    type=float,
+    default=0.15,
+    help='max negative target delta magnitude for graph residual',
+)
+parser.add_argument(
+    '--graph_fn_push_weight',
+    type=float,
+    default=0.0,
+    help='deprecated; use --graph_corr_weight',
+)
+parser.add_argument(
+    '--graph_fp_suppress_weight',
+    type=float,
+    default=0.0,
+    help='deprecated; use --graph_corr_weight',
+)
+parser.add_argument(
+    '--graph_delta_sparse_weight',
+    type=float,
+    default=0.0,
+    help='deprecated; use --graph_corr_weight',
+)
+parser.add_argument(
+    '--graph_base_lr',
+    type=float,
+    default=3e-4,
+    help='learning rate for graph-only training when backbone is frozen',
 )
 DEFAULT_0626_CHECKPOINT = (
     './model_out/train_stage23_structure_final_boundary_nw0_20260626/best.pth'
@@ -152,13 +209,9 @@ def apply_structure_profile_defaults(args):
 
     args.stage_topology_stages = "none"
     if not _cli_has("--stage2_skeleton_weight"):
-        args.stage2_skeleton_weight = 0.004
+        args.stage2_skeleton_weight = 0.008
     if not _cli_has("--stage3_skeleton_weight"):
-        args.stage3_skeleton_weight = 0.006
-    if not _cli_has("--stage2_skeleton_gradient_ratio"):
-        args.stage2_skeleton_gradient_ratio = 1.0
-    if not _cli_has("--stage3_skeleton_gradient_ratio"):
-        args.stage3_skeleton_gradient_ratio = 1.0
+        args.stage3_skeleton_weight = 0.012
     args.stage3_roadness_weight = 0.0
     args.final_topology_eta_init = 0.0
     args.final_gap_rho_init = 0.0
@@ -170,43 +223,76 @@ def apply_structure_profile_defaults(args):
 
 apply_structure_profile_defaults(args)
 
+if args.freeze_0626_backbone and not args.enable_graph_prop:
+    parser.error("--freeze_0626_backbone requires --enable_graph_prop")
+if args.freeze_0626_backbone and not args.resume:
+    args.resume = DEFAULT_0626_CHECKPOINT
+
+
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         return {
             "skeleton_weight": 0.10,
-            "connectivity_weight": 0.0,
+            "connectivity_weight": 0.03,
+            "skeleton_cldice_weight": 0.0,
             "boundary_weight": 0.01,
         }
     return {
         "skeleton_weight": 0.02,
         "connectivity_weight": 0.03,
+        "skeleton_cldice_weight": 0.01,
         "boundary_weight": 0.03,
     }
 
+def get_graph_outputs_from_model(model):
+    module = model.module if hasattr(model, "module") else model
+    head = module.swin_unet.guided_head
+    return (
+        head.last_surface_pre_logits,
+        head.last_delta_logit,
+        head.last_graph_delta,
+    )
+
 
 def build_criterion(args, loss_weights, device):
+    stage2_weight = 0.0 if args.freeze_0626_backbone else args.stage2_skeleton_weight
+    stage3_weight = 0.0 if args.freeze_0626_backbone else args.stage3_skeleton_weight
+    boundary_weight = 0.0 if args.freeze_0626_backbone else loss_weights["boundary_weight"]
+    graph_corr = args.graph_corr_weight if args.enable_graph_prop else 0.0
+    if args.freeze_0626_backbone:
+        graph_corr = args.graph_corr_weight
+
     return SurfaceStructureLoss(
         surface_dice_weight=0.5,
         skeleton_dice_weight=1.0,
         skeleton_weight=loss_weights["skeleton_weight"],
         connectivity_weight=loss_weights["connectivity_weight"],
         connectivity_erode_kernel_size=1,
-        boundary_weight=loss_weights["boundary_weight"],
+        skeleton_cldice_weight=loss_weights["skeleton_cldice_weight"],
+        skeleton_cldice_iterations=10,
+        boundary_weight=boundary_weight,
         boundary_radius=1,
         stage_structure_weights=(
             0.0,
             0.0,
-            args.stage2_skeleton_weight,
-            args.stage3_skeleton_weight,
+            stage2_weight,
+            stage3_weight,
         ),
-        road_attention_weight=args.road_attention_weight,
+        stage_roadness_weights=(0.0, 0.0, 0.0, args.stage3_roadness_weight),
+        road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
         stage_connectivity_factor=0.5,
         stage_direction_factor=args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
         stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
+        stage_distill_weights=(0.0, 0.0),
+        stage_distill_connectivity_factor=0.5,
         use_legacy_stage_connectivity_loss=(
             args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
         ),
+        graph_corr_weight=graph_corr,
+        graph_corr_k=args.graph_corr_k,
+        graph_corr_m_pos=args.graph_corr_m_pos,
+        graph_corr_m_neg=args.graph_corr_m_neg,
     ).to(device)
 
 
@@ -217,24 +303,44 @@ def format_training_config_lines(args, loss_weights):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final skeleton head: enabled; final connectivity disabled",
+            "  Final skeleton head: enabled and detached; final connectivity disabled",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage2/Stage3 skeleton gradient ratio: {:.3f}/{:.3f}".format(
                 args.stage2_skeleton_gradient_ratio,
                 args.stage3_skeleton_gradient_ratio,
             ),
-            "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
-            "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine; "
-            "connectivity BCE disabled".format(args.stage_direction_factor),
-            "  Stage skeleton-connectivity consistency: disabled",
+            "  Final skeleton head: detached feature + detached stage skeleton seed, gradient ratio={:.3f}".format(
+                args.final_skeleton_gradient_ratio,
+            ),
+            "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; skeleton BCE(dilated) + 0.3 Dice(hard) + 0.5 connectivity "
+            "(BCE) + {:.3f} direction-field cosine loss on skeleton".format(
+                args.stage_direction_factor
+            ),
+            "  Stage skeleton-connectivity consistency: S_i*S_j*(1-C_ij)*{:.3f} + C_ij*(1-S_i*S_j)*{:.3f}".format(
+                args.stage_sc_s2c_weight,
+                args.stage_sc_c2s_weight,
+            ),
             "  Encoder road attention: A1/A2 priors active for residual PatchMerging and Stage3 road attention bias",
             "  Encoder stage1 road prior: residual PatchMerging path",
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
-            "  Decoder direction-aware connectivity attention bias: active",
+            "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
             "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength",
         ])
+        if args.enable_graph_prop:
+            lines.extend([
+                "  Final graph propagation: stage2/3 priors -> delta-logit residual",
+                "  Graph propagation lambda: init=0.05, max=0.10, edge_beta=0.7",
+                "  Graph delta_logit: clamp(-0.3, 0.3) before lambda*G residual",
+                "  Graph G: learned gate_mlp(P, weak, two_sided_support, near_H, H, S, C)",
+                "  Graph support: sqrt(H_l*H_r) * mean(C_l,C_r); candidate=weak*(1-H)",
+                "  Graph correction loss: weighted SmoothL1(delta_logit, k*(GT-P_base))",
+            ])
+            if args.freeze_0626_backbone:
+                lines.append(
+                    "  Backbone: frozen 0626 (train graph_propagation + lambda only)"
+                )
     else:
         lines.extend([
             "  Decoder structure gates: restored 0621 stages 0/1/2/3",
@@ -259,27 +365,21 @@ def format_training_config_lines(args, loss_weights):
         f"stage3_grad_ratio={args.stage3_skeleton_gradient_ratio}, "
         f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
         f"direction_factor={args.stage_direction_factor}, "
-        "sc_s2c=0.0(loss disabled), "
-        "sc_c2s=0.0(loss disabled), "
+        f"sc_s2c={args.stage_sc_s2c_weight}, "
+        f"sc_c2s={args.stage_sc_c2s_weight}, "
+        f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
-        (
-            f"  Direct resize: {args.source_patch_size} -> {args.img_size}"
-            if args.direct_resize_train
-            else f"  Fixed overlap tiles: {args.source_patch_size} -> {args.img_size}, stride={args.overlap_stride}"
-        ),
+        f"  Fixed overlap tiles: {args.source_patch_size} -> {args.img_size}, stride={args.overlap_stride}",
         f"  Minimum crop road pixels: {args.min_crop_road_pixels} (no tile filtering)",
         f"  Train augmentation: {'enabled' if args.augment else 'disabled'}",
         f"  EMA: {'enabled' if args.use_ema else 'disabled'}, decay={args.ema_decay}",
-        (
-            "  Validation: direct resized logits -> sigmoid -> one threshold"
-            if args.direct_resize_train
-            else "  Validation: stitch logits -> sigmoid -> one threshold -> global TP/FP/FN"
-        ),
+        "  Validation: stitch logits -> sigmoid -> one threshold -> global TP/FP/FN",
         "  Boundary-aware refinement: enabled",
         "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
         "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
         "  Final skeleton loss weight: {:.2f}".format(loss_weights["skeleton_weight"]),
         "  Final connectivity loss weight: {:.2f}".format(loss_weights["connectivity_weight"]),
+        "  Final skeleton clDice weight: {:.2f}".format(loss_weights["skeleton_cldice_weight"]),
         "  Edge loss: disabled",
         "  Edge skip enhance: disabled",
         f"  Decoder skip MSFE: {'disabled' if args.disable_msfe_skip else 'enabled'}",
@@ -332,21 +432,30 @@ class ModelEMA:
                 ema_value.copy_(source_value)
 
 
-def get_cosine_warmup_lr(step_index, max_steps, base_lr, min_lr, warmup_steps):
-    if max_steps <= 0:
+def get_cosine_warmup_lr(epoch, max_epochs, base_lr, min_lr, warmup_epochs):
+    if max_epochs <= 0:
         return base_lr
 
-    warmup_steps = max(0, int(warmup_steps))
-    if warmup_steps > 0 and step_index < warmup_steps:
-        return base_lr * float(step_index + 1) / float(warmup_steps)
+    warmup_epochs = max(0, warmup_epochs)
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        return base_lr * float(epoch + 1) / float(warmup_epochs)
 
-    decay_steps = max(1, max_steps - warmup_steps)
-    if decay_steps == 1:
+    decay_epochs = max(1, max_epochs - warmup_epochs)
+    if decay_epochs == 1:
         return min_lr
 
-    progress = min(float(step_index - warmup_steps) / float(decay_steps - 1), 1.0)
+    progress = min(float(epoch - warmup_epochs) / float(decay_epochs - 1), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr + (base_lr - min_lr) * cosine
+
+
+def get_stage_distill_scale(epoch):
+    epoch_number = epoch + 1
+    if epoch_number <= 5:
+        return 0.0
+    if epoch_number < 10:
+        return (epoch_number - 5) / 5.0
+    return 1.0
 
 
 def get_stage_topology_alpha_scale(epoch, warmup_epochs=5):
@@ -518,6 +627,7 @@ def evaluate_skeleton(
     criterion,
     threshold=0.2,
     skeleton_threshold=0.5,
+    stage_distill_scale=1.0,
     stage_topology_alpha_scale=1.0,
 ):
     model.eval()
@@ -562,6 +672,14 @@ def evaluate_skeleton(
             skeletons_padded = crop_to_shape(skeletons_padded, orig_shape)
             skeletons_dilate_padded = crop_to_shape(skeletons_dilate_padded, orig_shape)
 
+            graph_base_logits, graph_delta_logit, graph_delta = (
+                get_graph_outputs_from_model(model)
+            )
+            if graph_base_logits is not None:
+                graph_base_logits = crop_to_shape(graph_base_logits, orig_shape)
+            if graph_delta_logit is not None:
+                graph_delta_logit = crop_to_shape(graph_delta_logit, orig_shape)
+
             loss, _ = criterion(
                 surface_logits,
                 surface_gt=masks_padded,
@@ -571,6 +689,9 @@ def evaluate_skeleton(
                 boundary_logits=boundary_logits,
                 skeleton_logits=skeleton_logits,
                 connectivity_logits=connectivity_logits,
+                stage_distill_scale=stage_distill_scale,
+                graph_base_logits=graph_base_logits,
+                graph_delta_logit=graph_delta_logit,
             )
             total_loss += loss.item()
 
@@ -617,15 +738,13 @@ def evaluate_skeleton(
 def evaluate_overlap_full_images(
     model,
     loader,
-    criterion=None,
     threshold=0.2,
     skeleton_threshold=0.5,
     tile_size=512,
-    stride=512,
+    stride=256,
     stage_topology_alpha_scale=1.0,
 ):
     model.eval()
-    total_loss = 0.0
     surface_tp = surface_fp = surface_fn = 0
     skeleton_tp = skeleton_fp = skeleton_fn = 0
     image_count = 0
@@ -639,12 +758,10 @@ def evaluate_overlap_full_images(
             full_images = batch['image'].to(device)
             full_masks = batch['mask'].to(device)
             full_skeletons = batch['skeleton'].to(device)
-            full_skeletons_dilate = batch['skeleton_dilate'].to(device)
             for image_index in range(full_images.shape[0]):
                 image = full_images[image_index:image_index + 1]
                 mask = full_masks[image_index:image_index + 1]
                 skeleton = full_skeletons[image_index:image_index + 1]
-                skeleton_dilate = full_skeletons_dilate[image_index:image_index + 1]
                 height, width = image.shape[-2:]
                 logit_canvas = torch.zeros((1, 1, height, width), device=device)
                 skeleton_logit_canvas = torch.zeros_like(logit_canvas)
@@ -667,39 +784,22 @@ def evaluate_overlap_full_images(
                             skeleton_logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += skeleton_logits * weight
                         weight_canvas[:, :, top:top + tile_height, left:left + tile_width] += weight
 
-                if weight_canvas.min().item() <= 0:
-                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
-                full_logits = logit_canvas / weight_canvas.clamp_min(1e-8)
+                full_logits = logit_canvas / weight_canvas.clamp_min(1.0)
                 surface_pred = (torch.sigmoid(full_logits) >= threshold).float()
                 mask_bin = (mask > 0.5).float()
                 surface_tp += int((surface_pred * mask_bin).sum().item())
                 surface_fp += int((surface_pred * (1.0 - mask_bin)).sum().item())
                 surface_fn += int(((1.0 - surface_pred) * mask_bin).sum().item())
 
+                if weight_canvas.min().item() <= 0:
+                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
                 if skeleton_logits is not None:
-                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas.clamp_min(1e-8)
-                    if criterion is not None:
-                        loss, _ = criterion(
-                            full_logits,
-                            surface_gt=mask,
-                            skeleton_gt=skeleton,
-                            skeleton_dilate_gt=skeleton_dilate,
-                            skeleton_logits=full_skeleton_logits,
-                        )
-                        total_loss += float(loss.item())
+                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas
                     skeleton_pred = (torch.sigmoid(full_skeleton_logits) >= skeleton_threshold).float()
                     skeleton_bin = (skeleton > 0.5).float()
                     skeleton_tp += int((skeleton_pred * skeleton_bin).sum().item())
                     skeleton_fp += int((skeleton_pred * (1.0 - skeleton_bin)).sum().item())
                     skeleton_fn += int(((1.0 - skeleton_pred) * skeleton_bin).sum().item())
-                elif criterion is not None:
-                    loss, _ = criterion(
-                        full_logits,
-                        surface_gt=mask,
-                        skeleton_gt=skeleton,
-                        skeleton_dilate_gt=skeleton_dilate,
-                    )
-                    total_loss += float(loss.item())
                 image_count += 1
 
     surface_precision = surface_tp / (surface_tp + surface_fp + 1e-8)
@@ -707,7 +807,7 @@ def evaluate_overlap_full_images(
     skeleton_precision = skeleton_tp / (skeleton_tp + skeleton_fp + 1e-8)
     skeleton_recall = skeleton_tp / (skeleton_tp + skeleton_fn + 1e-8)
     return {
-        'loss': total_loss / max(image_count, 1) if criterion is not None else 0.0,
+        'loss': 0.0,
         'surface_iou': surface_tp / (surface_tp + surface_fp + surface_fn + 1e-8),
         'surface_f1': 2 * surface_precision * surface_recall / (surface_precision + surface_recall + 1e-8),
         'surface_precision': surface_precision,
@@ -741,10 +841,7 @@ if __name__ == "__main__":
     base_output_dir = args.output_dir
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name.strip() if args.run_name.strip() else f"train_skeleton_{timestamp}"
-    if args.resume_output_dir.strip():
-        args.output_dir = args.resume_output_dir.strip()
-    else:
-        args.output_dir = make_unique_dir(base_output_dir, run_name)
+    args.output_dir = make_unique_dir(base_output_dir, run_name)
     os.makedirs(args.output_dir, exist_ok=True)
     checkpoints_dir = os.path.join(args.output_dir, 'checkpoints')
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -770,11 +867,11 @@ if __name__ == "__main__":
         config.freeze()
         args.img_size = aligned_img_size
     
-    # 创建网络
+    # 创建网络（启用 DilatedAsterisk 空间特征增强）
     args.num_classes = 1
     loss_weights = get_final_loss_weights(args)
     model = ViT_seg(config=config, img_size=args.img_size,
-                    num_classes=args.num_classes,
+                    num_classes=args.num_classes, use_asterisk=True,
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
                     final_topology_eta_init=args.final_topology_eta_init,
                     final_gap_rho_init=args.final_gap_rho_init,
@@ -785,6 +882,7 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
+                    enable_final_graph_prop=args.enable_graph_prop,
                     use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
@@ -814,52 +912,14 @@ if __name__ == "__main__":
         print(f"[INFO] LR groups: ImageNet-loaded={len(loaded_params)} tensors at {args.pretrained_lr:g}; new/custom={len(new_params)} tensors at {args.new_lr:g}", flush=True)
         return torch.optim.AdamW(groups, weight_decay=0.0001)
 
-    def restore_loaded_pretrained_names_from_checkpoint(checkpoint):
-        restored_names = checkpoint.get('loaded_pretrained_names')
-        if restored_names is not None:
-            return set(restored_names)
-
-        checkpoint_args = checkpoint.get('args', {})
-        pretrain_path = checkpoint_args.get('pretrain_ckpt') or config.MODEL.PRETRAIN_CKPT
-        if args.no_pretrain or not pretrain_path or not os.path.isfile(pretrain_path):
-            print(
-                "[WARN] Cannot restore ImageNet-loaded parameter group metadata; "
-                "resume optimizer may not match the original training groups.",
-                flush=True,
-            )
-            return set()
-
-        pretrain_checkpoint = torch.load(
-            pretrain_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        pretrained_dict = pretrain_checkpoint.get("model", pretrain_checkpoint)
-        model_dict = model.swin_unet.state_dict()
-        restored = set()
-        for key, value in pretrained_dict.items():
-            if key.startswith("head.") or "relative_position_index" in key or "attn_mask" in key:
-                continue
-            target_key = key
-            if ".downsample.reduction.weight" in key:
-                target_key = key.replace(".downsample.reduction.weight", ".downsample.linear_reduction.weight")
-            if target_key in model_dict and model_dict[target_key].shape == value.shape:
-                restored.add("swin_unet." + target_key)
-        print(
-            "[INFO] Restored ImageNet-loaded parameter group metadata from "
-            f"{len(restored)} compatible pretrain tensors.",
-            flush=True,
-        )
-        return restored
-
     # 加载数据
     train_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split='train',
         image_size=args.img_size,
         source_patch_size=args.source_patch_size,
-        tile_size=None if args.direct_resize_train else args.img_size,
-        tile_stride=None if args.direct_resize_train else args.overlap_stride,
+        tile_size=args.img_size,
+        tile_stride=args.overlap_stride,
         augment=args.augment,
     )
     train_loader = DataLoader(
@@ -869,16 +929,13 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True
     )
-    optimizer_steps_per_epoch = max(1, args.max_train_batches if args.max_train_batches > 0 else len(train_loader))
-    warmup_steps = args.warmup_epochs * optimizer_steps_per_epoch
-    total_optimizer_steps = max(1, args.max_epochs * optimizer_steps_per_epoch)
 
     val_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split='val',
-        image_size=args.img_size if args.direct_resize_train else None,
+        image_size=None,
         source_patch_size=args.source_patch_size,
-        return_full_image=not args.direct_resize_train,
+        return_full_image=True,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -899,29 +956,37 @@ if __name__ == "__main__":
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
             checkpoint_state = checkpoint["model_state_dict"]
-            model_state = model.state_dict()
-            filtered_checkpoint_state = {}
-            skipped_gate_keys = []
-            for key, value in checkpoint_state.items():
-                if (
-                    key in model_state
-                    and value.shape != model_state[key].shape
-                    and key.endswith("structure_gate.0.weight")
-                ):
-                    skipped_gate_keys.append(key)
-                    continue
-                filtered_checkpoint_state[key] = value
-            if skipped_gate_keys:
-                print(
-                    "[WARN] Reinitialized direction-gate input weights: "
-                    + ", ".join(skipped_gate_keys),
-                    flush=True,
+            if not args.freeze_0626_backbone:
+                model_state = model.state_dict()
+                filtered_checkpoint_state = {}
+                skipped_gate_keys = []
+                for key, value in checkpoint_state.items():
+                    if (
+                        key in model_state
+                        and value.shape != model_state[key].shape
+                        and key.endswith("structure_gate.0.weight")
+                    ):
+                        skipped_gate_keys.append(key)
+                        continue
+                    filtered_checkpoint_state[key] = value
+                if skipped_gate_keys:
+                    print(
+                        "[WARN] Reinitialized direction-gate input weights: "
+                        + ", ".join(skipped_gate_keys),
+                        flush=True,
+                    )
+                    checkpoint_state = filtered_checkpoint_state
+            if args.freeze_0626_backbone:
+                load_topology_checkpoint_state(
+                    model,
+                    checkpoint_state,
+                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
                 )
-                checkpoint_state = filtered_checkpoint_state
-            strict_load = args.bottleneck_type == 'global_local'
-            try:
-                model.load_state_dict(checkpoint_state, strict=strict_load)
-            except RuntimeError as exc:
+            else:
+                strict_load = args.bottleneck_type == 'global_local'
+                try:
+                    model.load_state_dict(checkpoint_state, strict=strict_load)
+                except RuntimeError as exc:
                     allowed_missing_prefixes = (
                         "swin_unet.stage2_topology_source.",
                         "swin_unet.stage_topology_scales.",
@@ -945,9 +1010,6 @@ if __name__ == "__main__":
                         "swin_unet.guided_head.detached_skeleton_refine.",
                         "swin_unet.guided_head.detached_skeleton_head.",
                     )
-                    allowed_unexpected_prefixes = (
-                        "asterisk.",
-                    )
                     result = model.load_state_dict(
                         checkpoint_state,
                         strict=False,
@@ -957,71 +1019,63 @@ if __name__ == "__main__":
                         for key in result.missing_keys
                         if not key.startswith(allowed_missing_prefixes)
                     ]
-                    invalid_unexpected = [
-                        key
-                        for key in result.unexpected_keys
-                        if not key.startswith(allowed_unexpected_prefixes)
-                    ]
-                    if invalid_missing or invalid_unexpected:
+                    if invalid_missing or result.unexpected_keys:
                         raise RuntimeError(
                             "Checkpoint mismatch on resume: "
-                            f"missing={invalid_missing}, unexpected={invalid_unexpected}"
+                            f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
                         ) from exc
-                    if result.unexpected_keys:
-                        print(
-                            "[WARN] Ignored legacy checkpoint keys not used by current model: "
-                            + ", ".join(result.unexpected_keys),
-                            flush=True,
-                        )
                     print(
                         "[WARN] Loaded checkpoint with strict=False; "
                         "some modules use fresh initialization.",
                         flush=True,
                     )
-            start_epoch = checkpoint.get('epoch', 0)
-            try:
-                loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
-                optimizer = build_layerwise_optimizer()
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except (ValueError, RuntimeError) as exc:
+            if args.freeze_0626_backbone:
+                trainable = freeze_backbone_train_graph_only(model)
                 print(
-                    "[WARN] Optimizer state not restored; "
-                    "continuing with a fresh optimizer for current parameters.",
+                    "[INFO] Frozen 0626 backbone; trainable graph params: "
+                    f"{len(trainable)} tensors",
                     flush=True,
                 )
-                print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
+                # 0626 ckpt epoch 可能 > max_epochs；graph-only 是新实验，从 0 开始
+                start_epoch = 0
+                print(
+                    "[INFO] Graph-only fine-tune: reset start_epoch to 0 "
+                    f"(checkpoint had epoch={checkpoint.get('epoch', '?')})",
+                    flush=True,
+                )
+            else:
+                start_epoch = checkpoint.get('epoch', 0)
+            if not args.freeze_0626_backbone:
+                try:
+                    optimizer = build_layerwise_optimizer()
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                except (ValueError, RuntimeError) as exc:
+                    print(
+                        "[WARN] Optimizer state not restored; "
+                        "continuing with a fresh optimizer for current parameters.",
+                        flush=True,
+                    )
+                    print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
             print(f"从epoch {start_epoch} 继续训练...")
         else:
             print(f"Warning: checkpoint未找到 {args.resume}")
 
     if optimizer is None:
-        optimizer = build_layerwise_optimizer()
+        if args.freeze_0626_backbone:
+            graph_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                graph_params,
+                lr=args.graph_base_lr,
+                weight_decay=0.0001,
+            )
+        else:
+            optimizer = build_layerwise_optimizer()
 
     ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     if ema is not None and args.resume and 'checkpoint' in locals():
         ema_state = checkpoint.get('ema_state_dict')
         if ema_state is not None:
-            try:
-                ema.ema.load_state_dict(ema_state)
-            except RuntimeError as exc:
-                ema_result = ema.ema.load_state_dict(ema_state, strict=False)
-                invalid_ema_missing = list(ema_result.missing_keys)
-                invalid_ema_unexpected = [
-                    key
-                    for key in ema_result.unexpected_keys
-                    if not key.startswith("asterisk.")
-                ]
-                if invalid_ema_missing or invalid_ema_unexpected:
-                    raise RuntimeError(
-                        "EMA checkpoint mismatch on resume: "
-                        f"missing={invalid_ema_missing}, unexpected={invalid_ema_unexpected}"
-                    ) from exc
-                if ema_result.unexpected_keys:
-                    print(
-                        "[WARN] Ignored legacy EMA checkpoint keys not used by current model: "
-                        + ", ".join(ema_result.unexpected_keys),
-                        flush=True,
-                    )
+            ema.ema.load_state_dict(ema_state)
 
     # 训练循环
     print("\n开始训练...")
@@ -1045,16 +1099,10 @@ if __name__ == "__main__":
     print("Using topology attention constrained version", flush=True)
     print_topology_coefficients(model)
 
-    best_val_f1 = checkpoint.get('val_f1', -1.0) if args.resume and 'checkpoint' in locals() else -1.0
-    append_existing_logs = bool(
-        args.resume_output_dir.strip()
-        and args.resume
-        and os.path.exists(loss_log_path)
-        and os.path.exists(batch_loss_log_path)
-    )
+    best_val_f1 = -1.0
     
     # 写入训练日志头
-    with open(training_log_path, 'a' if append_existing_logs else 'w', encoding='utf-8') as log_f:
+    with open(training_log_path, 'w', encoding='utf-8') as log_f:
         log_f.write("="*100 + "\n")
         log_f.write("Swin-UNet 训练日志\n")
         log_f.write("="*100 + "\n")
@@ -1072,24 +1120,35 @@ if __name__ == "__main__":
             log_f.write(f"  每轮最多训练batch数: {args.max_train_batches}\n")
         log_f.write("="*100 + "\n\n")
     
-    with open(loss_log_path, 'a' if append_existing_logs else 'w', newline='', encoding='utf-8') as loss_log_file, \
-         open(batch_loss_log_path, 'a' if append_existing_logs else 'w', newline='', encoding='utf-8') as batch_loss_log_file:
+    with open(loss_log_path, 'w', newline='', encoding='utf-8') as loss_log_file, \
+         open(batch_loss_log_path, 'w', newline='', encoding='utf-8') as batch_loss_log_file:
         loss_writer = csv.writer(loss_log_file)
         batch_loss_writer = csv.writer(batch_loss_log_file)
-        if not append_existing_logs:
-            loss_writer.writerow([
-                'epoch', 'lr', 'train_avg_loss', 'val_loss',
-                'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
-                'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
-            ])
-            batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
+        loss_writer.writerow([
+            'epoch', 'lr', 'train_avg_loss', 'val_loss',
+            'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
+            'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
+        ])
+        batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
 
         for epoch in range(start_epoch, args.max_epochs):
+            current_lr = get_cosine_warmup_lr(
+                epoch, args.max_epochs, args.new_lr, args.new_min_lr, args.warmup_epochs
+            )
+            for param_group in optimizer.param_groups:
+                if param_group.get('group_name') == 'imagenet_loaded':
+                    param_group['lr'] = get_cosine_warmup_lr(
+                        epoch, args.max_epochs, args.pretrained_lr,
+                        args.pretrained_min_lr, args.warmup_epochs
+                    )
+                else:
+                    param_group['lr'] = current_lr
+
             model.train()
             total_loss = 0
             train_batches = 0
             skipped_batches = 0
-            optimizer_step_index = epoch * optimizer_steps_per_epoch
+            stage_distill_scale = get_stage_distill_scale(epoch)
             stage_topology_alpha_scale = get_stage_topology_alpha_scale(
                 epoch,
                 args.stage_topology_warmup_epochs,
@@ -1144,6 +1203,9 @@ if __name__ == "__main__":
                 skeletons_padded = crop_to_shape(skeletons_padded, orig_shape)
                 skeletons_dilate_padded = crop_to_shape(skeletons_dilate_padded, orig_shape)
                 
+                graph_base_logits, graph_delta_logit, graph_delta = (
+                    get_graph_outputs_from_model(model)
+                )
                 loss, loss_dict = criterion(
                     surface_logits,
                     surface_gt=masks_padded,
@@ -1153,6 +1215,9 @@ if __name__ == "__main__":
                     boundary_logits=boundary_logits,
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
+                    stage_distill_scale=stage_distill_scale,
+                    graph_base_logits=graph_base_logits,
+                    graph_delta_logit=graph_delta_logit,
                     connectivity_gt=connectivity_gt,
                     direction_gt=direction_gt,
                     boundary_gt=boundary_gt,
@@ -1171,25 +1236,6 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 loss.backward()
 
-                current_lr = get_cosine_warmup_lr(
-                    optimizer_step_index,
-                    total_optimizer_steps,
-                    args.new_lr,
-                    args.new_min_lr,
-                    warmup_steps,
-                )
-                for param_group in optimizer.param_groups:
-                    if param_group.get('group_name') == 'imagenet_loaded':
-                        param_group['lr'] = get_cosine_warmup_lr(
-                            optimizer_step_index,
-                            total_optimizer_steps,
-                            args.pretrained_lr,
-                            args.pretrained_min_lr,
-                            warmup_steps,
-                        )
-                    else:
-                        param_group['lr'] = current_lr
-
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 if not torch.isfinite(grad_norm):
                     skipped_batches += 1
@@ -1201,7 +1247,6 @@ if __name__ == "__main__":
                     continue
 
                 optimizer.step()
-                optimizer_step_index += 1
                 if ema is not None:
                     ema.update(model)
 
@@ -1216,37 +1261,30 @@ if __name__ == "__main__":
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
+                        f"ClDice: {loss_dict['skeleton_cldice_loss'].item():.4f}, "
                         f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
+                        f"StageRoad: {loss_dict['stage_roadness_loss'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
+                        f"StageKD: {loss_dict['stage_distill_loss'].item():.4f}"
+                        f"x{stage_distill_scale:.2f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
                         f"TF: {teacher_forcing_ratio:.2f}, "
                         f"Boundary: {loss_dict['boundary_loss'].item():.4f}, "
-                        f"LR: {current_lr:.6g}",
+                        f"GraphCorr: {loss_dict['graph_corr_loss'].item():.4f}",
                         flush=True
                     )
 
             train_avg_loss = total_loss / max(train_batches, 1)
             eval_model = ema.ema if ema is not None else model
-            if args.direct_resize_train:
-                val_metrics = evaluate_skeleton(
-                    eval_model,
-                    val_loader,
-                    criterion,
-                    threshold=args.threshold,
-                    skeleton_threshold=args.skeleton_threshold,
-                    stage_topology_alpha_scale=stage_topology_alpha_scale,
-                )
-            else:
-                val_metrics = evaluate_overlap_full_images(
-                    eval_model,
-                    val_loader,
-                    criterion,
-                    threshold=args.threshold,
-                    skeleton_threshold=args.skeleton_threshold,
-                    tile_size=args.img_size,
-                    stride=args.overlap_stride,
-                    stage_topology_alpha_scale=stage_topology_alpha_scale,
-                )
+            val_metrics = evaluate_overlap_full_images(
+                eval_model,
+                val_loader,
+                threshold=args.threshold,
+                skeleton_threshold=args.skeleton_threshold,
+                tile_size=args.img_size,
+                stride=args.overlap_stride,
+                stage_topology_alpha_scale=stage_topology_alpha_scale,
+            )
             val_loss = val_metrics['loss']
             val_iou = val_metrics['surface_iou']
             val_f1 = val_metrics['surface_f1']
@@ -1334,7 +1372,6 @@ if __name__ == "__main__":
                 'topology_coefficients': get_topology_coefficients(model),
                 'stage_topology_alpha_scale': stage_topology_alpha_scale,
                 'stage_topology_teacher_forcing_ratio': teacher_forcing_ratio,
-                'loaded_pretrained_names': sorted(loaded_pretrained_names),
                 'args': vars(args),
             }
             # 保存 last.pth（总是覆盖）
@@ -1361,26 +1398,15 @@ if __name__ == "__main__":
     if os.path.isfile(best_path):
         best_checkpoint = torch.load(best_path, map_location='cuda')
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
-        if args.direct_resize_train:
-            best_val_metrics = evaluate_skeleton(
-                model,
-                val_loader,
-                criterion,
-                threshold=args.threshold,
-                skeleton_threshold=args.skeleton_threshold,
-                stage_topology_alpha_scale=1.0,
-            )
-        else:
-            best_val_metrics = evaluate_overlap_full_images(
-                model,
-                val_loader,
-                criterion,
-                threshold=args.threshold,
-                skeleton_threshold=args.skeleton_threshold,
-                tile_size=args.img_size,
-                stride=args.overlap_stride,
-                stage_topology_alpha_scale=1.0,
-            )
+        best_val_metrics = evaluate_overlap_full_images(
+            model,
+            val_loader,
+            threshold=args.threshold,
+            skeleton_threshold=args.skeleton_threshold,
+            tile_size=args.img_size,
+            stride=args.overlap_stride,
+            stage_topology_alpha_scale=1.0,
+        )
 
         best_eval_msg = (
             f"Best Checkpoint Eval, Val Loss: {best_val_metrics['loss']:.4f}, "
