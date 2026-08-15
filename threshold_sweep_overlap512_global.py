@@ -65,6 +65,7 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--source_patch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--overlap_stride", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--thresholds", type=str, default="")
@@ -87,20 +88,43 @@ def main():
     parser.add_argument("--stage_topology_alpha_max", type=float, default=1.0)
     parser.add_argument("--stage_topology_alpha_init", type=float, default=0.1)
     parser.add_argument("--structure_profile", type=str, default=STRUCTURE_PROFILE_FULL, choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626])
-    parser.add_argument("--enable_graph_prop", action="store_true")
     parser.add_argument(
         "--disable_msfe_skip",
         action="store_true",
         help="ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when present",
+    )
+    parser.add_argument("--enable_highres_structure_stream", action="store_true")
+    parser.add_argument("--highres_structure_channels", type=int, default=64)
+    parser.add_argument(
+        "--highres_structure_fuse_stages",
+        type=str,
+        default="stage23",
+        choices=["stage2", "stage3", "stage23"],
     )
     args = parser.parse_args()
 
     thresholds = parse_thresholds(args.thresholds)
     checkpoint = torch.load(args.model_path, map_location="cpu")
     if isinstance(checkpoint.get("args"), dict):
-        args.structure_profile = checkpoint["args"].get("structure_profile", args.structure_profile)
-        args.enable_graph_prop = bool(checkpoint["args"].get("enable_graph_prop", args.enable_graph_prop))
-        args.disable_msfe_skip = bool(checkpoint["args"].get("disable_msfe_skip", args.disable_msfe_skip))
+        saved_args = checkpoint["args"]
+        args.structure_profile = saved_args.get("structure_profile", args.structure_profile)
+        args.disable_msfe_skip = bool(saved_args.get("disable_msfe_skip", args.disable_msfe_skip))
+        args.enable_highres_structure_stream = bool(
+            saved_args.get(
+                "enable_highres_structure_stream",
+                args.enable_highres_structure_stream,
+            )
+        )
+        args.highres_structure_channels = int(
+            saved_args.get(
+                "highres_structure_channels",
+                args.highres_structure_channels,
+            )
+        )
+        args.highres_structure_fuse_stages = saved_args.get(
+            "highres_structure_fuse_stages",
+            args.highres_structure_fuse_stages,
+        )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     config = get_config(args)
@@ -108,7 +132,6 @@ def main():
         config=config,
         img_size=args.img_size,
         num_classes=1,
-        use_asterisk=True,
         return_skeleton=True,
         final_topology_eta_init=args.final_topology_eta_init,
         final_gap_rho_init=args.final_gap_rho_init,
@@ -116,8 +139,10 @@ def main():
         stage_topology_alpha_max=args.stage_topology_alpha_max,
         stage_topology_alpha_init=args.stage_topology_alpha_init,
         structure_profile=args.structure_profile,
-        enable_final_graph_prop=args.enable_graph_prop,
         use_msfe_skip=not args.disable_msfe_skip,
+        enable_highres_structure_stream=args.enable_highres_structure_stream,
+        highres_structure_channels=args.highres_structure_channels,
+        highres_structure_fuse_stages=args.highres_structure_fuse_stages,
     )
     load_topology_checkpoint_state(
         model,

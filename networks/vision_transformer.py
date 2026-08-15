@@ -17,7 +17,6 @@ from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNo
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
 from .swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys
-from .dilated_asterisk import DilatedAsteriskWithDirections
 
 logger = logging.getLogger(__name__)
 
@@ -38,57 +37,21 @@ def set_soft_graph_eval_mode(
     lambda_override=None,
     identity_dir_convs=False,
 ):
-    """Eval-only overrides for final soft skeleton graph propagation."""
-    swin_unet = _core_swin_unet(model)
-    head = swin_unet.guided_head
-    head.eval_use_soft_graph = bool(use_soft_graph)
-    graph = getattr(head, "graph_propagation", None)
-    if graph is not None:
-        graph.set_eval_lambda(lambda_value=lambda_override, lambda_scale=lambda_scale)
-        if identity_dir_convs:
-            graph.reset_dir_convs_to_identity()
-    lambda_eff = 0.0
-    if graph is not None:
-        if lambda_override is not None:
-            lambda_eff = float(lambda_override)
-        else:
-            lambda_eff = float(
-                (graph.effective_lambda() * graph.eval_lambda_scale).detach().cpu()
-            )
     return {
-        "use_soft_graph": bool(head.eval_use_soft_graph),
+        "use_soft_graph": False,
         "lambda_scale": float(lambda_scale),
         "lambda_override": lambda_override,
-        "lambda_eff": lambda_eff,
+        "lambda_eff": 0.0,
         "identity_dir_convs": bool(identity_dir_convs),
     }
 
 
 def configure_graph_diagnostics(model, enabled=True):
-    swin_unet = _core_swin_unet(model)
-    head = swin_unet.guided_head
-    head.capture_graph_diagnostics = bool(enabled)
-    if not enabled:
-        head.last_graph_diagnostics = None
-        graph = getattr(head, "graph_propagation", None)
-        if graph is not None:
-            graph.capture_diagnostics = False
-            graph.last_diagnostics = None
-            graph.last_export = None
+    return None
 
 
 def get_graph_propagation_state(model):
-    swin_unet = _core_swin_unet(model)
-    head = swin_unet.guided_head
-    graph = getattr(head, "graph_propagation", None)
-    if graph is None:
-        return None
-    return {
-        "eval_use_soft_graph": bool(head.eval_use_soft_graph),
-        "lambda_scale": float(graph.eval_lambda_scale),
-        "lambda_eff": float(graph.effective_lambda().detach().cpu()),
-        "raw_lambda": float(graph.raw_lambda.detach().cpu()),
-    }
+    return None
 
 
 def get_topology_coefficients(model):
@@ -98,7 +61,12 @@ def get_topology_coefficients(model):
     coefficients = {
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
-        "graph_prop_enabled": bool(getattr(guided_head, "enable_graph_prop", False)),
+        "graph_prop_enabled": False,
+        "highres_structure_stream": {
+            "enabled": bool(getattr(swin_unet, "enable_highres_structure_stream", False)),
+            "channels": int(getattr(swin_unet, "highres_structure_channels", 0)),
+            "fuse_stages": getattr(swin_unet, "highres_structure_fuse_stages", "stage23"),
+        },
         "stage_topology_stages": getattr(swin_unet, "stage_topology_stages", "none"),
         "stage_topology_active": {
             f"stage{stage}": bool(swin_unet._stage_topology_enabled(stage))
@@ -106,18 +74,9 @@ def get_topology_coefficients(model):
         },
     }
 
-    graph = getattr(guided_head, "graph_propagation", None)
-    if graph is not None:
-        coefficients["graph_propagation"] = {
-            "lambda_eff": float(graph.effective_lambda().detach().cpu()),
-            "lambda_scale": float(graph.eval_lambda_scale),
-            "eval_use_soft_graph": bool(guided_head.eval_use_soft_graph),
-        }
-
     for stage, structure_block in enumerate(swin_unet.decoder_structure_blocks):
         coefficients[f"decoder_stage{stage}"] = {
             "gamma1": float(structure_block.gamma1.detach().cpu()),
-            "gamma2": float(structure_block.gamma2.detach().cpu()),
             "structure_enabled": bool(swin_unet._decoder_structure_enabled(stage)),
         }
 
@@ -176,24 +135,6 @@ def apply_structure_profile_runtime(model):
     guided_head.raw_rho_gap.requires_grad_(False)
 
 
-def freeze_backbone_train_graph_only(model):
-    """Freeze encoder/decoder/heads; leave graph_propagation trainable."""
-    module = model.module if hasattr(model, "module") else model
-    for param in module.parameters():
-        param.requires_grad = False
-
-    graph = getattr(module.swin_unet.guided_head, "graph_propagation", None)
-    if graph is None:
-        raise RuntimeError(
-            "freeze_backbone_train_graph_only requires enable_graph_prop=True"
-        )
-    for param in graph.parameters():
-        param.requires_grad = True
-
-    trainable = [name for name, p in module.named_parameters() if p.requires_grad]
-    return trainable
-
-
 def format_topology_coefficients(model):
     coefficients = get_topology_coefficients(model)
     fields = [
@@ -202,11 +143,14 @@ def format_topology_coefficients(model):
         f"final_structure={'on' if coefficients['final_structure_enabled'] else 'off'}",
         f"graph_prop={'on' if coefficients['graph_prop_enabled'] else 'off'}",
     ]
-    if coefficients.get("graph_propagation"):
-        graph_values = coefficients["graph_propagation"]
-        fields.append(
-            "graph_lambda_eff={:.6f}".format(graph_values["lambda_eff"])
+    highres_values = coefficients["highres_structure_stream"]
+    fields.append(
+        "highres_structure={} channels={} fuse_stages={}".format(
+            "on" if highres_values["enabled"] else "off",
+            highres_values["channels"],
+            highres_values["fuse_stages"],
         )
+    )
     for stage in (
         "decoder_stage0",
         "decoder_stage1",
@@ -216,11 +160,10 @@ def format_topology_coefficients(model):
         values = coefficients[stage]
         enabled = "active" if values.get("structure_enabled") else "bypass"
         fields.append(
-            "{}[{}] gamma1={:.6f} gamma2={:.6f}".format(
+            "{}[{}] gamma1={:.6f}".format(
                 stage,
                 enabled,
                 values["gamma1"],
-                values["gamma2"],
             )
         )
     final_values = coefficients["final_topology"]
@@ -265,14 +208,47 @@ def load_topology_checkpoint_state(
     strict=True,
 ):
     model_state = model.state_dict()
+    highres_structure_missing_prefixes = (
+        "swin_unet.highres_structure_encoder.",
+        "swin_unet.highres_structure_skeleton_head.",
+        "swin_unet.highres_structure_fusion.",
+    )
+
+    def print_expected_highres_missing(missing_keys):
+        expected = [
+            key
+            for key in missing_keys
+            if key.startswith(highres_structure_missing_prefixes)
+        ]
+        if expected:
+            print(
+                "[TOPOLOGY] Expected new structure-stream missing keys: "
+                + ", ".join(expected[:12])
+                + (" ..." if len(expected) > 12 else ""),
+                flush=True,
+            )
+
     obsolete_unexpected_suffixes = (
         "decoder_connectivity_value_scale",
+        "raw_gamma2",
+        "road_bias_scale_a1",
+        "road_bias_scale",
+        "decoder_skeleton_bias_scale",
+    )
+    obsolete_unexpected_prefixes = (
+        "swin_unet.encoder_stage1_road_attention_head.",
     )
     filtered_state_dict = {}
     skipped_obsolete_keys = []
     skipped_shape_keys = []
     for key, value in state_dict.items():
-        if key not in model_state and key.endswith(obsolete_unexpected_suffixes):
+        if (
+            key not in model_state
+            and (
+                key.endswith(obsolete_unexpected_suffixes)
+                or key.startswith(obsolete_unexpected_prefixes)
+            )
+        ):
             skipped_obsolete_keys.append(key)
             continue
         if (
@@ -357,7 +333,7 @@ def load_topology_checkpoint_state(
             "swin_unet.stage2_topology_source.direction_gate.",
             "swin_unet.stage2_topology_source.direction_gate_beta",
             "swin_unet.stage2_topology_source.structure_gate.0.weight",
-        )
+        ) + highres_structure_missing_prefixes
         if is_0626_checkpoint:
             allowed_missing_prefixes = allowed_missing_prefixes + (
                 "swin_unet.guided_head.alpha",
@@ -377,6 +353,7 @@ def load_topology_checkpoint_state(
                 "Legacy structure checkpoint mismatch: "
                 f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
             )
+        print_expected_highres_missing(result.missing_keys)
         module = model.module if hasattr(model, "module") else model
         guided_head = module.swin_unet.guided_head
         with torch.no_grad():
@@ -449,7 +426,7 @@ def load_topology_checkpoint_state(
         "swin_unet.stage2_topology_source.gate_branch.",
         "swin_unet.guided_head.detached_skeleton_refine.",
         "swin_unet.guided_head.detached_skeleton_head.",
-    )
+    ) + highres_structure_missing_prefixes
     msaf_missing_prefixes = (
         "swin_unet.bottleneck_context_fusion.scale_projections.",
         "swin_unet.bottleneck_context_fusion.scale_attention.",
@@ -472,6 +449,7 @@ def load_topology_checkpoint_state(
                 "Checkpoint mismatch after allowing new encoder additions: "
                 f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
             )
+        print_expected_highres_missing(result.missing_keys)
         print(
             "[TOPOLOGY] Loaded checkpoint without new encoder additions; "
             "new parameters use runtime initialization.",
@@ -518,12 +496,14 @@ class SwinUnet(nn.Module):
                  use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
-                 final_skeleton_gradient_ratio=0.0):
+                 final_skeleton_gradient_ratio=0.0,
+                 enable_highres_structure_stream=False,
+                 highres_structure_channels=64,
+                 highres_structure_fuse_stages="stage23"):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.config = config
-        self.use_asterisk = use_asterisk
         self.return_skeleton = return_skeleton
         self.bottleneck_type = bottleneck_type
 
@@ -554,33 +534,13 @@ class SwinUnet(nn.Module):
                                 stage_topology_ratio=stage_topology_ratio,
                                 stage_topology_topo_clip=stage_topology_topo_clip,
                                 structure_profile=structure_profile,
-                                enable_final_graph_prop=enable_final_graph_prop,
                                 use_msfe_skip=use_msfe_skip,
                                 stage2_skeleton_gradient_ratio=stage2_skeleton_gradient_ratio,
                                 stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
-                                final_skeleton_gradient_ratio=final_skeleton_gradient_ratio)
-        
-        # Keep DilatedAsterisk in the graph, but turn off its residual effect.
-        if self.use_asterisk:
-            self.asterisk = DilatedAsteriskWithDirections(
-                in_channels=self.num_classes,
-                out_channels=self.num_classes,
-                alpha_init=0.0,
-            )
-            self._disable_asterisk_alpha()
-            print("[INFO] DilatedAsterisk code kept but disabled: alpha=0 (in_channels={})".format(self.num_classes))
-
-    def _disable_asterisk_alpha(self):
-        if self.use_asterisk and hasattr(self, "asterisk") and hasattr(self.asterisk, "alpha"):
-            with torch.no_grad():
-                self.asterisk.alpha.zero_()
-            self.asterisk.alpha.requires_grad_(False)
-
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        self._disable_asterisk_alpha()
-        return result
-
+                                final_skeleton_gradient_ratio=final_skeleton_gradient_ratio,
+                                enable_highres_structure_stream=enable_highres_structure_stream,
+                                highres_structure_channels=highres_structure_channels,
+                                highres_structure_fuse_stages=highres_structure_fuse_stages)
     def forward(
         self,
         x,
@@ -603,9 +563,6 @@ class SwinUnet(nn.Module):
         else:
             logits = outputs
             aux_outputs = ()
-
-        if self.use_asterisk:
-            logits = self.asterisk(logits)
 
         if self.return_skeleton:
             return (logits, *aux_outputs)

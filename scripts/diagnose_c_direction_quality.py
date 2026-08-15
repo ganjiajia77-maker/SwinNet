@@ -318,7 +318,8 @@ def extract_stage_c(model, images):
     # and structure outputs attached via swin_unet last?
     # Better: call swin_unet directly and fuse like up_x4.
     swin = model.swin_unet
-    x, x_downsample, road_attentions = swin.forward_features(images)
+    feature_outputs = swin.forward_features(images)
+    x, x_downsample, road_attentions = feature_outputs[:3]
     x, structure_outputs = swin.forward_up_features(
         x,
         x_downsample,

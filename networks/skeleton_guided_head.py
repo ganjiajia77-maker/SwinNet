@@ -494,13 +494,10 @@ class DecoderStructureRefinement(nn.Module):
         channels,
         connectivity_channels=8,
         init_gamma1=0.0,
-        init_gamma2=0.0,
         gamma_limit=None,
         context_channels=None,
         context_strength=0.03,
-        enable_roadness_head=False,
         enable_direct_feature_refinement=True,
-        enable_directional_feature_refinement=True,
         skeleton_gradient_ratio=0.5,
     ):
         super().__init__()
@@ -508,11 +505,7 @@ class DecoderStructureRefinement(nn.Module):
         self.connectivity_channels = connectivity_channels
         self.gamma_limit = gamma_limit
         self.context_strength = float(context_strength)
-        self.enable_roadness_head = bool(enable_roadness_head)
         self.enable_direct_feature_refinement = bool(enable_direct_feature_refinement)
-        self.enable_directional_feature_refinement = bool(
-            enable_directional_feature_refinement
-        )
         self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
 
         self.structure_branch = nn.Sequential(
@@ -535,10 +528,6 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
-        if self.enable_roadness_head:
-            self.stage_roadness_head = nn.Conv2d(channels, 1, kernel_size=1)
-        else:
-            self.stage_roadness_head = None
         if context_channels is not None:
             self.context_to_gate = nn.Conv2d(context_channels, 1, kernel_size=1)
             nn.init.zeros_(self.context_to_gate.weight)
@@ -551,7 +540,6 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.raw_gamma1 = nn.Parameter(torch.tensor(float(init_gamma1)))
-        self.raw_gamma2 = nn.Parameter(torch.tensor(float(init_gamma2)))
         self.capture_diagnostics = False
         self.last_diagnostics = None
 
@@ -560,12 +548,6 @@ class DecoderStructureRefinement(nn.Module):
         if self.gamma_limit is None:
             return self.raw_gamma1
         return float(self.gamma_limit) * torch.tanh(self.raw_gamma1)
-
-    @property
-    def gamma2(self):
-        if self.gamma_limit is None:
-            return self.raw_gamma2
-        return float(self.gamma_limit) * torch.tanh(self.raw_gamma2)
 
     @staticmethod
     def _shift_feature(x, dy, dx):
@@ -596,14 +578,24 @@ class DecoderStructureRefinement(nn.Module):
             propagated = propagated + connectivity_prob[:, idx:idx + 1] * shifted
         return propagated / float(len(directions))
 
-    def forward(self, x, global_context=None, apply_feature_refinement=True):
+    def forward(
+        self,
+        x,
+        global_context=None,
+        apply_feature_refinement=True,
+        disable_skeleton_prediction=False,
+    ):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
-        skeleton_logits = self.skeleton_head(structure_feat)
+        if disable_skeleton_prediction:
+            skeleton_logits = None
+            skeleton_prob = x.new_zeros((x.shape[0], 1, x.shape[-2], x.shape[-1]))
+        else:
+            skeleton_logits = self.skeleton_head(structure_feat)
+            skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_logits = self.connectivity_head(structure_feat)
         direction_logits = self.direction_head(structure_feat)
 
-        skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
@@ -628,24 +620,15 @@ class DecoderStructureRefinement(nn.Module):
         if self.enable_direct_feature_refinement and apply_feature_refinement:
             residual = structure_gate * self.feature_residual(x)
             gate_residual = self.gamma1 * residual
-            refined = x + gate_residual
-            if self.enable_directional_feature_refinement:
-                directional = self.directional_propagation(refined, connectivity_prob)
-                directional_residual = self.gamma2 * directional
-                out = refined + directional_residual
-            else:
-                directional_residual = torch.zeros_like(x)
-                out = refined
+            out = x + gate_residual
         else:
             gate_residual = torch.zeros_like(x)
-            directional_residual = torch.zeros_like(x)
             out = x
         if self.capture_diagnostics:
             with torch.no_grad():
                 feature_norm = torch.linalg.vector_norm(x)
                 self.last_diagnostics = {
                     "gamma1": float(self.gamma1.detach().cpu()),
-                    "gamma2": float(self.gamma2.detach().cpu()),
                     "gate_mean": float(structure_gate.mean().detach().cpu()),
                     "gate_max": float(structure_gate.max().detach().cpu()),
                     "conn_strength_mean": float(
@@ -657,12 +640,6 @@ class DecoderStructureRefinement(nn.Module):
                             / (feature_norm + 1e-6)
                         ).detach().cpu()
                     ),
-                    "directional_residual_relative_norm": float(
-                        (
-                            torch.linalg.vector_norm(directional_residual)
-                            / (feature_norm + 1e-6)
-                        ).detach().cpu()
-                    ),
                     "total_residual_relative_norm": float(
                         (
                             torch.linalg.vector_norm(out - x)
@@ -670,329 +647,14 @@ class DecoderStructureRefinement(nn.Module):
                         ).detach().cpu()
                     ),
                 }
-        roadness_logits = None
-        if self.stage_roadness_head is not None:
-            roadness_logits = self.stage_roadness_head(structure_feat)
         return (
             out,
             skeleton_logits,
             connectivity_logits,
             direction_logits,
             structure_gate,
-            roadness_logits,
+            None,
         )
-
-
-class SoftSkeletonGraphPropagation(nn.Module):
-    """Bilateral-anchor gap repair with direct delta-logit residual.
-
-    G fires only when both sides of a pixel have road anchors and aligned
-    connectivity (multi-radius r=1,2,4).  Correction is applied in logit space:
-
-        final_logits = base_logits + lambda * G * delta_logit
-    """
-
-    DELTA_LOGIT_CLAMP = 0.3
-
-    DIRECTIONS = [
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
-        (-1, -1),
-        (-1, 1),
-        (1, -1),
-        (1, 1),
-    ]
-    OPPOSITE = (1, 0, 3, 2, 7, 6, 5, 4)
-
-    def __init__(
-        self,
-        lambda_init=0.05,
-        lambda_max=0.10,
-        edge_beta=0.7,
-        radii=(1, 2, 4),
-        near_pool=7,
-    ):
-        super().__init__()
-        self.lambda_max = float(lambda_max)
-        self.edge_beta = float(edge_beta)
-        self.radii = tuple(int(r) for r in radii)
-        self.near_pool = int(near_pool)
-        ratio = float(lambda_init) / self.lambda_max
-        if not 0.0 < ratio < 1.0:
-            raise ValueError("lambda_init must be in (0, lambda_max)")
-        self.raw_lambda = nn.Parameter(torch.logit(torch.tensor(ratio)))
-        self.graph_proj = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, kernel_size=1, bias=False),
-        )
-        nn.init.zeros_(self.graph_proj[-1].weight)
-        # gate: 7ch -> P, weak_surface, two_sided_support, near_H, H, S, C_summary
-        self.gate_mlp = nn.Sequential(
-            nn.Conv2d(7, 16, kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, kernel_size=1, bias=True),
-        )
-        nn.init.constant_(self.gate_mlp[-1].bias, -2.0)
-        self.eval_lambda_scale = 1.0
-        self.eval_lambda_override = None
-        self.capture_diagnostics = False
-        self.last_diagnostics = None
-        self.last_export = None
-
-    def effective_lambda(self):
-        return self.lambda_max * torch.sigmoid(self.raw_lambda)
-
-    def set_eval_mode(self, use_soft_graph=True, lambda_scale=1.0):
-        self.eval_lambda_scale = float(lambda_scale)
-        return use_soft_graph
-
-    def set_eval_lambda(self, lambda_value=None, lambda_scale=1.0):
-        if lambda_value is None:
-            self.eval_lambda_override = None
-            self.eval_lambda_scale = float(lambda_scale)
-        else:
-            self.eval_lambda_override = float(lambda_value)
-            self.eval_lambda_scale = 1.0
-
-    def reset_dir_convs_to_identity(self):
-        """Backward-compatible no-op (v3 operates in logit space)."""
-
-    @staticmethod
-    def _shift(x, dy, dx):
-        _, _, height, width = x.shape
-        pad_left = max(dx, 0)
-        pad_right = max(-dx, 0)
-        pad_top = max(dy, 0)
-        pad_bottom = max(-dy, 0)
-        padded = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
-        y0 = max(-dy, 0)
-        x0 = max(-dx, 0)
-        return padded[:, :, y0:y0 + height, x0:x0 + width]
-
-    @staticmethod
-    def build_anchor_map(
-        surface_pre_logits,
-        skeleton_logits,
-        connectivity_logits,
-        near_pool=7,
-    ):
-        P = torch.sigmoid(surface_pre_logits).detach()
-        S = torch.sigmoid(skeleton_logits).detach()
-        C = torch.sigmoid(connectivity_logits).detach()
-        topk = min(2, C.shape[1])
-        conn_strength = C.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
-        topo_conf = S * conn_strength
-
-        surface_anchor = torch.sigmoid((P - 0.60) / 0.08)
-        pad = near_pool // 2
-        topo_near = F.max_pool2d(
-            topo_conf,
-            kernel_size=near_pool,
-            stride=1,
-            padding=pad,
-        )
-        supported_surface_anchor = surface_anchor * topo_near
-        H = 1.0 - (1.0 - topo_conf) * (1.0 - supported_surface_anchor)
-        return H, P, S, topo_conf, topo_near, supported_surface_anchor, C
-
-    @staticmethod
-    def build_weak_surface(P):
-        return torch.sigmoid((P - 0.03) / 0.03) * torch.sigmoid((0.60 - P) / 0.10)
-
-    @staticmethod
-    def soft_bilateral_support(h_left, h_right, c_left, c_right):
-        support_h = torch.sqrt(torch.clamp(h_left * h_right, min=1e-6))
-        support_c = 0.5 * (c_left + c_right)
-        return support_h * support_c
-
-    @classmethod
-    def build_two_sided_support_map(cls, H, C, radii=(1, 2, 4)):
-        """Max-pooled soft bilateral support over directions and radii."""
-        parts = []
-        for d_idx, (dy, dx) in enumerate(cls.DIRECTIONS):
-            opp = cls.OPPOSITE[d_idx]
-            for radius in radii:
-                h_fwd = cls._shift(H, dy * radius, dx * radius)
-                h_bwd = cls._shift(H, -dy * radius, -dx * radius)
-                c_fwd = cls._shift(C[:, d_idx:d_idx + 1], dy * radius, dx * radius)
-                c_bwd = cls._shift(
-                    C[:, opp:opp + 1], -dy * radius, -dx * radius
-                )
-                parts.append(
-                    cls.soft_bilateral_support(h_fwd, h_bwd, c_fwd, c_bwd)
-                )
-        if not parts:
-            return H.new_zeros(H.shape)
-        return torch.stack(parts, dim=0).amax(dim=0)
-
-    def build_gate_map(
-        self,
-        P,
-        H,
-        S,
-        C,
-        weak_surface=None,
-        near_pool=None,
-    ):
-        if weak_surface is None:
-            weak_surface = self.build_weak_surface(P)
-        if near_pool is None:
-            near_pool = self.near_pool
-        pad = near_pool // 2
-        near_H = F.max_pool2d(
-            H,
-            kernel_size=near_pool,
-            stride=1,
-            padding=pad,
-        )
-        two_sided_support = self.build_two_sided_support_map(H, C, radii=self.radii)
-        topk = min(2, C.shape[1])
-        c_summary = C.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
-        candidate_mask = weak_surface * (1.0 - H)
-        gate_input = torch.cat(
-            [
-                P,
-                weak_surface,
-                two_sided_support,
-                near_H,
-                H,
-                S,
-                c_summary,
-            ],
-            dim=1,
-        )
-        G = torch.sigmoid(self.gate_mlp(gate_input)) * candidate_mask
-        return G, candidate_mask, two_sided_support, near_H, weak_surface
-
-    def forward(
-        self,
-        surface_pre_logits,
-        skeleton_logits,
-        connectivity_logits,
-    ):
-        base_logits = surface_pre_logits
-        H, P, S, topo_conf, topo_near, supported_surface_anchor, C = (
-            self.build_anchor_map(
-                surface_pre_logits,
-                skeleton_logits,
-                connectivity_logits,
-                near_pool=self.near_pool,
-            )
-        )
-        G, candidate_mask, two_sided_support, near_H, weak_surface = (
-            self.build_gate_map(P, H, S, C)
-        )
-
-        weighted_messages = base_logits.new_zeros(base_logits.shape)
-        weights_sum = base_logits.new_zeros(
-            base_logits.shape[0], 1, base_logits.shape[2], base_logits.shape[3]
-        )
-        for d_idx, (dy, dx) in enumerate(self.DIRECTIONS):
-            for radius in self.radii:
-                neighbor_logits = self._shift(
-                    base_logits, dy * radius, dx * radius
-                )
-                opp = self.OPPOSITE[d_idx]
-                h_fwd = self._shift(H, dy * radius, dx * radius)
-                h_bwd = self._shift(H, -dy * radius, -dx * radius)
-                c_fwd = self._shift(
-                    C[:, d_idx:d_idx + 1], dy * radius, dx * radius
-                )
-                c_bwd = self._shift(
-                    C[:, opp:opp + 1], -dy * radius, -dx * radius
-                )
-                weight = self.soft_bilateral_support(h_fwd, h_bwd, c_fwd, c_bwd)
-                weighted_messages = weighted_messages + weight * neighbor_logits
-                weights_sum = weights_sum + weight
-
-        message_logits = weighted_messages / (weights_sum + 1e-6)
-        raw_delta_logits = message_logits - base_logits
-        delta_logit = self.graph_proj(
-            torch.cat([base_logits, message_logits, raw_delta_logits], dim=1)
-        )
-        delta_logit = delta_logit.clamp(
-            -self.DELTA_LOGIT_CLAMP,
-            self.DELTA_LOGIT_CLAMP,
-        )
-        if self.eval_lambda_override is not None:
-            lam = base_logits.new_tensor(float(self.eval_lambda_override))
-        else:
-            lam = self.effective_lambda() * float(self.eval_lambda_scale)
-        graph_correction = lam * G * delta_logit
-
-        if self.capture_diagnostics:
-            with torch.no_grad():
-                base_norm = torch.linalg.vector_norm(base_logits)
-                message_norm = torch.linalg.vector_norm(message_logits)
-                raw_delta_norm = torch.linalg.vector_norm(raw_delta_logits)
-                delta_logit_norm = torch.linalg.vector_norm(delta_logit)
-                correction_norm = torch.linalg.vector_norm(graph_correction)
-                self.last_diagnostics = {
-                    "lambda_eff": float(lam.detach().cpu()),
-                    "lambda_scale": float(self.eval_lambda_scale),
-                    "message_over_feature_norm": float(
-                        (message_norm / (base_norm + 1e-6)).detach().cpu()
-                    ),
-                    "message_over_logit_norm": float(
-                        (message_norm / (base_norm + 1e-6)).detach().cpu()
-                    ),
-                    "raw_delta_over_feature_norm": float(
-                        (raw_delta_norm / (base_norm + 1e-6)).detach().cpu()
-                    ),
-                    "delta_logit_over_base_norm": float(
-                        (delta_logit_norm / (base_norm + 1e-6)).detach().cpu()
-                    ),
-                    "graph_delta_over_feature_norm": float(
-                        (delta_logit_norm / (base_norm + 1e-6)).detach().cpu()
-                    ),
-                    "residual_over_feature_norm": float(
-                        (correction_norm / (base_norm + 1e-6)).detach().cpu()
-                    ),
-                    "correction_over_base_norm": float(
-                        (correction_norm / (base_norm + 1e-6)).detach().cpu()
-                    ),
-                    "G_mean": float(G.mean().detach().cpu()),
-                    "G_max": float(G.max().detach().cpu()),
-                    "G_gt_0_1_ratio": float(
-                        (G > 0.1).float().mean().detach().cpu()
-                    ),
-                    "H_mean": float(H.mean().detach().cpu()),
-                    "topo_conf_mean": float(topo_conf.mean().detach().cpu()),
-                    "topo_near_mean": float(topo_near.mean().detach().cpu()),
-                    "supported_surface_anchor_mean": float(
-                        supported_surface_anchor.mean().detach().cpu()
-                    ),
-                    "candidate_mask_mean": float(
-                        candidate_mask.mean().detach().cpu()
-                    ),
-                    "two_sided_support_mean": float(
-                        two_sided_support.mean().detach().cpu()
-                    ),
-                }
-                self.last_export = {
-                    "G": G.detach(),
-                    "H": H.detach(),
-                    "P": P.detach(),
-                    "S": S.detach(),
-                    "topo_conf": topo_conf.detach(),
-                    "topo_near": topo_near.detach(),
-                    "near_H": near_H.detach(),
-                    "weak_surface": weak_surface.detach(),
-                    "candidate_mask": candidate_mask.detach(),
-                    "two_sided_support": two_sided_support.detach(),
-                    "supported_surface_anchor": supported_surface_anchor.detach(),
-                    "message_logits": message_logits.detach(),
-                    "raw_delta_logits": raw_delta_logits.detach(),
-                    "delta_logit": delta_logit.detach(),
-                    "surface_pre_logits": surface_pre_logits.detach(),
-                    "graph_correction": graph_correction.detach(),
-                }
-
-        return graph_correction, delta_logit, G
 
 
 class SkeletonGuidedHead(nn.Module):
@@ -1005,9 +667,6 @@ class SkeletonGuidedHead(nn.Module):
         topology_eta_init=0.005,
         gap_rho_init=0.005,
         enable_final_structure=True,
-        enable_graph_prop=False,
-        graph_prop_lambda_init=0.05,
-        graph_prop_lambda_max=0.10,
         final_skeleton_gradient_ratio=0.0,
     ):
         super().__init__()
@@ -1018,7 +677,6 @@ class SkeletonGuidedHead(nn.Module):
         fusion_channels = max(hidden_channels // 2, 16)
         self.connectivity_channels = connectivity_channels
         self.enable_final_structure = bool(enable_final_structure)
-        self.enable_graph_prop = bool(enable_graph_prop)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
 
         self.surface_proj = ConvBNReLU(
@@ -1101,14 +759,6 @@ class SkeletonGuidedHead(nn.Module):
         )
 
         self.surface_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
-        if self.enable_graph_prop:
-            self.graph_propagation = SoftSkeletonGraphPropagation(
-                lambda_init=graph_prop_lambda_init,
-                lambda_max=graph_prop_lambda_max,
-                radii=(1, 2, 4),
-            )
-        else:
-            self.graph_propagation = None
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
         self.rho_gap_max = 0.05
         rho_ratio = float(gap_rho_init) / self.rho_gap_max
@@ -1128,9 +778,6 @@ class SkeletonGuidedHead(nn.Module):
         self.use_legacy_surface_residual = False
         self.capture_surface_diagnostics = False
         self.last_surface_diagnostics = None
-        self.eval_use_soft_graph = True
-        self.capture_graph_diagnostics = False
-        self.last_graph_diagnostics = None
         self.last_surface_pre_logits = None
         self.last_graph_delta = None
         self.last_delta_logit = None
@@ -1170,114 +817,52 @@ class SkeletonGuidedHead(nn.Module):
             * weak_surface
         ).detach()
 
-    def forward(
-        self,
-        x,
-        stage_skeleton_logits=None,
-        stage_connectivity_logits=None,
-    ):
+    def forward(self, x):
         surface_feat = self.surface_branch(self.surface_proj(x))
         skeleton_feat = self.skeleton_proj(x)
 
         if not self.enable_final_structure:
             final_structure_feat = self.structure_branch(skeleton_feat)
             final_skeleton_logits = self.skeleton_head(final_structure_feat)
-            final_connectivity_logits = self.connectivity_head(final_structure_feat)
-            # A direction field derived from the supervised 8-way connectivity
-            # head keeps the detached guide structurally meaningful without a
-            # separate unsupervised direction head.
-            final_connectivity_prob = torch.sigmoid(final_connectivity_logits)
-            final_direction_logits = torch.cat(
-                [
-                    final_connectivity_prob[:, 3:4] - final_connectivity_prob[:, 2:3]
-                    + final_connectivity_prob[:, 5:6] - final_connectivity_prob[:, 4:5]
-                    + final_connectivity_prob[:, 7:8] - final_connectivity_prob[:, 6:7],
-                    final_connectivity_prob[:, 1:2] - final_connectivity_prob[:, 0:1]
-                    + final_connectivity_prob[:, 6:7] - final_connectivity_prob[:, 4:5]
-                    + final_connectivity_prob[:, 7:8] - final_connectivity_prob[:, 5:6],
-                ],
-                dim=1,
-            )
             guided_surface_feat = self.surface_refine(surface_feat)
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
             boundary_logits = self.boundary_head(boundary_feat)
             boundary_attn = torch.sigmoid(boundary_logits)
             boundary_correction = self.boundary_residual(guided_surface_feat)
+            boundary_residual = self.beta * boundary_attn * boundary_correction
+            if self.capture_surface_diagnostics:
+                with torch.no_grad():
+                    self.last_surface_diagnostics = {
+                        "boundary_beta": float(self.beta.detach().cpu()),
+                        "boundary_attention_mean": float(
+                            boundary_attn.mean().detach().cpu()
+                        ),
+                        "boundary_attention_max": float(
+                            boundary_attn.max().detach().cpu()
+                        ),
+                        "boundary_residual_relative_norm": float(
+                            (
+                                torch.linalg.vector_norm(boundary_residual)
+                                / (
+                                    torch.linalg.vector_norm(guided_surface_feat)
+                                    + 1e-6
+                                )
+                            ).detach().cpu()
+                        ),
+                    }
             guided_surface_feat = (
                 guided_surface_feat
-                + self.beta * boundary_attn * boundary_correction
+                + boundary_residual
             )
             surface_pre_logits = self.surface_head(guided_surface_feat)
             self.last_surface_pre_logits = surface_pre_logits
             self.last_graph_delta = None
             self.last_delta_logit = None
 
-            use_graph = False
-            if use_graph:
-                if self.capture_graph_diagnostics:
-                    self.graph_propagation.capture_diagnostics = True
-                graph_correction, delta_logit, _gap = self.graph_propagation(
-                    surface_pre_logits,
-                    stage_skeleton_logits,
-                    stage_connectivity_logits,
-                )
-                if self.capture_graph_diagnostics:
-                    self.graph_propagation.capture_diagnostics = False
-                self.last_graph_delta = graph_correction
-                self.last_delta_logit = delta_logit
-                surface_logits = surface_pre_logits + graph_correction
-            else:
-                surface_logits = surface_pre_logits
-
-            if self.capture_graph_diagnostics and use_graph:
-                with torch.no_grad():
-                    graph_logit_delta = graph_correction
-                    self.last_graph_diagnostics = {
-                        "use_soft_graph": True,
-                        "eval_use_soft_graph": bool(self.eval_use_soft_graph),
-                        "graph_logit_delta_mean": float(
-                            graph_logit_delta.mean().detach().cpu()
-                        ),
-                        "graph_logit_delta_abs_mean": float(
-                            graph_logit_delta.abs().mean().detach().cpu()
-                        ),
-                        "surface_logit_delta_relative": float(
-                            (
-                                torch.linalg.vector_norm(graph_logit_delta)
-                                / (
-                                    torch.linalg.vector_norm(surface_pre_logits)
-                                    + 1e-6
-                                )
-                            ).detach().cpu()
-                        ),
-                    }
-                    if (
-                        self.graph_propagation is not None
-                        and self.graph_propagation.last_diagnostics is not None
-                    ):
-                        self.last_graph_diagnostics.update(
-                            self.graph_propagation.last_diagnostics
-                        )
-                    if (
-                        self.graph_propagation is not None
-                        and self.graph_propagation.last_export is not None
-                    ):
-                        self.last_graph_diagnostics["export"] = (
-                            self.graph_propagation.last_export
-                        )
-                        self.last_graph_diagnostics["graph_logit_delta"] = (
-                            graph_logit_delta.detach()
-                        )
-                        self.last_graph_diagnostics["surface_pre_logits"] = (
-                            surface_pre_logits.detach()
-                        )
-                        self.last_graph_diagnostics["surface_post_graph_logits"] = (
-                            surface_logits.detach()
-                        )
-
-            self.last_final_direction_logits = final_direction_logits
-            return surface_logits, boundary_logits, final_skeleton_logits, final_connectivity_logits
+            surface_logits = surface_pre_logits
+            self.last_final_direction_logits = None
+            return surface_logits, boundary_logits, final_skeleton_logits, None
 
         structure_feat = self.structure_branch(skeleton_feat)
 

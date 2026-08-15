@@ -105,6 +105,15 @@ parser.add_argument(
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
+parser.add_argument('--enable_highres_structure_stream', action='store_true')
+parser.add_argument('--highres_structure_channels', type=int, default=64)
+parser.add_argument(
+    '--highres_structure_fuse_stages',
+    type=str,
+    default='stage23',
+    choices=['stage2', 'stage3', 'stage23'],
+)
+parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
@@ -295,6 +304,9 @@ def build_criterion(args, loss_weights, device):
         stage_direction_factor=args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
         stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
+        highres_structure_skeleton_weight=(
+            0.0 if args.freeze_0626_backbone else args.highres_structure_skeleton_weight
+        ),
         use_legacy_stage_connectivity_loss=(
             args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
         ),
@@ -372,6 +384,11 @@ def format_training_config_lines(args, loss_weights):
         f"sc_c2s={args.stage_sc_c2s_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
+        "  High-res structure stream: "
+        f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
+        f"channels={args.highres_structure_channels}, "
+        f"fuse_stages={args.highres_structure_fuse_stages}, "
+        f"skeleton_weight={args.highres_structure_skeleton_weight}",
         "  Surface loss: BCE + 0.5*Dice",
         (
             f"  Direct resize: {args.source_patch_size} -> {args.img_size}"
@@ -455,12 +472,21 @@ def inherit_resume_architecture_args(args):
         args.source_patch_size = int(saved_args["source_patch_size"])
     if "overlap_stride" in saved_args and not _cli_has("--overlap_stride"):
         args.overlap_stride = int(saved_args["overlap_stride"])
+    if "enable_highres_structure_stream" in saved_args and not _cli_has("--enable_highres_structure_stream"):
+        args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
+    if "highres_structure_channels" in saved_args and not _cli_has("--highres_structure_channels"):
+        args.highres_structure_channels = int(saved_args["highres_structure_channels"])
+    if "highres_structure_fuse_stages" in saved_args and not _cli_has("--highres_structure_fuse_stages"):
+        args.highres_structure_fuse_stages = str(saved_args["highres_structure_fuse_stages"])
+    if "highres_structure_skeleton_weight" in saved_args and not _cli_has("--highres_structure_skeleton_weight"):
+        args.highres_structure_skeleton_weight = float(saved_args["highres_structure_skeleton_weight"])
     print(
         "[INFO] Resume architecture args: "
         f"profile={args.structure_profile}, "
         f"disable_msfe_skip={args.disable_msfe_skip}, "
         f"direct_resize_train={args.direct_resize_train}, "
-        f"img_size={args.img_size}, source_patch_size={args.source_patch_size}",
+        f"img_size={args.img_size}, source_patch_size={args.source_patch_size}, "
+        f"highres_structure={args.enable_highres_structure_stream}",
         flush=True,
     )
 
@@ -974,7 +1000,10 @@ if __name__ == "__main__":
                     use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
-                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio).to(device)
+                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
+                    enable_highres_structure_stream=args.enable_highres_structure_stream,
+                    highres_structure_channels=args.highres_structure_channels,
+                    highres_structure_fuse_stages=args.highres_structure_fuse_stages).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.no_pretrain:
@@ -1131,6 +1160,9 @@ if __name__ == "__main__":
                         "swin_unet.stage_topology_scales.",
                         "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
                         "swin_unet.guided_head.graph_propagation.",
+                        "swin_unet.highres_structure_encoder.",
+                        "swin_unet.highres_structure_skeleton_head.",
+                        "swin_unet.highres_structure_fusion.",
                         "swin_unet.decoder_structure_blocks.0.direction_head.",
                         "swin_unet.decoder_structure_blocks.1.direction_head.",
                         "swin_unet.decoder_structure_blocks.2.direction_head.",
@@ -1215,7 +1247,16 @@ if __name__ == "__main__":
     if ema is not None and args.resume and 'checkpoint' in locals():
         ema_state = checkpoint.get('ema_state_dict')
         if ema_state is not None:
-            ema.ema.load_state_dict(ema_state)
+            try:
+                ema.ema.load_state_dict(ema_state)
+            except RuntimeError as exc:
+                result = ema.ema.load_state_dict(ema_state, strict=False)
+                print(
+                    "[WARN] Loaded EMA checkpoint with strict=False; "
+                    f"missing={len(result.missing_keys)}, unexpected={len(result.unexpected_keys)}. "
+                    f"Detail: {exc}",
+                    flush=True,
+                )
 
     # 训练循环
     print("\n开始训练...")
@@ -1284,11 +1325,32 @@ if __name__ == "__main__":
             log_f.write(f"  每轮最多训练batch数: {args.max_train_batches}\n")
         log_f.write("="*100 + "\n\n")
     
-    with open(loss_log_path, 'a' if append_existing_logs else 'w', newline='', encoding='utf-8') as loss_log_file, \
-         open(batch_loss_log_path, 'a' if append_existing_logs else 'w', newline='', encoding='utf-8') as batch_loss_log_file:
+    csv_log_mode = 'a' if append_existing_logs else 'w'
+    write_csv_headers = not append_existing_logs
+    try:
+        loss_log_file = open(loss_log_path, csv_log_mode, newline='', encoding='utf-8')
+        try:
+            batch_loss_log_file = open(batch_loss_log_path, csv_log_mode, newline='', encoding='utf-8')
+        except PermissionError:
+            loss_log_file.close()
+            raise
+    except PermissionError as exc:
+        fallback_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        loss_log_path = os.path.join(args.output_dir, f'epoch_losses_resume_{fallback_stamp}.csv')
+        batch_loss_log_path = os.path.join(args.output_dir, f'batch_losses_resume_{fallback_stamp}.csv')
+        print(
+            "[WARN] CSV log file is locked; writing this resumed segment to "
+            f"{loss_log_path} and {batch_loss_log_path}. Detail: {exc}",
+            flush=True,
+        )
+        loss_log_file = open(loss_log_path, 'w', newline='', encoding='utf-8')
+        batch_loss_log_file = open(batch_loss_log_path, 'w', newline='', encoding='utf-8')
+        write_csv_headers = True
+
+    with loss_log_file, batch_loss_log_file:
         loss_writer = csv.writer(loss_log_file)
         batch_loss_writer = csv.writer(batch_loss_log_file)
-        if not append_existing_logs:
+        if write_csv_headers:
             loss_writer.writerow([
                 'epoch', 'lr', 'train_avg_loss', 'val_loss',
                 'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
