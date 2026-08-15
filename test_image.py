@@ -76,6 +76,14 @@ parser.add_argument(
     action='store_true',
     help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
 )
+parser.add_argument('--enable_highres_structure_stream', action='store_true')
+parser.add_argument('--highres_structure_channels', type=int, default=64)
+parser.add_argument(
+    '--highres_structure_fuse_stages',
+    type=str,
+    default='stage23',
+    choices=['stage2', 'stage3', 'stage23'],
+)
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -217,6 +225,9 @@ if __name__ == "__main__":
                 "stage2_skeleton_gradient_ratio",
                 "stage3_skeleton_gradient_ratio",
                 "final_skeleton_gradient_ratio",
+                "enable_highres_structure_stream",
+                "highres_structure_channels",
+                "highres_structure_fuse_stages",
             ):
                 if name in saved_args:
                     setattr(args, name, saved_args[name])
@@ -238,7 +249,10 @@ if __name__ == "__main__":
                     use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
-                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio).cuda()
+                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
+                    enable_highres_structure_stream=args.enable_highres_structure_stream,
+                    highres_structure_channels=args.highres_structure_channels,
+                    highres_structure_fuse_stages=args.highres_structure_fuse_stages).cuda()
     device = next(model.parameters()).device
     
     # 加载模型
