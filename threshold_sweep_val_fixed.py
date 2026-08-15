@@ -55,6 +55,8 @@ def main():
     parser.add_argument('--root_path', type=str, default='./data1')
     parser.add_argument('--model_path', type=str, 
                        default='./model_out/train_skeleton_20260521_094935/best.pth')
+    parser.add_argument('--split', type=str, default='val', choices=['val', 'test'])
+    parser.add_argument('--crop_list', type=str, default='', help='fixed crop list for the selected split')
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--img_size', type=int, default=256)
@@ -89,19 +91,22 @@ def main():
         choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
     )
     parser.add_argument(
-        '--enable_graph_prop',
-        action='store_true',
-        help='enable final soft skeleton graph propagation',
-    )
-    parser.add_argument(
         '--disable_msfe_skip',
         action='store_true',
         help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
     )
+    parser.add_argument('--enable_highres_structure_stream', action='store_true')
+    parser.add_argument('--highres_structure_channels', type=int, default=64)
+    parser.add_argument(
+        '--highres_structure_fuse_stages',
+        type=str,
+        default='stage23',
+        choices=['stage2', 'stage3', 'stage23'],
+    )
+    parser.add_argument('--highres_structure_detach_surface', action='store_true')
     
     args = parser.parse_args()
     
-    enable_graph_prop = args.enable_graph_prop
     checkpoint = None
     if os.path.exists(args.model_path):
         checkpoint = torch.load(args.model_path, map_location='cpu')
@@ -114,12 +119,32 @@ def main():
                     "structure_profile",
                     args.structure_profile,
                 )
-            if not enable_graph_prop and isinstance(checkpoint.get("args"), dict):
-                enable_graph_prop = bool(
-                    checkpoint["args"].get("enable_graph_prop", False)
-                )
             if isinstance(checkpoint.get("args"), dict) and "disable_msfe_skip" in checkpoint["args"]:
                 args.disable_msfe_skip = bool(checkpoint["args"]["disable_msfe_skip"])
+            if isinstance(checkpoint.get("args"), dict):
+                saved_args = checkpoint["args"]
+                args.enable_highres_structure_stream = bool(
+                    saved_args.get(
+                        "enable_highres_structure_stream",
+                        args.enable_highres_structure_stream,
+                    )
+                )
+                args.highres_structure_channels = int(
+                    saved_args.get(
+                        "highres_structure_channels",
+                        args.highres_structure_channels,
+                    )
+                )
+                args.highres_structure_fuse_stages = saved_args.get(
+                    "highres_structure_fuse_stages",
+                    args.highres_structure_fuse_stages,
+                )
+                args.highres_structure_detach_surface = bool(
+                    saved_args.get(
+                        "highres_structure_detach_surface",
+                        args.highres_structure_detach_surface,
+                    )
+                )
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device: {}'.format(device))
@@ -130,7 +155,6 @@ def main():
         config=config,
         img_size=args.img_size,
         num_classes=1,
-        use_asterisk=True,
         return_skeleton=True,
         final_topology_eta_init=args.final_topology_eta_init,
         final_gap_rho_init=args.final_gap_rho_init,
@@ -138,8 +162,11 @@ def main():
         stage_topology_alpha_max=args.stage_topology_alpha_max,
         stage_topology_alpha_init=args.stage_topology_alpha_init,
         structure_profile=args.structure_profile,
-        enable_final_graph_prop=enable_graph_prop,
         use_msfe_skip=not args.disable_msfe_skip,
+        enable_highres_structure_stream=args.enable_highres_structure_stream,
+        highres_structure_channels=args.highres_structure_channels,
+        highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+        highres_structure_detach_surface=args.highres_structure_detach_surface,
     )
     if checkpoint is None:
         checkpoint = torch.load(args.model_path, map_location=device)
@@ -154,12 +181,13 @@ def main():
     print("Using topology attention constrained version", flush=True)
     print_topology_coefficients(model)
     
-    print('\nLoading validation dataset')
+    print(f'\nLoading {args.split} dataset')
     val_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
-        split='val',
+        split=args.split,
         image_size=args.img_size,
         source_patch_size=args.source_patch_size,
+        crop_list_path=args.crop_list,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -167,9 +195,9 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
     )
-    print('Validation set size: {}'.format(len(val_dataset)))
+    print('{} set size: {}'.format(args.split.capitalize(), len(val_dataset)))
     
-    print('\nRunning inference on validation set')
+    print(f'\nRunning inference on {args.split} set')
     all_surface_logits = []
     all_surface_targets = []
     all_skeleton_logits = []

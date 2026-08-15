@@ -33,6 +33,7 @@ parser.add_argument('--output_dir', type=str, default='./predictions', help='out
 parser.add_argument('--batch_size', type=int, default=24, help='batch_size per gpu')
 parser.add_argument('--img_size', type=int, default=256, help='network input size after downsampling from a 1024 patch')
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
+parser.add_argument('--test_crop_list', type=str, default='', help='fixed test crop list: one line per crop, image: x=..., y=...')
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
 parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final skeleton')
@@ -71,15 +72,19 @@ parser.add_argument(
     choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
 )
 parser.add_argument(
-    '--enable_graph_prop',
-    action='store_true',
-    help='enable final soft skeleton graph propagation (auto-read from checkpoint when omitted)',
-)
-parser.add_argument(
     '--disable_msfe_skip',
     action='store_true',
     help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
 )
+parser.add_argument('--enable_highres_structure_stream', action='store_true')
+parser.add_argument('--highres_structure_channels', type=int, default=64)
+parser.add_argument(
+    '--highres_structure_fuse_stages',
+    type=str,
+    default='stage23',
+    choices=['stage2', 'stage3', 'stage23'],
+)
+parser.add_argument('--highres_structure_detach_surface', action='store_true')
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -101,6 +106,9 @@ parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
 args = parser.parse_args()
+if args.test_crop_list and args.overlap_infer:
+    print("[INFO] --test_crop_list is set; disabling --overlap_infer for fixed-crop evaluation.")
+    args.overlap_infer = False
 
 def make_unique_dir(base_dir, run_name):
     run_dir = os.path.join(base_dir, run_name)
@@ -196,7 +204,6 @@ if __name__ == "__main__":
     # 创建网络
     args.num_classes = 1
     checkpoint = None
-    enable_graph_prop = args.enable_graph_prop
     if os.path.exists(args.model_path):
         checkpoint = torch.load(args.model_path, map_location='cpu')
         if isinstance(checkpoint, dict):
@@ -219,18 +226,21 @@ if __name__ == "__main__":
                 "stage2_skeleton_gradient_ratio",
                 "stage3_skeleton_gradient_ratio",
                 "final_skeleton_gradient_ratio",
+                "highres_structure_channels",
+                "highres_structure_fuse_stages",
+                "highres_structure_detach_surface",
             ):
                 if name in saved_args:
                     setattr(args, name, saved_args[name])
-            if not enable_graph_prop and saved_args:
-                enable_graph_prop = bool(
-                    saved_args.get("enable_graph_prop", False)
-                )
             if saved_args and "disable_msfe_skip" in saved_args:
                 args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
+            if saved_args and "enable_highres_structure_stream" in saved_args:
+                args.enable_highres_structure_stream = bool(
+                    saved_args["enable_highres_structure_stream"]
+                )
 
     model = ViT_seg(config=config, img_size=args.img_size,
-                    num_classes=args.num_classes, use_asterisk=True,
+                    num_classes=args.num_classes,
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
                     final_topology_eta_init=args.final_topology_eta_init,
                     final_gap_rho_init=args.final_gap_rho_init,
@@ -241,11 +251,15 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    enable_final_graph_prop=enable_graph_prop,
                     use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
-                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio).cuda()
+                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
+                    enable_highres_structure_stream=args.enable_highres_structure_stream,
+                    highres_structure_channels=args.highres_structure_channels,
+                    highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+                    highres_structure_detach_surface=args.highres_structure_detach_surface).cuda()
+    device = next(model.parameters()).device
     
     # 加载模型
     if checkpoint is not None:
@@ -275,9 +289,13 @@ if __name__ == "__main__":
         print(f"错误: 模型文件不存在 {args.model_path}")
         exit(1)
     test_image_dir = os.path.join(args.root_path, 'test', 'image')
+    if not os.path.exists(test_image_dir):
+        test_image_dir = os.path.join(args.root_path, 'test')
     test_label_dir = os.path.join(args.root_path, 'test', 'mask')
     if not os.path.exists(test_label_dir):
         test_label_dir = os.path.join(args.root_path, 'test', 'label')
+    if not os.path.exists(test_label_dir):
+        test_label_dir = os.path.join(args.root_path, 'test_labels')
     
     print(f"加载测试数据...")
     print(f"  Image目录: {test_image_dir}")
@@ -304,7 +322,27 @@ if __name__ == "__main__":
         os.makedirs(surface_dir, exist_ok=True)
 
         stride = args.img_size // 2
+        tile_size = args.img_size
+        positions = RoadSkeletonDataset.sliding_positions
+        weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
+        tile_weight = (1.0 - weight_1d).clamp_min(0.05)
+        tile_weight = torch.outer(tile_weight, tile_weight).view(1, 1, tile_size, tile_size)
         image_list = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'))])
+        def find_label_name(image_name):
+            base = os.path.splitext(image_name)[0]
+            candidates = [
+                image_name,
+                base + ".png",
+                base + ".tif",
+                base + ".tiff",
+                base.replace("_sat", "_mask") + ".png",
+                base.replace("_sat", "_mask") + ".tif",
+                base.replace("_sat", "_mask") + ".tiff",
+            ]
+            for candidate in candidates:
+                if os.path.exists(os.path.join(test_label_dir, candidate)):
+                    return candidate
+            return None
         print(f"使用滑窗推理: tile={args.img_size}, stride={stride}, cases={len(image_list)}")
 
         with torch.no_grad():
@@ -314,22 +352,21 @@ if __name__ == "__main__":
                 img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 h, w, _ = img.shape
 
-                # canvas to accumulate probabilities and counts
-                prob_canvas = np.zeros((h, w), dtype=np.float32)
-                count_canvas = np.zeros((h, w), dtype=np.float32)
+                logit_canvas = torch.zeros((1, 1, h, w), device=device)
+                weight_canvas = torch.zeros_like(logit_canvas)
 
-                # sliding
-                for y in range(0, max(1, h - args.img_size + 1), stride):
-                    for x in range(0, max(1, w - args.img_size + 1), stride):
+                # sliding: include the final border tile, matching validation.
+                for y in positions(h, tile_size, stride):
+                    for x in positions(w, tile_size, stride):
                         y1 = y
                         x1 = x
-                        y2 = min(y1 + args.img_size, h)
-                        x2 = min(x1 + args.img_size, w)
+                        y2 = min(y1 + tile_size, h)
+                        x2 = min(x1 + tile_size, w)
                         crop = img[y1:y2, x1:x2]
 
                         # pad if needed
-                        ph = args.img_size - crop.shape[0]
-                        pw = args.img_size - crop.shape[1]
+                        ph = tile_size - crop.shape[0]
+                        pw = tile_size - crop.shape[1]
                         if ph > 0 or pw > 0:
                             crop = np.pad(crop, ((0, ph), (0, pw), (0, 0)), mode='constant', constant_values=0)
 
@@ -343,16 +380,28 @@ if __name__ == "__main__":
 
                         outputs = model(inp)
                         surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                        prob = torch.sigmoid(surface_logits)[0, 0].cpu().numpy()
+                        tile_h = y2 - y1
+                        tile_w = x2 - x1
+                        surface_logits = surface_logits[:, :, :tile_h, :tile_w]
+                        weight = tile_weight[:, :, :tile_h, :tile_w]
 
-                        # crop to original size if padded
-                        prob = prob[:(y2 - y1), :(x2 - x1)]
+                        logit_canvas[:, :, y1:y2, x1:x2] += surface_logits * weight
+                        weight_canvas[:, :, y1:y2, x1:x2] += weight
 
-                        prob_canvas[y1:y2, x1:x2] += prob
-                        count_canvas[y1:y2, x1:x2] += 1.0
-
-                avg_prob = prob_canvas / (count_canvas + 1e-7)
+                if weight_canvas.min().item() <= 0:
+                    raise RuntimeError("Overlap test left uncovered pixels in the full-image canvas.")
+                avg_prob = torch.sigmoid(logit_canvas / weight_canvas.clamp_min(1e-8))[0, 0].cpu().numpy()
                 pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
+                label_name = find_label_name(image_name)
+                if label_name is not None:
+                    mask = cv2.imread(os.path.join(test_label_dir, label_name), cv2.IMREAD_GRAYSCALE)
+                    if mask is not None:
+                        mask = mask[:avg_prob.shape[0], :avg_prob.shape[1]]
+                        pred_bool = avg_prob >= args.threshold
+                        mask_bool = mask > 127
+                        tp += int((pred_bool & mask_bool).sum())
+                        fp += int((pred_bool & ~mask_bool).sum())
+                        fn += int((~pred_bool & mask_bool).sum())
 
                 # save
                 case_name = os.path.splitext(image_name)[0]
@@ -362,11 +411,32 @@ if __name__ == "__main__":
                 total_samples += 1
 
         print(f"滑窗推理完成，结果保存在: {pred_dir}")
+        iou = tp / (tp + fp + fn + 1e-8)
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        print(f"Overlap Test IoU: {iou:.4f}, F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
+        with open(os.path.join(pred_dir, "test_results.txt"), "w", encoding="utf-8") as log_f:
+            log_f.write(f"模型路径: {args.model_path}\n")
+            log_f.write(f"阈值: {args.threshold}\n")
+            log_f.write(f"测试数据路径: {args.root_path}\n")
+            log_f.write(f"Overlap tile: {args.img_size}, stride: {stride}\n")
+            log_f.write("Stitching: weighted logits -> sigmoid -> threshold\n")
+            log_f.write(f"IoU: {iou:.6f}\n")
+            log_f.write(f"F1: {f1:.6f}\n")
+            log_f.write(f"Precision: {precision:.6f}\n")
+            log_f.write(f"Recall: {recall:.6f}\n")
         # exit after sliding infer
         sys.exit(0)
 
     # 非滑窗情况：使用 Dataset + DataLoader（会对图像做 resize 到 args.img_size）
-    test_dataset = RoadSkeletonDataset(root_dir=args.root_path, split='test', image_size=args.img_size, source_patch_size=args.source_patch_size)
+    test_dataset = RoadSkeletonDataset(
+        root_dir=args.root_path,
+        split='test',
+        image_size=args.img_size,
+        source_patch_size=args.source_patch_size,
+        crop_list_path=args.test_crop_list,
+    )
 
     print(f"测试集大小: {len(test_dataset)}")
 
@@ -395,14 +465,10 @@ if __name__ == "__main__":
         skeleton_weight=0.02,
         connectivity_weight=0.03,
         connectivity_erode_kernel_size=1,
-        skeleton_cldice_weight=0.01,
-        skeleton_cldice_iterations=10,
         boundary_weight=0.03,
         boundary_radius=1,
         stage_structure_weights=(0.0, 0.0, 0.0, 0.0),
         stage_connectivity_factor=0.5,
-        stage_distill_weights=(0.0, 0.0),
-        stage_distill_connectivity_factor=0.5,
     ).cuda()
     
     with torch.no_grad():

@@ -3,7 +3,6 @@ import os
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 from losses.road_losses import build_boundary_target, build_connectivity_target
 
@@ -20,6 +19,10 @@ class RoadSkeletonDataset(Dataset):
         tile_stride=None,
         augment=False,
         return_full_image=False,
+        random_crop_train=False,
+        random_crops_per_image=1,
+        random_crop_seed=1234,
+        crop_list_path="",
     ):
         super().__init__()
 
@@ -32,8 +35,12 @@ class RoadSkeletonDataset(Dataset):
         self.tile_stride = tile_stride if tile_stride is not None else tile_size
         self.augment = bool(augment and split == "train")
         self.return_full_image = return_full_image
+        self.random_crop_train = bool(random_crop_train and split == "train")
+        self.random_crops_per_image = max(1, int(random_crops_per_image))
+        self.random_crop_seed = int(random_crop_seed)
+        self.epoch = 0
 
-        self.image_dir = os.path.join(root_dir, split, "image")
+        self.image_dir = self._resolve_image_dir(root_dir, split)
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
 
         if not os.path.exists(self.image_dir):
@@ -48,9 +55,15 @@ class RoadSkeletonDataset(Dataset):
         if len(self.image_files) == 0:
             raise RuntimeError(f"No image files found in {self.image_dir}")
 
-        self.tile_positions = self._build_tile_positions()
+        self.fixed_crop_items = self._load_crop_list(crop_list_path)
+        self.tile_positions = None if self.fixed_crop_items else self._build_tile_positions()
 
     def __len__(self):
+        fixed_crop_items = getattr(self, "fixed_crop_items", [])
+        if fixed_crop_items:
+            return len(fixed_crop_items)
+        if self.random_crop_train:
+            return len(self.image_files) * self.random_crops_per_image
         if self.tile_positions is None:
             return len(self.image_files)
         return len(self.image_files) * len(self.tile_positions)
@@ -65,6 +78,55 @@ class RoadSkeletonDataset(Dataset):
             positions.append(last)
         return positions
 
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _load_crop_list(self, crop_list_path):
+        if not crop_list_path:
+            return []
+        if not os.path.exists(crop_list_path):
+            raise FileNotFoundError(f"Crop list not found: {crop_list_path}")
+
+        image_to_index = {
+            os.path.splitext(name)[0]: index for index, name in enumerate(self.image_files)
+        }
+        image_to_index.update({name: index for index, name in enumerate(self.image_files)})
+        items = []
+        with open(crop_list_path, "r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" not in line:
+                    raise ValueError(
+                        f"Invalid crop list line {line_number}: expected 'image: x=..., y=...'"
+                    )
+                image_key, rest = line.split(":", 1)
+                fields = {}
+                for part in rest.replace(",", " ").split():
+                    if "=" not in part:
+                        continue
+                    key, value = part.split("=", 1)
+                    fields[key.strip().lower()] = int(value)
+                if "x" not in fields or "y" not in fields:
+                    raise ValueError(
+                        f"Invalid crop list line {line_number}: missing x/y coordinates"
+                    )
+                image_key = image_key.strip()
+                lookup_keys = [image_key, os.path.splitext(image_key)[0]]
+                image_index = next(
+                    (image_to_index[key] for key in lookup_keys if key in image_to_index),
+                    None,
+                )
+                if image_index is None:
+                    raise ValueError(
+                        f"Crop list line {line_number} references unknown image: {image_key}"
+                    )
+                items.append((image_index, int(fields["y"]), int(fields["x"])))
+        if not items:
+            raise ValueError(f"Crop list is empty: {crop_list_path}")
+        return items
+
     def _build_tile_positions(self):
         if self.tile_size is None or self.return_full_image:
             return None
@@ -74,12 +136,29 @@ class RoadSkeletonDataset(Dataset):
         return [(top, left) for top in rows for left in cols]
 
     @staticmethod
+    def _resolve_image_dir(root_dir, split):
+        nested = os.path.join(root_dir, split, "image")
+        if os.path.exists(nested):
+            return nested
+        flat = os.path.join(root_dir, split)
+        if os.path.exists(flat):
+            return flat
+        raise FileNotFoundError(
+            f"Image dir not found. Expected one of: {nested}, {flat}"
+        )
+
+    @staticmethod
     def _resolve_label_dir(root_dir, split, candidates):
         for dirname in candidates:
             path = os.path.join(root_dir, split, dirname)
             if os.path.exists(path):
                 return path
-        expected = ", ".join(os.path.join(root_dir, split, name) for name in candidates)
+        sibling = os.path.join(root_dir, f"{split}_labels")
+        if os.path.exists(sibling):
+            return sibling
+        expected_dirs = [os.path.join(root_dir, split, name) for name in candidates]
+        expected_dirs.append(sibling)
+        expected = ", ".join(expected_dirs)
         raise FileNotFoundError(f"Mask/label dir not found. Expected one of: {expected}")
 
     def _find_label_name(self, image_name, label_dir):
@@ -88,9 +167,17 @@ class RoadSkeletonDataset(Dataset):
         candidates = [
             image_name,
             base + ".png",
+            base + ".tif",
+            base + ".tiff",
             base.replace("_sat", "_mask") + ".png",
+            base.replace("_sat", "_mask") + ".tif",
+            base.replace("_sat", "_mask") + ".tiff",
             base.replace("_image", "_mask") + ".png",
+            base.replace("_image", "_mask") + ".tif",
+            base.replace("_image", "_mask") + ".tiff",
             base.replace("_img", "_mask") + ".png",
+            base.replace("_img", "_mask") + ".tif",
+            base.replace("_img", "_mask") + ".tiff",
         ]
 
         for name in candidates:
@@ -196,44 +283,38 @@ class RoadSkeletonDataset(Dataset):
         return cv2.dilate(skeleton, kernel, iterations=iterations)
 
     @staticmethod
-    def _resize_tensor_nearest(tensor, size):
-        return F.interpolate(
-            tensor.unsqueeze(0).float(),
-            size=size,
-            mode="nearest",
-        ).squeeze(0)
-
-    @staticmethod
-    def _augment_geometry(image, mask):
-        if np.random.rand() < 0.5:
+    def _augment_geometry(image, mask, rng=None):
+        rng = rng if rng is not None else np.random
+        if rng.rand() < 0.5:
             image = np.flip(image, axis=1)
             mask = np.flip(mask, axis=1)
-        if np.random.rand() < 0.5:
+        if rng.rand() < 0.5:
             image = np.flip(image, axis=0)
             mask = np.flip(mask, axis=0)
-        if np.random.rand() < 0.5:
-            rotations = np.random.randint(0, 4)
+        rotations = rng.randint(0, 4)
+        if rotations:
             image = np.rot90(image, rotations, axes=(0, 1))
             mask = np.rot90(mask, rotations, axes=(0, 1))
         return image.copy(), mask.copy()
 
     @staticmethod
-    def _augment_color_degrade(image):
+    def _augment_color_degrade(image, rng=None):
+        rng = rng if rng is not None else np.random
         image = image.astype(np.float32)
-        image *= np.random.uniform(0.9, 1.1)
+        image *= rng.uniform(0.9, 1.1)
         mean = image.mean(axis=(0, 1), keepdims=True)
-        image = (image - mean) * np.random.uniform(0.9, 1.1) + mean
+        image = (image - mean) * rng.uniform(0.9, 1.1) + mean
         gray = (
             0.299 * image[..., 0:1]
             + 0.587 * image[..., 1:2]
             + 0.114 * image[..., 2:3]
         )
-        image = gray + (image - gray) * np.random.uniform(0.9, 1.1)
+        image = gray + (image - gray) * rng.uniform(0.9, 1.1)
         image = np.clip(image, 0.0, 255.0).astype(np.uint8)
-        if np.random.rand() < 0.15:
+        if rng.rand() < 0.15:
             image = cv2.GaussianBlur(image, (3, 3), sigmaX=0.6)
-        if np.random.rand() < 0.15:
-            noise = np.random.normal(0.0, np.random.uniform(3.0, 8.0), image.shape)
+        if rng.rand() < 0.15:
+            noise = rng.normal(0.0, rng.uniform(3.0, 8.0), image.shape)
             image = np.clip(image.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
         return image
 
@@ -261,7 +342,23 @@ class RoadSkeletonDataset(Dataset):
         return torch.gather(target_stack, 1, gather_index).squeeze(1)
 
     def __getitem__(self, idx):
-        if self.tile_positions is None:
+        rng = None
+        fixed_crop_items = getattr(self, "fixed_crop_items", [])
+        if fixed_crop_items:
+            image_index, top, left = fixed_crop_items[idx]
+            tile_position = (top, left)
+        elif self.random_crop_train:
+            image_index = idx // self.random_crops_per_image
+            crop_ordinal = idx % self.random_crops_per_image
+            rng_seed = (
+                self.random_crop_seed
+                + self.epoch * 1000003
+                + image_index * 9176
+                + crop_ordinal * 101
+            )
+            rng = np.random.RandomState(rng_seed)
+            tile_position = None
+        elif self.tile_positions is None:
             image_index = idx
             tile_position = None
         else:
@@ -288,8 +385,8 @@ class RoadSkeletonDataset(Dataset):
             mask = self._center_crop_or_pad(mask, source_size)
 
         if self.augment:
-            image, mask = self._augment_geometry(image, mask)
-            image = self._augment_color_degrade(image)
+            image, mask = self._augment_geometry(image, mask, rng=rng)
+            image = self._augment_color_degrade(image, rng=rng)
 
         mask = (mask > 127).astype(np.float32)
         skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
@@ -301,10 +398,22 @@ class RoadSkeletonDataset(Dataset):
         boundary_gt = build_boundary_target(full_surface).squeeze(0)
         valid_mask = torch.ones_like(full_skeleton).squeeze(0)
 
+        if self.random_crop_train:
+            crop_size = self.tile_size or self.image_size
+            if crop_size is None:
+                raise ValueError("random_crop_train requires tile_size or image_size.")
+            height, width = image.shape[:2]
+            max_top = max(height - crop_size, 0)
+            max_left = max(width - crop_size, 0)
+            top = rng.randint(0, max_top + 1) if max_top > 0 else 0
+            left = rng.randint(0, max_left + 1) if max_left > 0 else 0
+            tile_position = (top, left)
+
         if tile_position is not None:
             top, left = tile_position
-            bottom = top + self.tile_size
-            right = left + self.tile_size
+            crop_size = self.tile_size or self.image_size
+            bottom = top + crop_size
+            right = left + crop_size
             image = image[top:bottom, left:right]
             mask = mask[top:bottom, left:right]
             skeleton_hard = skeleton_hard[top:bottom, left:right]
@@ -318,13 +427,6 @@ class RoadSkeletonDataset(Dataset):
             size = (self.image_size, self.image_size)
             image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
             mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
-            skeleton_hard = cv2.resize(skeleton_hard, size, interpolation=cv2.INTER_NEAREST)
-            skeleton_dilate = cv2.resize(skeleton_dilate, size, interpolation=cv2.INTER_NEAREST)
-            connectivity_gt = self._resize_tensor_nearest(connectivity_gt, size)
-            direction_gt = self._resize_tensor_nearest(direction_gt, size)
-            direction_gt = F.normalize(direction_gt, dim=0, eps=1e-6)
-            boundary_gt = self._resize_tensor_nearest(boundary_gt, size)
-            valid_mask = self._resize_tensor_nearest(valid_mask, size)
 
         image = image.astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
