@@ -108,16 +108,6 @@ parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
-parser.add_argument('--enable_highres_structure_stream', action='store_true')
-parser.add_argument('--highres_structure_channels', type=int, default=64)
-parser.add_argument(
-    '--highres_structure_fuse_stages',
-    type=str,
-    default='stage23',
-    choices=['stage2', 'stage3', 'stage23'],
-)
-parser.add_argument('--highres_structure_detach_surface', action='store_true')
-parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage_direction_factor', type=float, default=0.2)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
@@ -301,11 +291,6 @@ def build_criterion(args, loss_weights, device):
             stage3_weight,
         ),
         road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
-        highres_structure_skeleton_weight=(
-            0.0
-            if args.freeze_0626_backbone
-            else args.highres_structure_skeleton_weight
-        ),
         stage_connectivity_factor=0.5,
         stage_direction_factor=args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
@@ -387,12 +372,6 @@ def format_training_config_lines(args, loss_weights):
         f"sc_c2s={args.stage_sc_c2s_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
-        "  High-res structure stream: "
-        f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
-        f"channels={args.highres_structure_channels}, "
-        f"fuse_stages={args.highres_structure_fuse_stages}, "
-        f"detach_surface={args.highres_structure_detach_surface}, "
-        f"skeleton_weight={args.highres_structure_skeleton_weight}",
         "  Surface loss: BCE + 0.5*Dice",
         (
             f"  Direct resize: {args.source_patch_size} -> {args.img_size}"
@@ -476,9 +455,6 @@ def inherit_resume_architecture_args(args):
         args.source_patch_size = int(saved_args["source_patch_size"])
     if "overlap_stride" in saved_args and not _cli_has("--overlap_stride"):
         args.overlap_stride = int(saved_args["overlap_stride"])
-    if "highres_structure_detach_surface" in saved_args and not _cli_has("--highres_structure_detach_surface"):
-        args.highres_structure_detach_surface = bool(saved_args["highres_structure_detach_surface"])
-
     print(
         "[INFO] Resume architecture args: "
         f"profile={args.structure_profile}, "
@@ -998,11 +974,7 @@ if __name__ == "__main__":
                     use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
-                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
-                    enable_highres_structure_stream=args.enable_highres_structure_stream,
-                    highres_structure_channels=args.highres_structure_channels,
-                    highres_structure_fuse_stages=args.highres_structure_fuse_stages,
-                    highres_structure_detach_surface=args.highres_structure_detach_surface).to(device)
+                    final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.no_pretrain:
@@ -1176,9 +1148,6 @@ if __name__ == "__main__":
                         "swin_unet.stage2_topology_source.gate_branch.",
                         "swin_unet.guided_head.detached_skeleton_refine.",
                         "swin_unet.guided_head.detached_skeleton_head.",
-                        "swin_unet.highres_structure_encoder.",
-                        "swin_unet.highres_structure_skeleton_head.",
-                        "swin_unet.highres_structure_fusion.",
                     )
                     result = model.load_state_dict(
                         checkpoint_state,
@@ -1246,30 +1215,7 @@ if __name__ == "__main__":
     if ema is not None and args.resume and 'checkpoint' in locals():
         ema_state = checkpoint.get('ema_state_dict')
         if ema_state is not None:
-            ema_result = ema.ema.load_state_dict(ema_state, strict=False)
-            allowed_ema_missing_prefixes = (
-                "swin_unet.highres_structure_encoder.",
-                "swin_unet.highres_structure_skeleton_head.",
-                "swin_unet.highres_structure_fusion.",
-            )
-            invalid_ema_missing = [
-                key
-                for key in ema_result.missing_keys
-                if not key.startswith(allowed_ema_missing_prefixes)
-            ]
-            if invalid_ema_missing or ema_result.unexpected_keys:
-                raise RuntimeError(
-                    "EMA checkpoint mismatch on resume: "
-                    f"missing={invalid_ema_missing}, "
-                    f"unexpected={ema_result.unexpected_keys}"
-                )
-            if ema_result.missing_keys:
-                print(
-                    "[INFO] EMA expected new highres structure missing keys: "
-                    + ", ".join(ema_result.missing_keys[:12])
-                    + (" ..." if len(ema_result.missing_keys) > 12 else ""),
-                    flush=True,
-                )
+            ema.ema.load_state_dict(ema_state)
 
     # 训练循环
     print("\n开始训练...")
@@ -1348,7 +1294,7 @@ if __name__ == "__main__":
                 'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
                 'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
             ])
-            batch_loss_writer.writerow(['epoch', 'batch', 'loss', 'loss_highres_structure_skeleton'])
+            batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
 
         for epoch in range(start_epoch, args.max_epochs):
             if hasattr(train_dataset, "set_epoch"):
@@ -1485,7 +1431,6 @@ if __name__ == "__main__":
                     epoch + 1,
                     i + 1,
                     f'{loss.item():.6f}',
-                    f"{loss_dict['loss_highres_structure_skeleton'].item():.6f}",
                 ])
                 batch_loss_log_file.flush()
 
@@ -1496,7 +1441,6 @@ if __name__ == "__main__":
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                         f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
-                        f"HighResStruct: {loss_dict['loss_highres_structure_skeleton'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
                         f"TF: {teacher_forcing_ratio:.2f}, "
