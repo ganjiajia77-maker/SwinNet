@@ -2383,9 +2383,10 @@ class SwinTransformerSys(nn.Module):
         if z_struct is None or not self._highres_structure_stage_enabled(stage):
             return x
         feature_map = token_to_map(x, target_hw[0], target_hw[1])
+        z_struct_for_surface = z_struct.detach()
         feature_map = self.highres_structure_fusion[str(stage)](
             feature_map,
-            z_struct,
+            z_struct_for_surface,
         )
         return map_to_token(feature_map)
 
