@@ -63,6 +63,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, default="./data1")
     parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--split", type=str, default="test", choices=["val", "test"])
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--source_patch_size", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=24)
@@ -154,16 +155,21 @@ def main():
 
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
-        split="val",
+        split=args.split,
         image_size=None,
         source_patch_size=args.source_patch_size,
         return_full_image=True,
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    print(
+        f"Running overlap global threshold sweep on {args.split}: "
+        f"cases={len(dataset)}, tile={args.img_size}, stride={args.overlap_stride}",
+        flush=True,
+    )
     counts = {threshold: {"tp": 0, "fp": 0, "fn": 0} for threshold in thresholds}
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Overlap512 global threshold sweep"):
+        for batch in tqdm(loader, desc=f"Overlap global threshold sweep [{args.split}]"):
             image = batch["image"].to(device)
             mask = (batch["mask"].to(device) > 0.5)
             logits = overlap_logits(model, image, args.img_size, args.overlap_stride, device)
