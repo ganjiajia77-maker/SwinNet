@@ -95,6 +95,14 @@ def main():
         action='store_true',
         help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
     )
+    parser.add_argument('--enable_highres_structure_stream', action='store_true')
+    parser.add_argument('--highres_structure_channels', type=int, default=64)
+    parser.add_argument(
+        '--highres_structure_fuse_stages',
+        type=str,
+        default='stage23',
+        choices=['stage2', 'stage3', 'stage23'],
+    )
     args = parser.parse_args()
     
     checkpoint = None
@@ -109,8 +117,17 @@ def main():
                     "structure_profile",
                     args.structure_profile,
                 )
-            if isinstance(checkpoint.get("args"), dict) and "disable_msfe_skip" in checkpoint["args"]:
-                args.disable_msfe_skip = bool(checkpoint["args"]["disable_msfe_skip"])
+            if isinstance(checkpoint.get("args"), dict):
+                saved_args = checkpoint["args"]
+                if "disable_msfe_skip" in saved_args:
+                    args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
+                for name in (
+                    "enable_highres_structure_stream",
+                    "highres_structure_channels",
+                    "highres_structure_fuse_stages",
+                ):
+                    if name in saved_args:
+                        setattr(args, name, saved_args[name])
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device: {}'.format(device))
@@ -129,6 +146,9 @@ def main():
         stage_topology_alpha_init=args.stage_topology_alpha_init,
         structure_profile=args.structure_profile,
         use_msfe_skip=not args.disable_msfe_skip,
+        enable_highres_structure_stream=args.enable_highres_structure_stream,
+        highres_structure_channels=args.highres_structure_channels,
+        highres_structure_fuse_stages=args.highres_structure_fuse_stages,
     )
     if checkpoint is None:
         checkpoint = torch.load(args.model_path, map_location=device)
