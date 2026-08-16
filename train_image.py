@@ -1354,9 +1354,17 @@ if __name__ == "__main__":
             loss_writer.writerow([
                 'epoch', 'lr', 'train_avg_loss', 'val_loss',
                 'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
-                'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall'
+                'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall',
+                'highres_skeleton_loss', 'hard_positive_weight_mean',
+                'hard_positive_weight_min', 'hard_positive_weight_max',
+                'hard_weight_p_lt_02', 'hard_weight_p_02_05', 'hard_weight_p_ge_05'
             ])
-            batch_loss_writer.writerow(['epoch', 'batch', 'loss'])
+            batch_loss_writer.writerow([
+                'epoch', 'batch', 'loss', 'highres_skeleton_loss',
+                'hard_positive_weight_mean', 'hard_positive_weight_min',
+                'hard_positive_weight_max', 'hard_weight_p_lt_02',
+                'hard_weight_p_02_05', 'hard_weight_p_ge_05'
+            ])
 
         for epoch in range(start_epoch, args.max_epochs):
             if hasattr(train_dataset, "set_epoch"):
@@ -1379,6 +1387,16 @@ if __name__ == "__main__":
             skipped_batches = 0
             optimizer.zero_grad(set_to_none=True)
             accumulation_count = 0
+            highres_stat_sums = {
+                "highres_structure_skeleton_raw": 0.0,
+                "hard_positive_weight_mean": 0.0,
+                "hard_positive_weight_min": 0.0,
+                "hard_positive_weight_max": 0.0,
+                "hard_weight_p_lt_02": 0.0,
+                "hard_weight_p_02_05": 0.0,
+                "hard_weight_p_ge_05": 0.0,
+            }
+            highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
             stage_topology_alpha_scale = get_stage_topology_alpha_scale(
                 epoch,
@@ -1489,10 +1507,22 @@ if __name__ == "__main__":
 
                 total_loss += loss.item()
                 train_batches += 1
+                for key in highres_stat_sums:
+                    value = float(loss_dict[key].item())
+                    if np.isfinite(value):
+                        highres_stat_sums[key] += value
+                        highres_stat_counts[key] += 1
                 batch_loss_writer.writerow([
                     epoch + 1,
                     i + 1,
                     f'{loss.item():.6f}',
+                    f"{loss_dict['highres_structure_skeleton_raw'].item():.6f}",
+                    f"{loss_dict['hard_positive_weight_mean'].item():.6f}",
+                    f"{loss_dict['hard_positive_weight_min'].item():.6f}",
+                    f"{loss_dict['hard_positive_weight_max'].item():.6f}",
+                    f"{loss_dict['hard_weight_p_lt_02'].item():.6f}",
+                    f"{loss_dict['hard_weight_p_02_05'].item():.6f}",
+                    f"{loss_dict['hard_weight_p_ge_05'].item():.6f}",
                 ])
                 batch_loss_log_file.flush()
 
@@ -1503,6 +1533,11 @@ if __name__ == "__main__":
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                         f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
+                        f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
+                        f"HardW(mean/min/max): "
+                        f"{loss_dict['hard_positive_weight_mean'].item():.3f}/"
+                        f"{loss_dict['hard_positive_weight_min'].item():.3f}/"
+                        f"{loss_dict['hard_positive_weight_max'].item():.3f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
                         f"TF: {teacher_forcing_ratio:.2f}, "
@@ -1511,6 +1546,14 @@ if __name__ == "__main__":
                     )
 
             train_avg_loss = total_loss / max(train_batches, 1)
+            highres_epoch_stats = {
+                key: (
+                    highres_stat_sums[key] / highres_stat_counts[key]
+                    if highres_stat_counts[key] > 0
+                    else float("nan")
+                )
+                for key in highres_stat_sums
+            }
             should_validate = (
                 args.val_interval <= 1
                 or (epoch + 1) % args.val_interval == 0
@@ -1573,6 +1616,17 @@ if __name__ == "__main__":
                     f"(interval={args.val_interval})"
                 )
             print(epoch_msg, flush=True)
+            hard_weight_msg = (
+                "[HighRes Skeleton Hard Weight] "
+                f"highres_skeleton_loss={highres_epoch_stats['highres_structure_skeleton_raw']:.4f}, "
+                f"positive_mean={highres_epoch_stats['hard_positive_weight_mean']:.4f}, "
+                f"min={highres_epoch_stats['hard_positive_weight_min']:.4f}, "
+                f"max={highres_epoch_stats['hard_positive_weight_max']:.4f}, "
+                f"p<0.2={highres_epoch_stats['hard_weight_p_lt_02']:.4f}, "
+                f"0.2~0.5={highres_epoch_stats['hard_weight_p_02_05']:.4f}, "
+                f"p>=0.5={highres_epoch_stats['hard_weight_p_ge_05']:.4f}"
+            )
+            print(hard_weight_msg, flush=True)
             topology_msg = print_topology_coefficients(
                 model,
                 prefix=f"[TOPOLOGY][Epoch {epoch + 1}]",
@@ -1584,7 +1638,14 @@ if __name__ == "__main__":
             loss_writer.writerow([
                 epoch + 1, f'{current_lr:.8f}', f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
                 f'{val_iou:.6f}', f'{val_f1:.6f}', f'{val_precision:.6f}', f'{val_recall:.6f}',
-                f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}'
+                f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}',
+                f"{highres_epoch_stats['highres_structure_skeleton_raw']:.6f}",
+                f"{highres_epoch_stats['hard_positive_weight_mean']:.6f}",
+                f"{highres_epoch_stats['hard_positive_weight_min']:.6f}",
+                f"{highres_epoch_stats['hard_positive_weight_max']:.6f}",
+                f"{highres_epoch_stats['hard_weight_p_lt_02']:.6f}",
+                f"{highres_epoch_stats['hard_weight_p_02_05']:.6f}",
+                f"{highres_epoch_stats['hard_weight_p_ge_05']:.6f}",
             ])
             loss_log_file.flush()
             
@@ -1601,6 +1662,7 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton F1: {skeleton_f1:.6f}\n")
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
+                log_f.write(hard_weight_msg + "\n")
                 log_f.write(
                     f"  Stage topology alpha scale: "
                     f"{stage_topology_alpha_scale:.6f}\n"

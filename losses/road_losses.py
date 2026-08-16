@@ -354,6 +354,8 @@ class SurfaceStructureLoss(nn.Module):
         )
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
+        self.highres_hard_weight_gamma = 2.0
+        self.highres_hard_weight_lambda = 2.0
 
     @staticmethod
     def _match_spatial_size(target, reference, mode="nearest"):
@@ -433,6 +435,76 @@ class SurfaceStructureLoss(nn.Module):
         dice_skeleton = self.skeleton_loss.dice(skeleton_logits, skeleton_gt)
         loss_skeleton = bce_skeleton + self.skeleton_loss.dice_weight * dice_skeleton
         return loss_skeleton, bce_skeleton, dice_skeleton
+
+    def highres_skeleton_pixel_loss(
+        self,
+        skeleton_logits,
+        skeleton_gt,
+        skeleton_dilate_gt,
+        surface_logits,
+    ):
+        skeleton_gt = self._match_spatial_size(skeleton_gt, skeleton_logits)
+        skeleton_dilate_gt = self._match_spatial_size(skeleton_dilate_gt, skeleton_logits)
+        surface_logits = self._match_spatial_size(
+            surface_logits.detach(),
+            skeleton_logits,
+            mode="bilinear",
+        )
+        surface_prob_detached = torch.sigmoid(surface_logits).detach()
+        if surface_prob_detached.requires_grad:
+            raise RuntimeError("High-res hard skeleton weights must not backprop into surface logits.")
+
+        raw_pos_weight = (
+            1.0
+            + self.highres_hard_weight_lambda
+            * (1.0 - surface_prob_detached).pow(self.highres_hard_weight_gamma)
+        )
+        positive_mask = skeleton_gt > 0.5
+        pixel_weight = torch.ones_like(raw_pos_weight)
+        if positive_mask.any():
+            mean_pos_weight = raw_pos_weight[positive_mask].mean().detach()
+            normalized_pos_weight = raw_pos_weight / mean_pos_weight.clamp_min(1e-6)
+            pixel_weight[positive_mask] = normalized_pos_weight[positive_mask]
+        else:
+            normalized_pos_weight = torch.ones_like(raw_pos_weight)
+
+        skeleton_pos_weight = (
+            self.skeleton_loss.pos_weight.to(skeleton_logits.device)
+            if self.skeleton_loss.pos_weight is not None
+            else None
+        )
+        bce_map = F.binary_cross_entropy_with_logits(
+            skeleton_logits,
+            skeleton_dilate_gt,
+            pos_weight=skeleton_pos_weight,
+            reduction="none",
+        )
+        bce_skeleton = (bce_map * pixel_weight).mean()
+        dice_skeleton = self.skeleton_loss.dice(skeleton_logits, skeleton_gt)
+        loss_skeleton = bce_skeleton + self.skeleton_loss.dice_weight * dice_skeleton
+
+        stats = {
+            "hard_positive_weight_mean": skeleton_gt.new_tensor(1.0),
+            "hard_positive_weight_min": skeleton_gt.new_tensor(1.0),
+            "hard_positive_weight_max": skeleton_gt.new_tensor(1.0),
+            "hard_weight_p_lt_02": skeleton_gt.new_tensor(1.0),
+            "hard_weight_p_02_05": skeleton_gt.new_tensor(1.0),
+            "hard_weight_p_ge_05": skeleton_gt.new_tensor(1.0),
+        }
+        if positive_mask.any():
+            pos_weights = pixel_weight[positive_mask].detach()
+            pos_probs = surface_prob_detached[positive_mask]
+            stats["hard_positive_weight_mean"] = pos_weights.mean()
+            stats["hard_positive_weight_min"] = pos_weights.min()
+            stats["hard_positive_weight_max"] = pos_weights.max()
+            bins = (
+                ("hard_weight_p_lt_02", pos_probs < 0.2),
+                ("hard_weight_p_02_05", (pos_probs >= 0.2) & (pos_probs < 0.5)),
+                ("hard_weight_p_ge_05", pos_probs >= 0.5),
+            )
+            for name, mask in bins:
+                stats[name] = pos_weights[mask].mean() if mask.any() else skeleton_gt.new_tensor(float("nan"))
+        return loss_skeleton, bce_skeleton, dice_skeleton, stats
 
     @staticmethod
     def _shift_map(x, dy, dx):
@@ -763,11 +835,25 @@ class SurfaceStructureLoss(nn.Module):
         stage_outputs,
         skeleton_gt,
         skeleton_dilate_gt,
+        surface_logits,
     ):
         if not stage_outputs or self.highres_structure_skeleton_weight <= 0:
-            return skeleton_gt.sum() * 0.0
+            zero = skeleton_gt.sum() * 0.0
+            stats = {
+                "highres_structure_skeleton_raw": zero.detach(),
+                "hard_positive_weight_mean": zero.detach(),
+                "hard_positive_weight_min": zero.detach(),
+                "hard_positive_weight_max": zero.detach(),
+                "hard_weight_p_lt_02": zero.detach(),
+                "hard_weight_p_02_05": zero.detach(),
+                "hard_weight_p_ge_05": zero.detach(),
+            }
+            return zero, stats
 
         total = skeleton_gt.sum() * 0.0
+        raw_total = skeleton_gt.sum() * 0.0
+        stat_totals = {}
+        stat_count = 0
         for stage_output in stage_outputs:
             skeleton_logits = stage_output.get("highres_structure_skeleton")
             if skeleton_logits is None:
@@ -778,13 +864,45 @@ class SurfaceStructureLoss(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-            loss_skeleton, _, _ = self.skeleton_pixel_loss(
+            loss_skeleton, _, _, stats = self.highres_skeleton_pixel_loss(
                 skeleton_logits_full,
                 skeleton_gt,
                 skeleton_dilate_gt,
+                surface_logits,
             )
             total = total + self.highres_structure_skeleton_weight * loss_skeleton
-        return total
+            raw_total = raw_total + loss_skeleton
+            for key, value in stats.items():
+                if torch.isfinite(value):
+                    stat_totals[key] = stat_totals.get(key, value.new_tensor(0.0)) + value
+            stat_count += 1
+        if stat_count > 0:
+            stats = {
+                key: (value / stat_count).detach()
+                for key, value in stat_totals.items()
+            }
+            stats["highres_structure_skeleton_raw"] = (raw_total / stat_count).detach()
+            for key in (
+                "hard_positive_weight_mean",
+                "hard_positive_weight_min",
+                "hard_positive_weight_max",
+                "hard_weight_p_lt_02",
+                "hard_weight_p_02_05",
+                "hard_weight_p_ge_05",
+            ):
+                if key not in stats:
+                    stats[key] = raw_total.new_tensor(float("nan")).detach()
+        else:
+            stats = {
+                "highres_structure_skeleton_raw": raw_total.detach(),
+                "hard_positive_weight_mean": raw_total.detach(),
+                "hard_positive_weight_min": raw_total.detach(),
+                "hard_positive_weight_max": raw_total.detach(),
+                "hard_weight_p_lt_02": raw_total.detach(),
+                "hard_weight_p_02_05": raw_total.detach(),
+                "hard_weight_p_ge_05": raw_total.detach(),
+            }
+        return total, stats
 
     def forward(
         self,
@@ -881,10 +999,11 @@ class SurfaceStructureLoss(nn.Module):
             valid_mask=valid_mask,
         )
         loss_road_attention = self.road_attention_loss(stage_outputs, surface_gt)
-        loss_highres_structure_skeleton = self.highres_structure_skeleton_loss(
+        loss_highres_structure_skeleton, highres_stats = self.highres_structure_skeleton_loss(
             stage_outputs,
             skeleton_gt,
             skeleton_dilate_gt,
+            surface_logits,
         )
 
         total_loss = (
@@ -909,6 +1028,13 @@ class SurfaceStructureLoss(nn.Module):
             "stage_structure_loss": loss_stage_structure.detach(),
             "road_attention_loss": loss_road_attention.detach(),
             "loss_highres_structure_skeleton": loss_highres_structure_skeleton.detach(),
+            "highres_structure_skeleton_raw": highres_stats["highres_structure_skeleton_raw"],
+            "hard_positive_weight_mean": highres_stats["hard_positive_weight_mean"],
+            "hard_positive_weight_min": highres_stats["hard_positive_weight_min"],
+            "hard_positive_weight_max": highres_stats["hard_positive_weight_max"],
+            "hard_weight_p_lt_02": highres_stats["hard_weight_p_lt_02"],
+            "hard_weight_p_02_05": highres_stats["hard_weight_p_02_05"],
+            "hard_weight_p_ge_05": highres_stats["hard_weight_p_ge_05"],
             "surface_bce": bce_surface,
             "surface_dice": dice_surface,
             "skeleton_bce": bce_skeleton,
