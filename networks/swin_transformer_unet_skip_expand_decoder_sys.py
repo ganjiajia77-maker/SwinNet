@@ -383,6 +383,108 @@ class HighResStructureEncoder(nn.Module):
                 nn.init.constant_(module.bias, 0)
 
 
+def _largest_group_divisor(channels, candidates=(8, 4, 2, 1)):
+    for groups in candidates:
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class PrePatchStructureEncoder(nn.Module):
+    def __init__(self, struct_channels):
+        super().__init__()
+        self.down1 = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(16),
+                num_channels=16,
+            ),
+            nn.GELU(),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(
+                16,
+                16,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                groups=16,
+                bias=False,
+            ),
+            nn.Conv2d(16, 32, kernel_size=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(32),
+                num_channels=32,
+            ),
+            nn.GELU(),
+        )
+        self.project = nn.Conv2d(32, struct_channels, kernel_size=1, bias=False)
+        bottleneck_channels = max(struct_channels // 4, 1)
+        self.refine = nn.Sequential(
+            nn.Conv2d(struct_channels, bottleneck_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(bottleneck_channels),
+                num_channels=bottleneck_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                bottleneck_channels,
+                bottleneck_channels,
+                kernel_size=3,
+                padding=1,
+                groups=bottleneck_channels,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(bottleneck_channels),
+                num_channels=bottleneck_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(bottleneck_channels, struct_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(struct_channels),
+                num_channels=struct_channels,
+            ),
+        )
+        self.act = nn.GELU()
+        self._shape_logged = False
+        self._init_weights()
+
+    def forward(self, x):
+        input_shape = tuple(x.shape)
+        x = self.down1(x)
+        down1_shape = tuple(x.shape)
+        x = self.down2(x)
+        down2_shape = tuple(x.shape)
+        x = self.project(x)
+        project_shape = tuple(x.shape)
+        identity = x
+        x = self.act(self.refine(x) + identity)
+        if not self._shape_logged:
+            print(
+                "[PrePatch Lite Structure] input={} after_down1={} after_down2={} projected={} z_struct={}".format(
+                    input_shape,
+                    down1_shape,
+                    down2_shape,
+                    project_shape,
+                    tuple(x.shape),
+                ),
+                flush=True,
+            )
+            self._shape_logged = True
+        return x
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.GroupNorm):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
+
 class HighResStructureFusion(nn.Module):
     def __init__(self, feature_channels, struct_channels):
         super().__init__()
@@ -418,6 +520,42 @@ class HighResStructureFusion(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
             elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
+
+class StructureSurfaceCorrectionHead(nn.Module):
+    def __init__(self, struct_channels, hidden_channels=32):
+        super().__init__()
+        mid_channels = 16
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(struct_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_largest_group_divisor(hidden_channels), hidden_channels),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(hidden_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_largest_group_divisor(mid_channels), mid_channels),
+            nn.GELU(),
+        )
+        self.out = nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True)
+        self._init_weights()
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, z_struct, target_hw):
+        x = self.conv1(z_struct)
+        x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
+        x = self.conv2(x)
+        return self.out(x)
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.GroupNorm):
                 nn.init.constant_(module.weight, 1)
                 nn.init.constant_(module.bias, 0)
 
@@ -1934,6 +2072,7 @@ class SwinTransformerSys(nn.Module):
                  enable_highres_structure_stream=False,
                  highres_structure_channels=64,
                  highres_structure_fuse_stages="stage23",
+                 highres_structure_fusion_mode="stage23",
                  **kwargs):
         super().__init__()
 
@@ -1978,11 +2117,18 @@ class SwinTransformerSys(nn.Module):
         self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
         self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
+        self.highres_structure_source = "prepatch"
         self.highres_structure_channels = int(highres_structure_channels)
         self.highres_structure_fuse_stages = str(highres_structure_fuse_stages).lower()
+        self._highres_structure_shape_logged = False
         if self.highres_structure_fuse_stages not in {"stage2", "stage3", "stage23"}:
             raise ValueError(
                 "highres_structure_fuse_stages must be one of: stage2, stage3, stage23"
+            )
+        self.highres_structure_fusion_mode = str(highres_structure_fusion_mode).lower()
+        if self.highres_structure_fusion_mode not in {"stage23", "final_correction", "none"}:
+            raise ValueError(
+                "highres_structure_fusion_mode must be one of: stage23, final_correction, none"
             )
 
         # split image into non-overlapping patches
@@ -2193,8 +2339,7 @@ class SwinTransformerSys(nn.Module):
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
         )
-        self.highres_structure_encoder = HighResStructureEncoder(
-            in_channels=embed_dim,
+        self.prepatch_structure_encoder = PrePatchStructureEncoder(
             struct_channels=self.highres_structure_channels,
         )
         self.highres_structure_skeleton_head = nn.Conv2d(
@@ -2209,11 +2354,15 @@ class SwinTransformerSys(nn.Module):
                 "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
             }
         )
+        self.structure_surface_correction_head = StructureSurfaceCorrectionHead(
+            self.highres_structure_channels,
+        )
         print(
-            "[INFO] High-res structure stream: {}, channels={}, fuse_stages={}".format(
+            "[INFO] High-res structure stream: {}, source=prepatch, channels={}, fuse_stages={}, fusion_mode={}".format(
                 "enabled" if self.enable_highres_structure_stream else "disabled",
                 self.highres_structure_channels,
                 self.highres_structure_fuse_stages,
+                self.highres_structure_fusion_mode,
             )
         )
         if self.structure_profile == "stage23_boundary_0626":
@@ -2359,6 +2508,8 @@ class SwinTransformerSys(nn.Module):
     def _highres_structure_stage_enabled(self, stage):
         if not self.enable_highres_structure_stream:
             return False
+        if self.highres_structure_fusion_mode != "stage23":
+            return False
         if self.highres_structure_fuse_stages == "stage23":
             return stage in (2, 3)
         if self.highres_structure_fuse_stages == "stage2":
@@ -2367,15 +2518,25 @@ class SwinTransformerSys(nn.Module):
             return stage == 3
         return False
 
-    def _build_highres_structure_outputs(self, stage1_tokens):
-        if not self.enable_highres_structure_stream or stage1_tokens is None:
+    def _build_highres_structure_outputs(self, structure_input):
+        if not self.enable_highres_structure_stream or structure_input is None:
             return None, None
-        stage1_map = token_to_map(
-            stage1_tokens,
-            self.patches_resolution[0],
-            self.patches_resolution[1],
-        )
-        z_struct = self.highres_structure_encoder(stage1_map)
+        z_struct = self.prepatch_structure_encoder(structure_input)
+        if not self._highres_structure_shape_logged:
+            expected_stage1_shape = (
+                structure_input.shape[0],
+                self.highres_structure_channels,
+                self.patches_resolution[0],
+                self.patches_resolution[1],
+            )
+            print(
+                "[PrePatch Structure] expected_stage1_z_struct={} new_z_struct={}".format(
+                    expected_stage1_shape,
+                    tuple(z_struct.shape),
+                ),
+                flush=True,
+            )
+            self._highres_structure_shape_logged = True
         skeleton_logits = self.highres_structure_skeleton_head(z_struct)
         return z_struct, skeleton_logits
 
@@ -2389,6 +2550,30 @@ class SwinTransformerSys(nn.Module):
             z_struct_for_surface,
         )
         return map_to_token(feature_map)
+
+    def _apply_structure_surface_correction(self, outputs, z_struct, structure_outputs):
+        if (
+            not self.enable_highres_structure_stream
+            or self.highres_structure_fusion_mode != "final_correction"
+            or z_struct is None
+            or not isinstance(outputs, tuple)
+        ):
+            return outputs
+
+        base_surface_logits = outputs[0]
+        delta_surface_logits = self.structure_surface_correction_head(
+            z_struct.detach(),
+            base_surface_logits.shape[-2:],
+        )
+        final_surface_logits = base_surface_logits + delta_surface_logits
+        if structure_outputs is not None:
+            structure_outputs.append(
+                {
+                    "stage": "structure_surface_correction",
+                    "structure_surface_delta_logits": delta_surface_logits,
+                }
+            )
+        return (final_surface_logits, *outputs[1:])
 
     def _stage_topology_enabled(self, stage):
         if self.stage_topology_stages == "stage23":
@@ -2867,9 +3052,10 @@ class SwinTransformerSys(nn.Module):
         topology_alpha_scale=1.0,
         teacher_forcing_ratio=0.0,
     ):
+        structure_input = x
         x, x_downsample, road_attentions, stage1_tokens = self.forward_features(x)
         z_struct, highres_structure_skeleton = self._build_highres_structure_outputs(
-            stage1_tokens
+            structure_input
         )
         x, structure_outputs = self.forward_up_features(
             x,
@@ -2894,6 +3080,11 @@ class SwinTransformerSys(nn.Module):
             structure_outputs=structure_outputs if self.return_skeleton else None,
         )
         if self.return_skeleton and isinstance(x, tuple):
+            x = self._apply_structure_surface_correction(
+                x,
+                z_struct,
+                structure_outputs,
+            )
             x = (*x, structure_outputs)
 
         return x

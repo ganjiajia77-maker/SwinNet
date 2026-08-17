@@ -113,6 +113,13 @@ parser.add_argument(
     default='stage23',
     choices=['stage2', 'stage3', 'stage23'],
 )
+parser.add_argument(
+    '--highres_structure_fusion_mode',
+    type=str,
+    default='stage23',
+    choices=['stage23', 'final_correction', 'none'],
+    help='stage23: decoder fusion; final_correction: final residual logit correction; none: skeleton-only high-res stream',
+)
 parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
@@ -388,6 +395,7 @@ def format_training_config_lines(args, loss_weights):
         f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
         f"channels={args.highres_structure_channels}, "
         f"fuse_stages={args.highres_structure_fuse_stages}, "
+        f"fusion_mode={args.highres_structure_fusion_mode}, "
         f"skeleton_weight={args.highres_structure_skeleton_weight}",
         "  Surface loss: BCE + 0.5*Dice",
         (
@@ -478,6 +486,8 @@ def inherit_resume_architecture_args(args):
         args.highres_structure_channels = int(saved_args["highres_structure_channels"])
     if "highres_structure_fuse_stages" in saved_args and not _cli_has("--highres_structure_fuse_stages"):
         args.highres_structure_fuse_stages = str(saved_args["highres_structure_fuse_stages"])
+    if "highres_structure_fusion_mode" in saved_args and not _cli_has("--highres_structure_fusion_mode"):
+        args.highres_structure_fusion_mode = str(saved_args["highres_structure_fusion_mode"])
     if "highres_structure_skeleton_weight" in saved_args and not _cli_has("--highres_structure_skeleton_weight"):
         args.highres_structure_skeleton_weight = float(saved_args["highres_structure_skeleton_weight"])
     print(
@@ -1003,7 +1013,8 @@ if __name__ == "__main__":
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
                     highres_structure_channels=args.highres_structure_channels,
-                    highres_structure_fuse_stages=args.highres_structure_fuse_stages).to(device)
+                    highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+                    highres_structure_fusion_mode=args.highres_structure_fusion_mode).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.no_pretrain:
@@ -1161,6 +1172,7 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
                         "swin_unet.guided_head.graph_propagation.",
                         "swin_unet.highres_structure_encoder.",
+                        "swin_unet.prepatch_structure_encoder.",
                         "swin_unet.highres_structure_skeleton_head.",
                         "swin_unet.highres_structure_fusion.",
                         "swin_unet.decoder_structure_blocks.0.direction_head.",
@@ -1355,15 +1367,18 @@ if __name__ == "__main__":
                 'epoch', 'lr', 'train_avg_loss', 'val_loss',
                 'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
                 'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall',
-                'highres_skeleton_loss', 'hard_positive_weight_mean',
-                'hard_positive_weight_min', 'hard_positive_weight_max',
-                'hard_weight_p_lt_02', 'hard_weight_p_02_05', 'hard_weight_p_ge_05'
+                'highres_skeleton_loss', 'structure_delta_mean',
+                'structure_delta_abs_mean', 'structure_delta_abs_max',
+                'structure_delta_weak_skeleton_fn_mean',
+                'structure_delta_skeleton_tp_mean',
+                'structure_delta_background_mean',
             ])
             batch_loss_writer.writerow([
                 'epoch', 'batch', 'loss', 'highres_skeleton_loss',
-                'hard_positive_weight_mean', 'hard_positive_weight_min',
-                'hard_positive_weight_max', 'hard_weight_p_lt_02',
-                'hard_weight_p_02_05', 'hard_weight_p_ge_05'
+                'structure_delta_mean', 'structure_delta_abs_mean',
+                'structure_delta_abs_max', 'structure_delta_weak_skeleton_fn_mean',
+                'structure_delta_skeleton_tp_mean',
+                'structure_delta_background_mean',
             ])
 
         for epoch in range(start_epoch, args.max_epochs):
@@ -1389,12 +1404,12 @@ if __name__ == "__main__":
             accumulation_count = 0
             highres_stat_sums = {
                 "highres_structure_skeleton_raw": 0.0,
-                "hard_positive_weight_mean": 0.0,
-                "hard_positive_weight_min": 0.0,
-                "hard_positive_weight_max": 0.0,
-                "hard_weight_p_lt_02": 0.0,
-                "hard_weight_p_02_05": 0.0,
-                "hard_weight_p_ge_05": 0.0,
+                "structure_delta_mean": 0.0,
+                "structure_delta_abs_mean": 0.0,
+                "structure_delta_abs_max": 0.0,
+                "structure_delta_weak_skeleton_fn_mean": 0.0,
+                "structure_delta_skeleton_tp_mean": 0.0,
+                "structure_delta_background_mean": 0.0,
             }
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
@@ -1517,12 +1532,12 @@ if __name__ == "__main__":
                     i + 1,
                     f'{loss.item():.6f}',
                     f"{loss_dict['highres_structure_skeleton_raw'].item():.6f}",
-                    f"{loss_dict['hard_positive_weight_mean'].item():.6f}",
-                    f"{loss_dict['hard_positive_weight_min'].item():.6f}",
-                    f"{loss_dict['hard_positive_weight_max'].item():.6f}",
-                    f"{loss_dict['hard_weight_p_lt_02'].item():.6f}",
-                    f"{loss_dict['hard_weight_p_02_05'].item():.6f}",
-                    f"{loss_dict['hard_weight_p_ge_05'].item():.6f}",
+                    f"{loss_dict['structure_delta_mean'].item():.6f}",
+                    f"{loss_dict['structure_delta_abs_mean'].item():.6f}",
+                    f"{loss_dict['structure_delta_abs_max'].item():.6f}",
+                    f"{loss_dict['structure_delta_weak_skeleton_fn_mean'].item():.6f}",
+                    f"{loss_dict['structure_delta_skeleton_tp_mean'].item():.6f}",
+                    f"{loss_dict['structure_delta_background_mean'].item():.6f}",
                 ])
                 batch_loss_log_file.flush()
 
@@ -1534,10 +1549,7 @@ if __name__ == "__main__":
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                         f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
                         f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
-                        f"HardW(mean/min/max): "
-                        f"{loss_dict['hard_positive_weight_mean'].item():.3f}/"
-                        f"{loss_dict['hard_positive_weight_min'].item():.3f}/"
-                        f"{loss_dict['hard_positive_weight_max'].item():.3f}, "
+                        f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
                         f"TF: {teacher_forcing_ratio:.2f}, "
@@ -1616,17 +1628,21 @@ if __name__ == "__main__":
                     f"(interval={args.val_interval})"
                 )
             print(epoch_msg, flush=True)
-            hard_weight_msg = (
-                "[HighRes Skeleton Hard Weight] "
-                f"highres_skeleton_loss={highres_epoch_stats['highres_structure_skeleton_raw']:.4f}, "
-                f"positive_mean={highres_epoch_stats['hard_positive_weight_mean']:.4f}, "
-                f"min={highres_epoch_stats['hard_positive_weight_min']:.4f}, "
-                f"max={highres_epoch_stats['hard_positive_weight_max']:.4f}, "
-                f"p<0.2={highres_epoch_stats['hard_weight_p_lt_02']:.4f}, "
-                f"0.2~0.5={highres_epoch_stats['hard_weight_p_02_05']:.4f}, "
-                f"p>=0.5={highres_epoch_stats['hard_weight_p_ge_05']:.4f}"
+            highres_skeleton_msg = (
+                "[HighRes Skeleton] "
+                f"highres_skeleton_loss={highres_epoch_stats['highres_structure_skeleton_raw']:.4f}"
             )
-            print(hard_weight_msg, flush=True)
+            print(highres_skeleton_msg, flush=True)
+            structure_delta_msg = (
+                "[Structure Surface Delta] "
+                f"mean={highres_epoch_stats['structure_delta_mean']:.4f}, "
+                f"abs_mean={highres_epoch_stats['structure_delta_abs_mean']:.4f}, "
+                f"abs_max={highres_epoch_stats['structure_delta_abs_max']:.4f}, "
+                f"weak_skel_fn={highres_epoch_stats['structure_delta_weak_skeleton_fn_mean']:.4f}, "
+                f"skel_tp={highres_epoch_stats['structure_delta_skeleton_tp_mean']:.4f}, "
+                f"background={highres_epoch_stats['structure_delta_background_mean']:.4f}"
+            )
+            print(structure_delta_msg, flush=True)
             topology_msg = print_topology_coefficients(
                 model,
                 prefix=f"[TOPOLOGY][Epoch {epoch + 1}]",
@@ -1640,12 +1656,12 @@ if __name__ == "__main__":
                 f'{val_iou:.6f}', f'{val_f1:.6f}', f'{val_precision:.6f}', f'{val_recall:.6f}',
                 f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}',
                 f"{highres_epoch_stats['highres_structure_skeleton_raw']:.6f}",
-                f"{highres_epoch_stats['hard_positive_weight_mean']:.6f}",
-                f"{highres_epoch_stats['hard_positive_weight_min']:.6f}",
-                f"{highres_epoch_stats['hard_positive_weight_max']:.6f}",
-                f"{highres_epoch_stats['hard_weight_p_lt_02']:.6f}",
-                f"{highres_epoch_stats['hard_weight_p_02_05']:.6f}",
-                f"{highres_epoch_stats['hard_weight_p_ge_05']:.6f}",
+                f"{highres_epoch_stats['structure_delta_mean']:.6f}",
+                f"{highres_epoch_stats['structure_delta_abs_mean']:.6f}",
+                f"{highres_epoch_stats['structure_delta_abs_max']:.6f}",
+                f"{highres_epoch_stats['structure_delta_weak_skeleton_fn_mean']:.6f}",
+                f"{highres_epoch_stats['structure_delta_skeleton_tp_mean']:.6f}",
+                f"{highres_epoch_stats['structure_delta_background_mean']:.6f}",
             ])
             loss_log_file.flush()
             
@@ -1662,7 +1678,8 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton F1: {skeleton_f1:.6f}\n")
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
-                log_f.write(hard_weight_msg + "\n")
+                log_f.write(highres_skeleton_msg + "\n")
+                log_f.write(structure_delta_msg + "\n")
                 log_f.write(
                     f"  Stage topology alpha scale: "
                     f"{stage_topology_alpha_scale:.6f}\n"

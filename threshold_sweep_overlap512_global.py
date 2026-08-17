@@ -102,6 +102,12 @@ def main():
         default="stage23",
         choices=["stage2", "stage3", "stage23"],
     )
+    parser.add_argument(
+        "--highres_structure_fusion_mode",
+        type=str,
+        default="stage23",
+        choices=["stage23", "final_correction", "none"],
+    )
     args = parser.parse_args()
 
     thresholds = parse_thresholds(args.thresholds)
@@ -126,6 +132,10 @@ def main():
             "highres_structure_fuse_stages",
             args.highres_structure_fuse_stages,
         )
+        args.highres_structure_fusion_mode = saved_args.get(
+            "highres_structure_fusion_mode",
+            args.highres_structure_fusion_mode,
+        )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     config = get_config(args)
@@ -144,6 +154,7 @@ def main():
         enable_highres_structure_stream=args.enable_highres_structure_stream,
         highres_structure_channels=args.highres_structure_channels,
         highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+        highres_structure_fusion_mode=args.highres_structure_fusion_mode,
     )
     load_topology_checkpoint_state(
         model,

@@ -64,8 +64,10 @@ def get_topology_coefficients(model):
         "graph_prop_enabled": False,
         "highres_structure_stream": {
             "enabled": bool(getattr(swin_unet, "enable_highres_structure_stream", False)),
+            "source": getattr(swin_unet, "highres_structure_source", "prepatch"),
             "channels": int(getattr(swin_unet, "highres_structure_channels", 0)),
             "fuse_stages": getattr(swin_unet, "highres_structure_fuse_stages", "stage23"),
+            "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),
         },
         "stage_topology_stages": getattr(swin_unet, "stage_topology_stages", "none"),
         "stage_topology_active": {
@@ -145,10 +147,12 @@ def format_topology_coefficients(model):
     ]
     highres_values = coefficients["highres_structure_stream"]
     fields.append(
-        "highres_structure={} channels={} fuse_stages={}".format(
+        "highres_structure={} source={} channels={} fuse_stages={} fusion_mode={}".format(
             "on" if highres_values["enabled"] else "off",
+            highres_values["source"],
             highres_values["channels"],
             highres_values["fuse_stages"],
+            highres_values["fusion_mode"],
         )
     )
     for stage in (
@@ -210,8 +214,10 @@ def load_topology_checkpoint_state(
     model_state = model.state_dict()
     highres_structure_missing_prefixes = (
         "swin_unet.highres_structure_encoder.",
+        "swin_unet.prepatch_structure_encoder.",
         "swin_unet.highres_structure_skeleton_head.",
         "swin_unet.highres_structure_fusion.",
+        "swin_unet.structure_surface_correction_head.",
     )
 
     def print_expected_highres_missing(missing_keys):
@@ -499,7 +505,8 @@ class SwinUnet(nn.Module):
                  final_skeleton_gradient_ratio=0.0,
                  enable_highres_structure_stream=False,
                  highres_structure_channels=64,
-                 highres_structure_fuse_stages="stage23"):
+                 highres_structure_fuse_stages="stage23",
+                 highres_structure_fusion_mode="stage23"):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -540,7 +547,8 @@ class SwinUnet(nn.Module):
                                 final_skeleton_gradient_ratio=final_skeleton_gradient_ratio,
                                 enable_highres_structure_stream=enable_highres_structure_stream,
                                 highres_structure_channels=highres_structure_channels,
-                                highres_structure_fuse_stages=highres_structure_fuse_stages)
+                                highres_structure_fuse_stages=highres_structure_fuse_stages,
+                                highres_structure_fusion_mode=highres_structure_fusion_mode)
     def forward(
         self,
         x,

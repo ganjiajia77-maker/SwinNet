@@ -103,6 +103,12 @@ def main():
         default='stage23',
         choices=['stage2', 'stage3', 'stage23'],
     )
+    parser.add_argument(
+        '--highres_structure_fusion_mode',
+        type=str,
+        default='stage23',
+        choices=['stage23', 'final_correction', 'none'],
+    )
     args = parser.parse_args()
     
     checkpoint = None
@@ -125,6 +131,7 @@ def main():
                     "enable_highres_structure_stream",
                     "highres_structure_channels",
                     "highres_structure_fuse_stages",
+                    "highres_structure_fusion_mode",
                 ):
                     if name in saved_args:
                         setattr(args, name, saved_args[name])
@@ -149,6 +156,7 @@ def main():
         enable_highres_structure_stream=args.enable_highres_structure_stream,
         highres_structure_channels=args.highres_structure_channels,
         highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+        highres_structure_fusion_mode=args.highres_structure_fusion_mode,
     )
     if checkpoint is None:
         checkpoint = torch.load(args.model_path, map_location=device)
