@@ -106,7 +106,7 @@ def main():
         "--highres_structure_fusion_mode",
         type=str,
         default="stage23",
-        choices=["stage23", "final_correction", "none"],
+        choices=["stage23", "final_correction", "stage23_final_correction", "none"],
     )
     args = parser.parse_args()
 

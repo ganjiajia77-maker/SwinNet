@@ -88,7 +88,7 @@ parser.add_argument(
     '--highres_structure_fusion_mode',
     type=str,
     default='stage23',
-    choices=['stage23', 'final_correction', 'none'],
+    choices=['stage23', 'final_correction', 'stage23_final_correction', 'none'],
 )
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')

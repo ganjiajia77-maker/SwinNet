@@ -814,18 +814,28 @@ class SurfaceStructureLoss(nn.Module):
         if not stage_outputs:
             return stats
         delta_logits = None
+        reference_logits = surface_logits
         for stage_output in stage_outputs:
             candidate = stage_output.get("structure_surface_delta_logits")
             if candidate is not None:
                 delta_logits = candidate
+                reference_logits = stage_output.get(
+                    "structure_surface_base_logits",
+                    surface_logits,
+                )
                 break
         if delta_logits is None:
             return stats
 
         delta_logits = self._match_spatial_size(delta_logits, surface_logits, mode="bilinear")
+        reference_logits = self._match_spatial_size(
+            reference_logits,
+            delta_logits,
+            mode="bilinear",
+        )
         surface_gt = self._match_spatial_size(surface_gt, delta_logits)
         skeleton_gt = self._match_spatial_size(skeleton_gt, delta_logits)
-        surface_prob = torch.sigmoid(surface_logits.detach())
+        surface_prob = torch.sigmoid(reference_logits.detach())
         surface_pred = surface_prob >= 0.5
         surface_bin = surface_gt > 0.5
         skeleton_bin = skeleton_gt > 0.5

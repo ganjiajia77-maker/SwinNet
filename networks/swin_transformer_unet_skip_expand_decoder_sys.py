@@ -2126,9 +2126,15 @@ class SwinTransformerSys(nn.Module):
                 "highres_structure_fuse_stages must be one of: stage2, stage3, stage23"
             )
         self.highres_structure_fusion_mode = str(highres_structure_fusion_mode).lower()
-        if self.highres_structure_fusion_mode not in {"stage23", "final_correction", "none"}:
+        if self.highres_structure_fusion_mode not in {
+            "stage23",
+            "final_correction",
+            "stage23_final_correction",
+            "none",
+        }:
             raise ValueError(
-                "highres_structure_fusion_mode must be one of: stage23, final_correction, none"
+                "highres_structure_fusion_mode must be one of: "
+                "stage23, final_correction, stage23_final_correction, none"
             )
 
         # split image into non-overlapping patches
@@ -2508,7 +2514,7 @@ class SwinTransformerSys(nn.Module):
     def _highres_structure_stage_enabled(self, stage):
         if not self.enable_highres_structure_stream:
             return False
-        if self.highres_structure_fusion_mode != "stage23":
+        if self.highres_structure_fusion_mode not in {"stage23", "stage23_final_correction"}:
             return False
         if self.highres_structure_fuse_stages == "stage23":
             return stage in (2, 3)
@@ -2554,7 +2560,8 @@ class SwinTransformerSys(nn.Module):
     def _apply_structure_surface_correction(self, outputs, z_struct, structure_outputs):
         if (
             not self.enable_highres_structure_stream
-            or self.highres_structure_fusion_mode != "final_correction"
+            or self.highres_structure_fusion_mode
+            not in {"final_correction", "stage23_final_correction"}
             or z_struct is None
             or not isinstance(outputs, tuple)
         ):
@@ -2570,6 +2577,7 @@ class SwinTransformerSys(nn.Module):
             structure_outputs.append(
                 {
                     "stage": "structure_surface_correction",
+                    "structure_surface_base_logits": base_surface_logits.detach(),
                     "structure_surface_delta_logits": delta_surface_logits,
                 }
             )

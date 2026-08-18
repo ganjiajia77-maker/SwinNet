@@ -117,8 +117,11 @@ parser.add_argument(
     '--highres_structure_fusion_mode',
     type=str,
     default='stage23',
-    choices=['stage23', 'final_correction', 'none'],
-    help='stage23: decoder fusion; final_correction: final residual logit correction; none: skeleton-only high-res stream',
+    choices=['stage23', 'final_correction', 'stage23_final_correction', 'none'],
+    help=(
+        'stage23: decoder fusion; final_correction: final residual logit correction; '
+        'stage23_final_correction: both; none: skeleton-only high-res stream'
+    ),
 )
 parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
