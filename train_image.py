@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import tempfile
+import time
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -134,6 +135,7 @@ parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--pretrain_ckpt', type=str, default='', help='optional ImageNet Swin checkpoint path')
+parser.add_argument('--warm_start_ckpt', type=str, default='', help='fresh run warm-start checkpoint; loads only matching tensors and does not restore epoch/optimizer')
 parser.add_argument('--pretrained_lr', type=float, default=5e-5, help='LR for tensors actually loaded from ImageNet')
 parser.add_argument('--pretrained_min_lr', type=float, default=5e-6)
 parser.add_argument('--new_lr', type=float, default=2e-4, help='LR for all randomly initialized tensors')
@@ -1020,7 +1022,7 @@ if __name__ == "__main__":
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode).to(device)
 
     loaded_pretrained_names = set()
-    if not args.resume and not args.no_pretrain:
+    if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
         pretrain_path = config.MODEL.PRETRAIN_CKPT
         if not os.path.isfile(pretrain_path):
             raise FileNotFoundError(
@@ -1082,6 +1084,45 @@ if __name__ == "__main__":
         return restored
 
     # 加载数据
+    def load_warm_start_checkpoint(path):
+        if not path:
+            return set()
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
+        print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
+        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
+        model_state = model.state_dict()
+        compatible = {}
+        skipped_shape = []
+        skipped_missing = []
+        for key, value in checkpoint_state.items():
+            if key not in model_state:
+                skipped_missing.append(key)
+                continue
+            if model_state[key].shape != value.shape:
+                skipped_shape.append(key)
+                continue
+            compatible[key] = value
+        result = model.load_state_dict(compatible, strict=False)
+        print(
+            "[INFO] Warm-start loaded {} tensors; skipped_missing={}, skipped_shape={}, runtime_missing={}".format(
+                len(compatible),
+                len(skipped_missing),
+                len(skipped_shape),
+                len(result.missing_keys),
+            ),
+            flush=True,
+        )
+        if skipped_shape:
+            print(
+                "[INFO] Warm-start skipped shape-mismatch tensors: "
+                + ", ".join(skipped_shape[:12])
+                + (" ..." if len(skipped_shape) > 12 else ""),
+                flush=True,
+            )
+        return set(compatible)
+
     train_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split='train',
@@ -1133,6 +1174,10 @@ if __name__ == "__main__":
 
     # 检查是否恢复训练
     start_epoch = 0
+    if args.warm_start_ckpt and args.resume:
+        raise ValueError("--warm_start_ckpt is for fresh runs; do not combine it with --resume")
+    if args.warm_start_ckpt:
+        loaded_pretrained_names = load_warm_start_checkpoint(args.warm_start_ckpt)
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
@@ -1382,6 +1427,7 @@ if __name__ == "__main__":
                 'structure_delta_abs_max', 'structure_delta_weak_skeleton_fn_mean',
                 'structure_delta_skeleton_tp_mean',
                 'structure_delta_background_mean',
+                'ms_per_batch',
             ])
 
         for epoch in range(start_epoch, args.max_epochs):
@@ -1429,6 +1475,7 @@ if __name__ == "__main__":
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
                     break
+                batch_start_time = time.perf_counter()
 
                 images = batch['image'].to(device)
                 masks = batch['mask'].to(device)
@@ -1525,6 +1572,9 @@ if __name__ == "__main__":
 
                 total_loss += loss.item()
                 train_batches += 1
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                ms_per_batch = (time.perf_counter() - batch_start_time) * 1000.0
                 for key in highres_stat_sums:
                     value = float(loss_dict[key].item())
                     if np.isfinite(value):
@@ -1541,6 +1591,7 @@ if __name__ == "__main__":
                     f"{loss_dict['structure_delta_weak_skeleton_fn_mean'].item():.6f}",
                     f"{loss_dict['structure_delta_skeleton_tp_mean'].item():.6f}",
                     f"{loss_dict['structure_delta_background_mean'].item():.6f}",
+                    f"{ms_per_batch:.3f}",
                 ])
                 batch_loss_log_file.flush()
 
@@ -1556,7 +1607,8 @@ if __name__ == "__main__":
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
                         f"TF: {teacher_forcing_ratio:.2f}, "
-                        f"Boundary: {loss_dict['boundary_loss'].item():.4f}",
+                        f"Boundary: {loss_dict['boundary_loss'].item():.4f}, "
+                        f"ms/batch: {ms_per_batch:.1f}",
                         flush=True
                     )
 

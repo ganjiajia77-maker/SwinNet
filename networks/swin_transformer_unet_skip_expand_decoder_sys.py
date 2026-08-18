@@ -404,14 +404,12 @@ class PrePatchStructureEncoder(nn.Module):
         self.down2 = nn.Sequential(
             nn.Conv2d(
                 16,
-                16,
+                32,
                 kernel_size=3,
                 stride=2,
                 padding=1,
-                groups=16,
                 bias=False,
             ),
-            nn.Conv2d(16, 32, kernel_size=1, bias=False),
             nn.GroupNorm(
                 num_groups=_largest_group_divisor(32),
                 num_channels=32,
@@ -419,34 +417,6 @@ class PrePatchStructureEncoder(nn.Module):
             nn.GELU(),
         )
         self.project = nn.Conv2d(32, struct_channels, kernel_size=1, bias=False)
-        bottleneck_channels = max(struct_channels // 4, 1)
-        self.refine = nn.Sequential(
-            nn.Conv2d(struct_channels, bottleneck_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(bottleneck_channels),
-                num_channels=bottleneck_channels,
-            ),
-            nn.GELU(),
-            nn.Conv2d(
-                bottleneck_channels,
-                bottleneck_channels,
-                kernel_size=3,
-                padding=1,
-                groups=bottleneck_channels,
-                bias=False,
-            ),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(bottleneck_channels),
-                num_channels=bottleneck_channels,
-            ),
-            nn.GELU(),
-            nn.Conv2d(bottleneck_channels, struct_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(struct_channels),
-                num_channels=struct_channels,
-            ),
-        )
-        self.act = nn.GELU()
         self._shape_logged = False
         self._init_weights()
 
@@ -458,11 +428,9 @@ class PrePatchStructureEncoder(nn.Module):
         down2_shape = tuple(x.shape)
         x = self.project(x)
         project_shape = tuple(x.shape)
-        identity = x
-        x = self.act(self.refine(x) + identity)
         if not self._shape_logged:
             print(
-                "[PrePatch Lite Structure] input={} after_down1={} after_down2={} projected={} z_struct={}".format(
+                "[PrePatch UltraLite Structure] input={} after_down1={} after_down2={} projected={} z_struct={}".format(
                     input_shape,
                     down1_shape,
                     down2_shape,
@@ -2121,6 +2089,8 @@ class SwinTransformerSys(nn.Module):
         self.highres_structure_channels = int(highres_structure_channels)
         self.highres_structure_fuse_stages = str(highres_structure_fuse_stages).lower()
         self._highres_structure_shape_logged = False
+        self.last_highres_z_struct = None
+        self.last_highres_structure_skeleton = None
         if self.highres_structure_fuse_stages not in {"stage2", "stage3", "stage23"}:
             raise ValueError(
                 "highres_structure_fuse_stages must be one of: stage2, stage3, stage23"
@@ -2345,6 +2315,10 @@ class SwinTransformerSys(nn.Module):
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
         )
+        self.highres_structure_encoder = HighResStructureEncoder(
+            in_channels=self.embed_dim,
+            struct_channels=self.highres_structure_channels,
+        )
         self.prepatch_structure_encoder = PrePatchStructureEncoder(
             struct_channels=self.highres_structure_channels,
         )
@@ -2364,8 +2338,9 @@ class SwinTransformerSys(nn.Module):
             self.highres_structure_channels,
         )
         print(
-            "[INFO] High-res structure stream: {}, source=prepatch, channels={}, fuse_stages={}, fusion_mode={}".format(
+            "[INFO] High-res structure stream: {}, source={}, channels={}, fuse_stages={}, fusion_mode={}".format(
                 "enabled" if self.enable_highres_structure_stream else "disabled",
+                self.highres_structure_source,
                 self.highres_structure_channels,
                 self.highres_structure_fuse_stages,
                 self.highres_structure_fusion_mode,
@@ -2527,7 +2502,13 @@ class SwinTransformerSys(nn.Module):
     def _build_highres_structure_outputs(self, structure_input):
         if not self.enable_highres_structure_stream or structure_input is None:
             return None, None
-        z_struct = self.prepatch_structure_encoder(structure_input)
+        if self.highres_structure_source == "stage1_tokens":
+            if structure_input.dim() == 3:
+                height, width = self.patches_resolution
+                structure_input = token_to_map(structure_input, height, width)
+            z_struct = self.highres_structure_encoder(structure_input)
+        else:
+            z_struct = self.prepatch_structure_encoder(structure_input)
         if not self._highres_structure_shape_logged:
             expected_stage1_shape = (
                 structure_input.shape[0],
@@ -2536,7 +2517,8 @@ class SwinTransformerSys(nn.Module):
                 self.patches_resolution[1],
             )
             print(
-                "[PrePatch Structure] expected_stage1_z_struct={} new_z_struct={}".format(
+                "[HighRes Structure] source={} expected_stage1_z_struct={} z_struct={}".format(
+                    self.highres_structure_source,
                     expected_stage1_shape,
                     tuple(z_struct.shape),
                 ),
@@ -2544,6 +2526,8 @@ class SwinTransformerSys(nn.Module):
             )
             self._highres_structure_shape_logged = True
         skeleton_logits = self.highres_structure_skeleton_head(z_struct)
+        self.last_highres_z_struct = z_struct
+        self.last_highres_structure_skeleton = skeleton_logits
         return z_struct, skeleton_logits
 
     def _apply_highres_structure_fusion(self, x, z_struct, stage, target_hw):
@@ -3062,6 +3046,8 @@ class SwinTransformerSys(nn.Module):
     ):
         structure_input = x
         x, x_downsample, road_attentions, stage1_tokens = self.forward_features(x)
+        if self.highres_structure_source == "stage1_tokens":
+            structure_input = stage1_tokens
         z_struct, highres_structure_skeleton = self._build_highres_structure_outputs(
             structure_input
         )

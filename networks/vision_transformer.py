@@ -440,10 +440,7 @@ def load_topology_checkpoint_state(
     allowed_new_missing_prefixes = (
         road_attention_missing_prefixes + msaf_missing_prefixes
     )
-    if strict and not any(
-        key.startswith(allowed_new_missing_prefixes)
-        for key in state_dict
-    ):
+    if strict:
         result = model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
             key
