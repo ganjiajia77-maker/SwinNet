@@ -417,6 +417,34 @@ class PrePatchStructureEncoder(nn.Module):
             nn.GELU(),
         )
         self.project = nn.Conv2d(32, struct_channels, kernel_size=1, bias=False)
+        bottleneck_channels = max(struct_channels // 4, 1)
+        self.refine = nn.Sequential(
+            nn.Conv2d(struct_channels, bottleneck_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(bottleneck_channels),
+                num_channels=bottleneck_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                bottleneck_channels,
+                bottleneck_channels,
+                kernel_size=3,
+                padding=1,
+                groups=bottleneck_channels,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(bottleneck_channels),
+                num_channels=bottleneck_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(bottleneck_channels, struct_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(struct_channels),
+                num_channels=struct_channels,
+            ),
+        )
+        self.act = nn.GELU()
         self._shape_logged = False
         self._init_weights()
 
@@ -428,9 +456,10 @@ class PrePatchStructureEncoder(nn.Module):
         down2_shape = tuple(x.shape)
         x = self.project(x)
         project_shape = tuple(x.shape)
+        x = self.act(self.refine(x) + x)
         if not self._shape_logged:
             print(
-                "[PrePatch UltraLite Structure] input={} after_down1={} after_down2={} projected={} z_struct={}".format(
+                "[PrePatch Lite Structure] input={} after_down1={} after_down2={} projected={} z_struct={}".format(
                     input_shape,
                     down1_shape,
                     down2_shape,
