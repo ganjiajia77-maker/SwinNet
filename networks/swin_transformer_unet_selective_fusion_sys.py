@@ -10,7 +10,7 @@ from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
-from .skeleton_guided_head import (
+from .skeleton_guided_head_selective_fusion import (
     DecoderStructureRefinement,
     GlobalContextHead,
     STAGE3_GLOBAL_CONTEXT_CHANNELS,
@@ -404,12 +404,14 @@ class PrePatchStructureEncoder(nn.Module):
         self.down2 = nn.Sequential(
             nn.Conv2d(
                 16,
-                32,
+                16,
                 kernel_size=3,
                 stride=2,
                 padding=1,
+                groups=16,
                 bias=False,
             ),
+            nn.Conv2d(16, 32, kernel_size=1, bias=False),
             nn.GroupNorm(
                 num_groups=_largest_group_divisor(32),
                 num_channels=32,

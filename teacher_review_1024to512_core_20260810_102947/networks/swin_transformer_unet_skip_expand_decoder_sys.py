@@ -346,217 +346,6 @@ def map_to_token(x):
     return x
 
 
-class HighResStructureEncoder(nn.Module):
-    def __init__(self, in_channels, struct_channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, struct_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(struct_channels),
-            nn.GELU(),
-            nn.Conv2d(
-                struct_channels,
-                struct_channels,
-                kernel_size=3,
-                padding=1,
-                groups=struct_channels,
-                bias=False,
-            ),
-            nn.BatchNorm2d(struct_channels),
-            nn.GELU(),
-            nn.Conv2d(struct_channels, struct_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(struct_channels),
-            nn.GELU(),
-        )
-        self._init_weights()
-
-    def forward(self, x):
-        return self.net(x)
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-
-
-def _largest_group_divisor(channels, candidates=(8, 4, 2, 1)):
-    for groups in candidates:
-        if channels % groups == 0:
-            return groups
-    return 1
-
-
-class PrePatchStructureEncoder(nn.Module):
-    def __init__(self, struct_channels):
-        super().__init__()
-        self.down1 = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(16),
-                num_channels=16,
-            ),
-            nn.GELU(),
-        )
-        self.down2 = nn.Sequential(
-            nn.Conv2d(
-                16,
-                32,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                bias=False,
-            ),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(32),
-                num_channels=32,
-            ),
-            nn.GELU(),
-        )
-        self.project = nn.Conv2d(32, struct_channels, kernel_size=1, bias=False)
-        bottleneck_channels = max(struct_channels // 4, 1)
-        self.refine = nn.Sequential(
-            nn.Conv2d(struct_channels, bottleneck_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(bottleneck_channels),
-                num_channels=bottleneck_channels,
-            ),
-            nn.GELU(),
-            nn.Conv2d(
-                bottleneck_channels,
-                bottleneck_channels,
-                kernel_size=3,
-                padding=1,
-                groups=bottleneck_channels,
-                bias=False,
-            ),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(bottleneck_channels),
-                num_channels=bottleneck_channels,
-            ),
-            nn.GELU(),
-            nn.Conv2d(bottleneck_channels, struct_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(
-                num_groups=_largest_group_divisor(struct_channels),
-                num_channels=struct_channels,
-            ),
-        )
-        self.act = nn.GELU()
-        self._shape_logged = False
-        self._init_weights()
-
-    def forward(self, x):
-        input_shape = tuple(x.shape)
-        x = self.down1(x)
-        down1_shape = tuple(x.shape)
-        x = self.down2(x)
-        down2_shape = tuple(x.shape)
-        x = self.project(x)
-        project_shape = tuple(x.shape)
-        x = self.act(self.refine(x) + x)
-        if not self._shape_logged:
-            print(
-                "[PrePatch Lite Structure] input={} after_down1={} after_down2={} projected={} z_struct={}".format(
-                    input_shape,
-                    down1_shape,
-                    down2_shape,
-                    project_shape,
-                    tuple(x.shape),
-                ),
-                flush=True,
-            )
-            self._shape_logged = True
-        return x
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.GroupNorm):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-
-
-class HighResStructureFusion(nn.Module):
-    def __init__(self, feature_channels, struct_channels):
-        super().__init__()
-        self.project = nn.Sequential(
-            nn.Conv2d(struct_channels, feature_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(feature_channels),
-            nn.GELU(),
-        )
-        self.delta = nn.Sequential(
-            nn.Conv2d(feature_channels * 2, feature_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(feature_channels),
-            nn.GELU(),
-            nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=True),
-        )
-        self._init_weights()
-        nn.init.constant_(self.delta[-1].weight, 0)
-        nn.init.constant_(self.delta[-1].bias, 0)
-
-    def forward(self, feature_map, z_struct):
-        z = F.interpolate(
-            z_struct,
-            size=feature_map.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        z = self.project(z)
-        return feature_map + self.delta(torch.cat([feature_map, z], dim=1))
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-
-
-class StructureSurfaceCorrectionHead(nn.Module):
-    def __init__(self, struct_channels, hidden_channels=32):
-        super().__init__()
-        mid_channels = 16
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(struct_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_largest_group_divisor(hidden_channels), hidden_channels),
-            nn.GELU(),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(hidden_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_largest_group_divisor(mid_channels), mid_channels),
-            nn.GELU(),
-        )
-        self.out = nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True)
-        self._init_weights()
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
-
-    def forward(self, z_struct, target_hw):
-        x = self.conv1(z_struct)
-        x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
-        x = self.conv2(x)
-        return self.out(x)
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.GroupNorm):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-
-
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
 
@@ -1478,7 +1267,6 @@ class BasicLayer(nn.Module):
         self.use_road_bias = bool(use_road_bias)
         self.road_attention_modulates_downsample = bool(road_attention_modulates_downsample)
         self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
-        self.last_pre_downsample = None
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -1512,7 +1300,6 @@ class BasicLayer(nn.Module):
             else:
                 x = blk(x, road_prior=road_prior)
         self.last_road_attention = None
-        self.last_pre_downsample = x
         if self.downsample is not None:
             road_attention = None
             if self.road_attention_head is not None:
@@ -2066,11 +1853,6 @@ class SwinTransformerSys(nn.Module):
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
                  final_skeleton_gradient_ratio=0.0,
-                 enable_highres_structure_stream=False,
-                 highres_structure_channels=64,
-                 highres_structure_fuse_stages="stage23",
-                 highres_structure_fusion_mode="stage23",
-                 enable_post_refine_structure_interaction=False,
                  **kwargs):
         super().__init__()
 
@@ -2114,34 +1896,6 @@ class SwinTransformerSys(nn.Module):
         self.stage2_skeleton_gradient_ratio = float(stage2_skeleton_gradient_ratio)
         self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
-        self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
-        self.highres_structure_source = "prepatch"
-        self.highres_structure_channels = int(highres_structure_channels)
-        self.highres_structure_fuse_stages = str(highres_structure_fuse_stages).lower()
-        self._highres_structure_shape_logged = False
-        self.last_highres_z_struct = None
-        self.last_highres_structure_skeleton = None
-        if self.highres_structure_fuse_stages not in {"stage2", "stage3", "stage23"}:
-            raise ValueError(
-                "highres_structure_fuse_stages must be one of: stage2, stage3, stage23"
-            )
-        self.highres_structure_fusion_mode = str(highres_structure_fusion_mode).lower()
-        if self.highres_structure_fusion_mode not in {
-            "stage23",
-            "final_correction",
-            "stage23_final_correction",
-            "post_refine_interaction",
-            "none",
-        }:
-            raise ValueError(
-                "highres_structure_fusion_mode must be one of: "
-                "stage23, final_correction, stage23_final_correction, "
-                "post_refine_interaction, none"
-            )
-        self.enable_post_refine_structure_interaction = bool(
-            enable_post_refine_structure_interaction
-            or self.highres_structure_fusion_mode == "post_refine_interaction"
-        )
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -2351,37 +2105,6 @@ class SwinTransformerSys(nn.Module):
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
         )
-        self.highres_structure_encoder = HighResStructureEncoder(
-            in_channels=self.embed_dim,
-            struct_channels=self.highres_structure_channels,
-        )
-        self.prepatch_structure_encoder = PrePatchStructureEncoder(
-            struct_channels=self.highres_structure_channels,
-        )
-        self.highres_structure_skeleton_head = nn.Conv2d(
-            self.highres_structure_channels,
-            1,
-            kernel_size=1,
-            bias=True,
-        )
-        self.highres_structure_fusion = nn.ModuleDict(
-            {
-                "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-                "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-            }
-        )
-        self.structure_surface_correction_head = StructureSurfaceCorrectionHead(
-            self.highres_structure_channels,
-        )
-        print(
-            "[INFO] High-res structure stream: {}, source={}, channels={}, fuse_stages={}, fusion_mode={}".format(
-                "enabled" if self.enable_highres_structure_stream else "disabled",
-                self.highres_structure_source,
-                self.highres_structure_channels,
-                self.highres_structure_fuse_stages,
-                self.highres_structure_fusion_mode,
-            )
-        )
         if self.structure_profile == "stage23_boundary_0626":
             print(
                 "[INFO] Decoder structure gates: stage2/stage3 only "
@@ -2447,10 +2170,6 @@ class SwinTransformerSys(nn.Module):
                         self.structure_profile != "stage23_boundary_0626"
                     ),
                     final_skeleton_gradient_ratio=self.final_skeleton_gradient_ratio,
-                    enable_post_refine_structure_interaction=(
-                        self.enable_post_refine_structure_interaction
-                    ),
-                    highres_structure_channels=self.highres_structure_channels,
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
@@ -2489,7 +2208,6 @@ class SwinTransformerSys(nn.Module):
         road_attentions = []
         stage1_road_attention = None
         stage2_road_attention = None
-        stage1_tokens = None
 
         for i_layer, layer in enumerate(self.layers):
             x_downsample.append(x)
@@ -2501,8 +2219,6 @@ class SwinTransformerSys(nn.Module):
                     else None
                 ),
             )
-            if i_layer == 0:
-                stage1_tokens = layer.last_pre_downsample
             if i_layer == 0 and layer.last_road_attention is not None:
                 stage1_road_attention = layer.last_road_attention
                 road_attentions.append(
@@ -2524,88 +2240,7 @@ class SwinTransformerSys(nn.Module):
         x = self.bottleneck_swin_block(x)
         x = self.norm(x)  # B L C
 
-        return x, x_downsample, road_attentions, stage1_tokens
-
-    def _highres_structure_stage_enabled(self, stage):
-        if not self.enable_highres_structure_stream:
-            return False
-        if self.highres_structure_fusion_mode not in {"stage23", "stage23_final_correction"}:
-            return False
-        if self.highres_structure_fuse_stages == "stage23":
-            return stage in (2, 3)
-        if self.highres_structure_fuse_stages == "stage2":
-            return stage == 2
-        if self.highres_structure_fuse_stages == "stage3":
-            return stage == 3
-        return False
-
-    def _build_highres_structure_outputs(self, structure_input):
-        if not self.enable_highres_structure_stream or structure_input is None:
-            return None, None
-        if self.highres_structure_source == "stage1_tokens":
-            if structure_input.dim() == 3:
-                height, width = self.patches_resolution
-                structure_input = token_to_map(structure_input, height, width)
-            z_struct = self.highres_structure_encoder(structure_input)
-        else:
-            z_struct = self.prepatch_structure_encoder(structure_input)
-        if not self._highres_structure_shape_logged:
-            expected_stage1_shape = (
-                structure_input.shape[0],
-                self.highres_structure_channels,
-                self.patches_resolution[0],
-                self.patches_resolution[1],
-            )
-            print(
-                "[HighRes Structure] source={} expected_stage1_z_struct={} z_struct={}".format(
-                    self.highres_structure_source,
-                    expected_stage1_shape,
-                    tuple(z_struct.shape),
-                ),
-                flush=True,
-            )
-            self._highres_structure_shape_logged = True
-        skeleton_logits = self.highres_structure_skeleton_head(z_struct)
-        self.last_highres_z_struct = z_struct
-        self.last_highres_structure_skeleton = skeleton_logits
-        return z_struct, skeleton_logits
-
-    def _apply_highres_structure_fusion(self, x, z_struct, stage, target_hw):
-        if z_struct is None or not self._highres_structure_stage_enabled(stage):
-            return x
-        feature_map = token_to_map(x, target_hw[0], target_hw[1])
-        z_struct_for_surface = z_struct.detach()
-        feature_map = self.highres_structure_fusion[str(stage)](
-            feature_map,
-            z_struct_for_surface,
-        )
-        return map_to_token(feature_map)
-
-    def _apply_structure_surface_correction(self, outputs, z_struct, structure_outputs):
-        if (
-            not self.enable_highres_structure_stream
-            or self.highres_structure_fusion_mode
-            not in {"final_correction", "stage23_final_correction"}
-            or z_struct is None
-            or not isinstance(outputs, tuple)
-        ):
-            return outputs
-
-        base_surface_logits = outputs[0]
-        delta_surface_logits = self.structure_surface_correction_head(
-            z_struct.detach(),
-            base_surface_logits.shape[-2:],
-        )
-        final_surface_logits = base_surface_logits + delta_surface_logits
-        if structure_outputs is not None:
-            structure_outputs.append(
-                {
-                    "stage": "structure_surface_correction",
-                    "structure_surface_base_logits": base_surface_logits.detach(),
-                    "structure_surface_delta_logits": delta_surface_logits,
-                }
-            )
-        return (final_surface_logits, *outputs[1:])
+        return x, x_downsample, road_attentions
 
     def _stage_topology_enabled(self, stage):
         if self.stage_topology_stages == "stage23":
@@ -2689,7 +2324,6 @@ class SwinTransformerSys(nn.Module):
         bottleneck_tokens,
         block_stage=None,
         apply_feature_refinement=True,
-        disable_skeleton_prediction=False,
     ):
         if not self._decoder_structure_enabled(stage):
             return feature_map, *self._placeholder_structure_outputs(feature_map)
@@ -2705,42 +2339,7 @@ class SwinTransformerSys(nn.Module):
             feature_map,
             global_context=global_context,
             apply_feature_refinement=apply_feature_refinement,
-            disable_skeleton_prediction=disable_skeleton_prediction,
         )
-
-    def _decoder_skeleton_disabled(self, stage):
-        return self.enable_highres_structure_stream and stage in (2, 3)
-
-    @staticmethod
-    def _append_structure_output(
-        structure_outputs,
-        stage,
-        skeleton,
-        connectivity,
-        direction,
-        structure_gate,
-        roadness,
-        refinement_step=None,
-        stage_loss_scale=None,
-    ):
-        item = {
-            "stage": stage,
-            "connectivity": connectivity,
-            "direction": direction,
-            "structure_gate": structure_gate,
-            "roadness": roadness,
-        }
-        if skeleton is not None:
-            item["skeleton"] = skeleton
-        if refinement_step is not None:
-            item["refinement_step"] = refinement_step
-        if stage_loss_scale is not None:
-            item["stage_loss_scale"] = stage_loss_scale
-        structure_outputs.append(item)
-
-    @staticmethod
-    def _decoder_connectivity_used(connectivity_logits, teacher_forcing_ratio=0.0):
-        return torch.sigmoid(connectivity_logits).detach()
 
     def _apply_stage_topology_config(self):
         for inx, layer_up in enumerate(self.layers_up):
@@ -2810,7 +2409,6 @@ class SwinTransformerSys(nn.Module):
         gt_skeleton=None,
         topology_alpha_scale=1.0,
         teacher_forcing_ratio=0.0,
-        z_struct=None,
     ):
         """
         Decoder with enhanced skip connection fusion using MSFE + DCA-FPN-Lite
@@ -2868,7 +2466,6 @@ class SwinTransformerSys(nn.Module):
             )
             topology_enabled = self._stage_topology_enabled(inx)
             if decoder_structure_gate_enabled:
-                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
                 input_height, input_width = layer_up.input_resolution
                 x_map = token_to_map(x, input_height, input_width)
                 (
@@ -2884,48 +2481,35 @@ class SwinTransformerSys(nn.Module):
                     bottleneck_tokens,
                     block_stage=1 if inx == 2 else inx,
                     apply_feature_refinement=False,
-                    disable_skeleton_prediction=decoder_skeleton_disabled,
                 )
-                if decoder_skeleton_disabled:
-                    skeleton_used = None
-                    connectivity_used = self._decoder_connectivity_used(
-                        connectivity_0,
-                        teacher_forcing_ratio,
-                    )
-                else:
-                    skeleton_used, connectivity_used = self._mix_teacher_topology(
-                        skeleton_0,
-                        connectivity_0,
-                        gt_skeleton,
-                        teacher_forcing_ratio,
-                    )
+                skeleton_used, connectivity_used = self._mix_teacher_topology(
+                    skeleton_0,
+                    connectivity_0,
+                    gt_skeleton,
+                    teacher_forcing_ratio,
+                )
                 x = layer_up(
                     x,
                     decoder_skeleton_prob=skeleton_used,
                     decoder_connectivity_prob=connectivity_used,
                     decoder_direction_prob=direction_0,
                 )
+                structure_outputs.append(
+                    {
+                        "stage": inx,
+                        "refinement_step": 0,
+                        "stage_loss_scale": 0.5,
+                        "skeleton": skeleton_0,
+                        "connectivity": connectivity_0,
+                        "direction": direction_0,
+                        "structure_gate": structure_gate_0,
+                        "roadness": roadness_0,
+                    }
+                )
+
                 output_scale = 2 ** max(2 - inx, 0)
                 output_height = self.patches_resolution[0] // output_scale
                 output_width = self.patches_resolution[1] // output_scale
-                x = self._apply_highres_structure_fusion(
-                    x,
-                    z_struct,
-                    inx,
-                    (output_height, output_width),
-                )
-                self._append_structure_output(
-                    structure_outputs,
-                    stage=inx,
-                    skeleton=skeleton_0,
-                    connectivity=connectivity_0,
-                    direction=direction_0,
-                    structure_gate=structure_gate_0,
-                    roadness=roadness_0,
-                    refinement_step=0,
-                    stage_loss_scale=0.5,
-                )
-
                 x_map = token_to_map(x, output_height, output_width)
                 (
                     x_map,
@@ -2939,23 +2523,22 @@ class SwinTransformerSys(nn.Module):
                     inx,
                     bottleneck_tokens,
                     apply_feature_refinement=True,
-                    disable_skeleton_prediction=decoder_skeleton_disabled,
                 )
                 x = map_to_token(x_map)
-                self._append_structure_output(
-                    structure_outputs,
-                    stage=inx,
-                    skeleton=skeleton_i,
-                    connectivity=connectivity_i,
-                    direction=direction_i,
-                    structure_gate=structure_gate_i,
-                    roadness=roadness_i,
-                    refinement_step=1,
-                    stage_loss_scale=1.0,
+                structure_outputs.append(
+                    {
+                        "stage": inx,
+                        "refinement_step": 1,
+                        "stage_loss_scale": 1.0,
+                        "skeleton": skeleton_i,
+                        "connectivity": connectivity_i,
+                        "direction": direction_i,
+                        "structure_gate": structure_gate_i,
+                        "roadness": roadness_i,
+                    }
                 )
                 continue
             elif topology_enabled:
-                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
                 topology_source = (
                     self.stage2_topology_source
                     if inx == 2
@@ -2974,22 +2557,14 @@ class SwinTransformerSys(nn.Module):
                     x_map,
                     inx,
                     bottleneck_tokens,
-                    disable_skeleton_prediction=decoder_skeleton_disabled,
                 )
                 x = map_to_token(x_map)
-                if decoder_skeleton_disabled:
-                    skeleton_used = None
-                    connectivity_used = self._decoder_connectivity_used(
-                        connectivity_i,
-                        teacher_forcing_ratio,
-                    )
-                else:
-                    skeleton_used, connectivity_used = self._mix_teacher_topology(
-                        skeleton_i,
-                        connectivity_i,
-                        gt_skeleton,
-                        teacher_forcing_ratio,
-                    )
+                skeleton_used, connectivity_used = self._mix_teacher_topology(
+                    skeleton_i,
+                    connectivity_i,
+                    gt_skeleton,
+                    teacher_forcing_ratio,
+                )
                 use_gap_query = (
                     self.stage_topology_bias_mode == "gap_query" and inx == 3
                 )
@@ -3001,37 +2576,18 @@ class SwinTransformerSys(nn.Module):
                         * float(topology_alpha_scale)
                     )
                 roadness_prob = roadness_i if use_gap_query else None
-                if decoder_skeleton_disabled:
-                    x = layer_up(x)
-                else:
-                    x = layer_up(
-                        x,
-                        skeleton_prob=skeleton_used,
-                        connectivity_prob=connectivity_used,
-                        topology_alpha=topology_alpha,
-                        roadness_prob=roadness_prob,
-                    )
-                output_scale = 2 ** max(2 - inx, 0)
-                output_height = self.patches_resolution[0] // output_scale
-                output_width = self.patches_resolution[1] // output_scale
-                x = self._apply_highres_structure_fusion(
+                x = layer_up(
                     x,
-                    z_struct,
-                    inx,
-                    (output_height, output_width),
+                    skeleton_prob=skeleton_used,
+                    connectivity_prob=connectivity_used,
+                    topology_alpha=topology_alpha,
+                    roadness_prob=roadness_prob,
                 )
             else:
-                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
                 x = layer_up(x)
                 output_scale = 2 ** max(2 - inx, 0)
                 output_height = self.patches_resolution[0] // output_scale
                 output_width = self.patches_resolution[1] // output_scale
-                x = self._apply_highres_structure_fusion(
-                    x,
-                    z_struct,
-                    inx,
-                    (output_height, output_width),
-                )
                 x_map = token_to_map(x, output_height, output_width)
                 (
                     x_map,
@@ -3044,24 +2600,24 @@ class SwinTransformerSys(nn.Module):
                     x_map,
                     inx,
                     bottleneck_tokens,
-                    disable_skeleton_prediction=decoder_skeleton_disabled,
                 )
                 x = map_to_token(x_map)
-            self._append_structure_output(
-                structure_outputs,
-                stage=inx,
-                skeleton=skeleton_i,
-                connectivity=connectivity_i,
-                direction=direction_i,
-                structure_gate=structure_gate_i,
-                roadness=roadness_i,
+            structure_outputs.append(
+                {
+                    "stage": inx,
+                    "skeleton": skeleton_i,
+                    "connectivity": connectivity_i,
+                    "direction": direction_i,
+                    "structure_gate": structure_gate_i,
+                    "roadness": roadness_i,
+                }
             )
 
         x = self.norm_up(x)  # B L C
 
         return x, structure_outputs
 
-    def up_x4(self, x, structure_outputs=None, z_struct=None):
+    def up_x4(self, x, structure_outputs=None):
         H, W = self.patches_resolution
         B, L, C = x.shape
         assert L == H * W, "input features has wrong size"
@@ -3071,7 +2627,7 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                x = self.guided_head(x, z_struct=z_struct)
+                x = self.guided_head(x)
             else:
                 x = self.output(x)
 
@@ -3084,13 +2640,7 @@ class SwinTransformerSys(nn.Module):
         topology_alpha_scale=1.0,
         teacher_forcing_ratio=0.0,
     ):
-        structure_input = x
-        x, x_downsample, road_attentions, stage1_tokens = self.forward_features(x)
-        if self.highres_structure_source == "stage1_tokens":
-            structure_input = stage1_tokens
-        z_struct, highres_structure_skeleton = self._build_highres_structure_outputs(
-            structure_input
-        )
+        x, x_downsample, road_attentions = self.forward_features(x)
         x, structure_outputs = self.forward_up_features(
             x,
             x_downsample,
@@ -3098,28 +2648,14 @@ class SwinTransformerSys(nn.Module):
             gt_skeleton=gt_skeleton,
             topology_alpha_scale=topology_alpha_scale,
             teacher_forcing_ratio=teacher_forcing_ratio,
-            z_struct=z_struct,
         )
-        if self.return_skeleton and highres_structure_skeleton is not None:
-            structure_outputs.append(
-                {
-                    "stage": "highres_structure",
-                    "highres_structure_skeleton": highres_structure_skeleton,
-                }
-            )
         if self.return_skeleton and road_attentions:
             structure_outputs.extend(road_attentions)
         x = self.up_x4(
             x,
             structure_outputs=structure_outputs if self.return_skeleton else None,
-            z_struct=z_struct,
         )
         if self.return_skeleton and isinstance(x, tuple):
-            x = self._apply_structure_surface_correction(
-                x,
-                z_struct,
-                structure_outputs,
-            )
             x = (*x, structure_outputs)
 
         return x

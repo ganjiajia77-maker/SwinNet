@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from losses.road_losses import build_boundary_target, build_connectivity_target
+from direction_target_utils import build_continuous_direction_target
 
 
 class RoadSkeletonDataset(Dataset):
@@ -320,26 +321,7 @@ class RoadSkeletonDataset(Dataset):
 
     @staticmethod
     def _build_direction_target(skeleton):
-        skeleton = (skeleton > 0.5).float()
-        padded = torch.nn.functional.pad(skeleton, (1, 1, 1, 1))
-        height, width = skeleton.shape[-2:]
-        definitions = (
-            (0, 1, 1.0, 0.0),
-            (1, 0, -1.0, 0.0),
-            (1, 1, 0.0, 1.0),
-            (1, -1, 0.0, -1.0),
-        )
-        scores = []
-        targets = []
-        for dy, dx, cos2, sin2 in definitions:
-            forward = padded[:, :, 1 + dy:1 + dy + height, 1 + dx:1 + dx + width]
-            backward = padded[:, :, 1 - dy:1 - dy + height, 1 - dx:1 - dx + width]
-            scores.append(forward + backward + 2.0 * forward * backward)
-            targets.append(torch.cat((torch.full_like(skeleton, cos2), torch.full_like(skeleton, sin2)), dim=1))
-        direction_index = torch.cat(scores, dim=1).argmax(dim=1, keepdim=True)
-        target_stack = torch.stack(targets, dim=1)
-        gather_index = direction_index.unsqueeze(1).expand(-1, 1, 2, -1, -1)
-        return torch.gather(target_stack, 1, gather_index).squeeze(1)
+        return build_continuous_direction_target(skeleton, radius=3)
 
     def __getitem__(self, idx):
         rng = None

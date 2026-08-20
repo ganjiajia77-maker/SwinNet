@@ -14,7 +14,7 @@ from datetime import datetime
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from networks.vision_transformer import (
+from networks.vision_transformer_selective_fusion import (
     TOPOLOGY_ATTENTION_VERSION,
     STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
@@ -24,7 +24,7 @@ from networks.vision_transformer import (
     print_topology_coefficients,
 )
 try:
-    from networks.vision_transformer import freeze_backbone_train_graph_only
+    from networks.vision_transformer_selective_fusion import freeze_backbone_train_graph_only
 except ImportError:
     def freeze_backbone_train_graph_only(model):
         raise RuntimeError(
@@ -34,6 +34,14 @@ except ImportError:
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
+
+
+def seed_worker(worker_id):
+    worker_seed = args.seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
@@ -178,6 +186,21 @@ parser.add_argument(
     help='final surface delta-logit soft graph propagation (stage2/3 priors)',
 )
 parser.add_argument(
+    '--prepatch_lite_profile100_baseline',
+    action='store_true',
+    help='use the saved PrePatch-Lite profile100 truncated training protocol',
+)
+parser.add_argument(
+    '--prepatch_lite_full_epoch_baseline',
+    action='store_true',
+    help='use the PrePatch-Lite full-epoch baseline protocol for strict 0.6181 comparison',
+)
+parser.add_argument(
+    '--masked_connectivity_center_experiment',
+    action='store_true',
+    help='use skeleton-center masked connectivity BCE plus small reciprocal symmetry regularization',
+)
+parser.add_argument(
     '--disable_msfe_skip',
     action='store_true',
     help='ablate MSFE blocks on decoder skip stages inx=2,3; DCA-FPN remains enabled',
@@ -250,6 +273,24 @@ parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
+normalized_argv = []
+skip_next = False
+for index, arg in enumerate(sys.argv[1:]):
+    if skip_next:
+        skip_next = False
+        continue
+    if arg in {"--use_ema", "--augment"} and index + 1 < len(sys.argv[1:]):
+        value = sys.argv[1:][index + 1].lower()
+        if value in {"true", "false", "1", "0", "yes", "no"}:
+            if value in {"false", "0", "no"}:
+                normalized_argv.append("--no-" + arg[2:])
+            else:
+                normalized_argv.append(arg)
+            skip_next = True
+            continue
+    normalized_argv.append(arg)
+sys.argv = [sys.argv[0], *normalized_argv]
+
 args = parser.parse_args()
 
 
@@ -258,6 +299,89 @@ def _cli_has(flag):
         arg == flag or arg.startswith(flag + "=")
         for arg in sys.argv[1:]
     )
+
+
+def apply_prepatch_lite_profile100_baseline(args):
+    if not args.prepatch_lite_profile100_baseline:
+        return
+
+    defaults = {
+        "structure_profile": STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        "max_epochs": 1,
+        "warmup_epochs": 10,
+        "batch_size": 4,
+        "img_size": 256,
+        "source_patch_size": 1024,
+        "direct_resize_train": True,
+        "num_workers": 0,
+        "seed": 1234,
+        "threshold": 0.2,
+        "val_interval": 999,
+        "disable_msfe_skip": True,
+        "use_ema": False,
+        "enable_highres_structure_stream": True,
+        "highres_structure_fuse_stages": "stage23",
+        "highres_structure_fusion_mode": "stage23",
+        "highres_structure_skeleton_weight": 0.008,
+        "stage2_skeleton_weight": 0.008,
+        "stage3_skeleton_weight": 0.012,
+        "stage3_roadness_weight": 0.0,
+        "final_topology_eta_init": 0.0,
+        "final_gap_rho_init": 0.0,
+        "max_train_batches": 100,
+        "warm_start_ckpt": (
+            r"D:\Code\Swin-Unet-main\model_out"
+            r"\data1_prepatch_lite_struct_detach_surface_w008_direct256_20260816"
+            r"\best.pth"
+        ),
+    }
+    for name, value in defaults.items():
+        if name == "warm_start_ckpt" and args.resume:
+            continue
+        flag = "--" + name
+        negative_flag = "--no-" + name
+        if _cli_has(flag) or _cli_has(negative_flag):
+            continue
+        setattr(args, name, value)
+
+
+def apply_prepatch_lite_full_epoch_baseline(args):
+    if not args.prepatch_lite_full_epoch_baseline:
+        return
+
+    defaults = {
+        "structure_profile": STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        "max_epochs": 60,
+        "warmup_epochs": 10,
+        "batch_size": 4,
+        "img_size": 256,
+        "source_patch_size": 1024,
+        "direct_resize_train": True,
+        "num_workers": 0,
+        "seed": 1234,
+        "threshold": 0.2,
+        "val_interval": 999,
+        "disable_msfe_skip": True,
+        "use_ema": False,
+        "enable_highres_structure_stream": True,
+        "highres_structure_fuse_stages": "stage23",
+        "highres_structure_fusion_mode": "stage23",
+        "highres_structure_skeleton_weight": 0.008,
+        "stage2_skeleton_weight": 0.008,
+        "stage3_skeleton_weight": 0.012,
+        "stage3_roadness_weight": 0.0,
+        "final_topology_eta_init": 0.0,
+        "final_gap_rho_init": 0.0,
+        "max_train_batches": 0,
+    }
+    for name, value in defaults.items():
+        if name == "warm_start_ckpt" and args.resume:
+            continue
+        flag = "--" + name
+        negative_flag = "--no-" + name
+        if _cli_has(flag) or _cli_has(negative_flag):
+            continue
+        setattr(args, name, value)
 
 
 def apply_structure_profile_defaults(args):
@@ -278,6 +402,8 @@ def apply_structure_profile_defaults(args):
         args.max_epochs = 60
 
 
+apply_prepatch_lite_profile100_baseline(args)
+apply_prepatch_lite_full_epoch_baseline(args)
 apply_structure_profile_defaults(args)
 
 if args.freeze_0626_backbone and not args.enable_graph_prop:
@@ -347,6 +473,7 @@ def build_criterion(args, loss_weights, device):
         use_legacy_stage_connectivity_loss=(
             args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
         ),
+        use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
     ).to(device)
 
 
@@ -380,6 +507,11 @@ def format_training_config_lines(args, loss_weights):
             "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
             "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength",
         ])
+        if args.masked_connectivity_center_experiment:
+            lines.extend([
+                "  Connectivity experiment: skeleton-center masked BCE + small reciprocal symmetry regularizer",
+                "  Connectivity feature target: connectivity head output only; surface still uses detached z_struct",
+            ])
         if args.enable_graph_prop:
             lines.extend([
                 "  Final graph propagation: stage2/3 priors -> delta-logit residual",
@@ -978,12 +1110,6 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
 
-    def seed_worker(worker_id):
-        worker_seed = args.seed + worker_id
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-
     loader_generator = torch.Generator()
     loader_generator.manual_seed(args.seed)
 
@@ -1400,6 +1526,7 @@ if __name__ == "__main__":
         print(f"  起始epoch: {start_epoch}")
 
     print("Using topology attention constrained version", flush=True)
+    print("[EXPERIMENT] Final Surface Head: pixel-wise selective fusion of surface_proj and surface_refine", flush=True)
     print_topology_coefficients(model)
 
     best_path = os.path.join(args.output_dir, 'best.pth')

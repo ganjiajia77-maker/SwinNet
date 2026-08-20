@@ -488,49 +488,6 @@ class GlobalContextHead(nn.Module):
 STAGE3_GLOBAL_CONTEXT_CHANNELS = 32
 
 
-class PostRefineStructureInteraction(nn.Module):
-    def __init__(self, surface_channels, structure_channels, structure_hidden=16):
-        super().__init__()
-        self.structure_proj = nn.Conv2d(
-            structure_channels,
-            structure_hidden,
-            kernel_size=1,
-            bias=False,
-        )
-        self.delta = nn.Sequential(
-            nn.Conv2d(
-                surface_channels + structure_hidden,
-                surface_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(surface_channels),
-            nn.GELU(),
-            nn.Conv2d(surface_channels, surface_channels, kernel_size=1, bias=True),
-        )
-        nn.init.zeros_(self.delta[-1].weight)
-        nn.init.zeros_(self.delta[-1].bias)
-
-    def reset_output(self):
-        nn.init.zeros_(self.delta[-1].weight)
-        nn.init.zeros_(self.delta[-1].bias)
-
-    def forward(self, surface_feat, z_struct):
-        if z_struct is None:
-            return surface_feat
-        z_struct = z_struct.detach()
-        struct_feat = self.structure_proj(z_struct)
-        struct_feat = F.interpolate(
-            struct_feat,
-            size=surface_feat.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        delta = self.delta(torch.cat([surface_feat, struct_feat], dim=1))
-        return surface_feat + delta
-
-
 class DecoderStructureRefinement(nn.Module):
     def __init__(
         self,
@@ -621,24 +578,14 @@ class DecoderStructureRefinement(nn.Module):
             propagated = propagated + connectivity_prob[:, idx:idx + 1] * shifted
         return propagated / float(len(directions))
 
-    def forward(
-        self,
-        x,
-        global_context=None,
-        apply_feature_refinement=True,
-        disable_skeleton_prediction=False,
-    ):
+    def forward(self, x, global_context=None, apply_feature_refinement=True):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
-        if disable_skeleton_prediction:
-            skeleton_logits = None
-            skeleton_prob = x.new_zeros((x.shape[0], 1, x.shape[-2], x.shape[-1]))
-        else:
-            skeleton_logits = self.skeleton_head(structure_feat)
-            skeleton_prob = torch.sigmoid(skeleton_logits)
+        skeleton_logits = self.skeleton_head(structure_feat)
         connectivity_logits = self.connectivity_head(structure_feat)
         direction_logits = self.direction_head(structure_feat)
 
+        skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
@@ -711,8 +658,6 @@ class SkeletonGuidedHead(nn.Module):
         gap_rho_init=0.005,
         enable_final_structure=True,
         final_skeleton_gradient_ratio=0.0,
-        enable_post_refine_structure_interaction=False,
-        highres_structure_channels=64,
     ):
         super().__init__()
 
@@ -723,9 +668,6 @@ class SkeletonGuidedHead(nn.Module):
         self.connectivity_channels = connectivity_channels
         self.enable_final_structure = bool(enable_final_structure)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
-        self.enable_post_refine_structure_interaction = bool(
-            enable_post_refine_structure_interaction
-        )
 
         self.surface_proj = ConvBNReLU(
             in_channels,
@@ -792,10 +734,6 @@ class SkeletonGuidedHead(nn.Module):
             ConvBNReLU(hidden_channels, hidden_channels),
             ConvBNReLU(hidden_channels, hidden_channels),
         )
-        self.post_refine_structure_interaction = PostRefineStructureInteraction(
-            hidden_channels,
-            highres_structure_channels,
-        )
 
         self.boundary_branch = nn.Sequential(
             ConvBNReLU(hidden_channels, hidden_channels),
@@ -835,7 +773,6 @@ class SkeletonGuidedHead(nn.Module):
         self.last_delta_logit = None
 
         self._init_weights()
-        self.post_refine_structure_interaction.reset_output()
         self.alpha.requires_grad_(False)
 
     def effective_rho_gap(self):
@@ -870,12 +807,7 @@ class SkeletonGuidedHead(nn.Module):
             * weak_surface
         ).detach()
 
-    def _apply_post_refine_structure_interaction(self, guided_surface_feat, z_struct):
-        if not self.enable_post_refine_structure_interaction:
-            return guided_surface_feat
-        return self.post_refine_structure_interaction(guided_surface_feat, z_struct)
-
-    def forward(self, x, z_struct=None):
+    def forward(self, x):
         surface_feat = self.surface_branch(self.surface_proj(x))
         skeleton_feat = self.skeleton_proj(x)
 
@@ -883,39 +815,14 @@ class SkeletonGuidedHead(nn.Module):
             final_structure_feat = self.structure_branch(skeleton_feat)
             final_skeleton_logits = self.skeleton_head(final_structure_feat)
             guided_surface_feat = self.surface_refine(surface_feat)
-            guided_surface_feat = self._apply_post_refine_structure_interaction(
-                guided_surface_feat,
-                z_struct,
-            )
 
             boundary_feat = self.boundary_branch(guided_surface_feat)
             boundary_logits = self.boundary_head(boundary_feat)
             boundary_attn = torch.sigmoid(boundary_logits)
             boundary_correction = self.boundary_residual(guided_surface_feat)
-            boundary_residual = self.beta * boundary_attn * boundary_correction
-            if self.capture_surface_diagnostics:
-                with torch.no_grad():
-                    self.last_surface_diagnostics = {
-                        "boundary_beta": float(self.beta.detach().cpu()),
-                        "boundary_attention_mean": float(
-                            boundary_attn.mean().detach().cpu()
-                        ),
-                        "boundary_attention_max": float(
-                            boundary_attn.max().detach().cpu()
-                        ),
-                        "boundary_residual_relative_norm": float(
-                            (
-                                torch.linalg.vector_norm(boundary_residual)
-                                / (
-                                    torch.linalg.vector_norm(guided_surface_feat)
-                                    + 1e-6
-                                )
-                            ).detach().cpu()
-                        ),
-                    }
             guided_surface_feat = (
                 guided_surface_feat
-                + boundary_residual
+                + self.beta * boundary_attn * boundary_correction
             )
             surface_pre_logits = self.surface_head(guided_surface_feat)
             self.last_surface_pre_logits = surface_pre_logits
@@ -944,10 +851,6 @@ class SkeletonGuidedHead(nn.Module):
         connectivity_prob = torch.sigmoid(connectivity_logits)
 
         guided_surface_feat = self.surface_refine(surface_feat)
-        guided_surface_feat = self._apply_post_refine_structure_interaction(
-            guided_surface_feat,
-            z_struct,
-        )
 
         boundary_feat = self.boundary_branch(guided_surface_feat)
         boundary_logits = self.boundary_head(boundary_feat)

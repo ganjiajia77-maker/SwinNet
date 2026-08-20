@@ -62,13 +62,6 @@ def get_topology_coefficients(model):
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
         "graph_prop_enabled": False,
-        "highres_structure_stream": {
-            "enabled": bool(getattr(swin_unet, "enable_highres_structure_stream", False)),
-            "source": getattr(swin_unet, "highres_structure_source", "prepatch"),
-            "channels": int(getattr(swin_unet, "highres_structure_channels", 0)),
-            "fuse_stages": getattr(swin_unet, "highres_structure_fuse_stages", "stage23"),
-            "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),
-        },
         "stage_topology_stages": getattr(swin_unet, "stage_topology_stages", "none"),
         "stage_topology_active": {
             f"stage{stage}": bool(swin_unet._stage_topology_enabled(stage))
@@ -145,16 +138,6 @@ def format_topology_coefficients(model):
         f"final_structure={'on' if coefficients['final_structure_enabled'] else 'off'}",
         f"graph_prop={'on' if coefficients['graph_prop_enabled'] else 'off'}",
     ]
-    highres_values = coefficients["highres_structure_stream"]
-    fields.append(
-        "highres_structure={} source={} channels={} fuse_stages={} fusion_mode={}".format(
-            "on" if highres_values["enabled"] else "off",
-            highres_values["source"],
-            highres_values["channels"],
-            highres_values["fuse_stages"],
-            highres_values["fusion_mode"],
-        )
-    )
     for stage in (
         "decoder_stage0",
         "decoder_stage1",
@@ -212,29 +195,6 @@ def load_topology_checkpoint_state(
     strict=True,
 ):
     model_state = model.state_dict()
-    highres_structure_missing_prefixes = (
-        "swin_unet.highres_structure_encoder.",
-        "swin_unet.prepatch_structure_encoder.",
-        "swin_unet.highres_structure_skeleton_head.",
-        "swin_unet.highres_structure_fusion.",
-        "swin_unet.structure_surface_correction_head.",
-        "swin_unet.guided_head.post_refine_structure_interaction.",
-    )
-
-    def print_expected_highres_missing(missing_keys):
-        expected = [
-            key
-            for key in missing_keys
-            if key.startswith(highres_structure_missing_prefixes)
-        ]
-        if expected:
-            print(
-                "[TOPOLOGY] Expected new structure-stream missing keys: "
-                + ", ".join(expected[:12])
-                + (" ..." if len(expected) > 12 else ""),
-                flush=True,
-            )
-
     obsolete_unexpected_suffixes = (
         "decoder_connectivity_value_scale",
         "raw_gamma2",
@@ -340,7 +300,7 @@ def load_topology_checkpoint_state(
             "swin_unet.stage2_topology_source.direction_gate.",
             "swin_unet.stage2_topology_source.direction_gate_beta",
             "swin_unet.stage2_topology_source.structure_gate.0.weight",
-        ) + highres_structure_missing_prefixes
+        )
         if is_0626_checkpoint:
             allowed_missing_prefixes = allowed_missing_prefixes + (
                 "swin_unet.guided_head.alpha",
@@ -360,7 +320,6 @@ def load_topology_checkpoint_state(
                 "Legacy structure checkpoint mismatch: "
                 f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
             )
-        print_expected_highres_missing(result.missing_keys)
         module = model.module if hasattr(model, "module") else model
         guided_head = module.swin_unet.guided_head
         with torch.no_grad():
@@ -433,7 +392,7 @@ def load_topology_checkpoint_state(
         "swin_unet.stage2_topology_source.gate_branch.",
         "swin_unet.guided_head.detached_skeleton_refine.",
         "swin_unet.guided_head.detached_skeleton_head.",
-    ) + highres_structure_missing_prefixes
+    )
     msaf_missing_prefixes = (
         "swin_unet.bottleneck_context_fusion.scale_projections.",
         "swin_unet.bottleneck_context_fusion.scale_attention.",
@@ -441,7 +400,10 @@ def load_topology_checkpoint_state(
     allowed_new_missing_prefixes = (
         road_attention_missing_prefixes + msaf_missing_prefixes
     )
-    if strict:
+    if strict and not any(
+        key.startswith(allowed_new_missing_prefixes)
+        for key in state_dict
+    ):
         result = model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
             key
@@ -453,7 +415,6 @@ def load_topology_checkpoint_state(
                 "Checkpoint mismatch after allowing new encoder additions: "
                 f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
             )
-        print_expected_highres_missing(result.missing_keys)
         print(
             "[TOPOLOGY] Loaded checkpoint without new encoder additions; "
             "new parameters use runtime initialization.",
@@ -500,12 +461,7 @@ class SwinUnet(nn.Module):
                  use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
-                 final_skeleton_gradient_ratio=0.0,
-                 enable_highres_structure_stream=False,
-                 highres_structure_channels=64,
-                 highres_structure_fuse_stages="stage23",
-                 highres_structure_fusion_mode="stage23",
-                 enable_post_refine_structure_interaction=False):
+                 final_skeleton_gradient_ratio=0.0):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -543,14 +499,7 @@ class SwinUnet(nn.Module):
                                 use_msfe_skip=use_msfe_skip,
                                 stage2_skeleton_gradient_ratio=stage2_skeleton_gradient_ratio,
                                 stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
-                                final_skeleton_gradient_ratio=final_skeleton_gradient_ratio,
-                                enable_highres_structure_stream=enable_highres_structure_stream,
-                                highres_structure_channels=highres_structure_channels,
-                                highres_structure_fuse_stages=highres_structure_fuse_stages,
-                                highres_structure_fusion_mode=highres_structure_fusion_mode,
-                                enable_post_refine_structure_interaction=(
-                                    enable_post_refine_structure_interaction
-                                ))
+                                final_skeleton_gradient_ratio=final_skeleton_gradient_ratio)
     def forward(
         self,
         x,

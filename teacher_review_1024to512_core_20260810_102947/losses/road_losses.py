@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from direction_target_utils import build_continuous_direction_target
-
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
@@ -315,9 +313,7 @@ class SurfaceStructureLoss(nn.Module):
         stage_skeleton_connectivity_s2c_weight=1.0,
         stage_skeleton_connectivity_c2s_weight=0.2,
         road_attention_weight=0.0,
-        highres_structure_skeleton_weight=0.0,
         use_legacy_stage_connectivity_loss=False,
-        use_masked_connectivity_center_experiment=False,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -355,11 +351,7 @@ class SurfaceStructureLoss(nn.Module):
         self.use_legacy_stage_connectivity_loss = bool(
             use_legacy_stage_connectivity_loss
         )
-        self.use_masked_connectivity_center_experiment = bool(
-            use_masked_connectivity_center_experiment
-        )
         self.road_attention_weight = float(road_attention_weight)
-        self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
 
     @staticmethod
     def _match_spatial_size(target, reference, mode="nearest"):
@@ -459,10 +451,8 @@ class SurfaceStructureLoss(nn.Module):
         skeleton_dilate_gt,
         positive_weight=2.0,
         valid_mask=None,
-        use_skeleton_center_mask=False,
-        symmetry_weight=0.20,
     ):
-        if self.use_legacy_stage_connectivity_loss and not use_skeleton_center_mask:
+        if self.use_legacy_stage_connectivity_loss:
             return F.binary_cross_entropy_with_logits(
                 connectivity_logits,
                 connectivity_gt,
@@ -472,41 +462,31 @@ class SurfaceStructureLoss(nn.Module):
         if corridor.sum() <= 0:
             corridor = torch.ones_like(corridor)
         valid = self._connectivity_boundary_mask(connectivity_logits, valid_mask)
-        if use_skeleton_center_mask:
-            center_source = valid_mask if valid_mask is not None else skeleton_dilate_gt
-            center_mask = (center_source > 0.5).to(dtype=connectivity_logits.dtype)
-            valid = center_mask.expand_as(connectivity_logits)
 
         bce_map = F.binary_cross_entropy_with_logits(
             connectivity_logits,
             connectivity_gt,
             reduction="none",
         )
-        if use_skeleton_center_mask:
-            loss_bce = (bce_map * valid).sum() / valid.sum().clamp_min(1.0)
-        else:
-            sample_weight = corridor * (
-                1.0 + connectivity_gt * (float(positive_weight) - 1.0)
-            ) * valid
-            loss_bce = (bce_map * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
+        sample_weight = corridor * (
+            1.0 + connectivity_gt * (float(positive_weight) - 1.0)
+        ) * valid
+        loss_bce = (bce_map * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
 
         conn_prob = torch.sigmoid(connectivity_logits)
-        if use_skeleton_center_mask:
-            loss_edge_dice = conn_prob.sum() * 0.0
-        else:
-            pred_strength = conn_prob.mean(dim=1, keepdim=True)
-            target_strength = connectivity_gt.max(dim=1, keepdim=True).values
-            edge_extractor = EdgeAwareLoss(edge_width=3)
-            pred_edge = edge_extractor.extract_edge(pred_strength)
-            target_edge = edge_extractor.extract_edge(target_strength)
-            edge_intersection = (pred_edge * target_edge * corridor * valid).sum(dim=(1, 2, 3))
-            edge_union = (
-                (pred_edge * corridor * valid).sum(dim=(1, 2, 3))
-                + (target_edge * corridor * valid).sum(dim=(1, 2, 3))
-            )
-            loss_edge_dice = (
-                1.0 - (2.0 * edge_intersection + 1.0) / (edge_union + 1.0)
-            ).mean()
+        pred_strength = conn_prob.mean(dim=1, keepdim=True)
+        target_strength = connectivity_gt.max(dim=1, keepdim=True).values
+        edge_extractor = EdgeAwareLoss(edge_width=3)
+        pred_edge = edge_extractor.extract_edge(pred_strength)
+        target_edge = edge_extractor.extract_edge(target_strength)
+        edge_intersection = (pred_edge * target_edge * corridor * valid).sum(dim=(1, 2, 3))
+        edge_union = (
+            (pred_edge * corridor * valid).sum(dim=(1, 2, 3))
+            + (target_edge * corridor * valid).sum(dim=(1, 2, 3))
+        )
+        loss_edge_dice = (
+            1.0 - (2.0 * edge_intersection + 1.0) / (edge_union + 1.0)
+        ).mean()
 
         directions = [
             (-1, 0),
@@ -529,16 +509,13 @@ class SurfaceStructureLoss(nn.Module):
                     -dx,
                 )
             )
-            symmetry_valid = corridor * valid[:, d_idx:d_idx + 1]
             symmetry_terms.append(
-                (torch.abs(forward - backward) * symmetry_valid).sum()
-                / symmetry_valid.sum().clamp_min(1.0)
+                (torch.abs(forward - backward) * corridor * valid[:, d_idx:d_idx + 1]).sum()
+                / (corridor * valid[:, d_idx:d_idx + 1]).sum().clamp_min(1.0)
             )
         loss_symmetry = torch.stack(symmetry_terms).mean()
 
-        if use_skeleton_center_mask:
-            return loss_bce + (float(symmetry_weight) * loss_symmetry)
-        return loss_bce + 0.30 * loss_edge_dice + (float(symmetry_weight) * loss_symmetry)
+        return loss_bce + 0.30 * loss_edge_dice + 0.20 * loss_symmetry
 
     def stage_skeleton_loss(self, stage_outputs, skeleton_gt, skeleton_dilate_gt):
         if not stage_outputs:
@@ -709,7 +686,33 @@ class SurfaceStructureLoss(nn.Module):
 
     def build_direction_target(self, skeleton):
         skel = (skeleton > 0.5).to(dtype=skeleton.dtype)
-        target = build_continuous_direction_target(skel, radius=3)
+        directions = [
+            (0, 1, 1.0, 0.0),
+            (1, 0, -1.0, 0.0),
+            (1, 1, 0.0, 1.0),
+            (1, -1, 0.0, -1.0),
+        ]
+        scores = []
+        targets = []
+        for dy, dx, cos2, sin2 in directions:
+            forward = self._shift_map(skel, dy, dx)
+            backward = self._shift_map(skel, -dy, -dx)
+            support = forward + backward + 2.0 * forward * backward
+            scores.append(support)
+            targets.append(
+                torch.cat(
+                    [
+                        torch.full_like(skel, cos2),
+                        torch.full_like(skel, sin2),
+                    ],
+                    dim=1,
+                )
+            )
+        score_stack = torch.cat(scores, dim=1)
+        target_stack = torch.stack(targets, dim=1)
+        index = score_stack.argmax(dim=1, keepdim=True)
+        gather_index = index.unsqueeze(1).expand(-1, 1, 2, -1, -1)
+        target = torch.gather(target_stack, dim=1, index=gather_index).squeeze(1)
         return target, skel
 
     def direction_field_loss(self, direction_logits, skeleton_gt):
@@ -753,105 +756,6 @@ class SurfaceStructureLoss(nn.Module):
             total = total + self.road_attention_weight * (bce + dice)
         return total
 
-    def highres_structure_skeleton_loss(
-        self,
-        stage_outputs,
-        skeleton_gt,
-        skeleton_dilate_gt,
-    ):
-        if not stage_outputs or self.highres_structure_skeleton_weight <= 0:
-            zero = skeleton_gt.sum() * 0.0
-            return zero, {"highres_structure_skeleton_raw": zero.detach()}
-
-        total = skeleton_gt.sum() * 0.0
-        raw_total = skeleton_gt.sum() * 0.0
-        stat_count = 0
-        for stage_output in stage_outputs:
-            skeleton_logits = stage_output.get("highres_structure_skeleton")
-            if skeleton_logits is None:
-                continue
-            skeleton_logits_full = F.interpolate(
-                skeleton_logits,
-                size=skeleton_gt.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            loss_skeleton, _, _ = self.skeleton_pixel_loss(
-                skeleton_logits_full,
-                skeleton_gt,
-                skeleton_dilate_gt,
-            )
-            total = total + self.highres_structure_skeleton_weight * loss_skeleton
-            raw_total = raw_total + loss_skeleton
-            stat_count += 1
-        if stat_count > 0:
-            stats = {"highres_structure_skeleton_raw": (raw_total / stat_count).detach()}
-        else:
-            stats = {"highres_structure_skeleton_raw": raw_total.detach()}
-        return total, stats
-
-    def structure_surface_delta_stats(
-        self,
-        stage_outputs,
-        surface_logits,
-        surface_gt,
-        skeleton_gt,
-    ):
-        zero = surface_logits.sum() * 0.0
-        stats = {
-            "structure_delta_mean": zero.detach(),
-            "structure_delta_abs_mean": zero.detach(),
-            "structure_delta_abs_max": zero.detach(),
-            "structure_delta_weak_skeleton_fn_mean": zero.new_tensor(float("nan")),
-            "structure_delta_skeleton_tp_mean": zero.new_tensor(float("nan")),
-            "structure_delta_background_mean": zero.new_tensor(float("nan")),
-        }
-        if not stage_outputs:
-            return stats
-        delta_logits = None
-        reference_logits = surface_logits
-        for stage_output in stage_outputs:
-            candidate = stage_output.get("structure_surface_delta_logits")
-            if candidate is not None:
-                delta_logits = candidate
-                reference_logits = stage_output.get(
-                    "structure_surface_base_logits",
-                    surface_logits,
-                )
-                break
-        if delta_logits is None:
-            return stats
-
-        delta_logits = self._match_spatial_size(delta_logits, surface_logits, mode="bilinear")
-        reference_logits = self._match_spatial_size(
-            reference_logits,
-            delta_logits,
-            mode="bilinear",
-        )
-        surface_gt = self._match_spatial_size(surface_gt, delta_logits)
-        skeleton_gt = self._match_spatial_size(skeleton_gt, delta_logits)
-        surface_prob = torch.sigmoid(reference_logits.detach())
-        surface_pred = surface_prob >= 0.5
-        surface_bin = surface_gt > 0.5
-        skeleton_bin = skeleton_gt > 0.5
-        weak_skeleton_fn = skeleton_bin & surface_bin & (~surface_pred)
-        skeleton_tp = skeleton_bin & surface_bin & surface_pred
-        background = ~surface_bin
-
-        delta_detached = delta_logits.detach()
-        stats["structure_delta_mean"] = delta_detached.mean()
-        stats["structure_delta_abs_mean"] = delta_detached.abs().mean()
-        stats["structure_delta_abs_max"] = delta_detached.abs().max()
-        masks = (
-            ("structure_delta_weak_skeleton_fn_mean", weak_skeleton_fn),
-            ("structure_delta_skeleton_tp_mean", skeleton_tp),
-            ("structure_delta_background_mean", background),
-        )
-        for key, mask in masks:
-            if mask.any():
-                stats[key] = delta_detached[mask].mean()
-        return stats
-
     def forward(
         self,
         surface_logits,
@@ -888,12 +792,7 @@ class SurfaceStructureLoss(nn.Module):
             dice_skeleton = loss_skeleton.detach()
 
         if connectivity_logits is not None and self.connectivity_weight > 0:
-            if self.use_masked_connectivity_center_experiment:
-                connectivity_gt = build_connectivity_target(
-                    skeleton_gt,
-                    erode_kernel_size=self.connectivity_erode_kernel_size,
-                )
-            elif connectivity_gt is None:
+            if connectivity_gt is None:
                 connectivity_gt = build_connectivity_target(
                     skeleton_gt,
                     erode_kernel_size=self.connectivity_erode_kernel_size,
@@ -903,23 +802,13 @@ class SurfaceStructureLoss(nn.Module):
                 dtype=connectivity_logits.dtype,
             )
             connectivity_gt = self._match_spatial_size(connectivity_gt, connectivity_logits)
-            if self.use_masked_connectivity_center_experiment:
-                loss_connectivity = self.stage_connectivity_loss(
-                    connectivity_logits,
-                    connectivity_gt,
-                    skeleton_dilate_gt,
-                    valid_mask=skeleton_gt,
-                    use_skeleton_center_mask=True,
-                    symmetry_weight=0.05,
-                )
-            else:
-                connectivity_valid = self._connectivity_boundary_mask(connectivity_logits, valid_mask)
-                connectivity_loss_map = F.binary_cross_entropy_with_logits(
-                    connectivity_logits,
-                    connectivity_gt,
-                    reduction="none",
-                )
-                loss_connectivity = (connectivity_loss_map * connectivity_valid).sum() / connectivity_valid.sum().clamp_min(1.0)
+            connectivity_valid = self._connectivity_boundary_mask(connectivity_logits, valid_mask)
+            connectivity_loss_map = F.binary_cross_entropy_with_logits(
+                connectivity_logits,
+                connectivity_gt,
+                reduction="none",
+            )
+            loss_connectivity = (connectivity_loss_map * connectivity_valid).sum() / connectivity_valid.sum().clamp_min(1.0)
         else:
             loss_connectivity = surface_logits.sum() * 0.0
         if boundary_logits is not None and self.boundary_weight > 0:
@@ -962,17 +851,6 @@ class SurfaceStructureLoss(nn.Module):
             valid_mask=valid_mask,
         )
         loss_road_attention = self.road_attention_loss(stage_outputs, surface_gt)
-        loss_highres_structure_skeleton, highres_stats = self.highres_structure_skeleton_loss(
-            stage_outputs,
-            skeleton_gt,
-            skeleton_dilate_gt,
-        )
-        delta_stats = self.structure_surface_delta_stats(
-            stage_outputs,
-            surface_logits,
-            surface_gt,
-            skeleton_gt,
-        )
 
         total_loss = (
             loss_surface
@@ -982,27 +860,17 @@ class SurfaceStructureLoss(nn.Module):
             + self.skeleton_stage_weight * loss_skeleton_stage
             + loss_stage_structure
             + loss_road_attention
-            + loss_highres_structure_skeleton
         )
 
         loss_dict = {
             "total_loss": total_loss.detach(),
             "surface_loss": loss_surface.detach(),
-            "surface_total_loss": loss_surface.detach(),
             "skeleton_loss": loss_skeleton.detach(),
             "connectivity_loss": loss_connectivity.detach(),
             "boundary_loss": loss_boundary.detach(),
             "skeleton_stage_loss": loss_skeleton_stage.detach(),
             "stage_structure_loss": loss_stage_structure.detach(),
             "road_attention_loss": loss_road_attention.detach(),
-            "loss_highres_structure_skeleton": loss_highres_structure_skeleton.detach(),
-            "highres_structure_skeleton_raw": highres_stats["highres_structure_skeleton_raw"],
-            "structure_delta_mean": delta_stats["structure_delta_mean"],
-            "structure_delta_abs_mean": delta_stats["structure_delta_abs_mean"],
-            "structure_delta_abs_max": delta_stats["structure_delta_abs_max"],
-            "structure_delta_weak_skeleton_fn_mean": delta_stats["structure_delta_weak_skeleton_fn_mean"],
-            "structure_delta_skeleton_tp_mean": delta_stats["structure_delta_skeleton_tp_mean"],
-            "structure_delta_background_mean": delta_stats["structure_delta_background_mean"],
             "surface_bce": bce_surface,
             "surface_dice": dice_surface,
             "skeleton_bce": bce_skeleton,

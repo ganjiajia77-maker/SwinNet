@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from networks.vision_transformer import (
+from networks.vision_transformer_selective_fusion import (
     SwinUnet as ViT_seg,
     load_topology_checkpoint_state,
     print_topology_coefficients,

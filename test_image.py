@@ -88,8 +88,15 @@ parser.add_argument(
     '--highres_structure_fusion_mode',
     type=str,
     default='stage23',
-    choices=['stage23', 'final_correction', 'stage23_final_correction', 'none'],
+    choices=[
+        'stage23',
+        'final_correction',
+        'stage23_final_correction',
+        'post_refine_interaction',
+        'none',
+    ],
 )
+parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -235,6 +242,7 @@ if __name__ == "__main__":
                 "highres_structure_channels",
                 "highres_structure_fuse_stages",
                 "highres_structure_fusion_mode",
+                "enable_post_refine_structure_interaction",
             ):
                 if name in saved_args:
                     setattr(args, name, saved_args[name])
@@ -260,7 +268,10 @@ if __name__ == "__main__":
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
                     highres_structure_channels=args.highres_structure_channels,
                     highres_structure_fuse_stages=args.highres_structure_fuse_stages,
-                    highres_structure_fusion_mode=args.highres_structure_fusion_mode).cuda()
+                    highres_structure_fusion_mode=args.highres_structure_fusion_mode,
+                    enable_post_refine_structure_interaction=(
+                        args.enable_post_refine_structure_interaction
+                    )).cuda()
     device = next(model.parameters()).device
     
     # 加载模型

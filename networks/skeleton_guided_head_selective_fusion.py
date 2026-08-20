@@ -26,6 +26,28 @@ class ConvBNReLU(nn.Module):
         return self.block(x)
 
 
+class PixelWiseSelectiveFusion(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 2, 16, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(4, 16),
+            nn.GELU(),
+            nn.Conv2d(16, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.reset_gate_bias()
+
+    def reset_gate_bias(self):
+        last_conv = self.gate[3]
+        nn.init.zeros_(last_conv.weight)
+        nn.init.constant_(last_conv.bias, -2.0)
+
+    def forward(self, f_proj, f_ref):
+        gate = self.gate(torch.cat([f_proj, f_ref], dim=1))
+        return gate * f_proj + (1.0 - gate) * f_ref
+
+
 class SkeletonSpatialHead(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -792,6 +814,7 @@ class SkeletonGuidedHead(nn.Module):
             ConvBNReLU(hidden_channels, hidden_channels),
             ConvBNReLU(hidden_channels, hidden_channels),
         )
+        self.surface_selective_fusion = PixelWiseSelectiveFusion(hidden_channels)
         self.post_refine_structure_interaction = PostRefineStructureInteraction(
             hidden_channels,
             highres_structure_channels,
@@ -835,6 +858,7 @@ class SkeletonGuidedHead(nn.Module):
         self.last_delta_logit = None
 
         self._init_weights()
+        self.surface_selective_fusion.reset_gate_bias()
         self.post_refine_structure_interaction.reset_output()
         self.alpha.requires_grad_(False)
 
@@ -876,13 +900,18 @@ class SkeletonGuidedHead(nn.Module):
         return self.post_refine_structure_interaction(guided_surface_feat, z_struct)
 
     def forward(self, x, z_struct=None):
-        surface_feat = self.surface_branch(self.surface_proj(x))
+        surface_proj_feat = self.surface_proj(x)
+        surface_feat = self.surface_branch(surface_proj_feat)
         skeleton_feat = self.skeleton_proj(x)
 
         if not self.enable_final_structure:
             final_structure_feat = self.structure_branch(skeleton_feat)
             final_skeleton_logits = self.skeleton_head(final_structure_feat)
-            guided_surface_feat = self.surface_refine(surface_feat)
+            surface_ref_feat = self.surface_refine(surface_feat)
+            guided_surface_feat = self.surface_selective_fusion(
+                surface_proj_feat,
+                surface_ref_feat,
+            )
             guided_surface_feat = self._apply_post_refine_structure_interaction(
                 guided_surface_feat,
                 z_struct,
@@ -943,7 +972,11 @@ class SkeletonGuidedHead(nn.Module):
         skeleton_prob = torch.sigmoid(skeleton_logits)
         connectivity_prob = torch.sigmoid(connectivity_logits)
 
-        guided_surface_feat = self.surface_refine(surface_feat)
+        surface_ref_feat = self.surface_refine(surface_feat)
+        guided_surface_feat = self.surface_selective_fusion(
+            surface_proj_feat,
+            surface_ref_feat,
+        )
         guided_surface_feat = self._apply_post_refine_structure_interaction(
             guided_surface_feat,
             z_struct,
