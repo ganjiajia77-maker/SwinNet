@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from networks.vision_transformer import (
+from networks.vision_transformer_selective_fusion import (
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet as ViT_seg,
     load_topology_checkpoint_state,

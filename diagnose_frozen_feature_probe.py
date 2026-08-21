@@ -17,7 +17,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from diagnose_surface_refine_identity_sweep import build_model
+from config import get_config
+from networks.vision_transformer_selective_fusion import (
+    SwinUnet as ViT_seg,
+    load_topology_checkpoint_state,
+)
 
 
 REGIONS = ("WeakFN", "SkeletonTP", "HardBG")
@@ -50,11 +54,39 @@ def resize_mask(mask, spatial_size):
 
 
 def run_normal_alpha1(model, swin, images):
-    swin.guided_head._diagnostic_surface_refine_alpha = 1.0
-    swin._diagnostic_mode = "normal"
-    swin.guided_head._diagnostic_trace = {}
     outputs = model(images)
-    return dict(swin.guided_head._diagnostic_trace), outputs
+    return outputs
+
+
+def build_model(args, checkpoint):
+    config = get_config(args)
+    model = ViT_seg(
+        config=config,
+        img_size=args.img_size,
+        num_classes=1,
+        return_skeleton=True,
+        final_topology_eta_init=args.final_topology_eta_init,
+        final_gap_rho_init=args.final_gap_rho_init,
+        stage_topology_stages=args.stage_topology_stages,
+        stage_topology_alpha_max=args.stage_topology_alpha_max,
+        stage_topology_alpha_init=args.stage_topology_alpha_init,
+        structure_profile=args.structure_profile,
+        use_msfe_skip=not args.disable_msfe_skip,
+        enable_highres_structure_stream=args.enable_highres_structure_stream,
+        highres_structure_channels=args.highres_structure_channels,
+        highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+        highres_structure_fusion_mode=args.highres_structure_fusion_mode,
+        enable_post_refine_structure_interaction=(
+            args.enable_post_refine_structure_interaction
+        ),
+    )
+    load_topology_checkpoint_state(
+        model,
+        checkpoint["model_state_dict"],
+        checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+        strict=False,
+    )
+    return model.to(args.device).eval()
 
 
 def apply_checkpoint_args(args, checkpoint):
@@ -200,8 +232,10 @@ def collect_feature_sets(args, batches, model, swin):
     with torch.no_grad():
         for batch in tqdm(batches, desc="Collect frozen features"):
             images = batch["image"].to(args.device)
-            trace, outputs = run_normal_alpha1(model, swin, images)
-            logits = trace["surface_logits"].cpu()
+            outputs = run_normal_alpha1(model, swin, images)
+            if not isinstance(outputs, tuple):
+                raise RuntimeError("Expected tuple outputs from structure-guided model.")
+            logits = outputs[0].detach().cpu()
             prob = torch.sigmoid(logits).squeeze(1)
             surface_gt = resize_mask(batch["mask"].float(), logits.shape[-2:]).squeeze(1) > 0.5
             skeleton = resize_mask(batch["skeleton"].float(), logits.shape[-2:]).squeeze(1) > 0.5
