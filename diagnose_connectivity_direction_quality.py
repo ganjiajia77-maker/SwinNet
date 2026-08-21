@@ -20,6 +20,23 @@ from analyze_structure_supervision import (
     select_stage_outputs,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from losses.road_losses import build_connectivity_target
+
+
+CONNECTIVITY_DIR_NAMES = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+CONNECTIVITY_DIR_OFFSETS = torch.tensor(
+    [
+        [-1, 0],
+        [-1, 1],
+        [0, 1],
+        [1, 1],
+        [1, 0],
+        [1, -1],
+        [0, -1],
+        [-1, -1],
+    ],
+    dtype=torch.float32,
+)
 
 
 def set_deterministic(seed):
@@ -42,8 +59,8 @@ def collect_batches(loader, max_batches):
 
 
 def reciprocal_symmetry_error(prob):
-    offsets = DIR_OFFSETS.to(prob.device, prob.dtype)
-    opposite = torch.tensor([1, 0, 3, 2, 7, 6, 5, 4], device=prob.device)
+    offsets = CONNECTIVITY_DIR_OFFSETS.to(prob.device, prob.dtype)
+    opposite = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], device=prob.device)
     total_err = 0.0
     total_count = 0
     for direction, (dy, dx) in enumerate(offsets.tolist()):
@@ -256,7 +273,6 @@ def main():
             masks = (batch["mask"].to(device) > 0.5)
             skeleton_raw = batch["skeleton"].to(device).float()
             direction_gt = batch["direction_gt"].to(device).float()
-            connectivity_gt = batch["connectivity_gt"].to(device).float()
 
             outputs = model(images, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
             surface_logits = outputs[0]
@@ -267,11 +283,16 @@ def main():
             stage_output = selected[stage_key]
             c_prob = torch.sigmoid(stage_output["connectivity"])
             d_logits = stage_output["direction"]
-            c_gt = resize_like(connectivity_gt, c_prob, mode="nearest")
+            c_gt = resize_like(
+                build_connectivity_target(skeleton.float()),
+                c_prob,
+                mode="nearest",
+            )
             d_gt = resize_like(direction_gt, d_logits[:, :1], mode="nearest")
             skeleton_dir = resize_like(skeleton.float(), d_logits[:, :1], mode="nearest") > 0.5
 
-            conn = connectivity_stats(c_prob, c_gt, torch.ones_like(c_prob[:, :1], dtype=torch.bool))
+            conn_valid = resize_like(skeleton.float(), c_prob[:, :1], mode="nearest") > 0.5
+            conn = connectivity_stats(c_prob, c_gt, conn_valid)
             for i, item in enumerate(conn["per_dir"]):
                 conn_tp[i] += item["tp"]
                 conn_fp[i] += item["fp"]
@@ -322,7 +343,7 @@ def main():
     print(f"  AUPRC: {overall_auprc:.4f}")
     print(f"  Reciprocal symmetry error: {reciprocal_error:.4f}")
     print("  Per-direction F1:")
-    for name, value in zip(DIR_NAMES, per_dir_f1):
+    for name, value in zip(CONNECTIVITY_DIR_NAMES, per_dir_f1):
         print(f"    {name}: {value:.4f}")
 
     print("\nDirection")

@@ -267,32 +267,33 @@ def build_boundary_target(surface_gt, radius=1):
     return (dilated - eroded).clamp(0.0, 1.0)
 
 
-def build_connectivity_target(surface_gt, erode_kernel_size=1):
-    if surface_gt.dim() == 3:
-        surface_gt = surface_gt.unsqueeze(1)
+CONNECTIVITY_DIRECTIONS = [
+    (-1, 0),   # N
+    (-1, 1),   # NE
+    (0, 1),    # E
+    (1, 1),    # SE
+    (1, 0),    # S
+    (1, -1),   # SW
+    (0, -1),   # W
+    (-1, -1),  # NW
+]
+CONNECTIVITY_OPPOSITE = (4, 5, 6, 7, 0, 1, 2, 3)
 
-    road = (surface_gt > 0.5).float()
-    road = erode_binary_mask(road, kernel_size=erode_kernel_size)
 
-    padded = F.pad(road, (1, 1, 1, 1))
-    height, width = road.shape[-2:]
-    directions = [
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
-        (-1, -1),
-        (-1, 1),
-        (1, -1),
-        (1, 1),
-    ]
+def build_connectivity_target(skeleton_gt, erode_kernel_size=1):
+    if skeleton_gt.dim() == 3:
+        skeleton_gt = skeleton_gt.unsqueeze(1)
+
+    skeleton = (skeleton_gt > 0.5).float()
+    padded = F.pad(skeleton, (1, 1, 1, 1))
+    height, width = skeleton.shape[-2:]
 
     targets = []
-    for dy, dx in directions:
+    for dy, dx in CONNECTIVITY_DIRECTIONS:
         y0 = 1 + dy
         x0 = 1 + dx
         neighbor = padded[:, :, y0:y0 + height, x0:x0 + width]
-        targets.append(road * neighbor)
+        targets.append(skeleton * neighbor)
 
     return torch.cat(targets, dim=1)
 
@@ -508,23 +509,12 @@ class SurfaceStructureLoss(nn.Module):
                 1.0 - (2.0 * edge_intersection + 1.0) / (edge_union + 1.0)
             ).mean()
 
-        directions = [
-            (-1, 0),
-            (1, 0),
-            (0, -1),
-            (0, 1),
-            (-1, -1),
-            (-1, 1),
-            (1, -1),
-            (1, 1),
-        ]
-        opposite = (1, 0, 3, 2, 7, 6, 5, 4)
         symmetry_terms = []
-        for d_idx, (dy, dx) in enumerate(directions):
+        for d_idx, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
             forward = torch.sigmoid(connectivity_logits[:, d_idx:d_idx + 1])
             backward = torch.sigmoid(
                 self._shift_map(
-                    connectivity_logits[:, opposite[d_idx]:opposite[d_idx] + 1],
+                    connectivity_logits[:, CONNECTIVITY_OPPOSITE[d_idx]:CONNECTIVITY_OPPOSITE[d_idx] + 1],
                     -dy,
                     -dx,
                 )
@@ -673,6 +663,23 @@ class SurfaceStructureLoss(nn.Module):
             )
             loss_connectivity_stage = loss_skeleton_stage * 0.0
             loss_skeleton_connectivity_consistency = loss_skeleton_stage * 0.0
+            if connectivity_gt is not None:
+                stage_connectivity_gt = F.interpolate(
+                    connectivity_gt,
+                    size=target_size,
+                    mode="nearest",
+                ).to(
+                    device=stage_connectivity_logits.device,
+                    dtype=stage_connectivity_logits.dtype,
+                )
+                loss_connectivity_stage = self.stage_connectivity_loss(
+                    stage_connectivity_logits,
+                    stage_connectivity_gt,
+                    stage_skel_dilate,
+                    valid_mask=stage_skel,
+                    use_skeleton_center_mask=self.use_masked_connectivity_center_experiment,
+                    symmetry_weight=0.05 if self.use_masked_connectivity_center_experiment else 0.20,
+                )
             direction_logits = stage_output.get("direction")
             if direction_logits is not None and self.stage_direction_factor > 0:
                 if direction_gt is None:
@@ -702,6 +709,7 @@ class SurfaceStructureLoss(nn.Module):
                 loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
                 loss_skeleton_stage
+                + self.stage_connectivity_factor * loss_connectivity_stage
                 + self.stage_direction_factor * loss_direction_stage
             )
 
@@ -876,6 +884,12 @@ class SurfaceStructureLoss(nn.Module):
         if skeleton_dilate_gt is None:
             skeleton_dilate_gt = skeleton_gt
 
+        if self.use_masked_connectivity_center_experiment:
+            connectivity_gt = build_connectivity_target(
+                skeleton_gt,
+                erode_kernel_size=self.connectivity_erode_kernel_size,
+            )
+
         if skeleton_logits is not None:
             loss_skeleton, bce_skeleton, dice_skeleton = self.skeleton_pixel_loss(
                 skeleton_logits,
@@ -889,10 +903,7 @@ class SurfaceStructureLoss(nn.Module):
 
         if connectivity_logits is not None and self.connectivity_weight > 0:
             if self.use_masked_connectivity_center_experiment:
-                connectivity_gt = build_connectivity_target(
-                    skeleton_gt,
-                    erode_kernel_size=self.connectivity_erode_kernel_size,
-                )
+                pass
             elif connectivity_gt is None:
                 connectivity_gt = build_connectivity_target(
                     skeleton_gt,
@@ -922,6 +933,29 @@ class SurfaceStructureLoss(nn.Module):
                 loss_connectivity = (connectivity_loss_map * connectivity_valid).sum() / connectivity_valid.sum().clamp_min(1.0)
         else:
             loss_connectivity = surface_logits.sum() * 0.0
+
+        if connectivity_gt is not None:
+            stats_connectivity_gt = self._match_spatial_size(
+                connectivity_gt.to(device=surface_logits.device, dtype=surface_logits.dtype),
+                surface_logits,
+            )
+            stats_valid = self._match_spatial_size(
+                skeleton_gt.to(device=surface_logits.device, dtype=surface_logits.dtype),
+                surface_logits,
+            ) > 0.5
+            stats_valid_expanded = stats_valid.expand_as(stats_connectivity_gt)
+            connectivity_gt_positive_edges = (stats_connectivity_gt * stats_valid_expanded).sum()
+            connectivity_gt_total_edges = stats_valid_expanded.sum().clamp_min(1.0)
+            connectivity_gt_positive_ratio = connectivity_gt_positive_edges / connectivity_gt_total_edges
+            connectivity_gt_valid_pixels = stats_valid.sum().to(dtype=surface_logits.dtype)
+            connectivity_gt_dir_positive_ratio = (
+                (stats_connectivity_gt * stats_valid_expanded).sum(dim=(0, 2, 3))
+                / stats_valid_expanded.sum(dim=(0, 2, 3)).clamp_min(1.0)
+            )
+        else:
+            connectivity_gt_positive_ratio = surface_logits.sum() * 0.0
+            connectivity_gt_valid_pixels = surface_logits.sum() * 0.0
+            connectivity_gt_dir_positive_ratio = surface_logits.new_zeros(8)
         if boundary_logits is not None and self.boundary_weight > 0:
             if boundary_gt is None:
                 boundary_gt = build_boundary_target(
@@ -1009,6 +1043,9 @@ class SurfaceStructureLoss(nn.Module):
             "skeleton_dice": dice_skeleton,
             "boundary_bce": bce_boundary,
             "boundary_dice": dice_boundary,
+            "connectivity_gt_positive_ratio": connectivity_gt_positive_ratio.detach(),
+            "connectivity_gt_valid_pixels": connectivity_gt_valid_pixels.detach(),
+            "connectivity_gt_dir_positive_ratio": connectivity_gt_dir_positive_ratio.detach(),
         }
 
         return total_loss, loss_dict

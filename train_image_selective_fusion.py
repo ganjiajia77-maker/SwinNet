@@ -36,6 +36,9 @@ from losses.road_losses import SurfaceStructureLoss
 from config import get_config
 
 
+CONNECTIVITY_DIR_NAMES = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
 def seed_worker(worker_id):
     worker_seed = args.seed + worker_id
     random.seed(worker_seed)
@@ -198,7 +201,7 @@ parser.add_argument(
 parser.add_argument(
     '--masked_connectivity_center_experiment',
     action='store_true',
-    help='use skeleton-center masked connectivity BCE plus small reciprocal symmetry regularization',
+    help='use skeleton-center connectivity BCE plus small reciprocal symmetry regularization',
 )
 parser.add_argument(
     '--disable_msfe_skip',
@@ -509,7 +512,7 @@ def format_training_config_lines(args, loss_weights):
         ])
         if args.masked_connectivity_center_experiment:
             lines.extend([
-                "  Connectivity experiment: skeleton-center masked BCE + small reciprocal symmetry regularizer",
+                "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
                 "  Connectivity feature target: connectivity head output only; surface still uses detached z_struct",
             ])
         if args.enable_graph_prop:
@@ -1646,6 +1649,9 @@ if __name__ == "__main__":
                 "structure_delta_weak_skeleton_fn_mean": 0.0,
                 "structure_delta_skeleton_tp_mean": 0.0,
                 "structure_delta_background_mean": 0.0,
+                "connectivity_gt_positive_ratio": 0.0,
+                "connectivity_gt_valid_pixels": 0.0,
+                "connectivity_gt_dir_positive_ratio": torch.zeros(8, device=device),
             }
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
@@ -1763,6 +1769,12 @@ if __name__ == "__main__":
                     torch.cuda.synchronize()
                 ms_per_batch = (time.perf_counter() - batch_start_time) * 1000.0
                 for key in highres_stat_sums:
+                    if key == "connectivity_gt_dir_positive_ratio":
+                        value_tensor = loss_dict[key].detach()
+                        if torch.isfinite(value_tensor).all():
+                            highres_stat_sums[key] = highres_stat_sums[key] + value_tensor
+                            highres_stat_counts[key] += 1
+                        continue
                     value = float(loss_dict[key].item())
                     if np.isfinite(value):
                         highres_stat_sums[key] += value
@@ -1808,6 +1820,10 @@ if __name__ == "__main__":
                 )
                 for key in highres_stat_sums
             }
+            if torch.is_tensor(highres_epoch_stats["connectivity_gt_dir_positive_ratio"]):
+                conn_dir_ratio = highres_epoch_stats["connectivity_gt_dir_positive_ratio"].detach().cpu()
+            else:
+                conn_dir_ratio = torch.full((8,), float("nan"))
             should_validate = (
                 args.val_interval <= 1
                 or (epoch + 1) % args.val_interval == 0
@@ -1875,6 +1891,16 @@ if __name__ == "__main__":
                 f"highres_skeleton_loss={highres_epoch_stats['highres_structure_skeleton_raw']:.4f}"
             )
             print(highres_skeleton_msg, flush=True)
+            connectivity_target_msg = (
+                "[Connectivity Target] "
+                f"pos_ratio={highres_epoch_stats['connectivity_gt_positive_ratio']:.4f}, "
+                f"valid_skeleton_pixels={highres_epoch_stats['connectivity_gt_valid_pixels']:.1f}, "
+                + ", ".join(
+                    f"{name}={float(value):.4f}"
+                    for name, value in zip(CONNECTIVITY_DIR_NAMES, conn_dir_ratio.tolist())
+                )
+            )
+            print(connectivity_target_msg, flush=True)
             structure_delta_msg = (
                 "[Structure Surface Delta] "
                 f"mean={highres_epoch_stats['structure_delta_mean']:.4f}, "
@@ -1921,6 +1947,7 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
                 log_f.write(highres_skeleton_msg + "\n")
+                log_f.write(connectivity_target_msg + "\n")
                 log_f.write(structure_delta_msg + "\n")
                 log_f.write(
                     f"  Stage topology alpha scale: "
