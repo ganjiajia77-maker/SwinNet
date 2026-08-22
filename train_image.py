@@ -146,6 +146,7 @@ parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
 parser.add_argument('--stage_direction_factor', type=float, default=0.2)
+parser.add_argument('--stage_connectivity_factor', type=float, default=0.5)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
@@ -176,6 +177,23 @@ parser.add_argument(
     '--enable_graph_prop',
     action='store_true',
     help='final surface delta-logit soft graph propagation (stage2/3 priors)',
+)
+parser.add_argument(
+    '--masked_connectivity_center_experiment',
+    action='store_true',
+    help='use skeleton-center connectivity BCE plus small reciprocal symmetry regularization',
+)
+parser.add_argument(
+    '--connectivity_pos_weight',
+    type=float,
+    default=1.0,
+    help='positive class weight for connectivity BCE/focal BCE',
+)
+parser.add_argument(
+    '--connectivity_focal_gamma',
+    type=float,
+    default=0.0,
+    help='gamma for focal weighting on connectivity BCE; 0 disables focal weighting',
 )
 parser.add_argument(
     '--disable_msfe_skip',
@@ -337,7 +355,7 @@ def build_criterion(args, loss_weights, device):
             stage3_weight,
         ),
         road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
-        stage_connectivity_factor=0.5,
+        stage_connectivity_factor=args.stage_connectivity_factor,
         stage_direction_factor=args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
         stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
@@ -347,6 +365,9 @@ def build_criterion(args, loss_weights, device):
         use_legacy_stage_connectivity_loss=(
             args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
         ),
+        use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
+        connectivity_pos_weight=args.connectivity_pos_weight,
+        connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).to(device)
 
 
@@ -369,8 +390,9 @@ def format_training_config_lines(args, loss_weights):
             ),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
             "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
-            "stage connectivity/consistency loss disabled".format(
-                args.stage_direction_factor
+            "{:.3f}*connectivity loss".format(
+                args.stage_direction_factor,
+                args.stage_connectivity_factor
             ),
             "  Stage skeleton-connectivity consistency: disabled",
             "  Encoder road attention: A1/A2 priors active for residual PatchMerging and Stage3 road attention bias",
@@ -380,6 +402,11 @@ def format_training_config_lines(args, loss_weights):
             "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
             "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength",
         ])
+        if args.masked_connectivity_center_experiment:
+            lines.extend([
+                "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
+                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}",
+            ])
         if args.enable_graph_prop:
             lines.extend([
                 "  Final graph propagation: stage2/3 priors -> delta-logit residual",
@@ -416,6 +443,7 @@ def format_training_config_lines(args, loss_weights):
         f"stage2_grad_ratio={args.stage2_skeleton_gradient_ratio}, "
         f"stage3_grad_ratio={args.stage3_skeleton_gradient_ratio}, "
         f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
+        f"connectivity_factor={args.stage_connectivity_factor}, "
         f"direction_factor={args.stage_direction_factor}, "
         f"sc_s2c={args.stage_sc_s2c_weight}, "
         f"sc_c2s={args.stage_sc_c2s_weight}, "

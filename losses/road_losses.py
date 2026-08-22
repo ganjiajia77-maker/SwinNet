@@ -319,6 +319,8 @@ class SurfaceStructureLoss(nn.Module):
         highres_structure_skeleton_weight=0.0,
         use_legacy_stage_connectivity_loss=False,
         use_masked_connectivity_center_experiment=False,
+        connectivity_pos_weight=1.0,
+        connectivity_focal_gamma=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -359,6 +361,8 @@ class SurfaceStructureLoss(nn.Module):
         self.use_masked_connectivity_center_experiment = bool(
             use_masked_connectivity_center_experiment
         )
+        self.connectivity_pos_weight = float(connectivity_pos_weight)
+        self.connectivity_focal_gamma = float(connectivity_focal_gamma)
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
 
@@ -403,18 +407,15 @@ class SurfaceStructureLoss(nn.Module):
             device=reference.device,
             dtype=reference.dtype,
         )
-        mask[:, 0, 0, :] = 0      # N
-        mask[:, 1, -1, :] = 0     # S
-        mask[:, 2, :, 0] = 0      # W
-        mask[:, 3, :, -1] = 0     # E
-        mask[:, 4, 0, :] = 0      # NW
-        mask[:, 4, :, 0] = 0
-        mask[:, 5, 0, :] = 0      # NE
-        mask[:, 5, :, -1] = 0
-        mask[:, 6, -1, :] = 0     # SW
-        mask[:, 6, :, 0] = 0
-        mask[:, 7, -1, :] = 0     # SE
-        mask[:, 7, :, -1] = 0
+        for index, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
+            if dy < 0:
+                mask[:, index, 0, :] = 0
+            if dy > 0:
+                mask[:, index, -1, :] = 0
+            if dx < 0:
+                mask[:, index, :, 0] = 0
+            if dx > 0:
+                mask[:, index, :, -1] = 0
         if valid_mask is not None:
             if valid_mask.dim() == 3:
                 valid_mask = valid_mask.unsqueeze(1)
@@ -444,13 +445,13 @@ class SurfaceStructureLoss(nn.Module):
     @staticmethod
     def _shift_map(x, dy, dx):
         _, _, height, width = x.shape
-        pad_left = max(dx, 0)
-        pad_right = max(-dx, 0)
-        pad_top = max(dy, 0)
-        pad_bottom = max(-dy, 0)
+        pad_left = max(-dx, 0)
+        pad_right = max(dx, 0)
+        pad_top = max(-dy, 0)
+        pad_bottom = max(dy, 0)
         padded = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
-        y0 = max(-dy, 0)
-        x0 = max(-dx, 0)
+        y0 = max(dy, 0)
+        x0 = max(dx, 0)
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
     def stage_connectivity_loss(
@@ -483,6 +484,21 @@ class SurfaceStructureLoss(nn.Module):
             connectivity_gt,
             reduction="none",
         )
+        if self.connectivity_pos_weight != 1.0:
+            pos_weight_map = torch.where(
+                connectivity_gt > 0.5,
+                torch.as_tensor(
+                    self.connectivity_pos_weight,
+                    device=connectivity_gt.device,
+                    dtype=connectivity_gt.dtype,
+                ),
+                torch.ones((), device=connectivity_gt.device, dtype=connectivity_gt.dtype),
+            )
+            bce_map = bce_map * pos_weight_map
+        if self.connectivity_focal_gamma > 0.0:
+            prob = torch.sigmoid(connectivity_logits)
+            pt = torch.where(connectivity_gt > 0.5, prob, 1.0 - prob)
+            bce_map = bce_map * (1.0 - pt).clamp_min(1e-6).pow(self.connectivity_focal_gamma)
         if use_skeleton_center_mask:
             loss_bce = (bce_map * valid).sum() / valid.sum().clamp_min(1.0)
         else:
@@ -515,8 +531,8 @@ class SurfaceStructureLoss(nn.Module):
             backward = torch.sigmoid(
                 self._shift_map(
                     connectivity_logits[:, CONNECTIVITY_OPPOSITE[d_idx]:CONNECTIVITY_OPPOSITE[d_idx] + 1],
-                    -dy,
-                    -dx,
+                    dy,
+                    dx,
                 )
             )
             symmetry_valid = corridor * valid[:, d_idx:d_idx + 1]
@@ -563,18 +579,8 @@ class SurfaceStructureLoss(nn.Module):
     def _connectivity_neighbor_skeleton(skeleton_prob):
         padded = F.pad(skeleton_prob, (1, 1, 1, 1))
         height, width = skeleton_prob.shape[-2:]
-        directions = [
-            (-1, 0),
-            (1, 0),
-            (0, -1),
-            (0, 1),
-            (-1, -1),
-            (-1, 1),
-            (1, -1),
-            (1, 1),
-        ]
         neighbors = []
-        for dy, dx in directions:
+        for dy, dx in CONNECTIVITY_DIRECTIONS:
             y0 = 1 + dy
             x0 = 1 + dx
             neighbors.append(padded[:, :, y0:y0 + height, x0:x0 + width])
