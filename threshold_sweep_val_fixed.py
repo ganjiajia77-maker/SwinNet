@@ -50,6 +50,25 @@ def compute_metrics_all_samples(logits_list, targets_list, threshold):
     }
 
 
+def select_skeleton_logits(outputs):
+    if not isinstance(outputs, tuple):
+        return None, "none"
+
+    if len(outputs) > 2 and outputs[2] is not None:
+        return outputs[2], "final"
+
+    structure_outputs = outputs[-1] if outputs and isinstance(outputs[-1], list) else []
+    for item in reversed(structure_outputs):
+        if not isinstance(item, dict):
+            continue
+        if item.get("highres_structure_skeleton") is not None:
+            return item["highres_structure_skeleton"], "highres_structure"
+        if item.get("skeleton") is not None:
+            return item["skeleton"], "stage{}".format(item.get("stage", "unknown"))
+
+    return None, "none"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root_path', type=str, default='./data1')
@@ -201,6 +220,7 @@ def main():
     all_surface_targets = []
     all_skeleton_logits = []
     all_skeleton_targets = []
+    skeleton_source = None
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc='Inference'):
@@ -211,7 +231,9 @@ def main():
             
             if isinstance(outputs, tuple):
                 surface_logits = outputs[0]
-                skeleton_logits = outputs[2] if len(outputs) > 2 else None
+                skeleton_logits, current_skeleton_source = select_skeleton_logits(outputs)
+                if skeleton_logits is not None and skeleton_source is None:
+                    skeleton_source = current_skeleton_source
             else:
                 raise RuntimeError("Structure-guided threshold sweep requires auxiliary outputs.")
             
@@ -222,6 +244,8 @@ def main():
                 all_skeleton_targets.append(batch["skeleton"].cpu())
     
     print('Inference complete')
+    if skeleton_source is not None:
+        print('Skeleton logits source: {}'.format(skeleton_source))
     
     print('\n' + '='*80)
     print('SURFACE SEGMENTATION - THRESHOLD SWEEP')
@@ -272,7 +296,7 @@ def main():
 
     print('\n' + '='*80)
     if all_skeleton_logits:
-        print('FINAL SKELETON (256x256) - THRESHOLD SWEEP')
+        print('SKELETON ({}) - THRESHOLD SWEEP'.format(skeleton_source))
     else:
         print('FINAL SKELETON (256x256) - SKIPPED (final skeleton head disabled)')
     print('='*80)
