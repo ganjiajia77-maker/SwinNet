@@ -193,6 +193,34 @@ def collect_head(store, name, logits, gt, skeleton_mask):
             store[name]["symmetry"].append(float(err))
 
 
+def load_compatible_state_dict(model, state_dict):
+    model_state = model.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state_dict.items():
+        candidate_keys = (key, key.removeprefix("module."))
+        matched_key = None
+        for candidate in candidate_keys:
+            if candidate in model_state and model_state[candidate].shape == value.shape:
+                matched_key = candidate
+                break
+        if matched_key is None:
+            skipped.append(key)
+            continue
+        compatible[matched_key] = value
+
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    print(
+        "[INFO] Loaded compatible checkpoint tensors: "
+        f"{len(compatible)}/{len(model_state)}; "
+        f"skipped_in_checkpoint={len(skipped)}; "
+        f"missing_in_model={len(missing)}; unexpected_after_filter={len(unexpected)}",
+        flush=True,
+    )
+    if skipped[:8]:
+        print("[INFO] Example skipped keys: " + ", ".join(skipped[:8]), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
@@ -217,7 +245,7 @@ def main():
     config = get_config(config_args)
     device = torch.device(args.device)
     model = build_model(config, config_args, device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    load_compatible_state_dict(model, checkpoint["model_state_dict"])
     model.eval()
 
     dataset = RoadSkeletonDataset(
