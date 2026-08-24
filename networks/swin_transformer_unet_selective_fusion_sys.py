@@ -670,16 +670,19 @@ class SwinTransformerBlock(nn.Module):
         dy = delta[..., 0]
         dx = delta[..., 1]
 
+        target_dy = -dy
+        target_dx = -dx
         direction = torch.zeros_like(dy, dtype=torch.long)
-        direction[(dy > 0) & (dx == 0)] = 1
-        direction[(dy == 0) & (dx < 0)] = 2
-        direction[(dy == 0) & (dx > 0)] = 3
-        direction[(dy < 0) & (dx < 0)] = 4
-        direction[(dy < 0) & (dx > 0)] = 5
-        direction[(dy > 0) & (dx < 0)] = 6
-        direction[(dy > 0) & (dx > 0)] = 7
+        direction[(target_dy < 0) & (target_dx == 0)] = 0
+        direction[(target_dy < 0) & (target_dx > 0)] = 1
+        direction[(target_dy == 0) & (target_dx > 0)] = 2
+        direction[(target_dy > 0) & (target_dx > 0)] = 3
+        direction[(target_dy > 0) & (target_dx == 0)] = 4
+        direction[(target_dy > 0) & (target_dx < 0)] = 5
+        direction[(target_dy == 0) & (target_dx < 0)] = 6
+        direction[(target_dy < 0) & (target_dx < 0)] = 7
 
-        opposite = torch.tensor([1, 0, 3, 2, 7, 6, 5, 4], dtype=torch.long)
+        opposite = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.long)
         distance = torch.maximum(dy.abs(), dx.abs()).float()
         distance_decay = torch.exp(-distance / 4.0)
         distance_decay[distance == 0] = 0.0
@@ -1837,16 +1840,19 @@ class _UnusedLegacyTopologyAwareSwinBlock(nn.Module):
         dy = delta[..., 0]
         dx = delta[..., 1]
 
+        target_dy = -dy
+        target_dx = -dx
         direction = torch.zeros_like(dy, dtype=torch.long)
-        direction[(dy > 0) & (dx == 0)] = 1
-        direction[(dy == 0) & (dx < 0)] = 2
-        direction[(dy == 0) & (dx > 0)] = 3
-        direction[(dy < 0) & (dx < 0)] = 4
-        direction[(dy < 0) & (dx > 0)] = 5
-        direction[(dy > 0) & (dx < 0)] = 6
-        direction[(dy > 0) & (dx > 0)] = 7
+        direction[(target_dy < 0) & (target_dx == 0)] = 0
+        direction[(target_dy < 0) & (target_dx > 0)] = 1
+        direction[(target_dy == 0) & (target_dx > 0)] = 2
+        direction[(target_dy > 0) & (target_dx > 0)] = 3
+        direction[(target_dy > 0) & (target_dx == 0)] = 4
+        direction[(target_dy > 0) & (target_dx < 0)] = 5
+        direction[(target_dy == 0) & (target_dx < 0)] = 6
+        direction[(target_dy < 0) & (target_dx < 0)] = 7
 
-        opposite = torch.tensor([1, 0, 3, 2, 7, 6, 5, 4], dtype=torch.long)
+        opposite = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.long)
         direction_one_hot = F.one_hot(direction, num_classes=8).float()
         opposite_one_hot = F.one_hot(opposite[direction], num_classes=8).float()
         distance = torch.maximum(dy.abs(), dx.abs()).float()

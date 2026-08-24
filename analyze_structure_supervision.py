@@ -13,11 +13,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from networks.vision_transformer_selective_fusion import (
+from networks.vision_transformer import (
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet as ViT_seg,
     load_topology_checkpoint_state,
     print_topology_coefficients,
+)
+from networks.vision_transformer_selective_fusion import (
+    SwinUnet as ViT_seg_selective,
+    load_topology_checkpoint_state as load_topology_checkpoint_state_selective,
+    print_topology_coefficients as print_topology_coefficients_selective,
 )
 
 
@@ -85,6 +90,17 @@ def parse_args():
     parser.add_argument("--stage2_skeleton_gradient_ratio", type=float, default=0.5)
     parser.add_argument("--stage3_skeleton_gradient_ratio", type=float, default=0.5)
     parser.add_argument("--final_skeleton_gradient_ratio", type=float, default=0.0)
+    parser.add_argument("--enable_highres_structure_stream", action="store_true")
+    parser.add_argument("--highres_structure_channels", type=int, default=64)
+    parser.add_argument("--highres_structure_fuse_stages", type=str, default="stage23")
+    parser.add_argument("--highres_structure_fusion_mode", type=str, default="stage23")
+    parser.add_argument(
+        "--model_impl",
+        type=str,
+        default="auto",
+        choices=["auto", "standard", "selective"],
+        help="model implementation used by the checkpoint",
+    )
     return parser.parse_args()
 
 
@@ -100,7 +116,7 @@ def resize_like(x, reference, mode="nearest"):
 def select_stage_outputs(structure_outputs):
     selected = {}
     for item in structure_outputs:
-        if "skeleton" not in item or "connectivity" not in item or "direction" not in item:
+        if "connectivity" not in item or "direction" not in item:
             continue
         stage = item.get("stage")
         step = item.get("refinement_step", None)
@@ -115,6 +131,7 @@ def select_stage_outputs(structure_outputs):
 
 def load_model(args, device):
     checkpoint = torch.load(args.model_path, map_location="cpu", weights_only=False)
+    state_dict = checkpoint["model_state_dict"]
     saved_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     if isinstance(saved_args, dict):
         args.structure_profile = saved_args.get("structure_profile", args.structure_profile)
@@ -130,6 +147,10 @@ def load_model(args, device):
             "stage3_skeleton_gradient_ratio",
             "final_skeleton_gradient_ratio",
             "bottleneck_type",
+            "enable_highres_structure_stream",
+            "highres_structure_channels",
+            "highres_structure_fuse_stages",
+            "highres_structure_fusion_mode",
         ):
             if name in saved_args:
                 setattr(args, name, saved_args[name])
@@ -137,7 +158,44 @@ def load_model(args, device):
         args.structure_profile = checkpoint["structure_profile"]
 
     config = get_config(args)
-    model = ViT_seg(
+    model_impl = getattr(args, "model_impl", "auto")
+    if model_impl == "auto":
+        probe = state_dict.get(
+            "swin_unet.decoder_structure_blocks.2.connectivity_head.edge_mlp.0.weight"
+        )
+        if probe is not None and probe.dim() == 4:
+            # Standard pairwise head uses [feature, neighbor, skel_p, skel_q, dir_prior]
+            # -> 2C+3.  In these blocks hidden_channels is C/2, so input is 4*out+3.
+            # Selective-fusion head adds [feature-neighbor, feature*neighbor] -> 4C+3,
+            # which is 8*out+3 for the same hidden width.
+            out_channels = int(probe.shape[0])
+            in_channels = int(probe.shape[1])
+            if in_channels == 4 * out_channels + 3:
+                model_impl = "standard"
+            elif in_channels == 8 * out_channels + 3:
+                model_impl = "selective"
+            elif in_channels == 4 * out_channels + 1:
+                model_impl = "standard"
+            elif in_channels == 8 * out_channels + 1:
+                model_impl = "selective"
+            else:
+                model_impl = "selective" if "selective" in str(saved_args.get("run_name", "")).lower() else "standard"
+        else:
+            model_impl = "selective" if "selective" in str(saved_args.get("run_name", "")).lower() else "standard"
+    model_cls = ViT_seg_selective if model_impl == "selective" else ViT_seg
+    loader = (
+        load_topology_checkpoint_state_selective
+        if model_impl == "selective"
+        else load_topology_checkpoint_state
+    )
+    printer = (
+        print_topology_coefficients_selective
+        if model_impl == "selective"
+        else print_topology_coefficients
+    )
+    print(f"[INFO] Diagnostic model implementation: {model_impl}", flush=True)
+
+    model = model_cls(
         config=config,
         img_size=args.img_size,
         num_classes=args.num_classes,
@@ -156,15 +214,19 @@ def load_model(args, device):
         stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
         stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
         final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
+        enable_highres_structure_stream=args.enable_highres_structure_stream,
+        highres_structure_channels=args.highres_structure_channels,
+        highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+        highres_structure_fusion_mode=args.highres_structure_fusion_mode,
     )
-    load_topology_checkpoint_state(
+    loader(
         model,
-        checkpoint["model_state_dict"],
+        state_dict,
         checkpoint.get("topology_attention_version", "legacy-unrecorded"),
         strict=(args.bottleneck_type == "global_local"),
     )
     model.to(device).eval()
-    print_topology_coefficients(model)
+    printer(model)
     return model
 
 

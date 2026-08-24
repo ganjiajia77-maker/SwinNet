@@ -74,6 +74,94 @@ class SkeletonSpatialHead(nn.Module):
         return self.out(x)
 
 
+CONNECTIVITY_DIRECTIONS = (
+    (-1, 0),   # N
+    (-1, 1),   # NE
+    (0, 1),    # E
+    (1, 1),    # SE
+    (1, 0),    # S
+    (1, -1),   # SW
+    (0, -1),   # W
+    (-1, -1),  # NW
+)
+
+
+class PairwiseConnectivityHead(nn.Module):
+    def __init__(
+        self,
+        channels,
+        connectivity_channels=8,
+        hidden_channels=None,
+    ):
+        super().__init__()
+        if connectivity_channels != len(CONNECTIVITY_DIRECTIONS):
+            raise ValueError("PairwiseConnectivityHead expects 8 connectivity channels.")
+        hidden_channels = hidden_channels or max(channels // 2, 16)
+        self.connectivity_channels = connectivity_channels
+        self.edge_mlp = nn.Sequential(
+            nn.Conv2d(4 * channels + 3, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+        )
+        basis = []
+        for dy, dx in CONNECTIVITY_DIRECTIONS:
+            theta = torch.atan2(torch.tensor(float(dy)), torch.tensor(float(dx)))
+            basis.append([torch.cos(2.0 * theta), torch.sin(2.0 * theta)])
+        self.register_buffer("axis_basis", torch.tensor(basis).float().view(1, 8, 2, 1, 1))
+
+    @staticmethod
+    def _shift_feature(x, dy, dx):
+        _, _, height, width = x.shape
+        pad_left = max(-dx, 0)
+        pad_right = max(dx, 0)
+        pad_top = max(-dy, 0)
+        pad_bottom = max(dy, 0)
+        padded = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
+        y0 = max(dy, 0)
+        x0 = max(dx, 0)
+        return padded[:, :, y0:y0 + height, x0:x0 + width]
+
+    def direction_alignment(self, direction_logits):
+        direction = F.normalize(direction_logits, dim=1, eps=1e-6)
+        direction = direction.unsqueeze(1)
+        return ((direction * self.axis_basis).sum(dim=2) + 1.0) * 0.5
+
+    def forward(self, feature, direction_alignment=None, skeleton_prob=None):
+        if direction_alignment is None:
+            direction_alignment = feature.new_zeros(
+                feature.shape[0],
+                self.connectivity_channels,
+                feature.shape[-2],
+                feature.shape[-1],
+            )
+        if skeleton_prob is None:
+            skeleton_prob = feature.new_zeros(
+                feature.shape[0],
+                1,
+                feature.shape[-2],
+                feature.shape[-1],
+            )
+        logits = []
+        for idx, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
+            neighbor = self._shift_feature(feature, dy, dx)
+            neighbor_skeleton = self._shift_feature(skeleton_prob, dy, dx)
+            edge_feature = torch.cat(
+                [
+                    feature,
+                    neighbor,
+                    feature - neighbor,
+                    feature * neighbor,
+                    skeleton_prob,
+                    neighbor_skeleton,
+                    direction_alignment[:, idx:idx + 1],
+                ],
+                dim=1,
+            )
+            logits.append(self.edge_mlp(edge_feature))
+        return torch.cat(logits, dim=1)
+
+
 class StageTopologyPredictor(nn.Module):
     def __init__(self, channels, connectivity_channels=8):
         super().__init__()
@@ -82,17 +170,18 @@ class StageTopologyPredictor(nn.Module):
             ConvBNReLU(channels, channels),
         )
         self.skeleton_head = SkeletonSpatialHead(channels)
-        self.connectivity_head = nn.Conv2d(
-            channels,
-            connectivity_channels,
-            kernel_size=1,
-        )
+        self.connectivity_head = PairwiseConnectivityHead(channels, connectivity_channels)
 
     def forward(self, x):
         structure_feat = self.structure_branch(x)
+        skeleton_logits = self.skeleton_head(structure_feat)
+        skeleton_prob = torch.sigmoid(skeleton_logits).detach()
         return (
-            self.skeleton_head(structure_feat),
-            self.connectivity_head(structure_feat),
+            skeleton_logits,
+            self.connectivity_head(
+                structure_feat,
+                skeleton_prob=skeleton_prob,
+            ),
         )
 
 
@@ -242,15 +331,18 @@ class FinalTopologyRepairAttention(nn.Module):
         dy = delta[..., 0]
         dx = delta[..., 1]
 
+        target_dy = -dy
+        target_dx = -dx
         direction = torch.zeros_like(dy, dtype=torch.long)
-        direction[(dy > 0) & (dx == 0)] = 1
-        direction[(dy == 0) & (dx < 0)] = 2
-        direction[(dy == 0) & (dx > 0)] = 3
-        direction[(dy < 0) & (dx < 0)] = 4
-        direction[(dy < 0) & (dx > 0)] = 5
-        direction[(dy > 0) & (dx < 0)] = 6
-        direction[(dy > 0) & (dx > 0)] = 7
-        opposite = torch.tensor([1, 0, 3, 2, 7, 6, 5, 4], dtype=torch.long)
+        direction[(target_dy < 0) & (target_dx == 0)] = 0
+        direction[(target_dy < 0) & (target_dx > 0)] = 1
+        direction[(target_dy == 0) & (target_dx > 0)] = 2
+        direction[(target_dy > 0) & (target_dx > 0)] = 3
+        direction[(target_dy > 0) & (target_dx == 0)] = 4
+        direction[(target_dy > 0) & (target_dx < 0)] = 5
+        direction[(target_dy == 0) & (target_dx < 0)] = 6
+        direction[(target_dy < 0) & (target_dx < 0)] = 7
+        opposite = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.long)
 
         relative = delta.clone()
         relative[..., 0] += self.window_size - 1
@@ -451,16 +543,16 @@ class DirectionalValueAggregation(nn.Module):
     @staticmethod
     def _shift_feature(x, dy, dx):
         _, _, height, width = x.shape
-        pad_left = max(dx, 0)
-        pad_right = max(-dx, 0)
-        pad_top = max(dy, 0)
-        pad_bottom = max(-dy, 0)
+        pad_left = max(-dx, 0)
+        pad_right = max(dx, 0)
+        pad_top = max(-dy, 0)
+        pad_bottom = max(dy, 0)
         padded = torch.nn.functional.pad(
             x,
             (pad_left, pad_right, pad_top, pad_bottom),
         )
-        y0 = max(-dy, 0)
-        x0 = max(-dx, 0)
+        y0 = max(dy, 0)
+        x0 = max(dx, 0)
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
     def effective_gamma(self):
@@ -472,21 +564,11 @@ class DirectionalValueAggregation(nn.Module):
         if not self.enabled:
             return feature
 
-        directions = [
-            (-1, 0),
-            (1, 0),
-            (0, -1),
-            (0, 1),
-            (-1, -1),
-            (-1, 1),
-            (1, -1),
-            (1, 1),
-        ]
         value = self.value_proj(feature)
         propagated = torch.zeros_like(value)
-        for index, (dy, dx) in enumerate(directions):
+        for index, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
             propagated = propagated + connectivity_prob[:, index:index + 1] * (
-                self._shift_feature(value, -dy, -dx)
+                self._shift_feature(value, dy, dx)
             )
         propagated = propagated / float(self.connectivity_channels)
         return feature + self.effective_gamma() * propagated
@@ -582,7 +664,7 @@ class DecoderStructureRefinement(nn.Module):
             ConvBNReLU(channels, channels),
         )
         self.skeleton_head = SkeletonSpatialHead(channels)
-        self.connectivity_head = nn.Conv2d(channels, connectivity_channels, kernel_size=1)
+        self.connectivity_head = PairwiseConnectivityHead(channels, connectivity_channels)
         self.direction_head = nn.Sequential(
             ConvBNReLU(channels, channels),
             nn.Conv2d(channels, 2, kernel_size=1),
@@ -617,31 +699,21 @@ class DecoderStructureRefinement(nn.Module):
     @staticmethod
     def _shift_feature(x, dy, dx):
         _, _, height, width = x.shape
-        pad_left = max(dx, 0)
-        pad_right = max(-dx, 0)
-        pad_top = max(dy, 0)
-        pad_bottom = max(-dy, 0)
+        pad_left = max(-dx, 0)
+        pad_right = max(dx, 0)
+        pad_top = max(-dy, 0)
+        pad_bottom = max(dy, 0)
         padded = torch.nn.functional.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
-        y0 = max(-dy, 0)
-        x0 = max(-dx, 0)
+        y0 = max(dy, 0)
+        x0 = max(dx, 0)
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
     def directional_propagation(self, feature, connectivity_prob):
-        directions = [
-            (-1, 0),
-            (1, 0),
-            (0, -1),
-            (0, 1),
-            (-1, -1),
-            (-1, 1),
-            (1, -1),
-            (1, 1),
-        ]
         propagated = torch.zeros_like(feature)
-        for idx, (dy, dx) in enumerate(directions):
+        for idx, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
             shifted = self._shift_feature(feature, dy, dx)
             propagated = propagated + connectivity_prob[:, idx:idx + 1] * shifted
-        return propagated / float(len(directions))
+        return propagated / float(len(CONNECTIVITY_DIRECTIONS))
 
     def forward(
         self,
@@ -658,8 +730,15 @@ class DecoderStructureRefinement(nn.Module):
         else:
             skeleton_logits = self.skeleton_head(structure_feat)
             skeleton_prob = torch.sigmoid(skeleton_logits)
-        connectivity_logits = self.connectivity_head(structure_feat)
         direction_logits = self.direction_head(structure_feat)
+        direction_alignment = self.connectivity_head.direction_alignment(
+            direction_logits
+        ).detach()
+        connectivity_logits = self.connectivity_head(
+            structure_feat,
+            direction_alignment,
+            skeleton_prob=skeleton_prob.detach(),
+        )
 
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
@@ -777,10 +856,9 @@ class SkeletonGuidedHead(nn.Module):
             ConvBNReLU(hidden_channels, hidden_channels),
         )
         self.detached_skeleton_head = SkeletonSpatialHead(hidden_channels)
-        self.connectivity_head = nn.Conv2d(
+        self.connectivity_head = PairwiseConnectivityHead(
             hidden_channels,
             connectivity_channels,
-            kernel_size=1,
         )
         self.structure_to_surface = nn.Sequential(
             ConvBNReLU(hidden_channels + connectivity_channels + 3, hidden_channels),
@@ -961,15 +1039,22 @@ class SkeletonGuidedHead(nn.Module):
         # structure feature. Surface features never receive this attention
         # residual directly.
         seed_skeleton_logits = self.skeleton_head(structure_feat)
-        seed_connectivity_logits = self.connectivity_head(structure_feat)
+        seed_skeleton_prob = torch.sigmoid(seed_skeleton_logits).detach()
+        seed_connectivity_logits = self.connectivity_head(
+            structure_feat,
+            skeleton_prob=seed_skeleton_prob,
+        )
         structure_feat = self.final_topology_attention(
             structure_feat,
-            torch.sigmoid(seed_skeleton_logits).detach(),
+            seed_skeleton_prob,
             torch.sigmoid(seed_connectivity_logits).detach(),
         )
         skeleton_logits = self.skeleton_head(structure_feat)
-        connectivity_logits = self.connectivity_head(structure_feat)
         skeleton_prob = torch.sigmoid(skeleton_logits)
+        connectivity_logits = self.connectivity_head(
+            structure_feat,
+            skeleton_prob=skeleton_prob.detach(),
+        )
         connectivity_prob = torch.sigmoid(connectivity_logits)
 
         surface_ref_feat = self.surface_refine(surface_feat)

@@ -460,7 +460,11 @@ def load_topology_checkpoint_state(
             flush=True,
         )
     else:
-        result = model.load_state_dict(state_dict, strict=strict)
+        result = load_state_dict_ignore_mismatch(
+            model,
+            state_dict,
+            prefix="[TOPOLOGY] ",
+        )
     apply_structure_profile_runtime(model)
     return result
 

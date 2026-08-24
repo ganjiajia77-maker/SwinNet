@@ -13,8 +13,6 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analyze_structure_supervision import (
-    DIR_NAMES,
-    DIR_OFFSETS,
     load_model,
     resize_like,
     select_stage_outputs,
@@ -24,6 +22,7 @@ from losses.road_losses import build_connectivity_target
 
 
 CONNECTIVITY_DIR_NAMES = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+AXIAL_DIR_NAMES = ["N/S", "NE/SW", "E/W", "SE/NW"]
 CONNECTIVITY_DIR_OFFSETS = torch.tensor(
     [
         [-1, 0],
@@ -34,6 +33,15 @@ CONNECTIVITY_DIR_OFFSETS = torch.tensor(
         [1, -1],
         [0, -1],
         [-1, -1],
+    ],
+    dtype=torch.float32,
+)
+AXIAL_DIR_OFFSETS = torch.tensor(
+    [
+        [-1, 0],
+        [-1, 1],
+        [0, 1],
+        [1, 1],
     ],
     dtype=torch.float32,
 )
@@ -88,35 +96,39 @@ def reciprocal_symmetry_error(prob):
 def direction_stats(direction_logits, direction_gt, valid_mask):
     pred_vec = F.normalize(direction_logits.float(), dim=1, eps=1e-6)
     gt_vec = F.normalize(direction_gt.float(), dim=1, eps=1e-6)
-    offsets = DIR_OFFSETS.to(direction_logits.device, direction_logits.dtype)
-    offsets = F.normalize(offsets, dim=1, eps=1e-6)
-    pred_score = torch.einsum("bchw,kc->bkhw", pred_vec, offsets)
-    gt_score = torch.einsum("bchw,kc->bkhw", gt_vec, offsets)
+    offsets = AXIAL_DIR_OFFSETS.to(direction_logits.device, direction_logits.dtype)
+    theta = torch.atan2(offsets[:, 0], offsets[:, 1])
+    axis_basis = torch.stack(
+        [torch.cos(2.0 * theta), torch.sin(2.0 * theta)],
+        dim=1,
+    )
+    pred_score = torch.einsum("bchw,kc->bkhw", pred_vec, axis_basis)
+    gt_score = torch.einsum("bchw,kc->bkhw", gt_vec, axis_basis)
     pred_idx = pred_score.argmax(dim=1)
     gt_idx = gt_score.argmax(dim=1)
     cosine = (pred_vec * gt_vec).sum(dim=1).clamp(-1.0, 1.0)
-    angle_deg = torch.rad2deg(torch.acos(cosine))
+    angle_deg = 0.5 * torch.rad2deg(torch.acos(cosine))
     mask = valid_mask.squeeze(1).bool()
     pred_flat = pred_idx[mask].detach().cpu().numpy()
     gt_flat = gt_idx[mask].detach().cpu().numpy()
     angle_flat = angle_deg[mask].detach().cpu().numpy()
-    pred_hist = np.bincount(pred_flat, minlength=8)
-    gt_hist = np.bincount(gt_flat, minlength=8)
+    pred_hist = np.bincount(pred_flat, minlength=4)
+    gt_hist = np.bincount(gt_flat, minlength=4)
     return {
         "count": int(mask.sum().item()),
         "pred_hist": pred_hist,
         "gt_hist": gt_hist,
         "angle_mean": float(angle_flat.mean()) if angle_flat.size else float("nan"),
         "angle_median": float(np.median(angle_flat)) if angle_flat.size else float("nan"),
-        "accuracy_8dir": float((pred_flat == gt_flat).mean()) if pred_flat.size else float("nan"),
+        "accuracy_axial4": float((pred_flat == gt_flat).mean()) if pred_flat.size else float("nan"),
     }
 
 
-def connectivity_stats(connectivity_prob, connectivity_gt, valid_mask):
+def connectivity_stats(connectivity_prob, connectivity_gt, valid_mask, threshold=0.5):
     prob = connectivity_prob.detach().cpu()
     gt = (connectivity_gt.detach().cpu() > 0.5)
     valid = valid_mask.detach().cpu().bool().expand_as(gt)
-    pred = (prob >= 0.5) & valid
+    pred = (prob >= float(threshold)) & valid
 
     per_dir = []
     pos_probs = []
@@ -198,6 +210,9 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_batches", type=int, default=39)
     parser.add_argument("--threshold", type=float, default=0.45)
+    parser.add_argument("--threshold_sweep_start", type=float, default=0.01)
+    parser.add_argument("--threshold_sweep_end", type=float, default=0.20)
+    parser.add_argument("--threshold_sweep_step", type=float, default=0.01)
     parser.add_argument("--stage", type=str, default="stage3_refine", choices=["stage2_refine", "stage3_refine"])
     parser.add_argument("--seed", type=int, default=20260818)
     parser.add_argument("--img_size", type=int, default=256)
@@ -224,11 +239,16 @@ def main():
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--throughput", action="store_true")
     parser.add_argument("--dataset", type=str, default="ImageData")
-    parser.add_argument("--num_classes", type=int, default=2)
+    parser.add_argument("--num_classes", type=int, default=1)
     parser.add_argument("--opts", nargs=argparse.REMAINDER, default=None)
     parser.add_argument("--structure_profile", type=str, default="stage23_boundary_0626")
     parser.add_argument("--disable_msfe_skip", action="store_true")
     parser.add_argument("--bottleneck_type", type=str, default="global_local")
+    parser.add_argument("--enable_highres_structure_stream", action="store_true")
+    parser.add_argument("--highres_structure_channels", type=int, default=64)
+    parser.add_argument("--highres_structure_fuse_stages", type=str, default="stage23")
+    parser.add_argument("--highres_structure_fusion_mode", type=str, default="stage23")
+    parser.add_argument("--model_impl", type=str, default="auto", choices=["auto", "standard", "selective"])
     args = parser.parse_args()
 
     set_deterministic(args.seed)
@@ -247,8 +267,8 @@ def main():
     conn_gt_rows = []
     conn_prob_rows = []
     dir_stats_acc = {
-        "pred_hist": np.zeros(8, dtype=np.int64),
-        "gt_hist": np.zeros(8, dtype=np.int64),
+        "pred_hist": np.zeros(4, dtype=np.int64),
+        "gt_hist": np.zeros(4, dtype=np.int64),
         "count": 0,
         "angle_sum": 0.0,
         "angle_median_values": [],
@@ -292,7 +312,7 @@ def main():
             skeleton_dir = resize_like(skeleton.float(), d_logits[:, :1], mode="nearest") > 0.5
 
             conn_valid = resize_like(skeleton.float(), c_prob[:, :1], mode="nearest") > 0.5
-            conn = connectivity_stats(c_prob, c_gt, conn_valid)
+            conn = connectivity_stats(c_prob, c_gt, conn_valid, threshold=args.threshold)
             for i, item in enumerate(conn["per_dir"]):
                 conn_tp[i] += item["tp"]
                 conn_fp[i] += item["fp"]
@@ -303,8 +323,9 @@ def main():
                 conn_neg_sum[i] += item["neg_sum"]
             pos_probs.append(np.array([conn["positive_mean_prob"]], dtype=np.float32))
             neg_probs.append(np.array([conn["negative_mean_prob"]], dtype=np.float32))
-            flat_conn_prob.append(c_prob.detach().cpu().reshape(-1).numpy())
-            flat_conn_gt.append((c_gt.detach().cpu().reshape(-1) > 0.5).numpy().astype(np.int32))
+            valid_flat = conn_valid.detach().cpu().bool().expand_as(c_gt)
+            flat_conn_prob.append(c_prob.detach().cpu()[valid_flat].reshape(-1).numpy())
+            flat_conn_gt.append((c_gt.detach().cpu()[valid_flat].reshape(-1) > 0.5).numpy().astype(np.int32))
             symmetry_errors.append(reciprocal_symmetry_error(c_prob.detach().cpu()))
 
             d_stats = direction_stats(d_logits, d_gt, skeleton_dir.float())
@@ -313,7 +334,7 @@ def main():
             dir_stats_acc["count"] += d_stats["count"]
             dir_stats_acc["angle_sum"] += d_stats["angle_mean"] * d_stats["count"]
             dir_stats_acc["angle_median_values"].append(d_stats["angle_median"])
-            dir_stats_acc["accuracy_count"] += d_stats["accuracy_8dir"] * d_stats["count"]
+            dir_stats_acc["accuracy_count"] += d_stats["accuracy_axial4"] * d_stats["count"]
 
     flat_conn_prob = np.concatenate(flat_conn_prob, axis=0)
     flat_conn_gt = np.concatenate(flat_conn_gt, axis=0)
@@ -328,6 +349,22 @@ def main():
     positive_mean = float((conn_pos_sum / np.maximum(conn_pos_count, 1.0)).mean())
     negative_mean = float((conn_neg_sum / np.maximum(conn_neg_count, 1.0)).mean())
     reciprocal_error = float(np.mean(symmetry_errors))
+    sweep_rows = []
+    start = float(args.threshold_sweep_start)
+    end = float(args.threshold_sweep_end)
+    step = float(args.threshold_sweep_step)
+    if step > 0 and end >= start:
+        for threshold in np.arange(start, end + 0.5 * step, step):
+            pred = flat_conn_prob >= threshold
+            gt = flat_conn_gt.astype(bool)
+            tp = float(np.logical_and(pred, gt).sum())
+            fp = float(np.logical_and(pred, ~gt).sum())
+            fn = float(np.logical_and(~pred, gt).sum())
+            precision = tp / (tp + fp + 1e-8)
+            recall = tp / (tp + fn + 1e-8)
+            f1 = 2.0 * precision * recall / (precision + recall + 1e-8)
+            sweep_rows.append((float(threshold), precision, recall, f1, tp, fp, fn))
+    best_sweep = max(sweep_rows, key=lambda row: row[3]) if sweep_rows else None
 
     print(f"\nCheckpoint: {args.model_path}")
     print(f"Stage: {stage_key}")
@@ -342,19 +379,25 @@ def main():
     print(f"  AUROC: {overall_auc:.4f}")
     print(f"  AUPRC: {overall_auprc:.4f}")
     print(f"  Reciprocal symmetry error: {reciprocal_error:.4f}")
+    if best_sweep is not None:
+        threshold, precision, recall, f1, tp, fp, fn = best_sweep
+        print(
+            "  Best threshold sweep: "
+            f"thr={threshold:.3f}, P={precision:.4f}, R={recall:.4f}, F1={f1:.4f}"
+        )
     print("  Per-direction F1:")
     for name, value in zip(CONNECTIVITY_DIR_NAMES, per_dir_f1):
         print(f"    {name}: {value:.4f}")
 
     print("\nDirection")
-    accuracy_8dir = dir_stats_acc["accuracy_count"] / max(dir_stats_acc["count"], 1)
+    accuracy_axial4 = dir_stats_acc["accuracy_count"] / max(dir_stats_acc["count"], 1)
     angle_mean = dir_stats_acc["angle_sum"] / max(dir_stats_acc["count"], 1)
     angle_median = float(np.median(np.array(dir_stats_acc["angle_median_values"], dtype=np.float32)))
-    print(f"  8-dir accuracy:        {accuracy_8dir:.4f}")
-    print(f"  Mean angular error:    {angle_mean:.4f}")
-    print(f"  Median angular error:   {angle_median:.4f}")
-    print(f"  Pred histogram: {dict(zip(DIR_NAMES, dir_stats_acc['pred_hist'].tolist()))}")
-    print(f"  GT histogram:   {dict(zip(DIR_NAMES, dir_stats_acc['gt_hist'].tolist()))}")
+    print(f"  Axial-4 accuracy:      {accuracy_axial4:.4f}")
+    print(f"  Mean axial error:      {angle_mean:.4f}")
+    print(f"  Median axial error:    {angle_median:.4f}")
+    print(f"  Pred axis histogram: {dict(zip(AXIAL_DIR_NAMES, dir_stats_acc['pred_hist'].tolist()))}")
+    print(f"  GT axis histogram:   {dict(zip(AXIAL_DIR_NAMES, dir_stats_acc['gt_hist'].tolist()))}")
 
 
 if __name__ == "__main__":
