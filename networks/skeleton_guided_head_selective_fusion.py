@@ -74,6 +74,45 @@ class SkeletonSpatialHead(nn.Module):
         return self.out(x)
 
 
+class ConnectivityContextBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.dilate1 = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                groups=channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.dilate2 = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=2,
+                dilation=2,
+                groups=channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(2 * channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        context = torch.cat([self.dilate1(x), self.dilate2(x)], dim=1)
+        return x + self.fuse(context)
+
+
 CONNECTIVITY_DIRECTIONS = (
     (-1, 0),   # N
     (-1, 1),   # NE
@@ -170,16 +209,18 @@ class StageTopologyPredictor(nn.Module):
             ConvBNReLU(channels, channels),
         )
         self.skeleton_head = SkeletonSpatialHead(channels)
+        self.connectivity_context = ConnectivityContextBlock(channels)
         self.connectivity_head = PairwiseConnectivityHead(channels, connectivity_channels)
 
     def forward(self, x):
         structure_feat = self.structure_branch(x)
         skeleton_logits = self.skeleton_head(structure_feat)
         skeleton_prob = torch.sigmoid(skeleton_logits).detach()
+        connectivity_feat = self.connectivity_context(structure_feat)
         return (
             skeleton_logits,
             self.connectivity_head(
-                structure_feat,
+                connectivity_feat,
                 skeleton_prob=skeleton_prob,
             ),
         )
@@ -664,6 +705,7 @@ class DecoderStructureRefinement(nn.Module):
             ConvBNReLU(channels, channels),
         )
         self.skeleton_head = SkeletonSpatialHead(channels)
+        self.connectivity_context = ConnectivityContextBlock(channels)
         self.connectivity_head = PairwiseConnectivityHead(channels, connectivity_channels)
         self.direction_head = nn.Sequential(
             ConvBNReLU(channels, channels),
@@ -734,8 +776,9 @@ class DecoderStructureRefinement(nn.Module):
         direction_alignment = self.connectivity_head.direction_alignment(
             direction_logits
         ).detach()
+        connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
-            structure_feat,
+            connectivity_feat,
             direction_alignment,
             skeleton_prob=skeleton_prob.detach(),
         )
@@ -856,6 +899,7 @@ class SkeletonGuidedHead(nn.Module):
             ConvBNReLU(hidden_channels, hidden_channels),
         )
         self.detached_skeleton_head = SkeletonSpatialHead(hidden_channels)
+        self.connectivity_context = ConnectivityContextBlock(hidden_channels)
         self.connectivity_head = PairwiseConnectivityHead(
             hidden_channels,
             connectivity_channels,
@@ -1040,8 +1084,9 @@ class SkeletonGuidedHead(nn.Module):
         # residual directly.
         seed_skeleton_logits = self.skeleton_head(structure_feat)
         seed_skeleton_prob = torch.sigmoid(seed_skeleton_logits).detach()
+        seed_connectivity_feat = self.connectivity_context(structure_feat)
         seed_connectivity_logits = self.connectivity_head(
-            structure_feat,
+            seed_connectivity_feat,
             skeleton_prob=seed_skeleton_prob,
         )
         structure_feat = self.final_topology_attention(
@@ -1051,8 +1096,9 @@ class SkeletonGuidedHead(nn.Module):
         )
         skeleton_logits = self.skeleton_head(structure_feat)
         skeleton_prob = torch.sigmoid(skeleton_logits)
+        connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
-            structure_feat,
+            connectivity_feat,
             skeleton_prob=skeleton_prob.detach(),
         )
         connectivity_prob = torch.sigmoid(connectivity_logits)

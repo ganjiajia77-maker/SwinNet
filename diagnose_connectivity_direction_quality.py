@@ -3,6 +3,7 @@ import os
 import random
 import sys
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from analyze_structure_supervision import (
     select_stage_outputs,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from losses.cldice_loss import soft_skeletonize
 from losses.road_losses import build_connectivity_target
 
 
@@ -201,6 +203,139 @@ def connectivity_stats(connectivity_prob, connectivity_gt, valid_mask, threshold
     }
 
 
+def surface_cldice_score(surface_prob, surface_gt, iter_num=10):
+    prob = surface_prob.float().clamp(0.0, 1.0)
+    target = surface_gt.float().clamp(0.0, 1.0)
+    pred_skel = soft_skeletonize(prob, iter_num=iter_num)
+    target_skel = soft_skeletonize(target, iter_num=iter_num)
+    tprec = (pred_skel * target).sum(dim=(1, 2, 3)) / (
+        pred_skel.sum(dim=(1, 2, 3)) + 1e-8
+    )
+    tsens = (target_skel * prob).sum(dim=(1, 2, 3)) / (
+        target_skel.sum(dim=(1, 2, 3)) + 1e-8
+    )
+    cldice = (2.0 * tprec * tsens) / (tprec + tsens + 1e-8)
+    return cldice.detach().cpu().numpy()
+
+
+def _component_stats(mask_bool, short_area_threshold):
+    u8 = mask_bool.astype(np.uint8)
+    num, _, stats, _ = cv2.connectedComponentsWithStats(u8, connectivity=8)
+    areas = stats[1:, cv2.CC_STAT_AREA] if num > 1 else np.empty((0,), dtype=np.int32)
+    total = float(areas.sum()) if areas.size else 0.0
+    return {
+        "components": float(num - 1),
+        "short_components": float((areas < short_area_threshold).sum()) if areas.size else 0.0,
+        "largest_ratio": float(areas.max() / total) if total > 0 else 0.0,
+    }
+
+
+def surface_fragmentation_stats(surface_prob, surface_gt, threshold=0.2, short_area_threshold=20):
+    pred = (surface_prob.detach().cpu().numpy()[:, 0] >= float(threshold))
+    gt = (surface_gt.detach().cpu().numpy()[:, 0] > 0.5)
+    rows = []
+    for pred_mask, gt_mask in zip(pred, gt):
+        pred_stats = _component_stats(pred_mask, short_area_threshold)
+        gt_stats = _component_stats(gt_mask, short_area_threshold)
+        gt_components = max(gt_stats["components"], 1.0)
+        rows.append(
+            {
+                "pred_components": pred_stats["components"],
+                "gt_components": gt_stats["components"],
+                "fragmentation_index": pred_stats["components"] / gt_components,
+                "extra_components": max(pred_stats["components"] - gt_stats["components"], 0.0),
+                "pred_short_components": pred_stats["short_components"],
+                "gt_short_components": gt_stats["short_components"],
+                "pred_largest_ratio": pred_stats["largest_ratio"],
+                "gt_largest_ratio": gt_stats["largest_ratio"],
+            }
+        )
+    return rows
+
+
+def _edge_slices(height, width, dy, dx):
+    src_y0 = max(-dy, 0)
+    src_y1 = height - max(dy, 0)
+    src_x0 = max(-dx, 0)
+    src_x1 = width - max(dx, 0)
+    dst_y0 = src_y0 + dy
+    dst_y1 = src_y1 + dy
+    dst_x0 = src_x0 + dx
+    dst_x1 = src_x1 + dx
+    return (
+        slice(src_y0, src_y1),
+        slice(src_x0, src_x1),
+        slice(dst_y0, dst_y1),
+        slice(dst_x0, dst_x1),
+    )
+
+
+def _active_nodes_from_gt_edges(valid, gt_edges):
+    height, width = valid.shape
+    active = np.zeros_like(valid, dtype=bool)
+    for direction, (dy, dx) in enumerate(CONNECTIVITY_DIR_OFFSETS.int().tolist()):
+        sy, sx, dy_slice, dx_slice = _edge_slices(height, width, dy, dx)
+        edge = gt_edges[direction, sy, sx] & valid[sy, sx] & valid[dy_slice, dx_slice]
+        active[sy, sx] |= edge
+        active[dy_slice, dx_slice] |= edge
+    return active
+
+
+def _count_graph_components(active, edges):
+    height, width = active.shape
+    node_ids = -np.ones((height, width), dtype=np.int64)
+    ys, xs = np.nonzero(active)
+    node_ids[ys, xs] = np.arange(len(ys), dtype=np.int64)
+    if len(ys) == 0:
+        return 0.0
+    parent = np.arange(len(ys), dtype=np.int64)
+
+    def find(idx):
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(a, b):
+        ra = find(int(a))
+        rb = find(int(b))
+        if ra != rb:
+            parent[rb] = ra
+
+    for direction, (dy, dx) in enumerate(CONNECTIVITY_DIR_OFFSETS.int().tolist()):
+        sy, sx, dy_slice, dx_slice = _edge_slices(height, width, dy, dx)
+        edge = edges[direction, sy, sx] & active[sy, sx] & active[dy_slice, dx_slice]
+        src_ids = node_ids[sy, sx][edge]
+        dst_ids = node_ids[dy_slice, dx_slice][edge]
+        for src_id, dst_id in zip(src_ids, dst_ids):
+            union(src_id, dst_id)
+    roots = {find(idx) for idx in range(len(ys))}
+    return float(len(roots))
+
+
+def connectivity_graph_fragmentation_stats(connectivity_prob, connectivity_gt, valid_mask, threshold=0.5):
+    prob = connectivity_prob.detach().cpu().numpy()
+    gt = connectivity_gt.detach().cpu().numpy() > 0.5
+    valid = valid_mask.detach().cpu().numpy()[:, 0].astype(bool)
+    pred = prob >= float(threshold)
+    rows = []
+    for batch_idx in range(prob.shape[0]):
+        active = _active_nodes_from_gt_edges(valid[batch_idx], gt[batch_idx])
+        if not active.any():
+            continue
+        gt_components = _count_graph_components(active, gt[batch_idx])
+        pred_components = _count_graph_components(active, pred[batch_idx])
+        rows.append(
+            {
+                "pred_components": pred_components,
+                "gt_components": gt_components,
+                "fragmentation_index": pred_components / max(gt_components, 1.0),
+                "extra_components": max(pred_components - gt_components, 0.0),
+            }
+        )
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, default="./data1")
@@ -210,9 +345,11 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_batches", type=int, default=39)
     parser.add_argument("--threshold", type=float, default=0.45)
+    parser.add_argument("--surface_threshold", type=float, default=0.2)
     parser.add_argument("--threshold_sweep_start", type=float, default=0.01)
     parser.add_argument("--threshold_sweep_end", type=float, default=0.20)
     parser.add_argument("--threshold_sweep_step", type=float, default=0.01)
+    parser.add_argument("--fragment_short_area", type=int, default=20)
     parser.add_argument("--stage", type=str, default="stage3_refine", choices=["stage2_refine", "stage3_refine"])
     parser.add_argument("--seed", type=int, default=20260818)
     parser.add_argument("--img_size", type=int, default=256)
@@ -286,6 +423,9 @@ def main():
     flat_conn_prob = []
     flat_conn_gt = []
     symmetry_errors = []
+    surface_cldice_values = []
+    surface_fragment_rows = []
+    graph_fragment_rows = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(batches, desc=f"Evaluate {stage_key}")):
@@ -296,6 +436,19 @@ def main():
 
             outputs = model(images, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
             surface_logits = outputs[0]
+            surface_prob = torch.sigmoid(surface_logits)
+            masks_resized = resize_like(masks.float(), surface_logits, mode="nearest")
+            surface_cldice_values.extend(
+                surface_cldice_score(surface_prob, masks_resized).tolist()
+            )
+            surface_fragment_rows.extend(
+                surface_fragmentation_stats(
+                    surface_prob,
+                    masks_resized,
+                    threshold=args.surface_threshold,
+                    short_area_threshold=args.fragment_short_area,
+                )
+            )
             skeleton = resize_like(skeleton_raw, surface_logits, mode="nearest") > 0.5
             selected = select_stage_outputs(outputs[-1])
             if stage_key not in selected:
@@ -313,6 +466,14 @@ def main():
 
             conn_valid = resize_like(skeleton.float(), c_prob[:, :1], mode="nearest") > 0.5
             conn = connectivity_stats(c_prob, c_gt, conn_valid, threshold=args.threshold)
+            graph_fragment_rows.extend(
+                connectivity_graph_fragmentation_stats(
+                    c_prob,
+                    c_gt,
+                    conn_valid,
+                    threshold=args.threshold,
+                )
+            )
             for i, item in enumerate(conn["per_dir"]):
                 conn_tp[i] += item["tp"]
                 conn_fp[i] += item["fp"]
@@ -349,6 +510,27 @@ def main():
     positive_mean = float((conn_pos_sum / np.maximum(conn_pos_count, 1.0)).mean())
     negative_mean = float((conn_neg_sum / np.maximum(conn_neg_count, 1.0)).mean())
     reciprocal_error = float(np.mean(symmetry_errors))
+    surface_cldice = float(np.mean(surface_cldice_values)) if surface_cldice_values else float("nan")
+
+    def mean_row(rows, key):
+        return float(np.mean([row[key] for row in rows])) if rows else float("nan")
+
+    surface_frag = {
+        "pred_components": mean_row(surface_fragment_rows, "pred_components"),
+        "gt_components": mean_row(surface_fragment_rows, "gt_components"),
+        "fragmentation_index": mean_row(surface_fragment_rows, "fragmentation_index"),
+        "extra_components": mean_row(surface_fragment_rows, "extra_components"),
+        "pred_short_components": mean_row(surface_fragment_rows, "pred_short_components"),
+        "gt_short_components": mean_row(surface_fragment_rows, "gt_short_components"),
+        "pred_largest_ratio": mean_row(surface_fragment_rows, "pred_largest_ratio"),
+        "gt_largest_ratio": mean_row(surface_fragment_rows, "gt_largest_ratio"),
+    }
+    graph_frag = {
+        "pred_components": mean_row(graph_fragment_rows, "pred_components"),
+        "gt_components": mean_row(graph_fragment_rows, "gt_components"),
+        "fragmentation_index": mean_row(graph_fragment_rows, "fragmentation_index"),
+        "extra_components": mean_row(graph_fragment_rows, "extra_components"),
+    }
     sweep_rows = []
     start = float(args.threshold_sweep_start)
     end = float(args.threshold_sweep_end)
@@ -369,7 +551,7 @@ def main():
     print(f"\nCheckpoint: {args.model_path}")
     print(f"Stage: {stage_key}")
     print(f"split={args.split}, batches={len(batches)}, images={sum(batch['image'].shape[0] for batch in batches)}")
-    print(f"threshold={args.threshold}, seed={args.seed}")
+    print(f"threshold={args.threshold}, surface_threshold={args.surface_threshold}, seed={args.seed}")
     print("\nConnectivity")
     print(f"  8-dir macro Precision: {macro_precision:.4f}")
     print(f"  8-dir macro Recall:    {macro_recall:.4f}")
@@ -388,6 +570,34 @@ def main():
     print("  Per-direction F1:")
     for name, value in zip(CONNECTIVITY_DIR_NAMES, per_dir_f1):
         print(f"    {name}: {value:.4f}")
+
+    print("\nTopology")
+    print(f"  Surface clDice: {surface_cldice:.4f}")
+    print(
+        "  Surface fragmentation: "
+        f"pred_comp={surface_frag['pred_components']:.2f}, "
+        f"gt_comp={surface_frag['gt_components']:.2f}, "
+        f"frag_idx={surface_frag['fragmentation_index']:.3f}, "
+        f"extra_comp={surface_frag['extra_components']:.2f}"
+    )
+    print(
+        "  Surface short components: "
+        f"pred={surface_frag['pred_short_components']:.2f}, "
+        f"gt={surface_frag['gt_short_components']:.2f}, "
+        f"short_area<{args.fragment_short_area}"
+    )
+    print(
+        "  Surface largest-component ratio: "
+        f"pred={surface_frag['pred_largest_ratio']:.3f}, "
+        f"gt={surface_frag['gt_largest_ratio']:.3f}"
+    )
+    print(
+        "  Connectivity graph fragmentation: "
+        f"pred_comp={graph_frag['pred_components']:.2f}, "
+        f"gt_comp={graph_frag['gt_components']:.2f}, "
+        f"frag_idx={graph_frag['fragmentation_index']:.3f}, "
+        f"extra_comp={graph_frag['extra_components']:.2f}"
+    )
 
     print("\nDirection")
     accuracy_axial4 = dir_stats_acc["accuracy_count"] / max(dir_stats_acc["count"], 1)
