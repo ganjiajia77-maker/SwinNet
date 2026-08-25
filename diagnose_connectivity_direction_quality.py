@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import sys
+import types
 
 import cv2
 import numpy as np
@@ -47,6 +48,28 @@ AXIAL_DIR_OFFSETS = torch.tensor(
     ],
     dtype=torch.float32,
 )
+
+
+def install_connectivity_ablation(model, mode):
+    if mode == "full":
+        return 0
+    replaced = 0
+    for module in model.modules():
+        head = getattr(module, "connectivity_head", None)
+        if head is None or not hasattr(head, "edge_mlp"):
+            continue
+        original_forward = head.forward
+
+        def ablated_forward(self, feature, direction_alignment=None, skeleton_prob=None, _original=original_forward):
+            if mode in ("no_dir", "no_ske_dir"):
+                direction_alignment = None
+            if mode in ("no_ske", "no_ske_dir"):
+                skeleton_prob = None
+            return _original(feature, direction_alignment, skeleton_prob=skeleton_prob)
+
+        head.forward = types.MethodType(ablated_forward, head)
+        replaced += 1
+    return replaced
 
 
 def set_deterministic(seed):
@@ -386,11 +409,25 @@ def main():
     parser.add_argument("--highres_structure_fuse_stages", type=str, default="stage23")
     parser.add_argument("--highres_structure_fusion_mode", type=str, default="stage23")
     parser.add_argument("--model_impl", type=str, default="auto", choices=["auto", "standard", "selective"])
+    parser.add_argument(
+        "--connectivity_ablation",
+        type=str,
+        default="full",
+        choices=["full", "no_dir", "no_ske", "no_ske_dir"],
+        help="diagnostic-only ablation of priors passed into the connectivity head",
+    )
     args = parser.parse_args()
 
     set_deterministic(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = load_model(args, device)
+    ablated_heads = install_connectivity_ablation(model, args.connectivity_ablation)
+    if args.connectivity_ablation != "full":
+        print(
+            f"[DIAG] connectivity_ablation={args.connectivity_ablation}; "
+            f"patched_heads={ablated_heads}",
+            flush=True,
+        )
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split=args.split,
@@ -550,6 +587,7 @@ def main():
 
     print(f"\nCheckpoint: {args.model_path}")
     print(f"Stage: {stage_key}")
+    print(f"connectivity_ablation={args.connectivity_ablation}")
     print(f"split={args.split}, batches={len(batches)}, images={sum(batch['image'].shape[0] for batch in batches)}")
     print(f"threshold={args.threshold}, surface_threshold={args.surface_threshold}, seed={args.seed}")
     print("\nConnectivity")
