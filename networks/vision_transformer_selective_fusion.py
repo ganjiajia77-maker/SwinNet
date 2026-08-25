@@ -260,8 +260,12 @@ def load_topology_checkpoint_state(
             continue
         if (
             key in model_state
+            and hasattr(value, "shape")
             and value.shape != model_state[key].shape
-            and key.endswith("structure_gate.0.weight")
+            and (
+                key.endswith("structure_gate.0.weight")
+                or key.startswith(highres_structure_missing_prefixes)
+            )
         ):
             skipped_shape_keys.append(key)
             continue
@@ -274,7 +278,7 @@ def load_topology_checkpoint_state(
         )
     if skipped_shape_keys:
         print(
-            "[TOPOLOGY] Reinitialized direction-gate input weights: "
+            "[TOPOLOGY] Reinitialized shape-incompatible compatibility keys: "
             + ", ".join(skipped_shape_keys),
             flush=True,
         )
