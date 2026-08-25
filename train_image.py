@@ -149,6 +149,9 @@ parser.add_argument('--stage_direction_factor', type=float, default=0.2)
 parser.add_argument('--stage_connectivity_factor', type=float, default=0.5)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
+parser.add_argument('--final_skeleton_weight', type=float, default=None, help='override final skeleton auxiliary loss weight')
+parser.add_argument('--final_connectivity_weight', type=float, default=None, help='override final connectivity auxiliary loss weight')
+parser.add_argument('--boundary_weight', type=float, default=None, help='override boundary auxiliary loss weight')
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
@@ -310,16 +313,24 @@ if args.freeze_post_refine_interaction_only:
 
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
-        return {
+        weights = {
             "skeleton_weight": 0.10,
             "connectivity_weight": 0.03,
             "boundary_weight": 0.01,
         }
-    return {
-        "skeleton_weight": 0.02,
-        "connectivity_weight": 0.03,
-        "boundary_weight": 0.03,
-    }
+    else:
+        weights = {
+            "skeleton_weight": 0.02,
+            "connectivity_weight": 0.03,
+            "boundary_weight": 0.03,
+        }
+    if args.final_skeleton_weight is not None:
+        weights["skeleton_weight"] = float(args.final_skeleton_weight)
+    if args.final_connectivity_weight is not None:
+        weights["connectivity_weight"] = float(args.final_connectivity_weight)
+    if args.boundary_weight is not None:
+        weights["boundary_weight"] = float(args.boundary_weight)
+    return weights
 
 def get_graph_outputs_from_model(model):
     module = model.module if hasattr(model, "module") else model
