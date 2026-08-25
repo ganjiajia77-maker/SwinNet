@@ -10,15 +10,21 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from networks.vision_transformer_selective_fusion import (
-    SwinUnet as ViT_seg,
-    load_topology_checkpoint_state,
-    print_topology_coefficients,
+from networks.vision_transformer import (
+    SwinUnet as ViTStandard,
+    load_topology_checkpoint_state as load_topology_checkpoint_state_standard,
+    print_topology_coefficients as print_topology_coefficients_standard,
     STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
 )
+from networks.vision_transformer_selective_fusion import (
+    SwinUnet as ViTSelective,
+    load_topology_checkpoint_state as load_topology_checkpoint_state_selective,
+    print_topology_coefficients as print_topology_coefficients_selective,
+)
 from losses.road_losses import binary_metrics_from_logits
 from config import get_config
+from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
 
 
 def compute_metrics_all_samples(logits_list, targets_list, threshold):
@@ -104,6 +110,19 @@ def main():
     parser.add_argument('--n_class', default=2, type=int)
     parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None)
     parser.add_argument(
+        '--model_impl',
+        type=str,
+        default='standard',
+        choices=['standard', 'selective'],
+        help='model implementation used by the checkpoint',
+    )
+    parser.add_argument(
+        '--bottleneck_type',
+        type=str,
+        default='global_local',
+        choices=['global_local', 'legacy_global_local', 'g2l2'],
+    )
+    parser.add_argument(
         '--structure_profile',
         type=str,
         default=STRUCTURE_PROFILE_FULL,
@@ -154,11 +173,15 @@ def main():
                 if "disable_msfe_skip" in saved_args:
                     args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
                 for name in (
+                    "stage_topology_stages",
+                    "stage_topology_alpha_max",
+                    "stage_topology_alpha_init",
                     "enable_highres_structure_stream",
                     "highres_structure_channels",
                     "highres_structure_fuse_stages",
                     "highres_structure_fusion_mode",
                     "enable_post_refine_structure_interaction",
+                    "bottleneck_type",
                 ):
                     if name in saved_args:
                         setattr(args, name, saved_args[name])
@@ -168,11 +191,21 @@ def main():
     
     print('\nLoading model from: {}'.format(args.model_path))
     config = get_config(args)
-    model = ViT_seg(
+    if args.model_impl == 'selective':
+        vit_cls = ViTSelective
+        loader = load_topology_checkpoint_state_selective
+        printer = print_topology_coefficients_selective
+    else:
+        vit_cls = ViTStandard
+        loader = load_topology_checkpoint_state_standard
+        printer = print_topology_coefficients_standard
+
+    model = vit_cls(
         config=config,
         img_size=args.img_size,
         num_classes=1,
         return_skeleton=True,
+        bottleneck_type=args.bottleneck_type,
         final_topology_eta_init=args.final_topology_eta_init,
         final_gap_rho_init=args.final_gap_rho_init,
         stage_topology_stages=args.stage_topology_stages,
@@ -188,7 +221,12 @@ def main():
     )
     if checkpoint is None:
         checkpoint = torch.load(args.model_path, map_location=device)
-    load_topology_checkpoint_state(
+    adapt_connectivity_modules_for_checkpoint(
+        model,
+        checkpoint['model_state_dict'],
+        args.model_impl,
+    )
+    loader(
         model,
         checkpoint['model_state_dict'],
         checkpoint.get("topology_attention_version", "legacy-unrecorded"),
@@ -197,7 +235,7 @@ def main():
     model.eval()
     print('Model loaded')
     print("Using topology attention constrained version", flush=True)
-    print_topology_coefficients(model)
+    printer(model)
     
     print(f'\nLoading {args.split} dataset')
     val_dataset = RoadSkeletonDataset(
