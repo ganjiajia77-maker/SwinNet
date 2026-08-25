@@ -201,6 +201,23 @@ class PairwiseConnectivityHead(nn.Module):
         return torch.cat(logits, dim=1)
 
 
+class LegacyConvConnectivityHead(nn.Conv2d):
+    def __init__(self, channels, connectivity_channels=8):
+        super().__init__(channels, connectivity_channels, kernel_size=1)
+        self.connectivity_channels = connectivity_channels
+
+    def direction_alignment(self, direction_logits):
+        return direction_logits.new_zeros(
+            direction_logits.shape[0],
+            self.connectivity_channels,
+            direction_logits.shape[-2],
+            direction_logits.shape[-1],
+        )
+
+    def forward(self, feature, direction_alignment=None, skeleton_prob=None):
+        return super().forward(feature)
+
+
 class StageTopologyPredictor(nn.Module):
     def __init__(self, channels, connectivity_channels=8):
         super().__init__()
