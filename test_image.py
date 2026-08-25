@@ -24,6 +24,7 @@ from networks.vision_transformer import (
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
+from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
@@ -277,6 +278,11 @@ if __name__ == "__main__":
     # 加载模型
     if checkpoint is not None:
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            adapt_connectivity_modules_for_checkpoint(
+                model,
+                checkpoint['model_state_dict'],
+                "standard",
+            )
             load_topology_checkpoint_state(
                 model,
                 checkpoint['model_state_dict'],
