@@ -161,7 +161,12 @@ def adapt_connectivity_modules_for_checkpoint(model, state_dict, model_impl):
         first = head.edge_mlp[0]
         channels = (int(first.in_channels) - 3) // divisor
         connectivity_channels = getattr(head, "connectivity_channels", 8)
-        module.connectivity_head = legacy_cls(channels, connectivity_channels)
+        device = first.weight.device
+        dtype = first.weight.dtype
+        module.connectivity_head = legacy_cls(channels, connectivity_channels).to(
+            device=device,
+            dtype=dtype,
+        )
         replaced += 1
     if replaced:
         print(
