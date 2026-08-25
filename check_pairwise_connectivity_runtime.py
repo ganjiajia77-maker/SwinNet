@@ -8,6 +8,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg", type=str, default="configs/swin_tiny_patch4_window7_224_lite.yaml")
     parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_classes", type=int, default=1)
     parser.add_argument("--structure_profile", type=str, default="stage23_boundary_0626")
     parser.add_argument("--disable_msfe_skip", action="store_true")
