@@ -244,6 +244,7 @@ def load_topology_checkpoint_state(
     )
     obsolete_unexpected_prefixes = (
         "swin_unet.encoder_stage1_road_attention_head.",
+        "swin_unet.guided_head.surface_selective_fusion.",
     )
     filtered_state_dict = {}
     skipped_obsolete_keys = []
@@ -254,6 +255,7 @@ def load_topology_checkpoint_state(
             and (
                 key.endswith(obsolete_unexpected_suffixes)
                 or key.startswith(obsolete_unexpected_prefixes)
+                or key.startswith(highres_structure_missing_prefixes)
             )
         ):
             skipped_obsolete_keys.append(key)
