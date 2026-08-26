@@ -145,9 +145,11 @@ parser.add_argument(
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
-parser.add_argument('--stage_direction_factor', type=float, default=0.2)
+parser.add_argument('--stage_direction_factor', type=float, default=0.1)
+parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
+parser.add_argument('--boundary_weight', type=float, default=None, help='override boundary auxiliary loss weight')
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
@@ -157,6 +159,8 @@ parser.add_argument('--pretrained_lr', type=float, default=5e-5, help='LR for te
 parser.add_argument('--pretrained_min_lr', type=float, default=5e-6)
 parser.add_argument('--new_lr', type=float, default=2e-4, help='LR for all randomly initialized tensors')
 parser.add_argument('--new_min_lr', type=float, default=1e-5)
+parser.add_argument('--connectivity_pos_weight', type=float, default=5.0, help='positive class weight for connectivity BCE/focal BCE')
+parser.add_argument('--connectivity_focal_gamma', type=float, default=1.5, help='gamma for focal weighting on connectivity BCE; 0 disables focal weighting')
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
 parser.add_argument(
     '--bottleneck_type',
@@ -292,16 +296,20 @@ if args.freeze_post_refine_interaction_only:
 
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
-        return {
+        weights = {
             "skeleton_weight": 0.10,
             "connectivity_weight": 0.03,
             "boundary_weight": 0.01,
         }
-    return {
-        "skeleton_weight": 0.02,
-        "connectivity_weight": 0.03,
-        "boundary_weight": 0.03,
-    }
+    else:
+        weights = {
+            "skeleton_weight": 0.02,
+            "connectivity_weight": 0.03,
+            "boundary_weight": 0.03,
+        }
+    if args.boundary_weight is not None:
+        weights["boundary_weight"] = float(args.boundary_weight)
+    return weights
 
 def get_graph_outputs_from_model(model):
     module = model.module if hasattr(model, "module") else model
@@ -337,7 +345,7 @@ def build_criterion(args, loss_weights, device):
             stage3_weight,
         ),
         road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
-        stage_connectivity_factor=0.5,
+        stage_connectivity_factor=args.stage_connectivity_factor,
         stage_direction_factor=args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
         stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
@@ -347,6 +355,8 @@ def build_criterion(args, loss_weights, device):
         use_legacy_stage_connectivity_loss=(
             args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
         ),
+        connectivity_pos_weight=args.connectivity_pos_weight,
+        connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).to(device)
 
 
@@ -369,8 +379,9 @@ def format_training_config_lines(args, loss_weights):
             ),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
             "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
-            "stage connectivity/consistency loss disabled".format(
-                args.stage_direction_factor
+            "{:.3f}*connectivity loss; consistency disabled".format(
+                args.stage_direction_factor,
+                args.stage_connectivity_factor,
             ),
             "  Stage skeleton-connectivity consistency: disabled",
             "  Encoder road attention: A1/A2 priors active for residual PatchMerging and Stage3 road attention bias",
@@ -416,6 +427,7 @@ def format_training_config_lines(args, loss_weights):
         f"stage2_grad_ratio={args.stage2_skeleton_gradient_ratio}, "
         f"stage3_grad_ratio={args.stage3_skeleton_gradient_ratio}, "
         f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
+        f"connectivity_factor={args.stage_connectivity_factor}, "
         f"direction_factor={args.stage_direction_factor}, "
         f"sc_s2c={args.stage_sc_s2c_weight}, "
         f"sc_c2s={args.stage_sc_c2s_weight}, "
@@ -456,6 +468,10 @@ def format_training_config_lines(args, loss_weights):
         "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
         "  Final skeleton loss weight: {:.2f}".format(loss_weights["skeleton_weight"]),
         "  Final connectivity loss weight: {:.2f}".format(loss_weights["connectivity_weight"]),
+        "  Connectivity loss balance: pos_weight={:.3f}, focal_gamma={:.3f}".format(
+            args.connectivity_pos_weight,
+            args.connectivity_focal_gamma,
+        ),
         "  Edge loss: disabled",
         "  Edge skip enhance: disabled",
         f"  Decoder skip MSFE: {'disabled' if args.disable_msfe_skip else 'enabled'}",

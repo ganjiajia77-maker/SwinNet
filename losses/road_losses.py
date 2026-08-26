@@ -318,6 +318,8 @@ class SurfaceStructureLoss(nn.Module):
         highres_structure_skeleton_weight=0.0,
         use_legacy_stage_connectivity_loss=False,
         use_masked_connectivity_center_experiment=False,
+        connectivity_pos_weight=1.0,
+        connectivity_focal_gamma=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -358,6 +360,8 @@ class SurfaceStructureLoss(nn.Module):
         self.use_masked_connectivity_center_experiment = bool(
             use_masked_connectivity_center_experiment
         )
+        self.connectivity_pos_weight = float(connectivity_pos_weight)
+        self.connectivity_focal_gamma = float(connectivity_focal_gamma)
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
 
@@ -370,6 +374,24 @@ class SurfaceStructureLoss(nn.Module):
             size=reference.shape[-2:],
             mode=mode,
         )
+
+    def _connectivity_bce_map(self, connectivity_logits, connectivity_gt):
+        pos_weight = None
+        if self.connectivity_pos_weight != 1.0:
+            pos_weight = connectivity_logits.new_tensor(self.connectivity_pos_weight)
+        bce_map = F.binary_cross_entropy_with_logits(
+            connectivity_logits,
+            connectivity_gt,
+            pos_weight=pos_weight,
+            reduction="none",
+        )
+        if self.connectivity_focal_gamma > 0:
+            prob = torch.sigmoid(connectivity_logits)
+            pt = prob * connectivity_gt + (1.0 - prob) * (1.0 - connectivity_gt)
+            bce_map = bce_map * (1.0 - pt).clamp_min(1e-6).pow(
+                self.connectivity_focal_gamma
+            )
+        return bce_map
 
     @staticmethod
     def _spatial_boundary_mask(reference, valid_mask=None):
@@ -463,10 +485,10 @@ class SurfaceStructureLoss(nn.Module):
         symmetry_weight=0.20,
     ):
         if self.use_legacy_stage_connectivity_loss and not use_skeleton_center_mask:
-            return F.binary_cross_entropy_with_logits(
+            return self._connectivity_bce_map(
                 connectivity_logits,
                 connectivity_gt,
-            )
+            ).mean()
 
         corridor = skeleton_dilate_gt.clamp(0.0, 1.0)
         if corridor.sum() <= 0:
@@ -477,11 +499,7 @@ class SurfaceStructureLoss(nn.Module):
             center_mask = (center_source > 0.5).to(dtype=connectivity_logits.dtype)
             valid = center_mask.expand_as(connectivity_logits)
 
-        bce_map = F.binary_cross_entropy_with_logits(
-            connectivity_logits,
-            connectivity_gt,
-            reduction="none",
-        )
+        bce_map = self._connectivity_bce_map(connectivity_logits, connectivity_gt)
         if use_skeleton_center_mask:
             loss_bce = (bce_map * valid).sum() / valid.sum().clamp_min(1.0)
         else:
@@ -671,7 +689,19 @@ class SurfaceStructureLoss(nn.Module):
                 stage_skel,
                 stage_skel_dilate,
             )
-            loss_connectivity_stage = loss_skeleton_stage * 0.0
+            stage_connectivity_gt = build_connectivity_target(stage_skel)
+            loss_connectivity_stage = self.stage_connectivity_loss(
+                stage_connectivity_logits,
+                stage_connectivity_gt,
+                stage_skel_dilate,
+                valid_mask=stage_skel,
+                use_skeleton_center_mask=self.use_masked_connectivity_center_experiment,
+                symmetry_weight=(
+                    0.05
+                    if self.use_masked_connectivity_center_experiment
+                    else 0.20
+                ),
+            )
             loss_skeleton_connectivity_consistency = loss_skeleton_stage * 0.0
             direction_logits = stage_output.get("direction")
             if direction_logits is not None and self.stage_direction_factor > 0:
@@ -702,6 +732,7 @@ class SurfaceStructureLoss(nn.Module):
                 loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
                 loss_skeleton_stage
+                + self.stage_connectivity_factor * loss_connectivity_stage
                 + self.stage_direction_factor * loss_direction_stage
             )
 
@@ -914,10 +945,9 @@ class SurfaceStructureLoss(nn.Module):
                 )
             else:
                 connectivity_valid = self._connectivity_boundary_mask(connectivity_logits, valid_mask)
-                connectivity_loss_map = F.binary_cross_entropy_with_logits(
+                connectivity_loss_map = self._connectivity_bce_map(
                     connectivity_logits,
                     connectivity_gt,
-                    reduction="none",
                 )
                 loss_connectivity = (connectivity_loss_map * connectivity_valid).sum() / connectivity_valid.sum().clamp_min(1.0)
         else:
