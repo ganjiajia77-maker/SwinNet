@@ -689,19 +689,7 @@ class SurfaceStructureLoss(nn.Module):
                 stage_skel,
                 stage_skel_dilate,
             )
-            stage_connectivity_gt = build_connectivity_target(stage_skel)
-            loss_connectivity_stage = self.stage_connectivity_loss(
-                stage_connectivity_logits,
-                stage_connectivity_gt,
-                stage_skel_dilate,
-                valid_mask=stage_skel,
-                use_skeleton_center_mask=self.use_masked_connectivity_center_experiment,
-                symmetry_weight=(
-                    0.05
-                    if self.use_masked_connectivity_center_experiment
-                    else 0.20
-                ),
-            )
+            loss_connectivity_stage = loss_skeleton_stage * 0.0
             loss_skeleton_connectivity_consistency = loss_skeleton_stage * 0.0
             direction_logits = stage_output.get("direction")
             if direction_logits is not None and self.stage_direction_factor > 0:
@@ -732,7 +720,6 @@ class SurfaceStructureLoss(nn.Module):
                 loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
                 loss_skeleton_stage
-                + self.stage_connectivity_factor * loss_connectivity_stage
                 + self.stage_direction_factor * loss_direction_stage
             )
 
