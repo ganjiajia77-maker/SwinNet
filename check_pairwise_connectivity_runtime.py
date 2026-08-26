@@ -49,16 +49,22 @@ def main():
     state = model.state_dict()
     has_pairwise = any(".connectivity_head.edge_mlp." in key for key in state)
     has_axis_basis = any(".connectivity_head.axis_basis" in key for key in state)
+    has_prior_embed = any(".connectivity_head.prior_embed." in key for key in state)
     has_old_conv = any(key.endswith(".connectivity_head.weight") for key in state)
     print(f"runtime pairwise edge_mlp: {has_pairwise}")
     print(f"runtime axis_basis: {has_axis_basis}")
+    print(f"runtime prior_embed: {has_prior_embed}")
     print(f"runtime old conv: {has_old_conv}")
-    for key, value in state.items():
-        if "decoder_structure_blocks.2.connectivity_head" in key:
-            print(key, tuple(value.shape))
-            break
-    if not has_pairwise or not has_axis_basis or has_old_conv:
-        raise SystemExit("Runtime connectivity head is not the expected pairwise head.")
+    preferred_key = "swin_unet.decoder_structure_blocks.2.connectivity_head.edge_mlp.0.weight"
+    if preferred_key in state:
+        print(preferred_key, tuple(state[preferred_key].shape))
+    else:
+        for key, value in state.items():
+            if "decoder_structure_blocks.2.connectivity_head" in key:
+                print(key, tuple(value.shape))
+                break
+    if not has_pairwise or not has_axis_basis or not has_prior_embed or has_old_conv:
+        raise SystemExit("Runtime connectivity head is not the expected pairwise prior-embedding head.")
 
 
 if __name__ == "__main__":

@@ -159,7 +159,10 @@ def adapt_connectivity_modules_for_checkpoint(model, state_dict, model_impl):
         if head is None or not hasattr(head, "edge_mlp"):
             continue
         first = head.edge_mlp[0]
-        channels = (int(first.in_channels) - 3) // divisor
+        channels = int(getattr(head, "feature_channels", 0))
+        if channels <= 0:
+            prior_channels = int(getattr(head, "prior_channels", 3))
+            channels = (int(first.in_channels) - prior_channels) // divisor
         connectivity_channels = getattr(head, "connectivity_channels", 8)
         device = first.weight.device
         dtype = first.weight.dtype
@@ -211,19 +214,15 @@ def load_model(args, device):
             "swin_unet.decoder_structure_blocks.2.connectivity_head.edge_mlp.0.weight"
         )
         if probe is not None and probe.dim() == 4:
-            # Standard pairwise head uses [feature, neighbor, skel_p, skel_q, dir_prior]
-            # -> 2C+3.  In these blocks hidden_channels is C/2, so input is 4*out+3.
-            # Selective-fusion head adds [feature-neighbor, feature*neighbor] -> 4C+3,
-            # which is 8*out+3 for the same hidden width.
+            # Standard pairwise head uses [feature, neighbor, prior_embed] -> 2C+P.
+            # In these blocks hidden_channels is C/2, so input is 4*out+P.
+            # Selective-fusion head adds [feature-neighbor, feature*neighbor] -> 4C+P,
+            # which is 8*out+P for the same hidden width. Older checkpoints used P=3.
             out_channels = int(probe.shape[0])
             in_channels = int(probe.shape[1])
-            if in_channels == 4 * out_channels + 3:
+            if in_channels in (4 * out_channels + 3, 4 * out_channels + 16):
                 model_impl = "standard"
-            elif in_channels == 8 * out_channels + 3:
-                model_impl = "selective"
-            elif in_channels == 4 * out_channels + 1:
-                model_impl = "standard"
-            elif in_channels == 8 * out_channels + 1:
+            elif in_channels in (8 * out_channels + 3, 8 * out_channels + 16):
                 model_impl = "selective"
             else:
                 model_impl = "selective" if "selective" in str(saved_args.get("run_name", "")).lower() else "standard"

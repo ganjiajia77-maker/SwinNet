@@ -137,8 +137,15 @@ class PairwiseConnectivityHead(nn.Module):
             raise ValueError("PairwiseConnectivityHead expects 8 connectivity channels.")
         hidden_channels = hidden_channels or max(channels // 2, 16)
         self.connectivity_channels = connectivity_channels
+        self.feature_channels = channels
+        self.prior_channels = 16
+        self.prior_embed = nn.Sequential(
+            nn.Conv2d(3, self.prior_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.prior_channels),
+            nn.ReLU(inplace=True),
+        )
         self.edge_mlp = nn.Sequential(
-            nn.Conv2d(4 * channels + 3, hidden_channels, kernel_size=1, bias=False),
+            nn.Conv2d(4 * channels + self.prior_channels, hidden_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
@@ -185,15 +192,23 @@ class PairwiseConnectivityHead(nn.Module):
         for idx, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
             neighbor = self._shift_feature(feature, dy, dx)
             neighbor_skeleton = self._shift_feature(skeleton_prob, dy, dx)
+            prior_feature = self.prior_embed(
+                torch.cat(
+                    [
+                        skeleton_prob,
+                        neighbor_skeleton,
+                        direction_alignment[:, idx:idx + 1],
+                    ],
+                    dim=1,
+                )
+            )
             edge_feature = torch.cat(
                 [
                     feature,
                     neighbor,
                     feature - neighbor,
                     feature * neighbor,
-                    skeleton_prob,
-                    neighbor_skeleton,
-                    direction_alignment[:, idx:idx + 1],
+                    prior_feature,
                 ],
                 dim=1,
             )

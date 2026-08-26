@@ -145,8 +145,8 @@ parser.add_argument(
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
-parser.add_argument('--stage_direction_factor', type=float, default=0.2)
-parser.add_argument('--stage_connectivity_factor', type=float, default=0.5)
+parser.add_argument('--stage_direction_factor', type=float, default=0.1)
+parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--final_skeleton_weight', type=float, default=None, help='override final skeleton auxiliary loss weight')
@@ -189,13 +189,13 @@ parser.add_argument(
 parser.add_argument(
     '--connectivity_pos_weight',
     type=float,
-    default=1.0,
+    default=5.0,
     help='positive class weight for connectivity BCE/focal BCE',
 )
 parser.add_argument(
     '--connectivity_focal_gamma',
     type=float,
-    default=0.0,
+    default=1.5,
     help='gamma for focal weighting on connectivity BCE; 0 disables focal weighting',
 )
 parser.add_argument(
