@@ -30,6 +30,7 @@ args = argparse.Namespace(
     dataset="ImageData",
     n_class=2,
     batch_size=4,
+    img_size=256,
 )
 config = get_config(args)
 model = SwinUnet(
