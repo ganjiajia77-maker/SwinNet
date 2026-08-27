@@ -12,6 +12,7 @@ from tqdm import tqdm
 from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from networks.vision_transformer import (
+    STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet,
     load_topology_checkpoint_state,
@@ -35,6 +36,28 @@ def parse_args():
     parser.add_argument("--stage2_skeleton_gradient_ratio", type=float, default=0.5)
     parser.add_argument("--stage3_skeleton_gradient_ratio", type=float, default=0.5)
     parser.add_argument("--final_skeleton_gradient_ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--structure_profile",
+        type=str,
+        default=STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        choices=(STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626),
+    )
+    parser.add_argument("--stage_topology_stages", type=str, default="none")
+    parser.add_argument("--stage_topology_alpha_max", type=float, default=1.0)
+    parser.add_argument("--stage_topology_alpha_init", type=float, default=0.1)
+    parser.add_argument(
+        "--stage_topology_bias_mode",
+        type=str,
+        default="pairwise_skeleton",
+    )
+    parser.add_argument("--stage_topology_ratio", type=float, default=0.08)
+    parser.add_argument("--stage_topology_topo_clip", type=float, default=4.0)
+    parser.add_argument("--disable_msfe_skip", action="store_true")
+    parser.add_argument("--enable_highres_structure_stream", action="store_true")
+    parser.add_argument("--highres_structure_channels", type=int, default=64)
+    parser.add_argument("--highres_structure_fuse_stages", type=str, default="stage23")
+    parser.add_argument("--highres_structure_fusion_mode", type=str, default="stage23")
+    parser.add_argument("--enable_post_refine_structure_interaction", action="store_true")
     parser.add_argument(
         "--bottleneck_type",
         type=str,
@@ -64,6 +87,35 @@ def parse_args():
     return parser.parse_args()
 
 
+def inherit_checkpoint_architecture_args(args, checkpoint):
+    saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
+    saved_profile = checkpoint.get("structure_profile")
+    if saved_profile:
+        args.structure_profile = saved_profile
+
+    for name in (
+        "structure_profile",
+        "stage_topology_stages",
+        "stage_topology_alpha_max",
+        "stage_topology_alpha_init",
+        "stage_topology_bias_mode",
+        "stage_topology_ratio",
+        "stage_topology_topo_clip",
+        "stage2_skeleton_gradient_ratio",
+        "stage3_skeleton_gradient_ratio",
+        "final_skeleton_gradient_ratio",
+        "bottleneck_type",
+        "disable_msfe_skip",
+        "enable_highres_structure_stream",
+        "highres_structure_channels",
+        "highres_structure_fuse_stages",
+        "highres_structure_fusion_mode",
+        "enable_post_refine_structure_interaction",
+    ):
+        if name in saved_args:
+            setattr(args, name, saved_args[name])
+
+
 def build_model(args):
     config = get_config(args)
     model = SwinUnet(
@@ -75,12 +127,25 @@ def build_model(args):
         bottleneck_type=args.bottleneck_type,
         final_topology_eta_init=0.0,
         final_gap_rho_init=0.0,
-        stage_topology_stages="none",
-        structure_profile=STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        stage_topology_stages=args.stage_topology_stages,
+        stage_topology_alpha_max=args.stage_topology_alpha_max,
+        stage_topology_alpha_init=args.stage_topology_alpha_init,
+        stage_topology_bias_mode=args.stage_topology_bias_mode,
+        stage_topology_ratio=args.stage_topology_ratio,
+        stage_topology_topo_clip=args.stage_topology_topo_clip,
+        structure_profile=args.structure_profile,
         enable_final_graph_prop=False,
+        use_msfe_skip=not args.disable_msfe_skip,
         stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
         stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
         final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
+        enable_highres_structure_stream=args.enable_highres_structure_stream,
+        highres_structure_channels=args.highres_structure_channels,
+        highres_structure_fuse_stages=args.highres_structure_fuse_stages,
+        highres_structure_fusion_mode=args.highres_structure_fusion_mode,
+        enable_post_refine_structure_interaction=(
+            args.enable_post_refine_structure_interaction
+        ),
     )
     return model.cuda()
 
@@ -131,8 +196,9 @@ def main():
         raise FileNotFoundError(args.checkpoint)
 
     thresholds = [float(x.strip()) for x in args.thresholds.split(",") if x.strip()]
-    model = build_model(args)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    inherit_checkpoint_architecture_args(args, checkpoint)
+    model = build_model(args)
     load_topology_checkpoint_state(
         model,
         checkpoint["model_state_dict"],
@@ -142,6 +208,15 @@ def main():
     print("[LOAD]", args.checkpoint)
     print("[LOAD] epoch:", checkpoint.get("epoch"))
     print("[LOAD] saved val_iou:", checkpoint.get("val_iou"))
+    print(
+        "[LOAD] architecture: "
+        f"profile={args.structure_profile}, "
+        f"disable_msfe_skip={args.disable_msfe_skip}, "
+        f"highres_structure={args.enable_highres_structure_stream}, "
+        f"fuse_stages={args.highres_structure_fuse_stages}, "
+        f"fusion_mode={args.highres_structure_fusion_mode}",
+        flush=True,
+    )
     print_topology_coefficients(model, prefix="[SWEEP]")
 
     dataset = RoadSkeletonDataset(

@@ -11,8 +11,11 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from analyze_structure_supervision import DIR_NAMES, DIR_OFFSETS
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from topology_direction_constants import CONNECTIVITY_DIR_NAMES, connectivity_double_angle_basis
+
+DIR_NAMES = list(CONNECTIVITY_DIR_NAMES)
+DIR_OFFSETS = connectivity_double_angle_basis()
 
 
 def angle_from_vec(vec):

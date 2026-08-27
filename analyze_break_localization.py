@@ -19,21 +19,10 @@ from networks.vision_transformer import (
     load_topology_checkpoint_state,
     print_topology_coefficients,
 )
+from topology_direction_constants import CONNECTIVITY_DIRECTIONS, connectivity_double_angle_basis
 
 
-DIR_OFFSETS = torch.tensor(
-    [
-        [-1, 0],
-        [1, 0],
-        [0, -1],
-        [0, 1],
-        [-1, -1],
-        [-1, 1],
-        [1, -1],
-        [1, 1],
-    ],
-    dtype=torch.float32,
-)
+DIR_OFFSETS = connectivity_double_angle_basis()
 
 
 def parse_args():

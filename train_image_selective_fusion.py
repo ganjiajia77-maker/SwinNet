@@ -10,6 +10,7 @@ import time
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from datetime import datetime
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -32,11 +33,13 @@ except ImportError:
             "training has been removed from this cleaned model."
         )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from losses.road_losses import SurfaceStructureLoss
+from losses.road_losses import (
+    SurfaceStructureLoss,
+    build_connectivity_target,
+    build_stage_skeleton_target,
+)
 from config import get_config
-
-
-CONNECTIVITY_DIR_NAMES = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+from topology_direction_constants import CONNECTIVITY_DIR_NAMES
 
 
 def seed_worker(worker_id):
@@ -157,6 +160,7 @@ parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
 parser.add_argument('--stage_direction_factor', type=float, default=0.2)
+parser.add_argument('--stage_connectivity_factor', type=float, default=0.5)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
@@ -168,6 +172,17 @@ parser.add_argument('--pretrained_lr', type=float, default=5e-5, help='LR for te
 parser.add_argument('--pretrained_min_lr', type=float, default=5e-6)
 parser.add_argument('--new_lr', type=float, default=2e-4, help='LR for all randomly initialized tensors')
 parser.add_argument('--new_min_lr', type=float, default=1e-5)
+parser.add_argument(
+    '--train_connectivity_heads_only',
+    action='store_true',
+    help='freeze the loaded model and train only decoder stage2/3 connectivity heads',
+)
+parser.add_argument(
+    '--connectivity_head_lr',
+    type=float,
+    default=3e-4,
+    help='LR used by --train_connectivity_heads_only',
+)
 parser.add_argument('--disable_centerline_loss', action='store_true', help='disable the centerline response term for debugging NaN instability')
 parser.add_argument(
     '--bottleneck_type',
@@ -202,6 +217,18 @@ parser.add_argument(
     '--masked_connectivity_center_experiment',
     action='store_true',
     help='use skeleton-center connectivity BCE plus small reciprocal symmetry regularization',
+)
+parser.add_argument(
+    '--connectivity_pos_weight',
+    type=float,
+    default=1.0,
+    help='positive class weight for connectivity BCE/focal BCE',
+)
+parser.add_argument(
+    '--connectivity_focal_gamma',
+    type=float,
+    default=0.0,
+    help='gamma for focal weighting on connectivity BCE; 0 disables focal weighting',
 )
 parser.add_argument(
     '--disable_msfe_skip',
@@ -451,13 +478,14 @@ def build_criterion(args, loss_weights, device):
         else loss_weights["boundary_weight"]
     )
 
+    connectivity_head_only = args.train_connectivity_heads_only
     return SurfaceStructureLoss(
         surface_dice_weight=0.5,
         skeleton_dice_weight=1.0,
-        skeleton_weight=loss_weights["skeleton_weight"],
-        connectivity_weight=loss_weights["connectivity_weight"],
+        skeleton_weight=0.0 if connectivity_head_only else loss_weights["skeleton_weight"],
+        connectivity_weight=0.0 if connectivity_head_only else loss_weights["connectivity_weight"],
         connectivity_erode_kernel_size=1,
-        boundary_weight=boundary_weight,
+        boundary_weight=0.0 if connectivity_head_only else boundary_weight,
         boundary_radius=1,
         stage_structure_weights=(
             0.0,
@@ -465,19 +493,112 @@ def build_criterion(args, loss_weights, device):
             stage2_weight,
             stage3_weight,
         ),
-        road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
-        stage_connectivity_factor=0.5,
-        stage_direction_factor=args.stage_direction_factor,
+        road_attention_weight=0.0 if (args.freeze_0626_backbone or connectivity_head_only) else args.road_attention_weight,
+        stage_connectivity_factor=args.stage_connectivity_factor,
+        stage_direction_factor=0.0 if connectivity_head_only else args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
         stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
         highres_structure_skeleton_weight=(
-            0.0 if args.freeze_0626_backbone else args.highres_structure_skeleton_weight
+            0.0 if (args.freeze_0626_backbone or connectivity_head_only) else args.highres_structure_skeleton_weight
         ),
         use_legacy_stage_connectivity_loss=(
             args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
         ),
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
+        connectivity_pos_weight=args.connectivity_pos_weight,
+        connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).to(device)
+
+
+def connectivity_heads_only_loss(
+    criterion,
+    stage_outputs,
+    connectivity_gt,
+    skeleton_gt,
+    skeleton_dilate_gt,
+    stage_weights,
+):
+    total = None
+    used = 0
+    raw_sum = 0.0
+    for idx, stage_output in enumerate(stage_outputs or []):
+        try:
+            stage_index = int(stage_output.get("stage", idx))
+        except (TypeError, ValueError):
+            continue
+        if stage_index not in (2, 3):
+            continue
+        if stage_index >= len(stage_weights) or stage_weights[stage_index] <= 0:
+            continue
+        connectivity_logits = stage_output.get("connectivity")
+        if connectivity_logits is None:
+            continue
+
+        target_size = connectivity_logits.shape[-2:]
+        stage_skel = build_stage_skeleton_target(
+            skeleton_gt,
+            target_size,
+        ).to(device=connectivity_logits.device, dtype=connectivity_logits.dtype)
+        stage_skel_dilate = build_stage_skeleton_target(
+            skeleton_dilate_gt,
+            target_size,
+        ).to(device=connectivity_logits.device, dtype=connectivity_logits.dtype)
+        stage_connectivity_gt = build_connectivity_target(stage_skel).to(
+            device=connectivity_logits.device,
+            dtype=connectivity_logits.dtype,
+        )
+        raw_loss = criterion.stage_connectivity_loss(
+            connectivity_logits,
+            stage_connectivity_gt,
+            stage_skel_dilate,
+            valid_mask=stage_skel_dilate,
+            use_skeleton_center_mask=criterion.use_masked_connectivity_center_experiment,
+            symmetry_weight=0.05 if criterion.use_masked_connectivity_center_experiment else 0.20,
+        )
+        weighted = float(stage_weights[stage_index]) * raw_loss
+        total = weighted if total is None else total + weighted
+        raw_sum += float(raw_loss.detach().item())
+        used += 1
+
+    if total is None:
+        raise RuntimeError(
+            "No stage2/3 connectivity logits were found for --train_connectivity_heads_only."
+        )
+    if not total.requires_grad:
+        raise RuntimeError(
+            "Connectivity-head-only loss has no grad path. "
+            "Check that the active stage2/3 connectivity_head parameters are trainable."
+        )
+    loss_dict = {
+        "total_loss": total.detach(),
+        "surface_loss": total.detach() * 0.0,
+        "surface_total_loss": total.detach() * 0.0,
+        "skeleton_loss": total.detach() * 0.0,
+        "connectivity_loss": total.detach(),
+        "boundary_loss": total.detach() * 0.0,
+        "skeleton_stage_loss": total.detach() * 0.0,
+        "stage_structure_loss": total.detach(),
+        "road_attention_loss": total.detach() * 0.0,
+        "loss_highres_structure_skeleton": total.detach() * 0.0,
+        "highres_structure_skeleton_raw": total.detach() * 0.0,
+        "structure_delta_mean": total.detach() * 0.0,
+        "structure_delta_abs_mean": total.detach() * 0.0,
+        "structure_delta_abs_max": total.detach() * 0.0,
+        "structure_delta_weak_skeleton_fn_mean": total.detach() * 0.0,
+        "structure_delta_skeleton_tp_mean": total.detach() * 0.0,
+        "structure_delta_background_mean": total.detach() * 0.0,
+        "surface_bce": total.detach() * 0.0,
+        "surface_dice": total.detach() * 0.0,
+        "skeleton_bce": total.detach() * 0.0,
+        "skeleton_dice": total.detach() * 0.0,
+        "boundary_bce": total.detach() * 0.0,
+        "boundary_dice": total.detach() * 0.0,
+        "connectivity_gt_positive_ratio": total.detach() * 0.0,
+        "connectivity_gt_valid_pixels": total.detach() * 0.0,
+        "connectivity_gt_dir_positive_ratio": torch.zeros(8, device=total.device),
+        "stage_connectivity_raw": total.detach().new_tensor(raw_sum / max(used, 1)),
+    }
+    return total, loss_dict
 
 
 def format_training_config_lines(args, loss_weights):
@@ -513,6 +634,7 @@ def format_training_config_lines(args, loss_weights):
         if args.masked_connectivity_center_experiment:
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
+                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}",
                 "  Connectivity feature target: connectivity head output only; surface still uses detached z_struct",
             ])
         if args.enable_graph_prop:
@@ -551,11 +673,17 @@ def format_training_config_lines(args, loss_weights):
         f"stage2_grad_ratio={args.stage2_skeleton_gradient_ratio}, "
         f"stage3_grad_ratio={args.stage3_skeleton_gradient_ratio}, "
         f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
+        f"connectivity_factor={args.stage_connectivity_factor}, "
         f"direction_factor={args.stage_direction_factor}, "
         f"sc_s2c={args.stage_sc_s2c_weight}, "
         f"sc_c2s={args.stage_sc_c2s_weight}, "
         f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
+        (
+            f"  Connectivity-head-only training: enabled, lr={args.connectivity_head_lr}"
+            if args.train_connectivity_heads_only
+            else "  Connectivity-head-only training: disabled"
+        ),
         "  High-res structure stream: "
         f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
         f"channels={args.highres_structure_channels}, "
@@ -1267,6 +1395,36 @@ if __name__ == "__main__":
         )
         return trainable_names
 
+    def freeze_connectivity_heads_only():
+        trainable_names = []
+        target_fragments = (
+            "stage2_topology_source.connectivity_head.",
+            "decoder_structure_blocks.2.connectivity_head.",
+            "decoder_structure_blocks.3.connectivity_head.",
+        )
+        for name, parameter in model.named_parameters():
+            keep_trainable = any(fragment in name for fragment in target_fragments)
+            parameter.requires_grad_(keep_trainable)
+            if keep_trainable:
+                trainable_names.append(name)
+        if not trainable_names:
+            raise RuntimeError(
+                "No decoder stage2/3 connectivity head parameters found. "
+                "Check the selected architecture before using --train_connectivity_heads_only."
+            )
+        print(
+            "[INFO] Frozen full model; training only "
+            f"{len(trainable_names)} stage2/3 connectivity-head tensors.",
+            flush=True,
+        )
+        print(
+            "[INFO] Trainable connectivity-head tensors: "
+            + ", ".join(trainable_names[:12])
+            + (" ..." if len(trainable_names) > 12 else ""),
+            flush=True,
+        )
+        return trainable_names
+
     # 加载数据
     def load_warm_start_checkpoint(path):
         if not path:
@@ -1480,9 +1638,28 @@ if __name__ == "__main__":
     if args.freeze_post_refine_interaction_only:
         freeze_post_refine_interaction_only()
         optimizer = None
+    if args.train_connectivity_heads_only:
+        freeze_connectivity_heads_only()
+        optimizer = None
 
     if optimizer is None:
-        if args.freeze_0626_backbone:
+        if args.train_connectivity_heads_only:
+            connectivity_head_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                [{
+                    'params': connectivity_head_params,
+                    'lr': args.connectivity_head_lr,
+                    'initial_lr': args.connectivity_head_lr,
+                    'group_name': 'connectivity_head_only',
+                }],
+                lr=args.connectivity_head_lr,
+                weight_decay=0.0001,
+            )
+            print(
+                f"[INFO] Connectivity-head-only optimizer: {len(connectivity_head_params)} tensors at {args.connectivity_head_lr:g}",
+                flush=True,
+            )
+        elif args.freeze_0626_backbone:
             graph_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(
                 graph_params,
@@ -1632,6 +1809,11 @@ if __name__ == "__main__":
                         epoch, args.max_epochs, args.pretrained_lr,
                         args.pretrained_min_lr, args.warmup_epochs
                     )
+                elif param_group.get('group_name') == 'connectivity_head_only':
+                    param_group['lr'] = get_cosine_warmup_lr(
+                        epoch, args.max_epochs, args.connectivity_head_lr,
+                        args.new_min_lr, args.warmup_epochs
+                    )
                 else:
                     param_group['lr'] = current_lr
 
@@ -1710,20 +1892,35 @@ if __name__ == "__main__":
                 skeletons_padded = crop_to_shape(skeletons_padded, orig_shape)
                 skeletons_dilate_padded = crop_to_shape(skeletons_dilate_padded, orig_shape)
                 
-                loss, loss_dict = criterion(
-                    surface_logits,
-                    surface_gt=masks_padded,
-                    skeleton_gt=skeletons_padded,
-                    skeleton_dilate_gt=skeletons_dilate_padded,
-                    stage_outputs=stage_outputs,
-                    boundary_logits=boundary_logits,
-                    skeleton_logits=skeleton_logits,
-                    connectivity_logits=connectivity_logits,
-                    connectivity_gt=connectivity_gt,
-                    direction_gt=direction_gt,
-                    boundary_gt=boundary_gt,
-                    valid_mask=valid_mask,
-                )
+                if args.train_connectivity_heads_only:
+                    loss, loss_dict = connectivity_heads_only_loss(
+                        criterion,
+                        stage_outputs,
+                        connectivity_gt,
+                        skeletons_padded,
+                        skeletons_dilate_padded,
+                        (
+                            0.0,
+                            0.0,
+                            args.stage2_skeleton_weight,
+                            args.stage3_skeleton_weight,
+                        ),
+                    )
+                else:
+                    loss, loss_dict = criterion(
+                        surface_logits,
+                        surface_gt=masks_padded,
+                        skeleton_gt=skeletons_padded,
+                        skeleton_dilate_gt=skeletons_dilate_padded,
+                        stage_outputs=stage_outputs,
+                        boundary_logits=boundary_logits,
+                        skeleton_logits=skeleton_logits,
+                        connectivity_logits=connectivity_logits,
+                        connectivity_gt=connectivity_gt,
+                        direction_gt=direction_gt,
+                        boundary_gt=boundary_gt,
+                        valid_mask=valid_mask,
+                    )
 
                 if not torch.isfinite(loss):
                     skipped_batches += 1

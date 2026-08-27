@@ -21,33 +21,19 @@ from analyze_structure_supervision import (
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.cldice_loss import soft_skeletonize
-from losses.road_losses import build_connectivity_target
+from losses.road_losses import build_connectivity_target, build_stage_skeleton_target
+from topology_direction_constants import (
+    AXIAL_DIR_NAMES,
+    AXIAL_DIRECTIONS,
+    CONNECTIVITY_DIR_NAMES,
+    CONNECTIVITY_DIRECTIONS,
+    CONNECTIVITY_OPPOSITE,
+    axial_double_angle_basis,
+)
 
 
-CONNECTIVITY_DIR_NAMES = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-AXIAL_DIR_NAMES = ["N/S", "NE/SW", "E/W", "SE/NW"]
-CONNECTIVITY_DIR_OFFSETS = torch.tensor(
-    [
-        [-1, 0],
-        [-1, 1],
-        [0, 1],
-        [1, 1],
-        [1, 0],
-        [1, -1],
-        [0, -1],
-        [-1, -1],
-    ],
-    dtype=torch.float32,
-)
-AXIAL_DIR_OFFSETS = torch.tensor(
-    [
-        [-1, 0],
-        [-1, 1],
-        [0, 1],
-        [1, 1],
-    ],
-    dtype=torch.float32,
-)
+CONNECTIVITY_DIR_OFFSETS = torch.tensor(CONNECTIVITY_DIRECTIONS, dtype=torch.float32)
+AXIAL_DIR_OFFSETS = torch.tensor(AXIAL_DIRECTIONS, dtype=torch.float32)
 
 
 def install_connectivity_ablation(model, mode):
@@ -363,7 +349,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, default="./data1")
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--split", type=str, default="test", choices=["val", "test"])
+    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_batches", type=int, default=39)
@@ -435,7 +421,6 @@ def main():
         source_patch_size=args.source_patch_size,
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    batches = collect_batches(loader, args.max_batches)
 
     stage_key = args.stage
     conn_gt_rows = []
@@ -455,6 +440,10 @@ def main():
     conn_neg_count = np.zeros(8, dtype=np.float64)
     conn_pos_sum = np.zeros(8, dtype=np.float64)
     conn_neg_sum = np.zeros(8, dtype=np.float64)
+    conn_pos_logit_sum = np.zeros(8, dtype=np.float64)
+    conn_neg_logit_sum = np.zeros(8, dtype=np.float64)
+    per_dir_prob_rows = [[] for _ in range(8)]
+    per_dir_gt_rows = [[] for _ in range(8)]
     pos_probs = []
     neg_probs = []
     flat_conn_prob = []
@@ -463,9 +452,15 @@ def main():
     surface_cldice_values = []
     surface_fragment_rows = []
     graph_fragment_rows = []
+    batches_processed = 0
+    images_processed = 0
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(batches, desc=f"Evaluate {stage_key}")):
+        for batch_idx, batch in enumerate(tqdm(loader, desc=f"Evaluate {stage_key}")):
+            if args.max_batches > 0 and batch_idx >= args.max_batches:
+                break
+            batches_processed += 1
+            images_processed += int(batch["image"].shape[0])
             images = batch["image"].to(device)
             masks = (batch["mask"].to(device) > 0.5)
             skeleton_raw = batch["skeleton"].to(device).float()
@@ -491,17 +486,15 @@ def main():
             if stage_key not in selected:
                 raise RuntimeError(f"Stage {stage_key} not present in structure outputs.")
             stage_output = selected[stage_key]
-            c_prob = torch.sigmoid(stage_output["connectivity"])
+            c_logits = stage_output["connectivity"]
+            c_prob = torch.sigmoid(c_logits)
             d_logits = stage_output["direction"]
-            c_gt = resize_like(
-                build_connectivity_target(skeleton.float()),
-                c_prob,
-                mode="nearest",
-            )
+            stage_skeleton_gt = build_stage_skeleton_target(skeleton_raw, c_prob.shape[-2:]).to(device)
+            c_gt = build_connectivity_target(stage_skeleton_gt)
             d_gt = resize_like(direction_gt, d_logits[:, :1], mode="nearest")
-            skeleton_dir = resize_like(skeleton.float(), d_logits[:, :1], mode="nearest") > 0.5
+            skeleton_dir = resize_like(stage_skeleton_gt, d_logits[:, :1], mode="nearest") > 0.5
 
-            conn_valid = resize_like(skeleton.float(), c_prob[:, :1], mode="nearest") > 0.5
+            conn_valid = stage_skeleton_gt > 0.5
             conn = connectivity_stats(c_prob, c_gt, conn_valid, threshold=args.threshold)
             graph_fragment_rows.extend(
                 connectivity_graph_fragmentation_stats(
@@ -524,6 +517,26 @@ def main():
             valid_flat = conn_valid.detach().cpu().bool().expand_as(c_gt)
             flat_conn_prob.append(c_prob.detach().cpu()[valid_flat].reshape(-1).numpy())
             flat_conn_gt.append((c_gt.detach().cpu()[valid_flat].reshape(-1) > 0.5).numpy().astype(np.int32))
+            c_logits_cpu = c_logits.detach().cpu()
+            c_prob_cpu = c_prob.detach().cpu()
+            c_gt_cpu = c_gt.detach().cpu() > 0.5
+            valid_cpu = conn_valid.detach().cpu().bool()
+            for dir_idx in range(8):
+                dir_valid = valid_cpu[:, 0]
+                dir_gt = c_gt_cpu[:, dir_idx][dir_valid]
+                dir_prob = c_prob_cpu[:, dir_idx][dir_valid]
+                dir_logit = c_logits_cpu[:, dir_idx][dir_valid]
+                if dir_gt.numel() == 0:
+                    continue
+                dir_gt_np = dir_gt.reshape(-1).numpy().astype(np.int32)
+                per_dir_gt_rows[dir_idx].append(dir_gt_np)
+                per_dir_prob_rows[dir_idx].append(dir_prob.reshape(-1).numpy())
+                pos_mask = dir_gt
+                neg_mask = ~dir_gt
+                if pos_mask.any():
+                    conn_pos_logit_sum[dir_idx] += float(dir_logit[pos_mask].double().sum().item())
+                if neg_mask.any():
+                    conn_neg_logit_sum[dir_idx] += float(dir_logit[neg_mask].double().sum().item())
             symmetry_errors.append(reciprocal_symmetry_error(c_prob.detach().cpu()))
 
             d_stats = direction_stats(d_logits, d_gt, skeleton_dir.float())
@@ -546,6 +559,19 @@ def main():
     macro_f1 = float(per_dir_f1.mean())
     positive_mean = float((conn_pos_sum / np.maximum(conn_pos_count, 1.0)).mean())
     negative_mean = float((conn_neg_sum / np.maximum(conn_neg_count, 1.0)).mean())
+    per_dir_positive_ratio = conn_pos_count / np.maximum(conn_pos_count + conn_neg_count, 1.0)
+    per_dir_pos_logit_mean = conn_pos_logit_sum / np.maximum(conn_pos_count, 1.0)
+    per_dir_neg_logit_mean = conn_neg_logit_sum / np.maximum(conn_neg_count, 1.0)
+    per_dir_auc = np.full(8, np.nan, dtype=np.float64)
+    per_dir_auprc = np.full(8, np.nan, dtype=np.float64)
+    for dir_idx in range(8):
+        if not per_dir_gt_rows[dir_idx]:
+            continue
+        dir_gt = np.concatenate(per_dir_gt_rows[dir_idx], axis=0)
+        dir_prob = np.concatenate(per_dir_prob_rows[dir_idx], axis=0)
+        if np.unique(dir_gt).size > 1:
+            per_dir_auc[dir_idx] = float(roc_auc_score(dir_gt, dir_prob))
+            per_dir_auprc[dir_idx] = float(average_precision_score(dir_gt, dir_prob))
     reciprocal_error = float(np.mean(symmetry_errors))
     surface_cldice = float(np.mean(surface_cldice_values)) if surface_cldice_values else float("nan")
 
@@ -588,7 +614,7 @@ def main():
     print(f"\nCheckpoint: {args.model_path}")
     print(f"Stage: {stage_key}")
     print(f"connectivity_ablation={args.connectivity_ablation}")
-    print(f"split={args.split}, batches={len(batches)}, images={sum(batch['image'].shape[0] for batch in batches)}")
+    print(f"split={args.split}, batches={batches_processed}, images={images_processed}")
     print(f"threshold={args.threshold}, surface_threshold={args.surface_threshold}, seed={args.seed}")
     print("\nConnectivity")
     print(f"  8-dir macro Precision: {macro_precision:.4f}")
@@ -608,6 +634,22 @@ def main():
     print("  Per-direction F1:")
     for name, value in zip(CONNECTIVITY_DIR_NAMES, per_dir_f1):
         print(f"    {name}: {value:.4f}")
+    print("  Per-direction train/valid connectivity stats:")
+    print(
+        "    dir positive_count negative_count positive_ratio "
+        "AUROC AUPRC mean_positive_logit mean_negative_logit"
+    )
+    for idx, name in enumerate(CONNECTIVITY_DIR_NAMES):
+        print(
+            f"    {name} "
+            f"{int(conn_pos_count[idx])} "
+            f"{int(conn_neg_count[idx])} "
+            f"{per_dir_positive_ratio[idx]:.6f} "
+            f"{per_dir_auc[idx]:.4f} "
+            f"{per_dir_auprc[idx]:.4f} "
+            f"{per_dir_pos_logit_mean[idx]:.4f} "
+            f"{per_dir_neg_logit_mean[idx]:.4f}"
+        )
 
     print("\nTopology")
     print(f"  Surface clDice: {surface_cldice:.4f}")

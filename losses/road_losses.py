@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from direction_target_utils import build_continuous_direction_target
+from topology_direction_constants import CONNECTIVITY_DIRECTIONS, CONNECTIVITY_OPPOSITE
 
 
 class DiceLoss(nn.Module):
@@ -267,19 +268,6 @@ def build_boundary_target(surface_gt, radius=1):
     return (dilated - eroded).clamp(0.0, 1.0)
 
 
-CONNECTIVITY_DIRECTIONS = [
-    (-1, 0),   # N
-    (-1, 1),   # NE
-    (0, 1),    # E
-    (1, 1),    # SE
-    (1, 0),    # S
-    (1, -1),   # SW
-    (0, -1),   # W
-    (-1, -1),  # NW
-]
-CONNECTIVITY_OPPOSITE = (4, 5, 6, 7, 0, 1, 2, 3)
-
-
 def build_connectivity_target(skeleton_gt, erode_kernel_size=1):
     if skeleton_gt.dim() == 3:
         skeleton_gt = skeleton_gt.unsqueeze(1)
@@ -296,6 +284,17 @@ def build_connectivity_target(skeleton_gt, erode_kernel_size=1):
         targets.append(skeleton * neighbor)
 
     return torch.cat(targets, dim=1)
+
+
+def build_stage_skeleton_target(skeleton_gt, target_size):
+    if skeleton_gt.dim() == 3:
+        skeleton_gt = skeleton_gt.unsqueeze(1)
+    skeleton = (skeleton_gt > 0.5).float()
+    if tuple(skeleton.shape[-2:]) == tuple(target_size):
+        return skeleton
+    if target_size[0] <= skeleton.shape[-2] and target_size[1] <= skeleton.shape[-1]:
+        return F.adaptive_max_pool2d(skeleton, target_size).clamp(0.0, 1.0)
+    return F.interpolate(skeleton, size=target_size, mode="nearest").clamp(0.0, 1.0)
 
 
 class SurfaceStructureLoss(nn.Module):
@@ -556,16 +555,8 @@ class SurfaceStructureLoss(nn.Module):
                 break
             stage_logits = stage_output["skeleton"]
             target_size = stage_logits.shape[-2:]
-            stage_skel = F.interpolate(
-                skeleton_gt,
-                size=target_size,
-                mode="nearest",
-            )
-            stage_skel_dilate = F.interpolate(
-                skeleton_dilate_gt,
-                size=target_size,
-                mode="nearest",
-            )
+            stage_skel = build_stage_skeleton_target(skeleton_gt, target_size)
+            stage_skel_dilate = build_stage_skeleton_target(skeleton_dilate_gt, target_size)
             loss_stage, _, _ = self.skeleton_pixel_loss(
                 stage_logits,
                 stage_skel,
@@ -619,7 +610,11 @@ class SurfaceStructureLoss(nn.Module):
 
         total = skeleton_gt.sum() * 0.0
         for idx, stage_output in enumerate(stage_outputs):
-            if "skeleton" not in stage_output or "connectivity" not in stage_output:
+            if (
+                "skeleton" not in stage_output
+                and "connectivity" not in stage_output
+                and "direction" not in stage_output
+            ):
                 continue
             try:
                 stage_index = int(stage_output.get("stage", idx))
@@ -635,9 +630,17 @@ class SurfaceStructureLoss(nn.Module):
             if stage_weight <= 0:
                 continue
 
-            stage_skeleton_logits = stage_output["skeleton"]
-            stage_connectivity_logits = stage_output["connectivity"]
-            target_size = stage_skeleton_logits.shape[-2:]
+            stage_skeleton_logits = stage_output.get("skeleton")
+            stage_connectivity_logits = stage_output.get("connectivity")
+            direction_logits = stage_output.get("direction")
+            reference_logits = (
+                stage_skeleton_logits
+                if stage_skeleton_logits is not None
+                else stage_connectivity_logits
+                if stage_connectivity_logits is not None
+                else direction_logits
+            )
+            target_size = reference_logits.shape[-2:]
             source_stage_skel = (
                 stage_skeleton_gt
                 if stage_skeleton_gt is not None
@@ -648,33 +651,19 @@ class SurfaceStructureLoss(nn.Module):
                 if stage_skeleton_dilate_gt is not None
                 else skeleton_dilate_gt
             )
-            if source_stage_skel.shape[-2:] == target_size:
-                stage_skel = source_stage_skel
-                stage_skel_dilate = source_stage_skel_dilate
+            stage_skel = build_stage_skeleton_target(source_stage_skel, target_size)
+            stage_skel_dilate = build_stage_skeleton_target(source_stage_skel_dilate, target_size)
+            if stage_skeleton_logits is not None:
+                loss_skeleton_stage, _, _ = self.skeleton_pixel_loss(
+                    stage_skeleton_logits,
+                    stage_skel,
+                    stage_skel_dilate,
+                )
             else:
-                stage_skel = F.interpolate(
-                    source_stage_skel,
-                    size=target_size,
-                    mode="nearest",
-                )
-                stage_skel_dilate = F.interpolate(
-                    source_stage_skel_dilate,
-                    size=target_size,
-                    mode="nearest",
-                )
-            loss_skeleton_stage, _, _ = self.skeleton_pixel_loss(
-                stage_skeleton_logits,
-                stage_skel,
-                stage_skel_dilate,
-            )
-            loss_connectivity_stage = loss_skeleton_stage * 0.0
-            loss_skeleton_connectivity_consistency = loss_skeleton_stage * 0.0
-            if connectivity_gt is not None:
-                stage_connectivity_gt = F.interpolate(
-                    connectivity_gt,
-                    size=target_size,
-                    mode="nearest",
-                ).to(
+                loss_skeleton_stage = reference_logits.sum() * 0.0
+            loss_connectivity_stage = reference_logits.sum() * 0.0
+            if stage_connectivity_logits is not None:
+                stage_connectivity_gt = build_connectivity_target(stage_skel).to(
                     device=stage_connectivity_logits.device,
                     dtype=stage_connectivity_logits.dtype,
                 )
@@ -686,7 +675,6 @@ class SurfaceStructureLoss(nn.Module):
                     use_skeleton_center_mask=self.use_masked_connectivity_center_experiment,
                     symmetry_weight=0.05 if self.use_masked_connectivity_center_experiment else 0.20,
                 )
-            direction_logits = stage_output.get("direction")
             if direction_logits is not None and self.stage_direction_factor > 0:
                 if direction_gt is None:
                     loss_direction_stage = self.direction_field_loss(

@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from analyze_structure_supervision import DIR_NAMES, DIR_OFFSETS
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from topology_direction_constants import AXIAL_DIR_NAMES, axial_double_angle_basis
 
 
 def main():
@@ -44,8 +44,8 @@ def main():
     print(f"direction_gt shape= {tuple(first['direction_gt'].shape)}")
     print(f"direction_gt dtype= {first['direction_gt'].dtype}")
 
-    offsets = F.normalize(DIR_OFFSETS.to(dtype=torch.float32), dim=1, eps=1e-6)
-    counts = torch.zeros(8, dtype=torch.long)
+    offsets = axial_double_angle_basis()
+    counts = torch.zeros(4, dtype=torch.long)
     total_skel = 0
     total_px = 0
     junction_like = 0
@@ -67,7 +67,7 @@ def main():
 
         total_skel += int(mask.sum().item())
         total_px += int(mask.numel())
-        for k in range(8):
+        for k in range(4):
             counts[k] += int((idx[mask.squeeze(1)] == k).sum().item())
 
         magnitude = torch.linalg.vector_norm(direction_gt, dim=1)
@@ -78,10 +78,10 @@ def main():
     print(f"batch direction_gt shapes = {sorted(shapes)}")
     print(f"valid skeleton pixels     = {total_skel}")
     print(f"skeleton pixel ratio      = {total_skel / max(total_px, 1):.6f}")
-    print("direction class counts    =", dict(zip(DIR_NAMES, counts.tolist())))
+    print("direction axis counts     =", dict(zip(AXIAL_DIR_NAMES, counts.tolist())))
     print(
-        "direction class ratios    =",
-        {n: round(c / max(total_skel, 1), 4) for n, c in zip(DIR_NAMES, counts.tolist())},
+        "direction axis ratios     =",
+        {n: round(c / max(total_skel, 1), 4) for n, c in zip(AXIAL_DIR_NAMES, counts.tolist())},
     )
     print(f"zero-vector-like pixels   = {ignore_like}")
     print(f"junction-like count        = {junction_like}")

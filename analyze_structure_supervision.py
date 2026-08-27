@@ -24,26 +24,18 @@ from networks.vision_transformer_selective_fusion import (
     load_topology_checkpoint_state as load_topology_checkpoint_state_selective,
     print_topology_coefficients as print_topology_coefficients_selective,
 )
-from networks.skeleton_guided_head import LegacyConvConnectivityHead
+from networks.skeleton_guided_head import (
+    LegacyConvConnectivityHead,
+    LegacyPairwisePriorConnectivityHead,
+)
 from networks.skeleton_guided_head_selective_fusion import (
     LegacyConvConnectivityHead as LegacyConvConnectivityHeadSelective,
 )
+from topology_direction_constants import CONNECTIVITY_DIR_NAMES, CONNECTIVITY_DIRECTIONS
 
 
-DIR_NAMES = ["N", "S", "W", "E", "NW", "NE", "SW", "SE"]
-DIR_OFFSETS = torch.tensor(
-    [
-        [-1, 0],
-        [1, 0],
-        [0, -1],
-        [0, 1],
-        [-1, -1],
-        [-1, 1],
-        [1, -1],
-        [1, 1],
-    ],
-    dtype=torch.float32,
-)
+DIR_NAMES = list(CONNECTIVITY_DIR_NAMES)
+DIR_OFFSETS = torch.tensor(CONNECTIVITY_DIRECTIONS, dtype=torch.float32)
 
 
 def parse_args():
@@ -143,6 +135,44 @@ def adapt_connectivity_modules_for_checkpoint(model, state_dict, model_impl):
         for module in model.modules():
             if hasattr(module, "connectivity_context"):
                 module.connectivity_context = torch.nn.Identity()
+
+    pairwise_prior_replaced = 0
+    if has_pairwise_head and model_impl != "selective":
+        divisor = 4 if model_impl == "selective" else 2
+        for module_name, module in model.named_modules():
+            head = getattr(module, "connectivity_head", None)
+            if head is None or not hasattr(head, "edge_mlp"):
+                continue
+            key = f"{module_name}.connectivity_head.edge_mlp.0.weight"
+            checkpoint_weight = state_dict.get(key)
+            if checkpoint_weight is None:
+                continue
+            first = head.edge_mlp[0]
+            if int(checkpoint_weight.shape[1]) == int(first.in_channels):
+                continue
+            channels = int(getattr(head, "feature_channels", 0))
+            if channels <= 0:
+                prior_channels = int(getattr(head, "prior_channels", 16))
+                channels = (int(first.in_channels) - prior_channels) // divisor
+            legacy_in_channels = divisor * channels + 3
+            if int(checkpoint_weight.shape[1]) != legacy_in_channels:
+                continue
+            connectivity_channels = getattr(head, "connectivity_channels", 8)
+            hidden_channels = int(checkpoint_weight.shape[0])
+            device = first.weight.device
+            dtype = first.weight.dtype
+            module.connectivity_head = LegacyPairwisePriorConnectivityHead(
+                channels,
+                connectivity_channels,
+                hidden_channels=hidden_channels,
+            ).to(device=device, dtype=dtype)
+            pairwise_prior_replaced += 1
+        if pairwise_prior_replaced:
+            print(
+                f"[INFO] Checkpoint uses legacy pairwise prior connectivity heads "
+                f"(2C+3); replaced {pairwise_prior_replaced} heads for compatible evaluation.",
+                flush=True,
+            )
 
     if not has_legacy_conv_head or has_pairwise_head:
         return

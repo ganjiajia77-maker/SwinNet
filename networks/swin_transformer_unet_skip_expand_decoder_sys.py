@@ -684,15 +684,15 @@ class SwinTransformerBlock(nn.Module):
         distance = torch.maximum(dy.abs(), dx.abs()).float()
         distance_decay = torch.exp(-distance / 4.0)
         distance_decay[distance == 0] = 0.0
-        pair_norm = distance.clamp_min(1.0)
-        pair_unit_i_to_j = torch.stack(
+        pair_theta = torch.atan2(target_dy.float(), target_dx.float())
+        pair_axis = torch.stack(
             (
-                -dx.float() / pair_norm,
-                -dy.float() / pair_norm,
+                torch.cos(2.0 * pair_theta),
+                torch.sin(2.0 * pair_theta),
             ),
             dim=-1,
         )
-        pair_unit_i_to_j[distance == 0] = 0.0
+        pair_axis[distance == 0] = 0.0
 
         self.register_buffer(
             "topology_direction_one_hot",
@@ -716,12 +716,12 @@ class SwinTransformerBlock(nn.Module):
         )
         self.register_buffer(
             "topology_pair_unit_i_to_j",
-            pair_unit_i_to_j,
+            pair_axis,
             persistent=False,
         )
         self.register_buffer(
             "topology_pair_unit_j_to_i",
-            -pair_unit_i_to_j,
+            pair_axis,
             persistent=False,
         )
 
@@ -2696,22 +2696,29 @@ class SwinTransformerSys(nn.Module):
         block_stage=None,
         apply_feature_refinement=True,
         disable_skeleton_prediction=False,
+        skeleton_prior=None,
     ):
         if not self._decoder_structure_enabled(stage):
             return feature_map, *self._placeholder_structure_outputs(feature_map)
 
         block_stage = stage if block_stage is None else block_stage
+        block = (
+            self.stage2_topology_source
+            if block_stage == "stage2_topology_source"
+            else self.decoder_structure_blocks[block_stage]
+        )
         global_context = None
         if self.use_stage3_global_context and stage == 3:
             global_context = self._build_stage3_global_context(
                 bottleneck_tokens,
                 feature_map.shape[-2:],
             )
-        return self.decoder_structure_blocks[block_stage](
+        return block(
             feature_map,
             global_context=global_context,
             apply_feature_refinement=apply_feature_refinement,
             disable_skeleton_prediction=disable_skeleton_prediction,
+            skeleton_prior=skeleton_prior,
         )
 
     def _decoder_skeleton_disabled(self, stage):
@@ -2817,6 +2824,7 @@ class SwinTransformerSys(nn.Module):
         topology_alpha_scale=1.0,
         teacher_forcing_ratio=0.0,
         z_struct=None,
+        highres_structure_skeleton=None,
     ):
         """
         Decoder with enhanced skip connection fusion using MSFE + DCA-FPN-Lite
@@ -2888,9 +2896,10 @@ class SwinTransformerSys(nn.Module):
                     x_map,
                     inx,
                     bottleneck_tokens,
-                    block_stage=1 if inx == 2 else inx,
+                    block_stage="stage2_topology_source" if inx == 2 else inx,
                     apply_feature_refinement=False,
                     disable_skeleton_prediction=decoder_skeleton_disabled,
+                    skeleton_prior=highres_structure_skeleton,
                 )
                 if decoder_skeleton_disabled:
                     skeleton_used = None
@@ -2946,6 +2955,7 @@ class SwinTransformerSys(nn.Module):
                     bottleneck_tokens,
                     apply_feature_refinement=True,
                     disable_skeleton_prediction=decoder_skeleton_disabled,
+                    skeleton_prior=highres_structure_skeleton,
                 )
                 x = map_to_token(x_map)
                 self._append_structure_output(
@@ -2981,6 +2991,7 @@ class SwinTransformerSys(nn.Module):
                     inx,
                     bottleneck_tokens,
                     disable_skeleton_prediction=decoder_skeleton_disabled,
+                    skeleton_prior=highres_structure_skeleton,
                 )
                 x = map_to_token(x_map)
                 if decoder_skeleton_disabled:
@@ -3051,17 +3062,19 @@ class SwinTransformerSys(nn.Module):
                     inx,
                     bottleneck_tokens,
                     disable_skeleton_prediction=decoder_skeleton_disabled,
+                    skeleton_prior=highres_structure_skeleton,
                 )
                 x = map_to_token(x_map)
-            self._append_structure_output(
-                structure_outputs,
-                stage=inx,
-                skeleton=skeleton_i,
-                connectivity=connectivity_i,
-                direction=direction_i,
-                structure_gate=structure_gate_i,
-                roadness=roadness_i,
-            )
+            if self._decoder_structure_enabled(inx):
+                self._append_structure_output(
+                    structure_outputs,
+                    stage=inx,
+                    skeleton=skeleton_i,
+                    connectivity=connectivity_i,
+                    direction=direction_i,
+                    structure_gate=structure_gate_i,
+                    roadness=roadness_i,
+                )
 
         x = self.norm_up(x)  # B L C
 
@@ -3105,6 +3118,7 @@ class SwinTransformerSys(nn.Module):
             topology_alpha_scale=topology_alpha_scale,
             teacher_forcing_ratio=teacher_forcing_ratio,
             z_struct=z_struct,
+            highres_structure_skeleton=highres_structure_skeleton,
         )
         if self.return_skeleton and highres_structure_skeleton is not None:
             structure_outputs.append(

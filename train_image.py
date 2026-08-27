@@ -12,7 +12,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from datetime import datetime
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from networks.vision_transformer import (
     TOPOLOGY_ATTENTION_VERSION,
@@ -34,6 +34,13 @@ except ImportError:
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
@@ -65,6 +72,9 @@ parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_windo
                     help='path to config file')
 parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
+parser.add_argument('--loader_prefetch_factor', default=2, type=int, help='DataLoader prefetch factor when num_workers > 0')
+parser.add_argument('--disable_persistent_workers', action='store_true', help='disable persistent DataLoader workers')
+parser.add_argument('--tiny_overfit_samples', default=0, type=int, help='use the first N training samples for tiny-set overfit debugging')
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
 parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final skeleton threshold for validation')
@@ -1017,12 +1027,6 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
 
-    def seed_worker(worker_id):
-        worker_seed = args.seed + worker_id
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-
     loader_generator = torch.Generator()
     loader_generator.manual_seed(args.seed)
 
@@ -1235,14 +1239,28 @@ if __name__ == "__main__":
         random_crops_per_image=args.random_crops_per_image,
         random_crop_seed=args.seed,
     )
+    if args.tiny_overfit_samples > 0:
+        tiny_count = min(int(args.tiny_overfit_samples), len(train_dataset))
+        train_dataset = Subset(train_dataset, list(range(tiny_count)))
+        print(
+            f"[INFO] Tiny overfit mode: using first {tiny_count} training samples; "
+            "train shuffle disabled.",
+            flush=True,
+        )
+    loader_kwargs = {}
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = not args.disable_persistent_workers
+        loader_kwargs["prefetch_factor"] = max(1, args.loader_prefetch_factor)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=not (args.tiny_overfit_samples > 0),
         num_workers=args.num_workers,
         pin_memory=True,
         worker_init_fn=seed_worker,
         generator=loader_generator,
+        **loader_kwargs,
     )
 
     val_dataset = RoadSkeletonDataset(
@@ -1260,6 +1278,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True,
         worker_init_fn=seed_worker,
+        **loader_kwargs,
     )
 
     # 优化器 / 损失（graph-only 模式在加载 checkpoint 后再建 optimizer）
@@ -1528,6 +1547,8 @@ if __name__ == "__main__":
                 'structure_delta_background_mean',
                 'ms_per_batch',
             ])
+            loss_log_file.flush()
+            batch_loss_log_file.flush()
 
         for epoch in range(start_epoch, args.max_epochs):
             if hasattr(train_dataset, "set_epoch"):

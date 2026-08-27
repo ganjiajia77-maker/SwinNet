@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from topology_direction_constants import (
+    CONNECTIVITY_DIRECTIONS,
+    connectivity_double_angle_basis,
+)
 
 def scale_gradient(x, ratio: float):
     return x.detach() + float(ratio) * (x - x.detach())
@@ -113,18 +117,6 @@ class ConnectivityContextBlock(nn.Module):
         return x + self.fuse(context)
 
 
-CONNECTIVITY_DIRECTIONS = (
-    (-1, 0),   # N
-    (-1, 1),   # NE
-    (0, 1),    # E
-    (1, 1),    # SE
-    (1, 0),    # S
-    (1, -1),   # SW
-    (0, -1),   # W
-    (-1, -1),  # NW
-)
-
-
 class PairwiseConnectivityHead(nn.Module):
     def __init__(
         self,
@@ -150,11 +142,7 @@ class PairwiseConnectivityHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
         )
-        basis = []
-        for dy, dx in CONNECTIVITY_DIRECTIONS:
-            theta = torch.atan2(torch.tensor(float(dy)), torch.tensor(float(dx)))
-            basis.append([torch.cos(2.0 * theta), torch.sin(2.0 * theta)])
-        self.register_buffer("axis_basis", torch.tensor(basis).float().view(1, 8, 2, 1, 1))
+        self.register_buffer("axis_basis", connectivity_double_angle_basis().view(1, 8, 2, 1, 1))
 
     @staticmethod
     def _shift_feature(x, dy, dx):
