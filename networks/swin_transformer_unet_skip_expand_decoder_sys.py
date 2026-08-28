@@ -2580,7 +2580,7 @@ class SwinTransformerSys(nn.Module):
         if z_struct is None or not self._highres_structure_stage_enabled(stage):
             return x
         feature_map = token_to_map(x, target_hw[0], target_hw[1])
-        z_struct_for_surface = z_struct.detach()
+        z_struct_for_surface = z_struct
         feature_map = self.highres_structure_fusion[str(stage)](
             feature_map,
             z_struct_for_surface,
@@ -2599,7 +2599,7 @@ class SwinTransformerSys(nn.Module):
 
         base_surface_logits = outputs[0]
         delta_surface_logits = self.structure_surface_correction_head(
-            z_struct.detach(),
+            z_struct,
             base_surface_logits.shape[-2:],
         )
         final_surface_logits = base_surface_logits + delta_surface_logits

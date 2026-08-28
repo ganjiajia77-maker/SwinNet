@@ -340,9 +340,12 @@ def audit_gradients(model, criterion, batch, outputs, args):
         from losses.road_losses import build_boundary_target
 
         boundary_gt = build_boundary_target(masks, radius=criterion.boundary_radius)
-    boundary_gt = criterion._match_spatial_size(boundary_gt, boundary_logits)
-    boundary_raw, _, _ = criterion.boundary_loss(boundary_logits, boundary_gt.to(boundary_logits))
-    boundary = criterion.boundary_weight * boundary_raw
+    if boundary_logits is not None and criterion.boundary_loss is not None and criterion.boundary_weight > 0:
+        boundary_gt = criterion._match_spatial_size(boundary_gt, boundary_logits)
+        boundary_raw, _, _ = criterion.boundary_loss(boundary_logits, boundary_gt.to(boundary_logits))
+        boundary = criterion.boundary_weight * boundary_raw
+    else:
+        boundary = surface_logits.sum() * 0.0
     high, _ = criterion.highres_structure_skeleton_loss(stage_outputs, skeletons, skeletons_dilate)
 
     losses = {
@@ -375,7 +378,11 @@ def audit_gradients(model, criterion, batch, outputs, args):
     highres_params = [
         (name, param)
         for name, param in model.named_parameters()
-        if param.requires_grad and "highres_structure" in name
+        if param.requires_grad
+        and (
+            "highres_structure" in name
+            or "prepatch_structure_encoder" in name
+        )
     ]
     print("\n[5b] HighRes-Only Gradient Audit")
     print(f"  highres_param_tensors={len(highres_params)}")
