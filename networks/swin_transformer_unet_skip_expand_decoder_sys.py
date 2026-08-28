@@ -2883,6 +2883,46 @@ class SwinTransformerSys(nn.Module):
             topology_enabled = self._stage_topology_enabled(inx)
             if decoder_structure_gate_enabled:
                 decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
+                if inx == 3:
+                    x = layer_up(x)
+                    output_scale = 2 ** max(2 - inx, 0)
+                    output_height = self.patches_resolution[0] // output_scale
+                    output_width = self.patches_resolution[1] // output_scale
+                    x = self._apply_highres_structure_fusion(
+                        x,
+                        z_struct,
+                        inx,
+                        (output_height, output_width),
+                    )
+                    x_map = token_to_map(x, output_height, output_width)
+                    (
+                        x_map,
+                        skeleton_i,
+                        connectivity_i,
+                        direction_i,
+                        structure_gate_i,
+                        roadness_i,
+                    ) = self._run_decoder_structure_block(
+                        x_map,
+                        inx,
+                        bottleneck_tokens,
+                        apply_feature_refinement=True,
+                        disable_skeleton_prediction=decoder_skeleton_disabled,
+                        skeleton_prior=highres_structure_skeleton,
+                    )
+                    x = map_to_token(x_map)
+                    self._append_structure_output(
+                        structure_outputs,
+                        stage=inx,
+                        skeleton=skeleton_i,
+                        connectivity=connectivity_i,
+                        direction=direction_i,
+                        structure_gate=structure_gate_i,
+                        roadness=roadness_i,
+                        refinement_step=1,
+                        stage_loss_scale=1.0,
+                    )
+                    continue
                 input_height, input_width = layer_up.input_resolution
                 x_map = token_to_map(x, input_height, input_width)
                 (
