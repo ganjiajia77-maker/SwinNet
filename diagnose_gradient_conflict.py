@@ -341,15 +341,13 @@ def stage_loss_components(criterion, stage_outputs, skeleton_gt, skeleton_dilate
             row["used"] = True
             debug_rows.append(row)
             continue
-        if direction_gt is None:
-            raw_dir = criterion.direction_field_loss(dir_logits, stage_skel)
-        else:
-            stage_dir_gt = F.interpolate(direction_gt, size=target_size, mode="nearest")
-            stage_dir_gt = F.normalize(stage_dir_gt, dim=1, eps=1e-6)
-            stage_valid = stage_skel * criterion._spatial_boundary_mask(stage_dir_gt, valid_mask)
-            dir_pred = F.normalize(dir_logits, dim=1, eps=1e-6)
-            dir_cos = (dir_pred * stage_dir_gt).sum(dim=1, keepdim=True)
-            raw_dir = ((1.0 - dir_cos) * stage_valid).sum() / stage_valid.sum().clamp_min(1.0)
+        stage_dir_gt, stage_valid = criterion.build_direction_target(stage_skel)
+        stage_dir_gt = stage_dir_gt.to(device=dir_logits.device, dtype=dir_logits.dtype)
+        stage_valid = stage_valid.to(device=dir_logits.device, dtype=dir_logits.dtype)
+        stage_valid = stage_valid * criterion._spatial_boundary_mask(dir_logits, valid_mask)
+        dir_pred = F.normalize(dir_logits, dim=1, eps=1e-6)
+        dir_cos = (dir_pred * stage_dir_gt).sum(dim=1, keepdim=True)
+        raw_dir = ((1.0 - dir_cos) * stage_valid).sum() / stage_valid.sum().clamp_min(1.0)
         stage_dir = stage_dir + stage_weight * criterion.stage_direction_factor * raw_dir
         row["raw_dir"] = float(raw_dir.detach().item())
         row["weighted_dir"] = float(

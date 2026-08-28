@@ -161,7 +161,7 @@ parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
 parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--final_skeleton_weight', type=float, default=None, help='override final skeleton auxiliary loss weight')
 parser.add_argument('--final_connectivity_weight', type=float, default=None, help='override final connectivity auxiliary loss weight')
-parser.add_argument('--boundary_weight', type=float, default=None, help='override boundary auxiliary loss weight')
+parser.add_argument('--boundary_weight', type=float, default=None, help='deprecated; boundary auxiliary loss is disabled')
 parser.add_argument('--road_attention_weight', type=float, default=0.003)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
@@ -326,20 +326,20 @@ def get_final_loss_weights(args):
         weights = {
             "skeleton_weight": 0.10,
             "connectivity_weight": 0.03,
-            "boundary_weight": 0.01,
+            "boundary_weight": 0.0,
         }
     else:
         weights = {
             "skeleton_weight": 0.02,
             "connectivity_weight": 0.03,
-            "boundary_weight": 0.03,
+            "boundary_weight": 0.0,
         }
     if args.final_skeleton_weight is not None:
         weights["skeleton_weight"] = float(args.final_skeleton_weight)
     if args.final_connectivity_weight is not None:
         weights["connectivity_weight"] = float(args.final_connectivity_weight)
-    if args.boundary_weight is not None:
-        weights["boundary_weight"] = float(args.boundary_weight)
+    if args.boundary_weight is not None and float(args.boundary_weight) != 0.0:
+        print("[WARN] --boundary_weight is ignored because boundary auxiliary loss is disabled.")
     return weights
 
 def get_graph_outputs_from_model(model):
@@ -355,11 +355,7 @@ def get_graph_outputs_from_model(model):
 def build_criterion(args, loss_weights, device):
     stage2_weight = 0.0 if args.freeze_0626_backbone else args.stage2_skeleton_weight
     stage3_weight = 0.0 if args.freeze_0626_backbone else args.stage3_skeleton_weight
-    boundary_weight = (
-        0.0
-        if args.freeze_0626_backbone or args.freeze_post_refine_interaction_only
-        else loss_weights["boundary_weight"]
-    )
+    boundary_weight = 0.0
 
     return SurfaceStructureLoss(
         surface_dice_weight=0.5,
@@ -500,9 +496,7 @@ def format_training_config_lines(args, loss_weights):
             else "  Validation: stitch logits -> sigmoid -> one threshold -> global TP/FP/FN"
         ),
         f"  Validation interval: every {max(1, args.val_interval)} epoch(s), final epoch always",
-        "  Boundary-aware refinement: enabled",
-        "  Boundary loss weight: {:.2f}".format(loss_weights["boundary_weight"]),
-        "  Boundary target: dilate(mask, r=1) - erode(mask, k=3)",
+        "  Boundary auxiliary loss: disabled",
         "  Final skeleton loss weight: {:.2f}".format(loss_weights["skeleton_weight"]),
         "  Final connectivity loss weight: {:.2f}".format(loss_weights["connectivity_weight"]),
         "  Edge loss: disabled",
@@ -1727,7 +1721,6 @@ if __name__ == "__main__":
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
                         f"TF: {teacher_forcing_ratio:.2f}, "
-                        f"Boundary: {loss_dict['boundary_loss'].item():.4f}, "
                         f"ms/batch: {ms_per_batch:.1f}",
                         flush=True
                     )

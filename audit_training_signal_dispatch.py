@@ -58,6 +58,8 @@ def parse_args():
 
     parser.add_argument("--structure_profile", type=str, default="stage23_boundary_0626")
     parser.add_argument("--bottleneck_type", type=str, default="global_local")
+    parser.add_argument("--final_topology_eta_init", type=float, default=0.0)
+    parser.add_argument("--final_gap_rho_init", type=float, default=0.0)
     parser.add_argument("--stage_topology_stages", type=str, default="none")
     parser.add_argument("--stage_topology_alpha_max", type=float, default=1.0)
     parser.add_argument("--stage_topology_alpha_init", type=float, default=0.1)
@@ -292,11 +294,19 @@ def audit_structure_surface_delta(model, images, skeletons, args):
                 teacher_forcing_ratio=0.0,
             )[0]
     delta = (on - off).abs()
+    base_abs_mean = off.abs().mean()
+    base_std = off.std(unbiased=False)
+    delta_mean = delta.mean()
+    delta_p95 = torch.quantile(delta.flatten(), 0.95)
+    r_delta = delta_mean / base_std.clamp_min(1e-8)
     print(
         f"  surface_on={tuple(on.shape)} surface_off={tuple(off.shape)} "
-        f"delta_mean={float(delta.mean().item()):.8f} "
+        f"surface_logit_abs_mean={float(base_abs_mean.item()):.8f} "
+        f"surface_logit_std={float(base_std.item()):.8f} "
+        f"delta_mean={float(delta_mean.item()):.8f} "
         f"delta_max={float(delta.max().item()):.8f} "
-        f"delta_p95={float(torch.quantile(delta.flatten(), 0.95).item()):.8f}"
+        f"delta_p95={float(delta_p95.item()):.8f} "
+        f"R_delta={float(r_delta.item()):.8f}"
     )
     if float(delta.mean().item()) < 1e-6:
         print("  verdict=near_zero: structure branch is not measurably changing surface logits on this batch")
@@ -361,6 +371,44 @@ def audit_gradients(model, criterion, batch, outputs, args):
     print("  focus:")
     for left, right in (("Seg", "Con"), ("Seg", "High"), ("Con", "High"), ("Dir", "Con")):
         print(f"    cos({left},{right})={cosine(vectors[left], vectors[right]):.4f}")
+
+    highres_params = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad and "highres_structure" in name
+    ]
+    print("\n[5b] HighRes-Only Gradient Audit")
+    print(f"  highres_param_tensors={len(highres_params)}")
+    if not highres_params:
+        print("  verdict=no_highres_params_found")
+        return
+    high_seg = flatten_grad(seg, highres_params, model)
+    high_high = flatten_grad(high, highres_params, model)
+    high_seg_norm = float(torch.linalg.vector_norm(high_seg).detach().item())
+    high_high_norm = float(torch.linalg.vector_norm(high_high).detach().item())
+    high_cos = cosine(high_seg, high_high)
+    high_cos_text = "nan" if math.isnan(high_cos) else f"{high_cos:.4f}"
+    print(f"  grad_norm_highres_params[Seg]={high_seg_norm:.8e}")
+    print(f"  grad_norm_highres_params[High]={high_high_norm:.8e}")
+    print(f"  cos_highres_params(Seg,High)={high_cos_text}")
+    for loss_name, loss_value in (("Seg", seg), ("High", high)):
+        model.zero_grad(set_to_none=True)
+        if loss_value.requires_grad:
+            loss_value.backward(retain_graph=True)
+        norms = []
+        for name, param in highres_params:
+            if param.grad is None:
+                value = 0.0
+            else:
+                value = float(torch.linalg.vector_norm(param.grad.detach()).item())
+            if value > 0.0:
+                norms.append((value, name))
+        norms.sort(reverse=True)
+        print(f"  top_highres_param_grads[{loss_name}]:")
+        for value, name in norms[:8]:
+            print(f"    {value:.8e}  {name}")
+        if not norms:
+            print("    none")
 
 
 def audit_teacher_forcing(args, model):

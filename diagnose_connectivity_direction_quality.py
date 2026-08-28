@@ -22,6 +22,7 @@ from analyze_structure_supervision import (
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.cldice_loss import soft_skeletonize
 from losses.road_losses import build_connectivity_target, build_stage_skeleton_target
+from direction_target_utils import build_continuous_direction_target
 from topology_direction_constants import (
     AXIAL_DIR_NAMES,
     AXIAL_DIRECTIONS,
@@ -106,6 +107,8 @@ def reciprocal_symmetry_error(prob):
 
 def direction_stats(direction_logits, direction_gt, valid_mask):
     pred_vec = F.normalize(direction_logits.float(), dim=1, eps=1e-6)
+    direction_norm = direction_gt.float().norm(dim=1, keepdim=True)
+    direction_valid = direction_norm > 1e-6
     gt_vec = F.normalize(direction_gt.float(), dim=1, eps=1e-6)
     offsets = AXIAL_DIR_OFFSETS.to(direction_logits.device, direction_logits.dtype)
     theta = torch.atan2(offsets[:, 0], offsets[:, 1])
@@ -119,7 +122,7 @@ def direction_stats(direction_logits, direction_gt, valid_mask):
     gt_idx = gt_score.argmax(dim=1)
     cosine = (pred_vec * gt_vec).sum(dim=1).clamp(-1.0, 1.0)
     angle_deg = 0.5 * torch.rad2deg(torch.acos(cosine))
-    mask = valid_mask.squeeze(1).bool()
+    mask = (valid_mask.bool() & direction_valid).squeeze(1)
     pred_flat = pred_idx[mask].detach().cpu().numpy()
     gt_flat = gt_idx[mask].detach().cpu().numpy()
     angle_flat = angle_deg[mask].detach().cpu().numpy()
@@ -491,8 +494,11 @@ def main():
             d_logits = stage_output["direction"]
             stage_skeleton_gt = build_stage_skeleton_target(skeleton_raw, c_prob.shape[-2:]).to(device)
             c_gt = build_connectivity_target(stage_skeleton_gt)
-            d_gt = resize_like(direction_gt, d_logits[:, :1], mode="nearest")
             skeleton_dir = resize_like(stage_skeleton_gt, d_logits[:, :1], mode="nearest") > 0.5
+            d_gt = build_continuous_direction_target(skeleton_dir.float(), radius=3).to(
+                device=d_logits.device,
+                dtype=d_logits.dtype,
+            )
 
             conn_valid = stage_skeleton_gt > 0.5
             conn = connectivity_stats(c_prob, c_gt, conn_valid, threshold=args.threshold)

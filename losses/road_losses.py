@@ -305,7 +305,7 @@ class SurfaceStructureLoss(nn.Module):
         skeleton_weight=0.05,
         connectivity_weight=0.05,
         connectivity_erode_kernel_size=1,
-        boundary_weight=0.01,
+        boundary_weight=0.0,
         boundary_radius=1,
         skeleton_stage_weight=0.0,
         skeleton_stage_weights=(0.1, 0.2, 0.3, 0.3),
@@ -338,9 +338,9 @@ class SurfaceStructureLoss(nn.Module):
         self.skeleton_weight = skeleton_weight
         self.connectivity_weight = connectivity_weight
         self.connectivity_erode_kernel_size = connectivity_erode_kernel_size
-        self.boundary_weight = boundary_weight
+        self.boundary_weight = 0.0
         self.boundary_radius = boundary_radius
-        self.boundary_loss = BCEDiceLoss(dice_weight=1.0, bce_weight=1.0)
+        self.boundary_loss = None
         self.skeleton_stage_weight = skeleton_stage_weight
         self.skeleton_stage_weights = tuple(float(w) for w in skeleton_stage_weights)
         if stage_structure_weights is None:
@@ -676,29 +676,26 @@ class SurfaceStructureLoss(nn.Module):
                     symmetry_weight=0.05 if self.use_masked_connectivity_center_experiment else 0.20,
                 )
             if direction_logits is not None and self.stage_direction_factor > 0:
-                if direction_gt is None:
-                    loss_direction_stage = self.direction_field_loss(
-                        direction_logits,
-                        stage_skel,
-                    )
-                else:
-                    stage_direction_gt = F.interpolate(
-                        direction_gt,
-                        size=target_size,
-                        mode="nearest",
-                    )
-                    stage_direction_gt = F.normalize(stage_direction_gt, dim=1, eps=1e-6)
-                    stage_valid = stage_skel * self._spatial_boundary_mask(
-                        stage_direction_gt,
-                        valid_mask,
-                    )
-                    direction_pred = F.normalize(direction_logits, dim=1, eps=1e-6)
-                    direction_cosine = (
-                        direction_pred * stage_direction_gt
-                    ).sum(dim=1, keepdim=True)
-                    loss_direction_stage = (
-                        (1.0 - direction_cosine) * stage_valid
-                    ).sum() / stage_valid.sum().clamp_min(1.0)
+                stage_direction_gt, direction_valid = self.build_direction_target(stage_skel)
+                stage_direction_gt = stage_direction_gt.to(
+                    device=direction_logits.device,
+                    dtype=direction_logits.dtype,
+                )
+                direction_valid = direction_valid.to(
+                    device=direction_logits.device,
+                    dtype=direction_logits.dtype,
+                )
+                direction_valid = direction_valid * self._spatial_boundary_mask(
+                    direction_logits,
+                    valid_mask,
+                )
+                direction_pred = F.normalize(direction_logits, dim=1, eps=1e-6)
+                direction_cosine = (
+                    direction_pred * stage_direction_gt
+                ).sum(dim=1, keepdim=True)
+                loss_direction_stage = (
+                    (1.0 - direction_cosine) * direction_valid
+                ).sum() / direction_valid.sum().clamp_min(1.0)
             else:
                 loss_direction_stage = loss_skeleton_stage * 0.0
             total = total + stage_weight * (
@@ -712,7 +709,10 @@ class SurfaceStructureLoss(nn.Module):
     def build_direction_target(self, skeleton):
         skel = (skeleton > 0.5).to(dtype=skeleton.dtype)
         target = build_continuous_direction_target(skel, radius=3)
-        return target, skel
+        direction_valid = skel * (target.norm(dim=1, keepdim=True) > 1e-6).to(
+            dtype=skel.dtype
+        )
+        return target, direction_valid
 
     def direction_field_loss(self, direction_logits, skeleton_gt):
         direction_target, skeleton_mask = self.build_direction_target(skeleton_gt)
@@ -772,16 +772,16 @@ class SurfaceStructureLoss(nn.Module):
             skeleton_logits = stage_output.get("highres_structure_skeleton")
             if skeleton_logits is None:
                 continue
-            skeleton_logits_full = F.interpolate(
-                skeleton_logits,
-                size=skeleton_gt.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
+            target_size = skeleton_logits.shape[-2:]
+            stage_skel = build_stage_skeleton_target(skeleton_gt, target_size)
+            stage_skel_dilate = build_stage_skeleton_target(
+                skeleton_dilate_gt,
+                target_size,
             )
             loss_skeleton, _, _ = self.skeleton_pixel_loss(
-                skeleton_logits_full,
-                skeleton_gt,
-                skeleton_dilate_gt,
+                skeleton_logits,
+                stage_skel,
+                stage_skel_dilate,
             )
             total = total + self.highres_structure_skeleton_weight * loss_skeleton
             raw_total = raw_total + loss_skeleton
@@ -950,25 +950,9 @@ class SurfaceStructureLoss(nn.Module):
             connectivity_gt_positive_ratio = surface_logits.sum() * 0.0
             connectivity_gt_valid_pixels = surface_logits.sum() * 0.0
             connectivity_gt_dir_positive_ratio = surface_logits.new_zeros(8)
-        if boundary_logits is not None and self.boundary_weight > 0:
-            if boundary_gt is None:
-                boundary_gt = build_boundary_target(
-                    surface_gt,
-                    radius=self.boundary_radius,
-                )
-            boundary_gt = boundary_gt.to(
-                device=boundary_logits.device,
-                dtype=boundary_logits.dtype,
-            )
-            boundary_gt = self._match_spatial_size(boundary_gt, boundary_logits)
-            loss_boundary, bce_boundary, dice_boundary = self.boundary_loss(
-                boundary_logits,
-                boundary_gt,
-            )
-        else:
-            loss_boundary = surface_logits.sum() * 0.0
-            bce_boundary = loss_boundary.detach()
-            dice_boundary = loss_boundary.detach()
+        loss_boundary = surface_logits.sum() * 0.0
+        bce_boundary = loss_boundary.detach()
+        dice_boundary = loss_boundary.detach()
 
         if self.skeleton_stage_weight > 0 and stage_outputs:
             loss_skeleton_stage = self.stage_skeleton_loss(
@@ -1006,7 +990,6 @@ class SurfaceStructureLoss(nn.Module):
             loss_surface
             + self.skeleton_weight * loss_skeleton
             + self.connectivity_weight * loss_connectivity
-            + self.boundary_weight * loss_boundary
             + self.skeleton_stage_weight * loss_skeleton_stage
             + loss_stage_structure
             + loss_road_attention
