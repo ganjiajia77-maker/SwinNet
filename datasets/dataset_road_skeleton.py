@@ -24,6 +24,7 @@ class RoadSkeletonDataset(Dataset):
         random_crops_per_image=1,
         random_crop_seed=1234,
         crop_list_path="",
+        return_dense_targets=False,
     ):
         super().__init__()
 
@@ -39,6 +40,7 @@ class RoadSkeletonDataset(Dataset):
         self.random_crop_train = bool(random_crop_train and split == "train")
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
+        self.return_dense_targets = bool(return_dense_targets)
         self.epoch = 0
 
         self.image_dir = self._resolve_image_dir(root_dir, split)
@@ -373,12 +375,14 @@ class RoadSkeletonDataset(Dataset):
         mask = (mask > 127).astype(np.float32)
         skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
         skeleton_dilate = (self._dilate_skeleton(skeleton_hard * 255, iterations=1) > 127).astype(np.float32)
-        full_surface = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)
         full_skeleton = torch.from_numpy(skeleton_hard).float().unsqueeze(0).unsqueeze(0)
-        connectivity_gt = build_connectivity_target(full_skeleton).squeeze(0)
-        direction_gt = self._build_direction_target(full_skeleton).squeeze(0)
-        boundary_gt = build_boundary_target(full_surface).squeeze(0)
         valid_mask = torch.ones_like(full_skeleton).squeeze(0)
+        connectivity_gt = direction_gt = boundary_gt = None
+        if self.return_dense_targets:
+            full_surface = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)
+            connectivity_gt = build_connectivity_target(full_skeleton).squeeze(0)
+            direction_gt = self._build_direction_target(full_skeleton).squeeze(0)
+            boundary_gt = build_boundary_target(full_surface).squeeze(0)
 
         if self.random_crop_train:
             crop_size = self.tile_size or self.image_size
@@ -400,9 +404,12 @@ class RoadSkeletonDataset(Dataset):
             mask = mask[top:bottom, left:right]
             skeleton_hard = skeleton_hard[top:bottom, left:right]
             skeleton_dilate = skeleton_dilate[top:bottom, left:right]
-            connectivity_gt = connectivity_gt[:, top:bottom, left:right]
-            direction_gt = direction_gt[:, top:bottom, left:right]
-            boundary_gt = boundary_gt[:, top:bottom, left:right]
+            if connectivity_gt is not None:
+                connectivity_gt = connectivity_gt[:, top:bottom, left:right]
+            if direction_gt is not None:
+                direction_gt = direction_gt[:, top:bottom, left:right]
+            if boundary_gt is not None:
+                boundary_gt = boundary_gt[:, top:bottom, left:right]
             valid_mask = valid_mask[:, top:bottom, left:right]
 
         if self.image_size is not None and image.shape[:2] != (self.image_size, self.image_size):
@@ -425,13 +432,16 @@ class RoadSkeletonDataset(Dataset):
             "mask": torch.from_numpy(mask).float(),
             "skeleton": torch.from_numpy(skeleton_hard).float(),
             "skeleton_dilate": torch.from_numpy(skeleton_dilate).float(),
-            "connectivity_gt": connectivity_gt.float(),
-            "direction_gt": direction_gt.float(),
-            "boundary_gt": boundary_gt.float(),
             "valid_mask": valid_mask.float(),
             "image_name": image_name,
             "case_name": os.path.splitext(image_name)[0].replace("_sat", ""),
         }
+        if connectivity_gt is not None:
+            sample["connectivity_gt"] = connectivity_gt.float()
+        if direction_gt is not None:
+            sample["direction_gt"] = direction_gt.float()
+        if boundary_gt is not None:
+            sample["boundary_gt"] = boundary_gt.float()
 
         if tile_position is not None:
             sample["tile_top"] = tile_position[0]
