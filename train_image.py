@@ -203,6 +203,18 @@ parser.add_argument(
     help='positive class weight for connectivity BCE/focal BCE',
 )
 parser.add_argument(
+    '--connectivity_cardinal_pos_weight',
+    type=float,
+    default=None,
+    help='optional positive weight for N/E/S/W connectivity directions',
+)
+parser.add_argument(
+    '--connectivity_diagonal_pos_weight',
+    type=float,
+    default=None,
+    help='optional positive weight for NE/SE/SW/NW connectivity directions',
+)
+parser.add_argument(
     '--connectivity_focal_gamma',
     type=float,
     default=1.5,
@@ -384,6 +396,8 @@ def build_criterion(args, loss_weights, device):
         ),
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
+        connectivity_cardinal_pos_weight=args.connectivity_cardinal_pos_weight,
+        connectivity_diagonal_pos_weight=args.connectivity_diagonal_pos_weight,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).to(device)
 
@@ -421,9 +435,29 @@ def format_training_config_lines(args, loss_weights):
             "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength",
         ])
         if args.masked_connectivity_center_experiment:
+            if (
+                args.connectivity_cardinal_pos_weight is not None
+                or args.connectivity_diagonal_pos_weight is not None
+            ):
+                cardinal_pos_weight = (
+                    args.connectivity_cardinal_pos_weight
+                    if args.connectivity_cardinal_pos_weight is not None
+                    else args.connectivity_pos_weight
+                )
+                diagonal_pos_weight = (
+                    args.connectivity_diagonal_pos_weight
+                    if args.connectivity_diagonal_pos_weight is not None
+                    else args.connectivity_pos_weight
+                )
+                connectivity_balance = (
+                    "directional_pos_weight="
+                    f"cardinal={cardinal_pos_weight:.3f}, diagonal={diagonal_pos_weight:.3f}"
+                )
+            else:
+                connectivity_balance = f"pos_weight={args.connectivity_pos_weight:.3f}"
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
-                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}",
+                f"  Connectivity loss balance: {connectivity_balance}, focal_gamma={args.connectivity_focal_gamma:.3f}",
             ])
         if args.enable_graph_prop:
             lines.extend([

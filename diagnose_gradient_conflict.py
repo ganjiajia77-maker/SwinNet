@@ -85,6 +85,8 @@ def parse_args():
     parser.add_argument("--road_attention_weight", type=float, default=0.003)
     parser.add_argument("--masked_connectivity_center_experiment", action="store_true")
     parser.add_argument("--connectivity_pos_weight", type=float, default=5.0)
+    parser.add_argument("--connectivity_cardinal_pos_weight", type=float, default=None)
+    parser.add_argument("--connectivity_diagonal_pos_weight", type=float, default=None)
     parser.add_argument("--connectivity_focal_gamma", type=float, default=1.5)
     parser.add_argument("--teacher_forcing_ratio", type=float, default=0.0)
     parser.add_argument("--topology_alpha_scale", type=float, default=1.0)
@@ -132,6 +134,8 @@ def inherit_checkpoint_args(args, checkpoint):
         "stage_sc_c2s_weight",
         "masked_connectivity_center_experiment",
         "connectivity_pos_weight",
+        "connectivity_cardinal_pos_weight",
+        "connectivity_diagonal_pos_weight",
         "connectivity_focal_gamma",
     ):
         if name in saved_args:
@@ -188,6 +192,8 @@ def build_criterion(args):
         use_legacy_stage_connectivity_loss=(args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626),
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
+        connectivity_cardinal_pos_weight=args.connectivity_cardinal_pos_weight,
+        connectivity_diagonal_pos_weight=args.connectivity_diagonal_pos_weight,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).cuda()
 

@@ -90,6 +90,8 @@ def parse_args():
     parser.add_argument("--road_attention_weight", type=float, default=0.003)
     parser.add_argument("--masked_connectivity_center_experiment", action="store_true")
     parser.add_argument("--connectivity_pos_weight", type=float, default=5.0)
+    parser.add_argument("--connectivity_cardinal_pos_weight", type=float, default=None)
+    parser.add_argument("--connectivity_diagonal_pos_weight", type=float, default=None)
     parser.add_argument("--connectivity_focal_gamma", type=float, default=1.5)
     parser.add_argument("--teacher_forcing_ratio", type=float, default=0.0)
     parser.add_argument("--topology_alpha_scale", type=float, default=1.0)
