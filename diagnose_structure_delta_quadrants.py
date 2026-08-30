@@ -17,6 +17,16 @@ from analyze_structure_supervision import load_model
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 
 
+FEATURE_NAMES = (
+    "surface_off_logit",
+    "delta_z",
+    "skeleton_prob",
+    "conn_strength",
+    "structure_gate",
+    "direction_confidence",
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -210,6 +220,61 @@ def bucket_stats(bucket):
     }
 
 
+def feature_bucket_map():
+    return {name: empty_bucket() for name in FEATURE_NAMES}
+
+
+def stage_id(item):
+    try:
+        return int(item.get("stage", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def single_channel_map(tensor):
+    if tensor.shape[1] == 1:
+        return tensor
+    return tensor.float().mean(dim=1, keepdim=True)
+
+
+def extract_structure_features(stage_outputs, reference_logits):
+    features = {}
+    selected_stage = None
+    highres_skeleton = None
+
+    for item in stage_outputs or []:
+        if item.get("highres_structure_skeleton") is not None:
+            highres_skeleton = item["highres_structure_skeleton"]
+        if stage_id(item) in (2, 3):
+            selected_stage = item
+
+    if highres_skeleton is not None:
+        features["skeleton_prob"] = torch.sigmoid(
+            single_channel_map(resize_like(highres_skeleton, reference_logits, mode="bilinear"))
+        )
+    if selected_stage is None:
+        return features
+
+    connectivity = selected_stage.get("connectivity")
+    if connectivity is not None:
+        conn_prob = torch.sigmoid(resize_like(connectivity, reference_logits, mode="bilinear"))
+        topk = min(2, conn_prob.shape[1])
+        features["conn_strength"] = conn_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
+
+    gate = selected_stage.get("structure_gate")
+    if gate is not None:
+        features["structure_gate"] = single_channel_map(
+            resize_like(gate, reference_logits, mode="bilinear")
+        )
+
+    direction = selected_stage.get("direction")
+    if direction is not None:
+        direction = resize_like(direction, reference_logits, mode="bilinear")
+        features["direction_confidence"] = direction.float().norm(dim=1, keepdim=True)
+
+    return features
+
+
 def classification_metrics(pred, gt):
     tp = int((pred & gt).sum().item())
     fp = int((pred & (~gt)).sum().item())
@@ -291,6 +356,13 @@ def main():
         alpha: empty_transition_counts()
         for alpha in alpha_values
     }
+    transition_feature_buckets = {
+        alpha: {
+            "FN_to_TP": feature_bucket_map(),
+            "TN_to_FP": feature_bucket_map(),
+        }
+        for alpha in alpha_values
+    }
     delta_abs_values = []
     base_std_values = []
     batches = 0
@@ -306,7 +378,9 @@ def main():
             mask = (batch["mask"].to(device) > 0.5).float()
             skeleton = batch["skeleton"].to(device).float()
 
-            on_logits = model(image, gt_skeleton=skeleton)[0]
+            on_outputs = model(image, gt_skeleton=skeleton)
+            on_logits = on_outputs[0]
+            stage_outputs = on_outputs[4] if isinstance(on_outputs, tuple) and len(on_outputs) > 4 else []
             with structure_off(model):
                 off_logits = model(
                     image,
@@ -318,6 +392,9 @@ def main():
             gt = resize_like(mask, off_logits, mode="nearest") > 0.5
             on_logits = resize_like(on_logits, off_logits, mode="bilinear")
             delta = on_logits - off_logits
+            feature_maps = extract_structure_features(stage_outputs, off_logits)
+            feature_maps["surface_off_logit"] = off_logits
+            feature_maps["delta_z"] = delta
             off_pred = torch.sigmoid(off_logits) >= args.threshold
 
             fn_off = gt & (~off_pred)
@@ -343,6 +420,17 @@ def main():
                 counts["FP_to_TN"] += int((fp_off & (~alpha_pred)).sum().item())
                 counts["TN_to_FP"] += int((tn_off & alpha_pred).sum().item())
                 counts["TP_to_FN"] += int((tp_off & (~alpha_pred)).sum().item())
+                fn_to_tp = fn_off & alpha_pred
+                tn_to_fp = tn_off & alpha_pred
+                for feature_name, feature_map in feature_maps.items():
+                    update_bucket(
+                        transition_feature_buckets[alpha]["FN_to_TP"][feature_name],
+                        feature_map[fn_to_tp],
+                    )
+                    update_bucket(
+                        transition_feature_buckets[alpha]["TN_to_FP"][feature_name],
+                        feature_map[tn_to_fp],
+                    )
 
             delta_abs_values.append(delta.detach().abs().reshape(-1).cpu().numpy())
             base_std_values.append(float(off_logits.detach().float().std(unbiased=False).cpu().item()))
@@ -460,6 +548,54 @@ def main():
                 quality,
             )
         )
+
+    print("\nTransition feature statistics")
+    for alpha in alpha_values:
+        print(f"\nalpha={alpha:.3f}")
+        for transition_name in ("FN_to_TP", "TN_to_FP"):
+            print(f"  {transition_name}")
+            print(
+                "    {:<22} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}".format(
+                    "feature",
+                    "mean",
+                    "p05",
+                    "p25",
+                    "p50",
+                    "p75",
+                    "p95",
+                    "pixels",
+                )
+            )
+            print("    " + "-" * 106)
+            for feature_name in FEATURE_NAMES:
+                bucket = transition_feature_buckets[alpha][transition_name][feature_name]
+                if bucket["count"] <= 0:
+                    print(
+                        "    {:<22} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}".format(
+                            feature_name,
+                            "nan",
+                            "nan",
+                            "nan",
+                            "nan",
+                            "nan",
+                            "nan",
+                            0,
+                        )
+                    )
+                    continue
+                values = np.concatenate(bucket["values"], axis=0)
+                print(
+                    "    {:<22} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f} {:>12}".format(
+                        feature_name,
+                        float(values.mean()),
+                        float(np.quantile(values, 0.05)),
+                        float(np.quantile(values, 0.25)),
+                        float(np.quantile(values, 0.50)),
+                        float(np.quantile(values, 0.75)),
+                        float(np.quantile(values, 0.95)),
+                        int(values.size),
+                    )
+                )
 
 
 if __name__ == "__main__":
