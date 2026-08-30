@@ -177,7 +177,6 @@ def main():
 
             images_tensor = batch["image"].to(device)
             skeleton_gt = batch["skeleton"].to(device).float()
-            connectivity_gt = batch["connectivity_gt"].to(device).float()
 
             outputs = model(images_tensor, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
             structure_outputs = outputs[-1]

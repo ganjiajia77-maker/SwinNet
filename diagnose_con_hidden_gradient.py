@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from losses.road_losses import SurfaceStructureLoss
+from losses.road_losses import SurfaceStructureLoss, build_connectivity_target
 from networks.vision_transformer_selective_fusion import (
     SwinUnet as ViT_seg,
     load_topology_checkpoint_state,
@@ -204,9 +204,12 @@ def main():
         outputs = model(images, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
         stage_output = select_stage_outputs(outputs, args.stage)
         connectivity_logits = stage_output["connectivity"]
-        connectivity_gt = resize_like(batch["connectivity_gt"].to(device).float(), connectivity_logits)
         skeleton_match = resize_like(skeleton, connectivity_logits[:, :1])
         skeleton_dilate_match = resize_like(skeleton_dilate, connectivity_logits[:, :1])
+        connectivity_gt = build_connectivity_target(skeleton_match).to(
+            device=connectivity_logits.device,
+            dtype=connectivity_logits.dtype,
+        )
         hidden = captured["hidden"]
         if hidden is None:
             raise RuntimeError("Failed to capture con_hidden from structure_branch.")

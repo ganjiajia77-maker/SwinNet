@@ -467,7 +467,6 @@ def main():
             images = batch["image"].to(device)
             masks = (batch["mask"].to(device) > 0.5)
             skeleton_raw = batch["skeleton"].to(device).float()
-            direction_gt = batch["direction_gt"].to(device).float()
 
             outputs = model(images, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
             surface_logits = outputs[0]
