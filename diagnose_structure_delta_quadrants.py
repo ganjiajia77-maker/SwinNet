@@ -31,6 +31,13 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_batches", type=int, default=0)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--alpha_values",
+        type=float,
+        nargs="+",
+        default=[1.0],
+        help="Evaluate z_alpha = z_off + alpha * (z_on - z_off) for each value.",
+    )
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--source_patch_size", type=int, default=1024)
@@ -229,6 +236,16 @@ def add_metrics(total, metrics):
         total[key] += metrics[key]
 
 
+def empty_transition_counts():
+    return {
+        "FN_to_TP": 0,
+        "FP_to_TN": 0,
+        "TN_to_FP": 0,
+        "TP_to_FN": 0,
+        "changed": 0,
+    }
+
+
 def summarize_metrics(total):
     precision = total["tp"] / max(total["tp"] + total["fp"], 1)
     recall = total["tp"] / max(total["tp"] + total["fn"], 1)
@@ -265,13 +282,14 @@ def main():
         "TN_off_GTbg_predbg": empty_bucket(),
     }
     off_total = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
-    on_total = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
-    transitions = {
-        "FN_to_TP": 0,
-        "FP_to_TN": 0,
-        "TN_to_FP": 0,
-        "TP_to_FN": 0,
-        "changed": 0,
+    alpha_values = [float(alpha) for alpha in args.alpha_values]
+    alpha_totals = {
+        alpha: {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+        for alpha in alpha_values
+    }
+    alpha_transitions = {
+        alpha: empty_transition_counts()
+        for alpha in alpha_values
     }
     delta_abs_values = []
     base_std_values = []
@@ -301,7 +319,6 @@ def main():
             on_logits = resize_like(on_logits, off_logits, mode="bilinear")
             delta = on_logits - off_logits
             off_pred = torch.sigmoid(off_logits) >= args.threshold
-            on_pred = torch.sigmoid(on_logits) >= args.threshold
 
             fn_off = gt & (~off_pred)
             fp_off = (~gt) & off_pred
@@ -314,34 +331,35 @@ def main():
             update_bucket(buckets["TN_off_GTbg_predbg"], delta[tn_off])
 
             add_metrics(off_total, classification_metrics(off_pred, gt))
-            add_metrics(on_total, classification_metrics(on_pred, gt))
+            for alpha in alpha_values:
+                alpha_logits = off_logits + alpha * delta
+                alpha_pred = torch.sigmoid(alpha_logits) >= args.threshold
+                add_metrics(alpha_totals[alpha], classification_metrics(alpha_pred, gt))
 
-            changed = off_pred != on_pred
-            transitions["changed"] += int(changed.sum().item())
-            transitions["FN_to_TP"] += int((fn_off & on_pred).sum().item())
-            transitions["FP_to_TN"] += int((fp_off & (~on_pred)).sum().item())
-            transitions["TN_to_FP"] += int((tn_off & on_pred).sum().item())
-            transitions["TP_to_FN"] += int((tp_off & (~on_pred)).sum().item())
+                changed = off_pred != alpha_pred
+                counts = alpha_transitions[alpha]
+                counts["changed"] += int(changed.sum().item())
+                counts["FN_to_TP"] += int((fn_off & alpha_pred).sum().item())
+                counts["FP_to_TN"] += int((fp_off & (~alpha_pred)).sum().item())
+                counts["TN_to_FP"] += int((tn_off & alpha_pred).sum().item())
+                counts["TP_to_FN"] += int((tp_off & (~alpha_pred)).sum().item())
 
             delta_abs_values.append(delta.detach().abs().reshape(-1).cpu().numpy())
             base_std_values.append(float(off_logits.detach().float().std(unbiased=False).cpu().item()))
 
     off_precision, off_recall, off_iou, off_f1 = summarize_metrics(off_total)
-    on_precision, on_recall, on_iou, on_f1 = summarize_metrics(on_total)
     delta_abs = np.concatenate(delta_abs_values, axis=0) if delta_abs_values else np.empty((0,), dtype=np.float32)
     delta_abs_mean = float(delta_abs.mean()) if delta_abs.size else float("nan")
     base_std_mean = float(np.mean(base_std_values)) if base_std_values else float("nan")
     r_delta = delta_abs_mean / max(base_std_mean, 1e-12)
-    good = transitions["FN_to_TP"] + transitions["FP_to_TN"]
-    bad = transitions["TN_to_FP"] + transitions["TP_to_FN"]
-    quality = good / max(transitions["changed"], 1)
 
     print("\nSTRUCTURE DELTA QUADRANT DIAGNOSTIC")
     print(f"split={args.split} batches={batches} images={images} threshold={args.threshold:.3f}")
     print(f"model_path={args.model_path}")
-    print("\nSurface metrics")
+    print(f"alpha_values={alpha_values}")
+    print("\nSurface metrics by alpha")
     print(
-        "  off: IoU={:.6f} F1={:.6f} Precision={:.6f} Recall={:.6f} "
+        "  off alpha=0.000: IoU={:.6f} F1={:.6f} Precision={:.6f} Recall={:.6f} "
         "TP={} FP={} FN={} TN={}".format(
             off_iou,
             off_f1,
@@ -353,19 +371,23 @@ def main():
             off_total["tn"],
         )
     )
-    print(
-        "  on:  IoU={:.6f} F1={:.6f} Precision={:.6f} Recall={:.6f} "
-        "TP={} FP={} FN={} TN={}".format(
-            on_iou,
-            on_f1,
-            on_precision,
-            on_recall,
-            on_total["tp"],
-            on_total["fp"],
-            on_total["fn"],
-            on_total["tn"],
+    for alpha in alpha_values:
+        precision, recall, iou, f1 = summarize_metrics(alpha_totals[alpha])
+        total = alpha_totals[alpha]
+        print(
+            "  on  alpha={:.3f}: IoU={:.6f} F1={:.6f} Precision={:.6f} Recall={:.6f} "
+            "TP={} FP={} FN={} TN={}".format(
+                alpha,
+                iou,
+                f1,
+                precision,
+                recall,
+                total["tp"],
+                total["fp"],
+                total["fn"],
+                total["tn"],
+            )
         )
-    )
     print(
         "  delta_abs_mean={:.8f} surface_off_logit_std_mean={:.8f} R_delta={:.8f}".format(
             delta_abs_mean,
@@ -405,15 +427,39 @@ def main():
             )
         )
 
-    print("\nBinary transition counts")
-    print(f"  FN->TP: {transitions['FN_to_TP']}")
-    print(f"  FP->TN: {transitions['FP_to_TN']}")
-    print(f"  TN->FP: {transitions['TN_to_FP']}")
-    print(f"  TP->FN: {transitions['TP_to_FN']}")
-    print(f"  changed: {transitions['changed']}")
-    print(f"  good_changed: {good}")
-    print(f"  bad_changed: {bad}")
-    print(f"  Q=(FN->TP + FP->TN) / changed = {quality:.6f}")
+    print("\nBinary transition counts by alpha")
+    print(
+        "{:<8} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}".format(
+            "alpha",
+            "FN->TP",
+            "FP->TN",
+            "TN->FP",
+            "TP->FN",
+            "changed",
+            "good",
+            "bad",
+            "Q",
+        )
+    )
+    print("-" * 108)
+    for alpha in alpha_values:
+        counts = alpha_transitions[alpha]
+        good = counts["FN_to_TP"] + counts["FP_to_TN"]
+        bad = counts["TN_to_FP"] + counts["TP_to_FN"]
+        quality = good / max(counts["changed"], 1)
+        print(
+            "{:<8.3f} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10.6f}".format(
+                alpha,
+                counts["FN_to_TP"],
+                counts["FP_to_TN"],
+                counts["TN_to_FP"],
+                counts["TP_to_FN"],
+                counts["changed"],
+                good,
+                bad,
+                quality,
+            )
+        )
 
 
 if __name__ == "__main__":
