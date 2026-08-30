@@ -1067,10 +1067,12 @@ class SwinTransformerBlock(nn.Module):
                 raise ValueError(
                     "topology_alpha is required for pairwise_skeleton topology bias"
                 )
-            skeleton = torch.sigmoid(self._pad_probability_map(skeleton_prob, H, W, Hp, Wp)).detach().permute(
+            skeleton = self._pad_probability_map(skeleton_prob, H, W, Hp, Wp)
+            connectivity = self._pad_probability_map(connectivity_prob, H, W, Hp, Wp)
+            skeleton = skeleton.detach().clamp(0.0, 1.0).permute(
                 0, 2, 3, 1
             ).contiguous()
-            connectivity = torch.sigmoid(self._pad_probability_map(connectivity_prob, H, W, Hp, Wp)).detach().permute(
+            connectivity = connectivity.detach().clamp(0.0, 1.0).permute(
                 0, 2, 3, 1
             ).contiguous()
             roadness = None
