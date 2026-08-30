@@ -4,8 +4,6 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from losses.road_losses import build_boundary_target, build_connectivity_target
-from direction_target_utils import build_continuous_direction_target
 
 
 class RoadSkeletonDataset(Dataset):
@@ -319,10 +317,6 @@ class RoadSkeletonDataset(Dataset):
             image = np.clip(image.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
         return image
 
-    @staticmethod
-    def _build_direction_target(skeleton):
-        return build_continuous_direction_target(skeleton, radius=3)
-
     def __getitem__(self, idx):
         rng = None
         fixed_crop_items = getattr(self, "fixed_crop_items", [])
@@ -373,12 +367,6 @@ class RoadSkeletonDataset(Dataset):
         mask = (mask > 127).astype(np.float32)
         skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
         skeleton_dilate = (self._dilate_skeleton(skeleton_hard * 255, iterations=1) > 127).astype(np.float32)
-        full_surface = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)
-        full_skeleton = torch.from_numpy(skeleton_hard).float().unsqueeze(0).unsqueeze(0)
-        connectivity_gt = build_connectivity_target(full_skeleton).squeeze(0)
-        direction_gt = self._build_direction_target(full_skeleton).squeeze(0)
-        boundary_gt = build_boundary_target(full_surface).squeeze(0)
-        valid_mask = torch.ones_like(full_skeleton).squeeze(0)
 
         if self.random_crop_train:
             crop_size = self.tile_size or self.image_size
@@ -400,10 +388,6 @@ class RoadSkeletonDataset(Dataset):
             mask = mask[top:bottom, left:right]
             skeleton_hard = skeleton_hard[top:bottom, left:right]
             skeleton_dilate = skeleton_dilate[top:bottom, left:right]
-            connectivity_gt = connectivity_gt[:, top:bottom, left:right]
-            direction_gt = direction_gt[:, top:bottom, left:right]
-            boundary_gt = boundary_gt[:, top:bottom, left:right]
-            valid_mask = valid_mask[:, top:bottom, left:right]
 
         if self.image_size is not None and image.shape[:2] != (self.image_size, self.image_size):
             size = (self.image_size, self.image_size)
@@ -425,10 +409,6 @@ class RoadSkeletonDataset(Dataset):
             "mask": torch.from_numpy(mask).float(),
             "skeleton": torch.from_numpy(skeleton_hard).float(),
             "skeleton_dilate": torch.from_numpy(skeleton_dilate).float(),
-            "connectivity_gt": connectivity_gt.float(),
-            "direction_gt": direction_gt.float(),
-            "boundary_gt": boundary_gt.float(),
-            "valid_mask": valid_mask.float(),
             "image_name": image_name,
             "case_name": os.path.splitext(image_name)[0].replace("_sat", ""),
         }

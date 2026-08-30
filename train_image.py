@@ -417,7 +417,7 @@ def format_training_config_lines(args, loss_weights):
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
             "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
-            "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength",
+            "  Decoder gate: structure gate plus semantic/direction-confidence reliability correction",
         ])
         if args.masked_connectivity_center_experiment:
             lines.extend([
@@ -1338,12 +1338,22 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
+                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.0.reliability_beta",
+                        "swin_unet.decoder_structure_blocks.1.reliability_beta",
+                        "swin_unet.decoder_structure_blocks.2.reliability_beta",
+                        "swin_unet.decoder_structure_blocks.3.reliability_beta",
                         "swin_unet.decoder_structure_blocks.0.gate_branch.",
                         "swin_unet.decoder_structure_blocks.1.gate_branch.",
                         "swin_unet.decoder_structure_blocks.2.gate_branch.",
                         "swin_unet.decoder_structure_blocks.3.gate_branch.",
                         "swin_unet.stage2_topology_source.direction_head.",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
+                        "swin_unet.stage2_topology_source.reliability_correction.",
+                        "swin_unet.stage2_topology_source.reliability_beta",
                         "swin_unet.stage2_topology_source.gate_branch.",
                         "swin_unet.guided_head.detached_skeleton_refine.",
                         "swin_unet.guided_head.detached_skeleton_head.",
@@ -1595,10 +1605,6 @@ if __name__ == "__main__":
                 masks = batch['mask'].to(device)
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
-                connectivity_gt = batch['connectivity_gt'].to(device)
-                direction_gt = batch['direction_gt'].to(device)
-                boundary_gt = batch['boundary_gt'].to(device)
-                valid_mask = batch['valid_mask'].to(device)
 
                 images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
                 masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -1640,10 +1646,6 @@ if __name__ == "__main__":
                     boundary_logits=boundary_logits,
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
-                    connectivity_gt=connectivity_gt,
-                    direction_gt=direction_gt,
-                    boundary_gt=boundary_gt,
-                    valid_mask=valid_mask,
                 )
 
                 if not torch.isfinite(loss):

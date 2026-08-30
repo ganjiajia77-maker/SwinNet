@@ -774,6 +774,13 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
+        self.reliability_correction = nn.Sequential(
+            nn.Conv2d(channels + 1, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(fusion_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(fusion_channels, 1, kernel_size=1),
+        )
+        self.reliability_beta = nn.Parameter(torch.tensor(0.0))
         if context_channels is not None:
             self.context_to_gate = nn.Conv2d(context_channels, 1, kernel_size=1)
             nn.init.zeros_(self.context_to_gate.weight)
@@ -870,6 +877,16 @@ class DecoderStructureRefinement(nn.Module):
                 self.context_to_gate(global_context)
             )
             structure_gate_logits = structure_gate_logits + context_bias
+        direction_confidence = direction_logits.detach().float().norm(
+            dim=1,
+            keepdim=True,
+        )
+        reliability_correction = self.reliability_correction(
+            torch.cat([x, direction_confidence], dim=1)
+        )
+        structure_gate_logits = structure_gate_logits + (
+            self.reliability_beta * reliability_correction
+        )
         structure_gate = torch.sigmoid(structure_gate_logits)
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
@@ -888,6 +905,10 @@ class DecoderStructureRefinement(nn.Module):
                     "gate_max": float(structure_gate.max().detach().cpu()),
                     "conn_strength_mean": float(
                         conn_strength.mean().detach().cpu()
+                    ),
+                    "reliability_beta": float(self.reliability_beta.detach().cpu()),
+                    "reliability_correction_mean": float(
+                        reliability_correction.mean().detach().cpu()
                     ),
                     "gate_residual_relative_norm": float(
                         (
