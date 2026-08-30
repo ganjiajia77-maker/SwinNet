@@ -203,18 +203,6 @@ parser.add_argument(
     help='positive class weight for connectivity BCE/focal BCE',
 )
 parser.add_argument(
-    '--connectivity_cardinal_pos_weight',
-    type=float,
-    default=None,
-    help='optional positive weight for N/E/S/W connectivity directions',
-)
-parser.add_argument(
-    '--connectivity_diagonal_pos_weight',
-    type=float,
-    default=None,
-    help='optional positive weight for NE/SE/SW/NW connectivity directions',
-)
-parser.add_argument(
     '--connectivity_focal_gamma',
     type=float,
     default=1.5,
@@ -396,8 +384,6 @@ def build_criterion(args, loss_weights, device):
         ),
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
-        connectivity_cardinal_pos_weight=args.connectivity_cardinal_pos_weight,
-        connectivity_diagonal_pos_weight=args.connectivity_diagonal_pos_weight,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).to(device)
 
@@ -419,8 +405,7 @@ def format_training_config_lines(args, loss_weights):
             "  Final skeleton head: detached feature + detached stage skeleton seed, gradient ratio={:.3f}".format(
                 args.final_skeleton_gradient_ratio,
             ),
-            "  Stage loss: stage2 step0=0.5 + stage2 step1=1.0; "
-            "stage3 step0 prior-only loss=0.0 + stage3 step1=1.0; "
+            "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
             "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
             "{:.3f}*connectivity loss".format(
                 args.stage_direction_factor,
@@ -435,29 +420,9 @@ def format_training_config_lines(args, loss_weights):
             "  Decoder gate: original gate from structure feature + skeleton probability + connectivity strength",
         ])
         if args.masked_connectivity_center_experiment:
-            if (
-                args.connectivity_cardinal_pos_weight is not None
-                or args.connectivity_diagonal_pos_weight is not None
-            ):
-                cardinal_pos_weight = (
-                    args.connectivity_cardinal_pos_weight
-                    if args.connectivity_cardinal_pos_weight is not None
-                    else args.connectivity_pos_weight
-                )
-                diagonal_pos_weight = (
-                    args.connectivity_diagonal_pos_weight
-                    if args.connectivity_diagonal_pos_weight is not None
-                    else args.connectivity_pos_weight
-                )
-                connectivity_balance = (
-                    "directional_pos_weight="
-                    f"cardinal={cardinal_pos_weight:.3f}, diagonal={diagonal_pos_weight:.3f}"
-                )
-            else:
-                connectivity_balance = f"pos_weight={args.connectivity_pos_weight:.3f}"
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
-                f"  Connectivity loss balance: {connectivity_balance}, focal_gamma={args.connectivity_focal_gamma:.3f}",
+                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}",
             ])
         if args.enable_graph_prop:
             lines.extend([
@@ -1495,16 +1460,14 @@ if __name__ == "__main__":
         try:
             best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
-            if not math.isfinite(best_val_f1):
-                best_val_f1 = -1.0
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
                 flush=True,
             )
         except Exception as exc:
             print(f"[WARN] Could not read existing best.pth score: {exc}", flush=True)
-    elif args.resume:
-        print("[INFO] No existing best.pth found; next validation can create it.", flush=True)
+    elif args.resume and 'checkpoint' in locals():
+        best_val_f1 = float(checkpoint.get('val_f1', -1.0))
 
     append_existing_logs = bool(args.resume and start_epoch > 0)
     
@@ -1632,21 +1595,9 @@ if __name__ == "__main__":
                 masks = batch['mask'].to(device)
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
-                connectivity_gt = (
-                    batch["connectivity_gt"].to(device)
-                    if "connectivity_gt" in batch
-                    else None
-                )
-                direction_gt = (
-                    batch["direction_gt"].to(device)
-                    if "direction_gt" in batch
-                    else None
-                )
-                boundary_gt = (
-                    batch["boundary_gt"].to(device)
-                    if "boundary_gt" in batch
-                    else None
-                )
+                connectivity_gt = batch['connectivity_gt'].to(device)
+                direction_gt = batch['direction_gt'].to(device)
+                boundary_gt = batch['boundary_gt'].to(device)
                 valid_mask = batch['valid_mask'].to(device)
 
                 images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)

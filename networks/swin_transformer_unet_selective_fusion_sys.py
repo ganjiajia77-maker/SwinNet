@@ -2886,42 +2886,7 @@ class SwinTransformerSys(nn.Module):
             if decoder_structure_gate_enabled:
                 decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
                 if inx == 3:
-                    input_height, input_width = layer_up.input_resolution
-                    x_map = token_to_map(x, input_height, input_width)
-                    (
-                        _,
-                        skeleton_0,
-                        connectivity_0,
-                        direction_0,
-                        structure_gate_0,
-                        roadness_0,
-                    ) = self._run_decoder_structure_block(
-                        x_map,
-                        inx,
-                        bottleneck_tokens,
-                        apply_feature_refinement=False,
-                        disable_skeleton_prediction=decoder_skeleton_disabled,
-                        skeleton_prior=highres_structure_skeleton,
-                    )
-                    if decoder_skeleton_disabled:
-                        skeleton_used = None
-                        connectivity_used = self._decoder_connectivity_used(
-                            connectivity_0,
-                            teacher_forcing_ratio,
-                        )
-                    else:
-                        skeleton_used, connectivity_used = self._mix_teacher_topology(
-                            skeleton_0,
-                            connectivity_0,
-                            gt_skeleton,
-                            teacher_forcing_ratio,
-                        )
-                    x = layer_up(
-                        x,
-                        decoder_skeleton_prob=skeleton_used,
-                        decoder_connectivity_prob=connectivity_used,
-                        decoder_direction_prob=direction_0,
-                    )
+                    x = layer_up(x)
                     output_scale = 2 ** max(2 - inx, 0)
                     output_height = self.patches_resolution[0] // output_scale
                     output_width = self.patches_resolution[1] // output_scale
@@ -2930,17 +2895,6 @@ class SwinTransformerSys(nn.Module):
                         z_struct,
                         inx,
                         (output_height, output_width),
-                    )
-                    self._append_structure_output(
-                        structure_outputs,
-                        stage=inx,
-                        skeleton=skeleton_0,
-                        connectivity=connectivity_0,
-                        direction=direction_0,
-                        structure_gate=structure_gate_0,
-                        roadness=roadness_0,
-                        refinement_step=0,
-                        stage_loss_scale=0.0,
                     )
                     x_map = token_to_map(x, output_height, output_width)
                     (

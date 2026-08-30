@@ -138,36 +138,6 @@ def direction_stats(direction_logits, direction_gt, valid_mask):
     }
 
 
-def build_eval_direction_target(stage_skeleton, direction_logits):
-    stage_skeleton = resize_like(stage_skeleton, direction_logits[:, :1], mode="nearest")
-    skeleton_mask = (stage_skeleton > 0.5).to(
-        device=direction_logits.device,
-        dtype=direction_logits.dtype,
-    )
-    direction_gt = build_continuous_direction_target(skeleton_mask, radius=3).to(
-        device=direction_logits.device,
-        dtype=direction_logits.dtype,
-    )
-    direction_valid = skeleton_mask * (
-        direction_gt.norm(dim=1, keepdim=True) > 1e-6
-    ).to(dtype=direction_logits.dtype)
-
-    height, width = direction_logits.shape[-2:]
-    boundary_valid = torch.ones(
-        (direction_logits.shape[0], 1, height, width),
-        device=direction_logits.device,
-        dtype=direction_logits.dtype,
-    )
-    if height > 1:
-        boundary_valid[:, :, 0, :] = 0
-        boundary_valid[:, :, -1, :] = 0
-    if width > 1:
-        boundary_valid[:, :, :, 0] = 0
-        boundary_valid[:, :, :, -1] = 0
-    direction_valid = direction_valid * boundary_valid
-    return direction_gt, direction_valid
-
-
 def connectivity_stats(connectivity_prob, connectivity_gt, valid_mask, threshold=0.5):
     prob = connectivity_prob.detach().cpu()
     gt = (connectivity_gt.detach().cpu() > 0.5)
@@ -497,6 +467,7 @@ def main():
             images = batch["image"].to(device)
             masks = (batch["mask"].to(device) > 0.5)
             skeleton_raw = batch["skeleton"].to(device).float()
+            direction_gt = batch["direction_gt"].to(device).float()
 
             outputs = model(images, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
             surface_logits = outputs[0]
@@ -523,7 +494,11 @@ def main():
             d_logits = stage_output["direction"]
             stage_skeleton_gt = build_stage_skeleton_target(skeleton_raw, c_prob.shape[-2:]).to(device)
             c_gt = build_connectivity_target(stage_skeleton_gt)
-            d_gt, direction_valid = build_eval_direction_target(stage_skeleton_gt, d_logits)
+            skeleton_dir = resize_like(stage_skeleton_gt, d_logits[:, :1], mode="nearest") > 0.5
+            d_gt = build_continuous_direction_target(skeleton_dir.float(), radius=3).to(
+                device=d_logits.device,
+                dtype=d_logits.dtype,
+            )
 
             conn_valid = stage_skeleton_gt > 0.5
             conn = connectivity_stats(c_prob, c_gt, conn_valid, threshold=args.threshold)
@@ -570,7 +545,7 @@ def main():
                     conn_neg_logit_sum[dir_idx] += float(dir_logit[neg_mask].double().sum().item())
             symmetry_errors.append(reciprocal_symmetry_error(c_prob.detach().cpu()))
 
-            d_stats = direction_stats(d_logits, d_gt, direction_valid)
+            d_stats = direction_stats(d_logits, d_gt, skeleton_dir.float())
             dir_stats_acc["pred_hist"] += d_stats["pred_hist"]
             dir_stats_acc["gt_hist"] += d_stats["gt_hist"]
             dir_stats_acc["count"] += d_stats["count"]
