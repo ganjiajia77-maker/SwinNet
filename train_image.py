@@ -414,7 +414,7 @@ def format_training_config_lines(args, loss_weights):
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
             "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
-            "  Decoder gate: structure gate plus semantic/direction-confidence reliability correction",
+            "  Decoder gate: structure gate plus local+dilated semantic context and direction-confidence reliability correction",
         ])
         if args.masked_connectivity_center_experiment:
             lines.extend([
@@ -1339,6 +1339,22 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.2.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.3.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.0.reliability_local.",
+                        "swin_unet.decoder_structure_blocks.1.reliability_local.",
+                        "swin_unet.decoder_structure_blocks.2.reliability_local.",
+                        "swin_unet.decoder_structure_blocks.3.reliability_local.",
+                        "swin_unet.decoder_structure_blocks.0.reliability_context.",
+                        "swin_unet.decoder_structure_blocks.1.reliability_context.",
+                        "swin_unet.decoder_structure_blocks.2.reliability_context.",
+                        "swin_unet.decoder_structure_blocks.3.reliability_context.",
+                        "swin_unet.decoder_structure_blocks.0.reliability_direction.",
+                        "swin_unet.decoder_structure_blocks.1.reliability_direction.",
+                        "swin_unet.decoder_structure_blocks.2.reliability_direction.",
+                        "swin_unet.decoder_structure_blocks.3.reliability_direction.",
+                        "swin_unet.decoder_structure_blocks.0.reliability_fuse.",
+                        "swin_unet.decoder_structure_blocks.1.reliability_fuse.",
+                        "swin_unet.decoder_structure_blocks.2.reliability_fuse.",
+                        "swin_unet.decoder_structure_blocks.3.reliability_fuse.",
                         "swin_unet.decoder_structure_blocks.0.reliability_beta",
                         "swin_unet.decoder_structure_blocks.1.reliability_beta",
                         "swin_unet.decoder_structure_blocks.2.reliability_beta",
@@ -1350,11 +1366,22 @@ if __name__ == "__main__":
                         "swin_unet.stage2_topology_source.direction_head.",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
                         "swin_unet.stage2_topology_source.reliability_correction.",
+                        "swin_unet.stage2_topology_source.reliability_local.",
+                        "swin_unet.stage2_topology_source.reliability_context.",
+                        "swin_unet.stage2_topology_source.reliability_direction.",
+                        "swin_unet.stage2_topology_source.reliability_fuse.",
                         "swin_unet.stage2_topology_source.reliability_beta",
                         "swin_unet.stage2_topology_source.gate_branch.",
                         "swin_unet.guided_head.detached_skeleton_refine.",
                         "swin_unet.guided_head.detached_skeleton_head.",
                         "swin_unet.guided_head.post_refine_structure_interaction.",
+                    )
+                    allowed_unexpected_prefixes = (
+                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
+                        "swin_unet.stage2_topology_source.reliability_correction.",
                     )
                     result = model.load_state_dict(
                         checkpoint_state,
@@ -1365,10 +1392,15 @@ if __name__ == "__main__":
                         for key in result.missing_keys
                         if not key.startswith(allowed_missing_prefixes)
                     ]
-                    if invalid_missing or result.unexpected_keys:
+                    invalid_unexpected = [
+                        key
+                        for key in result.unexpected_keys
+                        if not key.startswith(allowed_unexpected_prefixes)
+                    ]
+                    if invalid_missing or invalid_unexpected:
                         raise RuntimeError(
                             "Checkpoint mismatch on resume: "
-                            f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+                            f"missing={invalid_missing}, unexpected={invalid_unexpected}"
                         ) from exc
                     print(
                         "[WARN] Loaded checkpoint with strict=False; "

@@ -774,8 +774,30 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
-        self.reliability_correction = nn.Sequential(
-            nn.Conv2d(channels + 1, fusion_channels, kernel_size=3, padding=1, bias=False),
+        self.reliability_local = nn.Sequential(
+            nn.Conv2d(channels, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(fusion_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.reliability_context = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                fusion_channels,
+                kernel_size=3,
+                padding=3,
+                dilation=3,
+                bias=False,
+            ),
+            nn.BatchNorm2d(fusion_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.reliability_direction = nn.Sequential(
+            nn.Conv2d(1, fusion_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(fusion_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.reliability_fuse = nn.Sequential(
+            nn.Conv2d(3 * fusion_channels, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
@@ -882,9 +904,19 @@ class DecoderStructureRefinement(nn.Module):
         direction_confidence = direction_logits.detach().float().norm(
             dim=1,
             keepdim=True,
-        )
-        reliability_correction = self.reliability_correction(
-            torch.cat([x, direction_confidence], dim=1)
+        ).to(dtype=x.dtype)
+        reliability_local = self.reliability_local(x)
+        reliability_context = self.reliability_context(x)
+        reliability_direction = self.reliability_direction(direction_confidence)
+        reliability_correction = self.reliability_fuse(
+            torch.cat(
+                [
+                    reliability_local,
+                    reliability_context,
+                    reliability_direction,
+                ],
+                dim=1,
+            )
         )
         structure_gate_logits = structure_gate_old_logits + (
             self.reliability_beta * reliability_correction
@@ -913,6 +945,15 @@ class DecoderStructureRefinement(nn.Module):
                     "reliability_correction_mean": float(
                         reliability_correction.mean().detach().cpu()
                     ),
+                    "reliability_local_mean": float(
+                        reliability_local.mean().detach().cpu()
+                    ),
+                    "reliability_context_mean": float(
+                        reliability_context.mean().detach().cpu()
+                    ),
+                    "reliability_direction_mean": float(
+                        reliability_direction.mean().detach().cpu()
+                    ),
                     "gate_residual_relative_norm": float(
                         (
                             torch.linalg.vector_norm(gate_residual)
@@ -929,6 +970,9 @@ class DecoderStructureRefinement(nn.Module):
         diagnostics = {
             "structure_gate_old": structure_gate_old,
             "reliability_correction": reliability_correction,
+            "reliability_local": reliability_local,
+            "reliability_context": reliability_context,
+            "reliability_direction": reliability_direction,
             "structure_gate_final": structure_gate,
             "reliability_beta": self.reliability_beta.detach(),
         }
