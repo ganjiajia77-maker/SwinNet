@@ -287,6 +287,14 @@ def extract_structure_features(stage_outputs, reference_logits):
             resize_like(gate_final, reference_logits, mode="bilinear")
         )
 
+    semantic_feature = selected_stage.get("semantic_feature")
+    if semantic_feature is not None:
+        features["semantic_feature"] = resize_like(
+            semantic_feature,
+            reference_logits,
+            mode="bilinear",
+        )
+
     direction = selected_stage.get("direction")
     if direction is not None:
         direction = resize_like(direction, reference_logits, mode="bilinear")

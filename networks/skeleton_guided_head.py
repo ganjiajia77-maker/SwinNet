@@ -794,6 +794,7 @@ class DecoderStructureRefinement(nn.Module):
         )
         self.raw_gamma1 = nn.Parameter(torch.tensor(float(init_gamma1)))
         self.capture_diagnostics = False
+        self.capture_feature_tensors = False
         self.last_diagnostics = None
 
     @property
@@ -925,18 +926,22 @@ class DecoderStructureRefinement(nn.Module):
                         ).detach().cpu()
                     ),
                 }
+        diagnostics = {
+            "structure_gate_old": structure_gate_old,
+            "reliability_correction": reliability_correction,
+            "structure_gate_final": structure_gate,
+            "reliability_beta": self.reliability_beta.detach(),
+        }
+        if self.capture_feature_tensors:
+            diagnostics["semantic_feature"] = x.detach()
+
         return (
             out,
             skeleton_logits,
             connectivity_logits,
             direction_logits,
             structure_gate,
-            {
-                "structure_gate_old": structure_gate_old,
-                "reliability_correction": reliability_correction,
-                "structure_gate_final": structure_gate,
-                "reliability_beta": self.reliability_beta.detach(),
-            },
+            diagnostics,
         )
 
 
