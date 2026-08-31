@@ -19,11 +19,21 @@ from diagnose_connectivity_direction_quality import (
     surface_fragmentation_stats,
 )
 from diagnose_structure_delta_quadrants import (
-    FEATURE_NAMES,
     bucket_stats,
     empty_bucket,
     extract_structure_features,
     update_bucket,
+)
+
+RELIABILITY_FEATURE_NAMES = (
+    "surface_off_logit",
+    "surface_on_logit",
+    "R_reliability",
+    "G_structure_old",
+    "G_final",
+    "direction_confidence",
+    "skeleton_prob",
+    "conn_strength",
 )
 
 
@@ -159,7 +169,7 @@ def summarize_counts(total):
 
 
 def empty_feature_buckets():
-    return {name: empty_bucket() for name in FEATURE_NAMES}
+    return {name: empty_bucket() for name in RELIABILITY_FEATURE_NAMES}
 
 
 def mean_row(rows, key):
@@ -239,8 +249,8 @@ def main():
         "changed": 0,
     }
     transition_features = {
-        "FN_to_TP": empty_feature_buckets(),
-        "TN_to_FP": empty_feature_buckets(),
+        "FP_to_TN": empty_feature_buckets(),
+        "TP_to_FN": empty_feature_buckets(),
     }
     batches = 0
     images = 0
@@ -273,6 +283,8 @@ def main():
             on_logits = resize_like(on_outputs[0], off_logits, mode="bilinear")
             stage_outputs = on_outputs[4] if isinstance(on_outputs, tuple) and len(on_outputs) > 4 else []
             feature_maps, _ = extract_structure_features(stage_outputs, off_logits)
+            feature_maps["surface_off_logit"] = off_logits
+            feature_maps["surface_on_logit"] = on_logits
 
             gt = resize_like(mask, off_logits, mode="nearest") > 0.5
             off_pred = torch.sigmoid(off_logits) >= args.threshold
@@ -296,11 +308,14 @@ def main():
             transitions["TP_to_FN"] += int((tp_off & (~on_pred)).sum().item())
 
             masks_by_transition = {
-                "FN_to_TP": fn_off & on_pred,
-                "TN_to_FP": tn_off & on_pred,
+                "FP_to_TN": fp_off & (~on_pred),
+                "TP_to_FN": tp_off & (~on_pred),
             }
             for transition_name, transition_mask in masks_by_transition.items():
-                for feature_name, feature_map in feature_maps.items():
+                for feature_name in RELIABILITY_FEATURE_NAMES:
+                    feature_map = feature_maps.get(feature_name)
+                    if feature_map is None:
+                        continue
                     update_bucket(
                         transition_features[transition_name][feature_name],
                         feature_map[transition_mask],
@@ -350,7 +365,8 @@ def main():
     print(f"  Q_rel:    {quality:.8f}")
     print("")
     print("Transition feature statistics from Reliability ON pass")
-    for transition_name in ("FN_to_TP", "TN_to_FP"):
+    print("  Focus: FP_to_TN explains correctly removed false roads; TP_to_FN explains damaged true roads.")
+    for transition_name in ("FP_to_TN", "TP_to_FN"):
         print(f"  {transition_name}")
         print(
             "    {:<18} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}".format(
@@ -365,7 +381,7 @@ def main():
             )
         )
         print("    " + "-" * 102)
-        for feature_name in FEATURE_NAMES:
+        for feature_name in RELIABILITY_FEATURE_NAMES:
             stats = bucket_stats(transition_features[transition_name][feature_name])
             print(
                 "    {:<18} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f} {:>12}".format(
