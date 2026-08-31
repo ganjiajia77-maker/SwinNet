@@ -2462,8 +2462,8 @@ class SwinTransformerSys(nn.Module):
                 )
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
-                        "[INFO] Final skeleton head: enabled as detached auxiliary "
-                        "(0626 profile; final connectivity disabled)"
+                        "[INFO] Final head: surface + boundary residual only "
+                        "(0626 profile; final skeleton/connectivity removed)"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
@@ -2738,6 +2738,8 @@ class SwinTransformerSys(nn.Module):
         refinement_step=None,
         stage_loss_scale=None,
     ):
+        diagnostics = roadness if isinstance(roadness, dict) else None
+        roadness = None if diagnostics is not None else roadness
         item = {
             "stage": stage,
             "connectivity": connectivity,
@@ -2745,6 +2747,8 @@ class SwinTransformerSys(nn.Module):
             "structure_gate": structure_gate,
             "roadness": roadness,
         }
+        if diagnostics:
+            item.update(diagnostics)
         if skeleton is not None:
             item["skeleton"] = skeleton
         if refinement_step is not None:

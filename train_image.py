@@ -324,8 +324,8 @@ if args.freeze_post_refine_interaction_only:
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         weights = {
-            "skeleton_weight": 0.10,
-            "connectivity_weight": 0.03,
+            "skeleton_weight": 0.0,
+            "connectivity_weight": 0.0,
             "boundary_weight": 0.0,
         }
     else:
@@ -395,15 +395,12 @@ def format_training_config_lines(args, loss_weights):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final skeleton head: enabled and detached; final connectivity disabled",
+            "  Final head: surface branch + boundary residual only; final skeleton/connectivity removed",
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage2/Stage3 skeleton gradient ratio: {:.3f}/{:.3f}".format(
                 args.stage2_skeleton_gradient_ratio,
                 args.stage3_skeleton_gradient_ratio,
-            ),
-            "  Final skeleton head: detached feature + detached stage skeleton seed, gradient ratio={:.3f}".format(
-                args.final_skeleton_gradient_ratio,
             ),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
             "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "

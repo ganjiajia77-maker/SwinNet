@@ -22,7 +22,9 @@ FEATURE_NAMES = (
     "delta_z",
     "skeleton_prob",
     "conn_strength",
-    "structure_gate",
+    "G_structure_old",
+    "R_reliability",
+    "G_final",
     "direction_confidence",
 )
 
@@ -241,10 +243,16 @@ def extract_structure_features(stage_outputs, reference_logits):
     features = {}
     selected_stage = None
     highres_skeleton = None
+    reliability_betas = []
 
     for item in stage_outputs or []:
         if item.get("highres_structure_skeleton") is not None:
             highres_skeleton = item["highres_structure_skeleton"]
+        if item.get("reliability_beta") is not None:
+            beta = item["reliability_beta"]
+            if torch.is_tensor(beta):
+                beta = float(beta.detach().cpu())
+            reliability_betas.append((item.get("stage", "unknown"), item.get("refinement_step", None), beta))
         if stage_id(item) in (2, 3):
             selected_stage = item
 
@@ -261,10 +269,22 @@ def extract_structure_features(stage_outputs, reference_logits):
         topk = min(2, conn_prob.shape[1])
         features["conn_strength"] = conn_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
 
-    gate = selected_stage.get("structure_gate")
-    if gate is not None:
-        features["structure_gate"] = single_channel_map(
-            resize_like(gate, reference_logits, mode="bilinear")
+    gate_old = selected_stage.get("structure_gate_old")
+    if gate_old is not None:
+        features["G_structure_old"] = single_channel_map(
+            resize_like(gate_old, reference_logits, mode="bilinear")
+        )
+
+    reliability = selected_stage.get("reliability_correction")
+    if reliability is not None:
+        features["R_reliability"] = single_channel_map(
+            resize_like(reliability, reference_logits, mode="bilinear")
+        )
+
+    gate_final = selected_stage.get("structure_gate_final", selected_stage.get("structure_gate"))
+    if gate_final is not None:
+        features["G_final"] = single_channel_map(
+            resize_like(gate_final, reference_logits, mode="bilinear")
         )
 
     direction = selected_stage.get("direction")
@@ -272,7 +292,7 @@ def extract_structure_features(stage_outputs, reference_logits):
         direction = resize_like(direction, reference_logits, mode="bilinear")
         features["direction_confidence"] = direction.float().norm(dim=1, keepdim=True)
 
-    return features
+    return features, reliability_betas
 
 
 def classification_metrics(pred, gt):
@@ -363,6 +383,7 @@ def main():
         }
         for alpha in alpha_values
     }
+    beta_values = {}
     delta_abs_values = []
     base_std_values = []
     batches = 0
@@ -392,7 +413,10 @@ def main():
             gt = resize_like(mask, off_logits, mode="nearest") > 0.5
             on_logits = resize_like(on_logits, off_logits, mode="bilinear")
             delta = on_logits - off_logits
-            feature_maps = extract_structure_features(stage_outputs, off_logits)
+            feature_maps, reliability_betas = extract_structure_features(stage_outputs, off_logits)
+            for stage, step, beta in reliability_betas:
+                key = f"stage={stage},step={step}"
+                beta_values.setdefault(key, []).append(float(beta))
             feature_maps["surface_off_logit"] = off_logits
             feature_maps["delta_z"] = delta
             off_pred = torch.sigmoid(off_logits) >= args.threshold
@@ -483,6 +507,20 @@ def main():
             r_delta,
         )
     )
+    print("\nReliability beta")
+    if beta_values:
+        for key in sorted(beta_values):
+            values = np.asarray(beta_values[key], dtype=np.float64)
+            print(
+                "  {}: mean={:.8f} min={:.8f} max={:.8f}".format(
+                    key,
+                    float(values.mean()),
+                    float(values.min()),
+                    float(values.max()),
+                )
+            )
+    else:
+        print("  no reliability_beta values found in stage outputs")
 
     print("\nSigned delta z by structure-off quadrant")
     print(

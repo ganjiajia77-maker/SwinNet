@@ -129,11 +129,13 @@ def apply_structure_profile_runtime(model):
 
     topology_attention = guided_head.final_topology_attention
     with torch.no_grad():
-        topology_attention.fixed_eta.zero_()
-        topology_attention.raw_eta.zero_()
+        if topology_attention is not None:
+            topology_attention.fixed_eta.zero_()
+            topology_attention.raw_eta.zero_()
         guided_head.fixed_rho_gap.zero_()
         guided_head.raw_rho_gap.zero_()
-    topology_attention.raw_eta.requires_grad_(False)
+    if topology_attention is not None:
+        topology_attention.raw_eta.requires_grad_(False)
     guided_head.raw_rho_gap.requires_grad_(False)
 
 
@@ -459,6 +461,20 @@ def load_topology_checkpoint_state(
     allowed_new_missing_prefixes = (
         road_attention_missing_prefixes + msaf_missing_prefixes
     )
+    allowed_removed_unexpected_prefixes = (
+        "swin_unet.guided_head.skeleton_proj.",
+        "swin_unet.guided_head.structure_branch.",
+        "swin_unet.guided_head.skeleton_head.",
+        "swin_unet.guided_head.detached_skeleton_refine.",
+        "swin_unet.guided_head.detached_skeleton_head.",
+        "swin_unet.guided_head.connectivity_context.",
+        "swin_unet.guided_head.connectivity_head.",
+        "swin_unet.guided_head.structure_to_surface.",
+        "swin_unet.guided_head.structure_to_surface_gamma",
+        "swin_unet.guided_head.final_topology_attention.",
+        "swin_unet.guided_head.structure_fusion.",
+        "swin_unet.guided_head.structure_residual.",
+    )
     if strict:
         result = model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
@@ -466,10 +482,15 @@ def load_topology_checkpoint_state(
             for key in result.missing_keys
             if not key.startswith(allowed_new_missing_prefixes)
         ]
-        if invalid_missing or result.unexpected_keys:
+        invalid_unexpected = [
+            key
+            for key in result.unexpected_keys
+            if not key.startswith(allowed_removed_unexpected_prefixes)
+        ]
+        if invalid_missing or invalid_unexpected:
             raise RuntimeError(
                 "Checkpoint mismatch after allowing new encoder additions: "
-                f"missing={invalid_missing}, unexpected={result.unexpected_keys}"
+                f"missing={invalid_missing}, unexpected={invalid_unexpected}"
             )
         print_expected_highres_missing(result.missing_keys)
         print(

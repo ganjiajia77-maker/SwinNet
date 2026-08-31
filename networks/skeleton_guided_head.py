@@ -862,7 +862,7 @@ class DecoderStructureRefinement(nn.Module):
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
         gate_feat = self.gate_branch(x)
-        structure_gate_logits = self.structure_gate(
+        structure_gate_old_logits = self.structure_gate(
             torch.cat(
                 [
                     gate_feat,
@@ -876,7 +876,8 @@ class DecoderStructureRefinement(nn.Module):
             context_bias = self.context_strength * torch.tanh(
                 self.context_to_gate(global_context)
             )
-            structure_gate_logits = structure_gate_logits + context_bias
+            structure_gate_old_logits = structure_gate_old_logits + context_bias
+        structure_gate_old = torch.sigmoid(structure_gate_old_logits)
         direction_confidence = direction_logits.detach().float().norm(
             dim=1,
             keepdim=True,
@@ -884,7 +885,7 @@ class DecoderStructureRefinement(nn.Module):
         reliability_correction = self.reliability_correction(
             torch.cat([x, direction_confidence], dim=1)
         )
-        structure_gate_logits = structure_gate_logits + (
+        structure_gate_logits = structure_gate_old_logits + (
             self.reliability_beta * reliability_correction
         )
         structure_gate = torch.sigmoid(structure_gate_logits)
@@ -901,6 +902,7 @@ class DecoderStructureRefinement(nn.Module):
                 feature_norm = torch.linalg.vector_norm(x)
                 self.last_diagnostics = {
                     "gamma1": float(self.gamma1.detach().cpu()),
+                    "gate_old_mean": float(structure_gate_old.mean().detach().cpu()),
                     "gate_mean": float(structure_gate.mean().detach().cpu()),
                     "gate_max": float(structure_gate.max().detach().cpu()),
                     "conn_strength_mean": float(
@@ -929,7 +931,12 @@ class DecoderStructureRefinement(nn.Module):
             connectivity_logits,
             direction_logits,
             structure_gate,
-            None,
+            {
+                "structure_gate_old": structure_gate_old,
+                "reliability_correction": reliability_correction,
+                "structure_gate_final": structure_gate,
+                "reliability_beta": self.reliability_beta.detach(),
+            },
         )
 
 
@@ -966,57 +973,71 @@ class SkeletonGuidedHead(nn.Module):
             kernel_size=3,
             padding=1,
         )
-        self.skeleton_proj = ConvBNReLU(
-            in_channels,
-            hidden_channels,
-            kernel_size=3,
-            padding=1,
-        )
+        self.skeleton_proj = None
 
         self.surface_branch = nn.Sequential(
             ConvBNReLU(hidden_channels, hidden_channels),
             ConvBNReLU(hidden_channels, hidden_channels),
         )
 
-        self.structure_branch = nn.Sequential(
-            ConvBNReLU(hidden_channels, hidden_channels),
-            ConvBNReLU(hidden_channels, hidden_channels),
-        )
-        self.skeleton_head = SkeletonSpatialHead(hidden_channels)
-        self.detached_skeleton_refine = nn.Sequential(
-            ConvBNReLU(hidden_channels + 1, hidden_channels),
-            ConvBNReLU(hidden_channels, hidden_channels),
-        )
-        self.detached_skeleton_head = SkeletonSpatialHead(hidden_channels)
-        self.connectivity_context = ConnectivityContextBlock(hidden_channels)
-        self.connectivity_head = PairwiseConnectivityHead(hidden_channels, connectivity_channels)
-        self.structure_to_surface = nn.Sequential(
-            ConvBNReLU(hidden_channels + connectivity_channels + 3, hidden_channels),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-        )
-        self.structure_to_surface_gamma = nn.Parameter(torch.tensor(0.0))
-        self.final_topology_attention = FinalTopologyRepairAttention(
-            channels=hidden_channels,
-            window_size=8,
-            tau=4.0,
-            eta_max=0.05,
-            eta_init=topology_eta_init,
-        )
-        self.structure_fusion = nn.Sequential(
-            nn.Conv2d(hidden_channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(fusion_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(fusion_channels, 1, kernel_size=1),
-            nn.Sigmoid(),
-        )
-        self.structure_residual = nn.Sequential(
-            nn.Conv2d(hidden_channels + 1, hidden_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-        )
+        if self.enable_final_structure:
+            self.skeleton_proj = ConvBNReLU(
+                in_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+            )
+            self.structure_branch = nn.Sequential(
+                ConvBNReLU(hidden_channels, hidden_channels),
+                ConvBNReLU(hidden_channels, hidden_channels),
+            )
+            self.skeleton_head = SkeletonSpatialHead(hidden_channels)
+            self.detached_skeleton_refine = nn.Sequential(
+                ConvBNReLU(hidden_channels + 1, hidden_channels),
+                ConvBNReLU(hidden_channels, hidden_channels),
+            )
+            self.detached_skeleton_head = SkeletonSpatialHead(hidden_channels)
+            self.connectivity_context = ConnectivityContextBlock(hidden_channels)
+            self.connectivity_head = PairwiseConnectivityHead(hidden_channels, connectivity_channels)
+            self.structure_to_surface = nn.Sequential(
+                ConvBNReLU(hidden_channels + connectivity_channels + 3, hidden_channels),
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            )
+            self.structure_to_surface_gamma = nn.Parameter(torch.tensor(0.0))
+            self.final_topology_attention = FinalTopologyRepairAttention(
+                channels=hidden_channels,
+                window_size=8,
+                tau=4.0,
+                eta_max=0.05,
+                eta_init=topology_eta_init,
+            )
+            self.structure_fusion = nn.Sequential(
+                nn.Conv2d(hidden_channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fusion_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(fusion_channels, 1, kernel_size=1),
+                nn.Sigmoid(),
+            )
+            self.structure_residual = nn.Sequential(
+                nn.Conv2d(hidden_channels + 1, hidden_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(hidden_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(hidden_channels),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.structure_branch = None
+            self.skeleton_head = None
+            self.detached_skeleton_refine = None
+            self.detached_skeleton_head = None
+            self.connectivity_context = None
+            self.connectivity_head = None
+            self.structure_to_surface = None
+            self.structure_to_surface_gamma = None
+            self.final_topology_attention = None
+            self.structure_fusion = None
+            self.structure_residual = None
 
         self.surface_refine = nn.Sequential(
             ConvBNReLU(hidden_channels, hidden_channels),
@@ -1107,11 +1128,8 @@ class SkeletonGuidedHead(nn.Module):
 
     def forward(self, x, z_struct=None):
         surface_feat = self.surface_branch(self.surface_proj(x))
-        skeleton_feat = self.skeleton_proj(x)
 
         if not self.enable_final_structure:
-            final_structure_feat = self.structure_branch(skeleton_feat)
-            final_skeleton_logits = self.skeleton_head(final_structure_feat)
             guided_surface_feat = self.surface_refine(surface_feat)
             guided_surface_feat = self._apply_post_refine_structure_interaction(
                 guided_surface_feat,
@@ -1154,8 +1172,9 @@ class SkeletonGuidedHead(nn.Module):
 
             surface_logits = surface_pre_logits
             self.last_final_direction_logits = None
-            return surface_logits, boundary_logits, final_skeleton_logits, None
+            return surface_logits, boundary_logits, None, None
 
+        skeleton_feat = self.skeleton_proj(x)
         structure_feat = self.structure_branch(skeleton_feat)
 
         # First predict a topology seed, then use it to refine only the
