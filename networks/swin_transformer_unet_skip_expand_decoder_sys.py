@@ -346,6 +346,32 @@ def map_to_token(x):
     return x
 
 
+class WeightedSkipConcat(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.weight_logits = nn.Conv2d(channels * 3, 3, kernel_size=1)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        nn.init.zeros_(self.weight_logits.weight)
+        nn.init.zeros_(self.weight_logits.bias)
+
+    def forward(self, f1, f2, f3):
+        merged = torch.cat([f1, f2, f3], dim=1)
+        weights = torch.softmax(self.weight_logits(merged), dim=1)
+        weighted = torch.cat(
+            [
+                weights[:, 0:1] * f1,
+                weights[:, 1:2] * f2,
+                weights[:, 2:3] * f3,
+            ],
+            dim=1,
+        )
+        return self.fuse(weighted)
+
+
 class HighResStructureEncoder(nn.Module):
     def __init__(self, in_channels, struct_channels):
         super().__init__()
@@ -2298,6 +2324,7 @@ class SwinTransformerSys(nn.Module):
 
         self.msce_blocks = nn.ModuleList()
         self.dca_blocks = nn.ModuleList()
+        self.weighted_skip_concat_blocks = nn.ModuleList()
         
         for skip_idx in range(2, self.num_layers):  # inx=2,3: Layer2 和 Layer1
             # 通道数: skip_idx=2 → 384 (Layer2), skip_idx=3 → 192 (Layer1)
@@ -2315,6 +2342,7 @@ class SwinTransformerSys(nn.Module):
                 max_offset=0.20
             )
             self.dca_blocks.append(dca_block)
+            self.weighted_skip_concat_blocks.append(WeightedSkipConcat(skip_channels))
             
             layer_name = "Layer 2" if skip_idx == 2 else "Layer 1"
             print(f"[INFO] MSFE Block {layer_name} (inx={skip_idx}): {'enabled' if self.use_msfe_skip else 'disabled'} ({skip_channels} channels)")
@@ -2870,12 +2898,14 @@ class SwinTransformerSys(nn.Module):
                 # 3. DCA-FPN 用 decoder feature 精化 skip
                 skip_refined = self.dca_blocks[block_idx](deep=x_map, shallow=skip_msce)  # [B, C, H, W]
                 
-                # 4. Feature Map → Token 转换
-                skip_refined = map_to_token(skip_refined)  # [B, L, C]
-                
-                # 5. Skip concatenation
-                x = torch.cat([x, skip_refined], -1)
-                x = self.concat_back_dim[inx](x)
+                # 4. Weighted attention modulation before concatenation:
+                #    Conv([w1*decoder, w2*MSFE(skip), w3*DCA(skip)]) -> C
+                x = self.weighted_skip_concat_blocks[block_idx](
+                    x_map,
+                    skip_msce,
+                    skip_refined,
+                )
+                x = map_to_token(x)  # [B, L, C]
 
             decoder_structure_gate_enabled = (
                 self._decoder_structure_enabled(inx)

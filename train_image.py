@@ -1334,6 +1334,10 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.direction_head.",
                         "swin_unet.decoder_structure_blocks.2.direction_head.",
                         "swin_unet.decoder_structure_blocks.3.direction_head.",
+                        "swin_unet.decoder_structure_blocks.0.direction_embedding.",
+                        "swin_unet.decoder_structure_blocks.1.direction_embedding.",
+                        "swin_unet.decoder_structure_blocks.2.direction_embedding.",
+                        "swin_unet.decoder_structure_blocks.3.direction_embedding.",
                         "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
                         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
@@ -1351,6 +1355,7 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.2.gate_branch.",
                         "swin_unet.decoder_structure_blocks.3.gate_branch.",
                         "swin_unet.stage2_topology_source.direction_head.",
+                        "swin_unet.stage2_topology_source.direction_embedding.",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
                         "swin_unet.stage2_topology_source.reliability_correction.",
                         "swin_unet.stage2_topology_source.reliability_beta",
@@ -1358,6 +1363,7 @@ if __name__ == "__main__":
                         "swin_unet.guided_head.detached_skeleton_refine.",
                         "swin_unet.guided_head.detached_skeleton_head.",
                         "swin_unet.guided_head.post_refine_structure_interaction.",
+                        "swin_unet.weighted_skip_concat_blocks.",
                     )
                     result = model.load_state_dict(
                         checkpoint_state,

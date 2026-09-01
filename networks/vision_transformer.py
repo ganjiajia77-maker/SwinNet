@@ -330,6 +330,10 @@ def load_topology_checkpoint_state(
             "swin_unet.decoder_structure_blocks.1.direction_head.",
             "swin_unet.decoder_structure_blocks.2.direction_head.",
             "swin_unet.decoder_structure_blocks.3.direction_head.",
+            "swin_unet.decoder_structure_blocks.0.direction_embedding.",
+            "swin_unet.decoder_structure_blocks.1.direction_embedding.",
+            "swin_unet.decoder_structure_blocks.2.direction_embedding.",
+            "swin_unet.decoder_structure_blocks.3.direction_embedding.",
             "swin_unet.decoder_structure_blocks.0.connectivity_context.",
             "swin_unet.decoder_structure_blocks.1.connectivity_context.",
             "swin_unet.decoder_structure_blocks.2.connectivity_context.",
@@ -347,10 +351,12 @@ def load_topology_checkpoint_state(
             "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
             "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
             "swin_unet.stage2_topology_source.direction_head.",
+            "swin_unet.stage2_topology_source.direction_embedding.",
             "swin_unet.stage2_topology_source.connectivity_context.",
             "swin_unet.stage2_topology_source.direction_gate.",
             "swin_unet.stage2_topology_source.direction_gate_beta",
             "swin_unet.stage2_topology_source.structure_gate.0.weight",
+            "swin_unet.weighted_skip_concat_blocks.",
         ) + highres_structure_missing_prefixes
         if is_0626_checkpoint:
             allowed_missing_prefixes = allowed_missing_prefixes + (
@@ -422,6 +428,10 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.1.direction_head.",
         "swin_unet.decoder_structure_blocks.2.direction_head.",
         "swin_unet.decoder_structure_blocks.3.direction_head.",
+        "swin_unet.decoder_structure_blocks.0.direction_embedding.",
+        "swin_unet.decoder_structure_blocks.1.direction_embedding.",
+        "swin_unet.decoder_structure_blocks.2.direction_embedding.",
+        "swin_unet.decoder_structure_blocks.3.direction_embedding.",
         "swin_unet.decoder_structure_blocks.0.connectivity_context.",
         "swin_unet.decoder_structure_blocks.1.connectivity_context.",
         "swin_unet.decoder_structure_blocks.2.connectivity_context.",
@@ -443,6 +453,7 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.2.gate_branch.",
         "swin_unet.decoder_structure_blocks.3.gate_branch.",
         "swin_unet.stage2_topology_source.direction_head.",
+        "swin_unet.stage2_topology_source.direction_embedding.",
         "swin_unet.stage2_topology_source.connectivity_context.",
         "swin_unet.stage2_topology_source.direction_gate.",
         "swin_unet.stage2_topology_source.direction_gate_beta",
@@ -451,6 +462,7 @@ def load_topology_checkpoint_state(
         "swin_unet.guided_head.detached_skeleton_refine.",
         "swin_unet.guided_head.detached_skeleton_head.",
         "swin_unet.guided_head.connectivity_context.",
+        "swin_unet.weighted_skip_concat_blocks.",
     ) + highres_structure_missing_prefixes
     msaf_missing_prefixes = (
         "swin_unet.bottleneck_context_fusion.scale_projections.",
