@@ -780,7 +780,24 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
-        self.reliability_beta = nn.Parameter(torch.tensor(0.0))
+        self.context_dw = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=2,
+                dilation=2,
+                groups=channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.context_out = nn.Conv2d(channels, 1, kernel_size=1)
+        nn.init.zeros_(self.context_out.weight)
+        nn.init.zeros_(self.context_out.bias)
+        self.reliability_beta_max = 0.10
+        self.reliability_beta = nn.Parameter(torch.tensor(-12.0))
         if context_channels is not None:
             self.context_to_gate = nn.Conv2d(context_channels, 1, kernel_size=1)
             nn.init.zeros_(self.context_to_gate.weight)
@@ -801,6 +818,9 @@ class DecoderStructureRefinement(nn.Module):
         if self.gamma_limit is None:
             return self.raw_gamma1
         return float(self.gamma_limit) * torch.tanh(self.raw_gamma1)
+
+    def reliability_beta_eff(self):
+        return self.reliability_beta_max * torch.sigmoid(self.reliability_beta)
 
     @staticmethod
     def _shift_feature(x, dy, dx):
@@ -881,11 +901,13 @@ class DecoderStructureRefinement(nn.Module):
             dim=1,
             keepdim=True,
         )
-        reliability_correction = self.reliability_correction(
+        reliability_old = self.reliability_correction(
             torch.cat([x, direction_confidence], dim=1)
         )
+        context_correction = self.context_out(self.context_dw(x))
+        reliability_correction = reliability_old + context_correction
         structure_gate_logits = structure_gate_logits + (
-            self.reliability_beta * reliability_correction
+            self.reliability_beta_eff() * reliability_correction
         )
         structure_gate = torch.sigmoid(structure_gate_logits)
 
@@ -906,9 +928,15 @@ class DecoderStructureRefinement(nn.Module):
                     "conn_strength_mean": float(
                         conn_strength.mean().detach().cpu()
                     ),
-                    "reliability_beta": float(self.reliability_beta.detach().cpu()),
+                    "reliability_beta": float(self.reliability_beta_eff().detach().cpu()),
                     "reliability_correction_mean": float(
                         reliability_correction.mean().detach().cpu()
+                    ),
+                    "reliability_old_mean": float(
+                        reliability_old.mean().detach().cpu()
+                    ),
+                    "reliability_context_mean": float(
+                        context_correction.mean().detach().cpu()
                     ),
                     "gate_residual_relative_norm": float(
                         (

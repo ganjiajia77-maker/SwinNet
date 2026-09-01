@@ -203,6 +203,18 @@ parser.add_argument(
     help='positive class weight for connectivity BCE/focal BCE',
 )
 parser.add_argument(
+    '--connectivity_cardinal_pos_weight',
+    type=float,
+    default=None,
+    help='optional positive weight for N/E/S/W connectivity directions',
+)
+parser.add_argument(
+    '--connectivity_diagonal_pos_weight',
+    type=float,
+    default=None,
+    help='optional positive weight for NE/SE/SW/NW connectivity directions',
+)
+parser.add_argument(
     '--connectivity_focal_gamma',
     type=float,
     default=1.5,
@@ -300,6 +312,11 @@ def apply_structure_profile_defaults(args):
         args.stage2_skeleton_weight = 0.008
     if not _cli_has("--stage3_skeleton_weight"):
         args.stage3_skeleton_weight = 0.012
+    if args.masked_connectivity_center_experiment:
+        if not _cli_has("--connectivity_cardinal_pos_weight"):
+            args.connectivity_cardinal_pos_weight = 1.0
+        if not _cli_has("--connectivity_diagonal_pos_weight"):
+            args.connectivity_diagonal_pos_weight = 2.5
     args.stage3_roadness_weight = 0.0
     args.final_topology_eta_init = 0.0
     args.final_gap_rho_init = 0.0
@@ -325,7 +342,7 @@ def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         weights = {
             "skeleton_weight": 0.10,
-            "connectivity_weight": 0.03,
+            "connectivity_weight": 0.0,
             "boundary_weight": 0.0,
         }
     else:
@@ -336,7 +353,13 @@ def get_final_loss_weights(args):
         }
     if args.final_skeleton_weight is not None:
         weights["skeleton_weight"] = float(args.final_skeleton_weight)
-    if args.final_connectivity_weight is not None:
+    if (
+        args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
+        and args.final_connectivity_weight is not None
+        and float(args.final_connectivity_weight) != 0.0
+    ):
+        print("[WARN] --final_connectivity_weight is ignored for stage23_boundary_0626.")
+    elif args.final_connectivity_weight is not None:
         weights["connectivity_weight"] = float(args.final_connectivity_weight)
     if args.boundary_weight is not None and float(args.boundary_weight) != 0.0:
         print("[WARN] --boundary_weight is ignored because boundary auxiliary loss is disabled.")
@@ -384,6 +407,8 @@ def build_criterion(args, loss_weights, device):
         ),
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
+        connectivity_cardinal_pos_weight=args.connectivity_cardinal_pos_weight,
+        connectivity_diagonal_pos_weight=args.connectivity_diagonal_pos_weight,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).to(device)
 
@@ -405,7 +430,7 @@ def format_training_config_lines(args, loss_weights):
             "  Final skeleton head: detached feature + detached stage skeleton seed, gradient ratio={:.3f}".format(
                 args.final_skeleton_gradient_ratio,
             ),
-            "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
+            "  Stage loss: stage2 step0=0.5 + stage2 step1=1.0; stage3 step0=deleted + stage3 step1=1.0; "
             "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
             "{:.3f}*connectivity loss".format(
                 args.stage_direction_factor,
@@ -417,12 +442,32 @@ def format_training_config_lines(args, loss_weights):
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
             "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
-            "  Decoder gate: structure gate plus semantic/direction-confidence reliability correction",
+            "  Decoder gate: semantic/direction reliability plus zero-init dilated context residual",
         ])
         if args.masked_connectivity_center_experiment:
+            if (
+                args.connectivity_cardinal_pos_weight is not None
+                or args.connectivity_diagonal_pos_weight is not None
+            ):
+                cardinal_pos_weight = (
+                    args.connectivity_cardinal_pos_weight
+                    if args.connectivity_cardinal_pos_weight is not None
+                    else args.connectivity_pos_weight
+                )
+                diagonal_pos_weight = (
+                    args.connectivity_diagonal_pos_weight
+                    if args.connectivity_diagonal_pos_weight is not None
+                    else args.connectivity_pos_weight
+                )
+                connectivity_balance = (
+                    "directional_pos_weight="
+                    f"cardinal={cardinal_pos_weight:.3f}, diagonal={diagonal_pos_weight:.3f}"
+                )
+            else:
+                connectivity_balance = f"pos_weight={args.connectivity_pos_weight:.3f}"
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
-                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}",
+                f"  Connectivity loss balance: {connectivity_balance}, focal_gamma={args.connectivity_focal_gamma:.3f}",
             ])
         if args.enable_graph_prop:
             lines.extend([
@@ -1342,6 +1387,14 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.1.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.2.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.3.reliability_correction.",
+                        "swin_unet.decoder_structure_blocks.0.context_dw.",
+                        "swin_unet.decoder_structure_blocks.1.context_dw.",
+                        "swin_unet.decoder_structure_blocks.2.context_dw.",
+                        "swin_unet.decoder_structure_blocks.3.context_dw.",
+                        "swin_unet.decoder_structure_blocks.0.context_out.",
+                        "swin_unet.decoder_structure_blocks.1.context_out.",
+                        "swin_unet.decoder_structure_blocks.2.context_out.",
+                        "swin_unet.decoder_structure_blocks.3.context_out.",
                         "swin_unet.decoder_structure_blocks.0.reliability_beta",
                         "swin_unet.decoder_structure_blocks.1.reliability_beta",
                         "swin_unet.decoder_structure_blocks.2.reliability_beta",
@@ -1353,6 +1406,8 @@ if __name__ == "__main__":
                         "swin_unet.stage2_topology_source.direction_head.",
                         "swin_unet.stage2_topology_source.structure_gate.0.weight",
                         "swin_unet.stage2_topology_source.reliability_correction.",
+                        "swin_unet.stage2_topology_source.context_dw.",
+                        "swin_unet.stage2_topology_source.context_out.",
                         "swin_unet.stage2_topology_source.reliability_beta",
                         "swin_unet.stage2_topology_source.gate_branch.",
                         "swin_unet.guided_head.detached_skeleton_refine.",

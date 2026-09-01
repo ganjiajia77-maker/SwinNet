@@ -319,6 +319,8 @@ class SurfaceStructureLoss(nn.Module):
         use_legacy_stage_connectivity_loss=False,
         use_masked_connectivity_center_experiment=False,
         connectivity_pos_weight=1.0,
+        connectivity_cardinal_pos_weight=None,
+        connectivity_diagonal_pos_weight=None,
         connectivity_focal_gamma=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
@@ -361,6 +363,36 @@ class SurfaceStructureLoss(nn.Module):
             use_masked_connectivity_center_experiment
         )
         self.connectivity_pos_weight = float(connectivity_pos_weight)
+        if (
+            connectivity_cardinal_pos_weight is not None
+            or connectivity_diagonal_pos_weight is not None
+        ):
+            cardinal = (
+                float(connectivity_cardinal_pos_weight)
+                if connectivity_cardinal_pos_weight is not None
+                else self.connectivity_pos_weight
+            )
+            diagonal = (
+                float(connectivity_diagonal_pos_weight)
+                if connectivity_diagonal_pos_weight is not None
+                else self.connectivity_pos_weight
+            )
+            directional_weights = [
+                cardinal,
+                diagonal,
+                cardinal,
+                diagonal,
+                cardinal,
+                diagonal,
+                cardinal,
+                diagonal,
+            ]
+            self.register_buffer(
+                "connectivity_direction_pos_weight",
+                torch.tensor(directional_weights, dtype=torch.float32).view(1, 8, 1, 1),
+            )
+        else:
+            self.register_buffer("connectivity_direction_pos_weight", None)
         self.connectivity_focal_gamma = float(connectivity_focal_gamma)
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
@@ -483,7 +515,18 @@ class SurfaceStructureLoss(nn.Module):
             connectivity_gt,
             reduction="none",
         )
-        if self.connectivity_pos_weight != 1.0:
+        if self.connectivity_direction_pos_weight is not None:
+            direction_weight = self.connectivity_direction_pos_weight.to(
+                device=connectivity_gt.device,
+                dtype=connectivity_gt.dtype,
+            )
+            pos_weight_map = torch.where(
+                connectivity_gt > 0.5,
+                direction_weight,
+                torch.ones((), device=connectivity_gt.device, dtype=connectivity_gt.dtype),
+            )
+            bce_map = bce_map * pos_weight_map
+        elif self.connectivity_pos_weight != 1.0:
             pos_weight_map = torch.where(
                 connectivity_gt > 0.5,
                 torch.as_tensor(
