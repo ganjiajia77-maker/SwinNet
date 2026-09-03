@@ -14,6 +14,9 @@ class DCAFPNLite(nn.Module):
         self.num_heads = num_heads
         self.num_points = num_points
         self.max_offset = max_offset
+        self.weight_mode = "current_unweighted"
+        self.capture_diagnostics = False
+        self.last_weights = None
         
         # 1x1 Conv 对齐通道
         self.align_deep = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
@@ -66,8 +69,8 @@ class DCAFPNLite(nn.Module):
         offsets = offsets * self.max_offset  # 限制偏移范围
         
         # 预测采样权重 [B, K, H, W] → 经 softmax 归一化
-        weights = self.weight_conv(Q)  # [B, K, H, W]
-        weights = torch.softmax(weights, dim=1)  # [B, K, H, W]
+        learned_weights = self.weight_conv(Q)  # [B, K, H, W]
+        learned_weights = torch.softmax(learned_weights, dim=1)  # [B, K, H, W]
         
         # 构造网格
         grid_y, grid_x = torch.meshgrid(
@@ -94,11 +97,22 @@ class DCAFPNLite(nn.Module):
             )  # [B, C, H, W]
             sampled_features.append(feat_k)
         
-        # 按权重融合
-        fused = torch.zeros_like(V)  # [B, C, H, W]
-        for k in range(self.num_points):
-            weight_k = weights[:, k:k+1, :, :]  # [B, 1, H, W]
-            fused = fused + weight_k * sampled_features[k]  # [B, C, H, W]
+        mode = getattr(self, "weight_mode", "current_unweighted")
+        if mode == "learned_weighted":
+            weights = learned_weights
+        elif mode == "uniform_weighted":
+            weights = torch.full_like(learned_weights, 1.0 / self.num_points)
+        elif mode == "current_unweighted":
+            weights = None
+        else:
+            raise ValueError(f"Unknown DCAFPNLite weight_mode: {mode}")
+        if self.capture_diagnostics:
+            self.last_weights = learned_weights.detach()
+        if weights is not None:
+            sampled_features = [
+                weights[:, k:k + 1, :, :] * sampled_features[k]
+                for k in range(self.num_points)
+            ]
         
         # 融合输出
         fused = self.fusion_conv(

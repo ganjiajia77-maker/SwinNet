@@ -349,6 +349,9 @@ def map_to_token(x):
 class WeightedSkipConcat(nn.Module):
     def __init__(self, channels):
         super().__init__()
+        self.mode = "learned"
+        self.capture_diagnostics = False
+        self.last_weights = None
         self.weight_logits = nn.Conv2d(channels * 3, 3, kernel_size=1)
         self.fuse = nn.Sequential(
             nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
@@ -360,7 +363,26 @@ class WeightedSkipConcat(nn.Module):
 
     def forward(self, f1, f2, f3):
         merged = torch.cat([f1, f2, f3], dim=1)
-        weights = torch.softmax(self.weight_logits(merged), dim=1)
+        learned_weights = torch.softmax(self.weight_logits(merged), dim=1)
+        mode = getattr(self, "mode", "learned")
+        if mode == "uniform":
+            weights = torch.full_like(learned_weights, 1.0 / learned_weights.shape[1])
+        elif mode == "spatial_mean":
+            weights = learned_weights.mean(dim=(2, 3), keepdim=True).expand_as(
+                learned_weights
+            )
+        elif mode == "unweighted":
+            weights = None
+        elif mode == "learned":
+            weights = learned_weights
+        else:
+            raise ValueError(f"Unknown WeightedSkipConcat mode: {mode}")
+        if self.capture_diagnostics:
+            self.last_weights = (
+                learned_weights if weights is None else weights
+            ).detach()
+        if weights is None:
+            return self.fuse(merged)
         weighted = torch.cat(
             [
                 weights[:, 0:1] * f1,
@@ -2325,6 +2347,9 @@ class SwinTransformerSys(nn.Module):
         self.msce_blocks = nn.ModuleList()
         self.dca_blocks = nn.ModuleList()
         self.weighted_skip_concat_blocks = nn.ModuleList()
+        self.disable_weighted_skip_decoder = False
+        self.disable_weighted_skip_raw = False
+        self.disable_weighted_skip_dca = False
         
         for skip_idx in range(2, self.num_layers):  # inx=2,3: Layer2 和 Layer1
             # 通道数: skip_idx=2 → 384 (Layer2), skip_idx=3 → 192 (Layer1)
@@ -2897,6 +2922,13 @@ class SwinTransformerSys(nn.Module):
                 
                 # 3. DCA-FPN 用 decoder feature 精化 skip
                 skip_refined = self.dca_blocks[block_idx](deep=x_map, shallow=skip_msce)  # [B, C, H, W]
+
+                if self.disable_weighted_skip_decoder:
+                    x_map = torch.zeros_like(x_map)
+                if self.disable_weighted_skip_raw:
+                    skip_msce = torch.zeros_like(skip_msce)
+                if self.disable_weighted_skip_dca:
+                    skip_refined = torch.zeros_like(skip_refined)
                 
                 # 4. Weighted attention modulation before concatenation:
                 #    Conv([w1*decoder, w2*MSFE(skip), w3*DCA(skip)]) -> C

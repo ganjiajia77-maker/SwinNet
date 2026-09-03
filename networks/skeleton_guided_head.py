@@ -799,6 +799,7 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.raw_gamma1 = nn.Parameter(torch.tensor(float(init_gamma1)))
+        self.disable_direction_embedding = False
         self.capture_diagnostics = False
         self.last_diagnostics = None
 
@@ -867,24 +868,32 @@ class DecoderStructureRefinement(nn.Module):
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
-        direction_embedding = self.direction_embedding(connectivity_prob.detach())
+        raw_direction_embedding = self.direction_embedding(connectivity_prob.detach())
+        if self.disable_direction_embedding:
+            direction_embedding = torch.zeros_like(raw_direction_embedding)
+        else:
+            direction_embedding = raw_direction_embedding
         gate_feat = self.gate_branch(x)
+        gate_common = [
+            gate_feat,
+            skeleton_prob.detach(),
+            conn_strength.detach(),
+        ]
         structure_gate_logits = self.structure_gate(
-            torch.cat(
-                [
-                    gate_feat,
-                    skeleton_prob.detach(),
-                    conn_strength.detach(),
-                    direction_embedding,
-                ],
-                dim=1,
-            )
+            torch.cat(gate_common + [direction_embedding], dim=1)
         )
+        without_dir_gate_logits = None
+        if self.capture_diagnostics:
+            without_dir_gate_logits = self.structure_gate(
+                torch.cat(gate_common + [torch.zeros_like(raw_direction_embedding)], dim=1)
+            )
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
                 self.context_to_gate(global_context)
             )
             structure_gate_logits = structure_gate_logits + context_bias
+            if without_dir_gate_logits is not None:
+                without_dir_gate_logits = without_dir_gate_logits + context_bias
         direction_confidence = direction_logits.detach().float().norm(
             dim=1,
             keepdim=True,
@@ -895,7 +904,21 @@ class DecoderStructureRefinement(nn.Module):
         structure_gate_logits = structure_gate_logits + (
             self.reliability_beta * reliability_correction
         )
+        if without_dir_gate_logits is not None:
+            without_dir_gate_logits = without_dir_gate_logits + (
+                self.reliability_beta * reliability_correction
+            )
         structure_gate = torch.sigmoid(structure_gate_logits)
+        if self.capture_diagnostics:
+            without_dir_gate = torch.sigmoid(without_dir_gate_logits)
+            self.last_diagnostics = {
+                "direction_embedding": raw_direction_embedding.detach(),
+                "structure_gate": structure_gate.detach(),
+                "structure_gate_without_direction_embedding": without_dir_gate.detach(),
+                "structure_gate_delta_direction_embedding": (
+                    structure_gate - without_dir_gate
+                ).detach(),
+            }
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
             residual = structure_gate * self.feature_residual(x)
