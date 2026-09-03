@@ -300,6 +300,7 @@ def load_topology_checkpoint_state(
     if is_legacy_structure_checkpoint:
         result = model.load_state_dict(state_dict, strict=False)
         allowed_missing_prefixes = (
+            "swin_unet.global_topology.",
             "swin_unet.guided_head.final_topology_attention.",
             "swin_unet.guided_head.raw_rho_gap",
             "swin_unet.guided_head.fixed_rho_gap",
@@ -400,6 +401,7 @@ def load_topology_checkpoint_state(
         apply_structure_profile_runtime(model)
         return result
     road_attention_missing_prefixes = (
+        "swin_unet.global_topology.",
         "swin_unet.encoder_road_attention_head.",
         "swin_unet.encoder_stage1_road_attention_head.",
         "swin_unet.encoder_stage2_road_attention_head.",
@@ -523,7 +525,16 @@ class SwinUnet(nn.Module):
                  highres_structure_channels=64,
                  highres_structure_fuse_stages="stage23",
                  highres_structure_fusion_mode="stage23",
-                 enable_post_refine_structure_interaction=False):
+                 enable_post_refine_structure_interaction=False,
+                 enable_global_topology=False,
+                 global_topology_max_nodes=32,
+                 global_topology_heads=4,
+                 global_topology_reach_hops=12,
+                 global_topology_nms_radius=2,
+                 global_topology_skeleton_threshold=0.5,
+                 global_topology_connectivity_threshold=0.25,
+                 global_topology_bend_angle_threshold=45.0,
+                 global_topology_alpha_max=0.05):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -568,7 +579,16 @@ class SwinUnet(nn.Module):
                                 highres_structure_fusion_mode=highres_structure_fusion_mode,
                                 enable_post_refine_structure_interaction=(
                                     enable_post_refine_structure_interaction
-                                ))
+                                ),
+                                enable_global_topology=enable_global_topology,
+                                global_topology_max_nodes=global_topology_max_nodes,
+                                global_topology_heads=global_topology_heads,
+                                global_topology_reach_hops=global_topology_reach_hops,
+                                global_topology_nms_radius=global_topology_nms_radius,
+                                global_topology_skeleton_threshold=global_topology_skeleton_threshold,
+                                global_topology_connectivity_threshold=global_topology_connectivity_threshold,
+                                global_topology_bend_angle_threshold=global_topology_bend_angle_threshold,
+                                global_topology_alpha_max=global_topology_alpha_max)
     def forward(
         self,
         x,

@@ -9,7 +9,10 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from networks.vision_transformer import SwinUnet as ViT_seg
+from networks.vision_transformer import (
+    SwinUnet as ViT_seg,
+    load_topology_checkpoint_state,
+)
 from losses.road_losses import binary_metrics_from_logits
 from config import get_config
 
@@ -58,6 +61,15 @@ def main():
     parser.add_argument('--dataset', type=str, default='ImageData')
     parser.add_argument('--n_class', default=2, type=int)
     parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None)
+    parser.add_argument('--enable_global_topology', action='store_true')
+    parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+    parser.add_argument('--global_topology_heads', type=int, default=4)
+    parser.add_argument('--global_topology_reach_hops', type=int, default=12)
+    parser.add_argument('--global_topology_nms_radius', type=int, default=2)
+    parser.add_argument('--global_topology_skeleton_threshold', type=float, default=0.5)
+    parser.add_argument('--global_topology_connectivity_threshold', type=float, default=0.25)
+    parser.add_argument('--global_topology_bend_angle_threshold', type=float, default=45.0)
+    parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
     
     args = parser.parse_args()
     
@@ -65,6 +77,19 @@ def main():
     print('Using device: {}'.format(device))
     
     print('\nLoading model from: {}'.format(args.model_path))
+    checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
+    saved_args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
+    for name in (
+        'structure_profile', 'bottleneck_type', 'enable_highres_structure_stream',
+        'highres_structure_channels', 'highres_structure_fuse_stages',
+        'highres_structure_fusion_mode', 'disable_msfe_skip',
+        'enable_global_topology', 'global_topology_max_nodes', 'global_topology_heads',
+        'global_topology_reach_hops', 'global_topology_nms_radius',
+        'global_topology_skeleton_threshold', 'global_topology_connectivity_threshold',
+        'global_topology_bend_angle_threshold', 'global_topology_alpha_max',
+    ):
+        if isinstance(saved_args, dict) and name in saved_args:
+            setattr(args, name, saved_args[name])
     config = get_config(args)
     model = ViT_seg(
         config=config,
@@ -72,9 +97,29 @@ def main():
         num_classes=1,
         use_asterisk=True,
         return_skeleton=True,
+        bottleneck_type=getattr(args, 'bottleneck_type', 'global_local'),
+        structure_profile=getattr(args, 'structure_profile', 'full'),
+        use_msfe_skip=not getattr(args, 'disable_msfe_skip', False),
+        enable_highres_structure_stream=getattr(args, 'enable_highres_structure_stream', False),
+        highres_structure_channels=getattr(args, 'highres_structure_channels', 64),
+        highres_structure_fuse_stages=getattr(args, 'highres_structure_fuse_stages', 'stage23'),
+        highres_structure_fusion_mode=getattr(args, 'highres_structure_fusion_mode', 'stage23'),
+        enable_global_topology=getattr(args, 'enable_global_topology', False),
+        global_topology_max_nodes=getattr(args, 'global_topology_max_nodes', 32),
+        global_topology_heads=getattr(args, 'global_topology_heads', 4),
+        global_topology_reach_hops=getattr(args, 'global_topology_reach_hops', 12),
+        global_topology_nms_radius=getattr(args, 'global_topology_nms_radius', 2),
+        global_topology_skeleton_threshold=getattr(args, 'global_topology_skeleton_threshold', 0.5),
+        global_topology_connectivity_threshold=getattr(args, 'global_topology_connectivity_threshold', 0.25),
+        global_topology_bend_angle_threshold=getattr(args, 'global_topology_bend_angle_threshold', 45.0),
+        global_topology_alpha_max=getattr(args, 'global_topology_alpha_max', 0.05),
     )
-    checkpoint = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    load_topology_checkpoint_state(
+        model,
+        checkpoint['model_state_dict'],
+        checkpoint.get('topology_attention_version', 'legacy-unrecorded'),
+        strict=True,
+    )
     model = model.to(device)
     model.eval()
     print('Model loaded')

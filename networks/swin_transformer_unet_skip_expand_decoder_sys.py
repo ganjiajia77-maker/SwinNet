@@ -16,6 +16,7 @@ from .skeleton_guided_head import (
     STAGE3_GLOBAL_CONTEXT_CHANNELS,
     SkeletonGuidedHead,
 )
+from .keypoint_global_topology import KeypointGuidedGlobalTopology
 
 
 class MoEFFNGating(nn.Module):
@@ -2079,6 +2080,15 @@ class SwinTransformerSys(nn.Module):
                  highres_structure_fuse_stages="stage23",
                  highres_structure_fusion_mode="stage23",
                  enable_post_refine_structure_interaction=False,
+                 enable_global_topology=False,
+                 global_topology_max_nodes=32,
+                 global_topology_heads=4,
+                 global_topology_reach_hops=12,
+                 global_topology_nms_radius=2,
+                 global_topology_skeleton_threshold=0.5,
+                 global_topology_connectivity_threshold=0.25,
+                 global_topology_bend_angle_threshold=45.0,
+                 global_topology_alpha_max=0.05,
                  **kwargs):
         super().__init__()
 
@@ -2150,6 +2160,7 @@ class SwinTransformerSys(nn.Module):
             enable_post_refine_structure_interaction
             or self.highres_structure_fusion_mode == "post_refine_interaction"
         )
+        self.enable_global_topology = bool(enable_global_topology)
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -2445,6 +2456,18 @@ class SwinTransformerSys(nn.Module):
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
             if self.return_skeleton:
+                self.global_topology = KeypointGuidedGlobalTopology(
+                    channels=embed_dim,
+                    max_nodes=global_topology_max_nodes,
+                    heads=global_topology_heads,
+                    reach_hops=global_topology_reach_hops,
+                    nms_radius=global_topology_nms_radius,
+                    skeleton_threshold=global_topology_skeleton_threshold,
+                    connectivity_threshold=global_topology_connectivity_threshold,
+                    bend_angle_threshold=global_topology_bend_angle_threshold,
+                    alpha_max=global_topology_alpha_max,
+                    enabled=self.enable_global_topology,
+                )
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,
                     hidden_channels=max(embed_dim // 2, 32),
@@ -3162,6 +3185,43 @@ class SwinTransformerSys(nn.Module):
             z_struct=z_struct,
             highres_structure_skeleton=highres_structure_skeleton,
         )
+        if self.enable_global_topology and self.return_skeleton:
+            stage3_output = next(
+                (
+                    item
+                    for item in reversed(structure_outputs)
+                    if item.get("stage") == 3 and item.get("connectivity") is not None
+                ),
+                None,
+            )
+            if stage3_output is not None:
+                feature_map = x.transpose(1, 2).reshape(
+                    x.shape[0], self.embed_dim, *self.patches_resolution
+                )
+                target_hw = feature_map.shape[-2:]
+                skeleton_logits = stage3_output.get("skeleton")
+                if skeleton_logits is None and highres_structure_skeleton is not None:
+                    skeleton_prob = torch.sigmoid(
+                        F.interpolate(
+                            highres_structure_skeleton,
+                            size=target_hw,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    )
+                elif skeleton_logits is not None:
+                    skeleton_prob = torch.sigmoid(skeleton_logits)
+                else:
+                    skeleton_prob = None
+                connectivity_prob = torch.sigmoid(stage3_output["connectivity"])
+                direction = stage3_output.get("direction")
+                if skeleton_prob is not None and direction is not None:
+                    x = self.global_topology(
+                        feature_map,
+                        skeleton_prob,
+                        connectivity_prob,
+                        direction,
+                    ).flatten(2).transpose(1, 2)
         if self.return_skeleton and highres_structure_skeleton is not None:
             structure_outputs.append(
                 {

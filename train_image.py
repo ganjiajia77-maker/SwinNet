@@ -155,6 +155,15 @@ parser.add_argument(
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
+parser.add_argument('--enable_global_topology', action='store_true')
+parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+parser.add_argument('--global_topology_heads', type=int, default=4)
+parser.add_argument('--global_topology_reach_hops', type=int, default=12)
+parser.add_argument('--global_topology_nms_radius', type=int, default=2)
+parser.add_argument('--global_topology_skeleton_threshold', type=float, default=0.5)
+parser.add_argument('--global_topology_connectivity_threshold', type=float, default=0.25)
+parser.add_argument('--global_topology_bend_angle_threshold', type=float, default=45.0)
+parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
 parser.add_argument('--stage_direction_factor', type=float, default=0.1)
 parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
 parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
@@ -1091,7 +1100,16 @@ if __name__ == "__main__":
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,
                     enable_post_refine_structure_interaction=(
                         args.enable_post_refine_structure_interaction
-                    )).to(device)
+                    ),
+                    enable_global_topology=args.enable_global_topology,
+                    global_topology_max_nodes=args.global_topology_max_nodes,
+                    global_topology_heads=args.global_topology_heads,
+                    global_topology_reach_hops=args.global_topology_reach_hops,
+                    global_topology_nms_radius=args.global_topology_nms_radius,
+                    global_topology_skeleton_threshold=args.global_topology_skeleton_threshold,
+                    global_topology_connectivity_threshold=args.global_topology_connectivity_threshold,
+                    global_topology_bend_angle_threshold=args.global_topology_bend_angle_threshold,
+                    global_topology_alpha_max=args.global_topology_alpha_max).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
