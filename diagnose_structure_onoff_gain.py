@@ -5,6 +5,7 @@ import sys
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -102,13 +103,13 @@ def restore_highres(model, old_value):
     swin.enable_highres_structure_stream = bool(old_value)
 
 
-def evaluate(model, loader, device, threshold, max_batches):
+def evaluate(model, loader, device, threshold, max_batches, desc):
     tp = fp = fn = 0.0
     probs = []
     masks = []
     images = 0
     with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
+        for batch_idx, batch in enumerate(tqdm(loader, desc=desc)):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
             image = batch["image"].to(device)
@@ -144,6 +145,7 @@ def evaluate(model, loader, device, threshold, max_batches):
 def main():
     args = parse_args()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}", flush=True)
     model = load_model(args, device)
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
@@ -159,12 +161,12 @@ def main():
         pin_memory=True,
     )
 
-    on = evaluate(model, loader, device, args.threshold, args.max_batches)
+    on = evaluate(model, loader, device, args.threshold, args.max_batches, "Structure ON")
     saved_refine = set_structure_refine_enabled(model, False)
     saved_highres = None
     if args.off_mode == "refine_highres":
         saved_highres = set_highres_enabled(model, False)
-    off = evaluate(model, loader, device, args.threshold, args.max_batches)
+    off = evaluate(model, loader, device, args.threshold, args.max_batches, "Structure OFF")
     restore_highres(model, saved_highres)
     restore_structure_refine(saved_refine)
 

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -119,7 +120,7 @@ def collect_run(name, model_path, base_args, loader, device):
     images = 0
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
+        for batch_idx, batch in enumerate(tqdm(loader, desc=name)):
             if base_args.max_batches > 0 and batch_idx >= base_args.max_batches:
                 break
             image = batch["image"].to(device)
@@ -296,6 +297,7 @@ def main():
         raise ValueError("Pass --model_path, or pass both --baseline_model_path and --current_model_path.")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}", flush=True)
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split=args.split,

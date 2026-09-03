@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -105,7 +106,7 @@ def restore_context(modules, saved):
             module.context_out.bias.data.copy_(bias)
 
 
-def run_pass(model, loader, device, threshold, modules, collect_context=False, max_batches=0):
+def run_pass(model, loader, device, threshold, modules, collect_context=False, max_batches=0, desc="Evaluate"):
     context_outputs = defaultdict(list)
     handles = []
     if collect_context:
@@ -121,7 +122,7 @@ def run_pass(model, loader, device, threshold, modules, collect_context=False, m
     gts = []
     processed = 0
     with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
+        for batch_idx, batch in enumerate(tqdm(loader, desc=desc)):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
             image = batch["image"].to(device)
@@ -163,6 +164,7 @@ def masked_mean(values, mask):
 def main():
     args = parse_args()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}", flush=True)
     model = load_model(args, device)
     modules = context_modules(model)
     if not modules:
@@ -183,9 +185,27 @@ def main():
     )
 
     saved = set_context_enabled(modules, enabled=False)
-    off = run_pass(model, loader, device, args.threshold, modules, collect_context=False, max_batches=args.max_batches)
+    off = run_pass(
+        model,
+        loader,
+        device,
+        args.threshold,
+        modules,
+        collect_context=False,
+        max_batches=args.max_batches,
+        desc="Context OFF",
+    )
     restore_context(modules, saved)
-    on = run_pass(model, loader, device, args.threshold, modules, collect_context=True, max_batches=args.max_batches)
+    on = run_pass(
+        model,
+        loader,
+        device,
+        args.threshold,
+        modules,
+        collect_context=True,
+        max_batches=args.max_batches,
+        desc="Context ON",
+    )
 
     off_iou, off_f1, off_p, off_r = off["metrics"]
     on_iou, on_f1, on_p, on_r = on["metrics"]
