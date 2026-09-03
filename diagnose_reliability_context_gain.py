@@ -21,6 +21,9 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     parser.add_argument("--threshold", type=float, default=0.45)
+    parser.add_argument("--single_pass", action="store_true")
+    parser.add_argument("--context_mode", type=str, default="learned", choices=["learned", "zero"])
+    parser.add_argument("--force_reliability_beta_eff", type=float, default=None)
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--source_patch_size", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -106,6 +109,32 @@ def restore_context(modules, saved):
             module.context_out.bias.data.copy_(bias)
 
 
+def force_reliability_beta_eff(modules, beta_eff):
+    if beta_eff is None:
+        return []
+    saved = []
+    for _, module in modules:
+        if not hasattr(module, "reliability_beta") or not hasattr(module, "reliability_beta_max"):
+            continue
+        param = module.reliability_beta
+        saved.append((param, param.detach().clone()))
+        beta_max = float(module.reliability_beta_max)
+        if beta_eff <= 0.0:
+            raw = -30.0
+        elif beta_eff >= beta_max:
+            raw = 30.0
+        else:
+            ratio = float(beta_eff) / beta_max
+            raw = float(np.log(ratio / (1.0 - ratio)))
+        param.data.fill_(raw)
+    return saved
+
+
+def restore_reliability_beta(saved):
+    for param, value in saved:
+        param.data.copy_(value)
+
+
 def run_pass(model, loader, device, threshold, modules, collect_context=False, max_batches=0, desc="Evaluate"):
     context_outputs = defaultdict(list)
     handles = []
@@ -184,6 +213,54 @@ def main():
         pin_memory=True,
     )
 
+    beta_saved = force_reliability_beta_eff(modules, args.force_reliability_beta_eff)
+    if args.single_pass:
+        context_saved = None
+        if args.context_mode == "zero":
+            context_saved = set_context_enabled(modules, enabled=False)
+        result = run_pass(
+            model,
+            loader,
+            device,
+            args.threshold,
+            modules,
+            collect_context=True,
+            max_batches=args.max_batches,
+            desc=f"beta={args.force_reliability_beta_eff if args.force_reliability_beta_eff is not None else 'learned'} context={args.context_mode}",
+        )
+        if context_saved is not None:
+            restore_context(modules, context_saved)
+        iou, f1, precision, recall = result["metrics"]
+        print(f"Checkpoint: {args.model_path}")
+        print(
+            f"split={args.split}, threshold={args.threshold}, images={result['images']}, "
+            f"context_mode={args.context_mode}, forced_beta_eff={args.force_reliability_beta_eff}"
+        )
+        print("\nSurface Reliability Single Pass")
+        print(f"  IoU={iou:.4f}, F1={f1:.4f}, P={precision:.4f}, R={recall:.4f}")
+        print("\nReliability Context Modules")
+        gt = result["gts"]
+        pred = result["probs"] >= float(args.threshold)
+        fp = pred & (~gt)
+        fn = (~pred) & gt
+        tp = pred & gt
+        tn = (~pred) & (~gt)
+        for name, module in modules:
+            beta = float(module.reliability_beta_eff().detach().cpu())
+            ctx = result["contexts"].get(name)
+            if ctx is None or ctx.numel() == 0:
+                continue
+            ctx_up = F.interpolate(ctx, size=gt.shape[-2:], mode="bilinear", align_corners=False)
+            print(f"  {name}")
+            print(f"    beta_eff={beta:.8f}")
+            print(f"    C_ctx mean={ctx.mean().item():+.6f}, std={ctx.std(unbiased=False).item():.6f}")
+            print(f"    C_ctx FP mean={masked_mean(ctx_up, fp):+.6f}")
+            print(f"    C_ctx FN mean={masked_mean(ctx_up, fn):+.6f}")
+            print(f"    C_ctx TP mean={masked_mean(ctx_up, tp):+.6f}")
+            print(f"    C_ctx TN mean={masked_mean(ctx_up, tn):+.6f}")
+        restore_reliability_beta(beta_saved)
+        return
+
     saved = set_context_enabled(modules, enabled=False)
     off = run_pass(
         model,
@@ -206,6 +283,7 @@ def main():
         max_batches=args.max_batches,
         desc="Context ON",
     )
+    restore_reliability_beta(beta_saved)
 
     off_iou, off_f1, off_p, off_r = off["metrics"]
     on_iou, on_f1, on_p, on_r = on["metrics"]
