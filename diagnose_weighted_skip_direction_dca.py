@@ -328,6 +328,10 @@ def update_weight_stats(model, dca_stats, skip_stats):
 
 
 def update_region_stats(model, pred, target, region_stats):
+    if pred.ndim == 4 and pred.shape[1] == 1:
+        pred = pred[:, 0]
+    if target.ndim == 4 and target.shape[1] == 1:
+        target = target[:, 0]
     regions = {
         "TP": pred & target,
         "TN": (~pred) & (~target),
