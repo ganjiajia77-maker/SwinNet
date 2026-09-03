@@ -65,7 +65,18 @@ parser.add_argument('--random_crops_per_image', type=int, default=1, help='rando
 parser.add_argument('--val_crop_list', type=str, default='', help='fixed validation crop list: one line per crop, image: x=..., y=...')
 parser.add_argument('--min_crop_road_pixels', type=int, default=0, help='retained for run metadata; fixed tiles are never filtered')
 parser.add_argument('--augment', action=argparse.BooleanOptionalAction, default=True, help='synchronized geometry and image-only appearance augmentation')
-parser.add_argument('--use_ema', action=argparse.BooleanOptionalAction, default=True, help='validate and save an EMA copy of the model')
+parser.add_argument(
+    '--use_ema', '--use-ema',
+    dest='use_ema',
+    action='store_true',
+    default=True,
+    help='validate and save an EMA copy of the model',
+)
+parser.add_argument(
+    '--no-use_ema', '--no-use-ema',
+    dest='use_ema',
+    action='store_false',
+)
 parser.add_argument('--ema_decay', type=float, default=0.999)
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
 parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml', 
