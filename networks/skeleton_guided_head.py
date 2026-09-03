@@ -930,7 +930,7 @@ class DecoderStructureRefinement(nn.Module):
         if self.capture_diagnostics:
             with torch.no_grad():
                 feature_norm = torch.linalg.vector_norm(x)
-                self.last_diagnostics = {
+                self.last_diagnostics.update({
                     "gamma1": float(self.gamma1.detach().cpu()),
                     "gate_mean": float(structure_gate.mean().detach().cpu()),
                     "gate_max": float(structure_gate.max().detach().cpu()),
@@ -953,7 +953,7 @@ class DecoderStructureRefinement(nn.Module):
                             / (feature_norm + 1e-6)
                         ).detach().cpu()
                     ),
-                }
+                })
         return (
             out,
             skeleton_logits,

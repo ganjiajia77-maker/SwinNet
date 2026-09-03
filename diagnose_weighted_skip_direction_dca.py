@@ -336,7 +336,7 @@ def update_region_stats(model, pred, target, region_stats):
     }
     for name, module in model.named_modules():
         diag = getattr(module, "last_diagnostics", None)
-        if not diag:
+        if not diag or "direction_embedding" not in diag:
             continue
         edir = diag["direction_embedding"]
         delta_gate = diag["structure_gate_delta_direction_embedding"]
