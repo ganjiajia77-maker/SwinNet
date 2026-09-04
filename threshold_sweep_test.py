@@ -154,6 +154,7 @@ def main():
             
             if isinstance(outputs, tuple):
                 surface_logits = outputs[0]
+                skeleton_logits = outputs[2] if len(outputs) > 2 else None
             else:
                 surface_logits = outputs
                 skeleton_logits = None
