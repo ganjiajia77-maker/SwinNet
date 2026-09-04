@@ -245,15 +245,57 @@ def thinning_binary(mask):
     if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
         return (cv2.ximgproc.thinning(mask_uint8) > 0).astype(np.uint8)
 
-    skeleton = np.zeros_like(mask_uint8)
-    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    working = mask_uint8.copy()
-    while cv2.countNonZero(working) > 0:
-        eroded = cv2.erode(working, element)
-        opened = cv2.dilate(eroded, element)
-        skeleton = cv2.bitwise_or(skeleton, cv2.subtract(working, opened))
-        working = eroded
-    return (skeleton > 0).astype(np.uint8)
+    return zhang_suen_thinning(mask_uint8 > 0)
+
+
+def zhang_suen_thinning(mask):
+    image = (mask > 0).astype(np.uint8)
+    if image.size == 0:
+        return image
+
+    def iteration_step(current, step):
+        padded = np.pad(current, ((1, 1), (1, 1)), mode="constant")
+        p2 = padded[:-2, 1:-1]
+        p3 = padded[:-2, 2:]
+        p4 = padded[1:-1, 2:]
+        p5 = padded[2:, 2:]
+        p6 = padded[2:, 1:-1]
+        p7 = padded[2:, :-2]
+        p8 = padded[1:-1, :-2]
+        p9 = padded[:-2, :-2]
+        neighbors = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+        transitions = (
+            ((p2 == 0) & (p3 == 1)).astype(np.uint8)
+            + ((p3 == 0) & (p4 == 1)).astype(np.uint8)
+            + ((p4 == 0) & (p5 == 1)).astype(np.uint8)
+            + ((p5 == 0) & (p6 == 1)).astype(np.uint8)
+            + ((p6 == 0) & (p7 == 1)).astype(np.uint8)
+            + ((p7 == 0) & (p8 == 1)).astype(np.uint8)
+            + ((p8 == 0) & (p9 == 1)).astype(np.uint8)
+            + ((p9 == 0) & (p2 == 1)).astype(np.uint8)
+        )
+        if step == 0:
+            keep_shape = (p2 * p4 * p6 == 0) & (p4 * p6 * p8 == 0)
+        else:
+            keep_shape = (p2 * p4 * p8 == 0) & (p2 * p6 * p8 == 0)
+        remove = (
+            (current == 1)
+            & (neighbors >= 2)
+            & (neighbors <= 6)
+            & (transitions == 1)
+            & keep_shape
+        )
+        next_image = current.copy()
+        next_image[remove] = 0
+        return next_image, int(remove.sum())
+
+    max_iterations = max(image.shape) * 2
+    for _ in range(max_iterations):
+        image, removed_a = iteration_step(image, 0)
+        image, removed_b = iteration_step(image, 1)
+        if removed_a + removed_b == 0:
+            break
+    return image.astype(np.uint8)
 
 
 def thin_skeleton_keypoints_single(module, skeleton_prob_2d, connectivity_prob, score_threshold):
