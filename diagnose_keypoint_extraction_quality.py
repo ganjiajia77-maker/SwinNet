@@ -125,13 +125,19 @@ def raw_keypoint_scores(module, skeleton_prob, symmetric_connectivity):
     return scores * (skeleton_prob[:, 0:1] >= module.skeleton_threshold).float()
 
 
-def extract_with_counts(module, skeleton_prob, connectivity_prob, direction):
-    symmetric = module.build_symmetric_connectivity(connectivity_prob)
-    scores = raw_keypoint_scores(module, skeleton_prob, symmetric)
+def extract_with_counts(module, skeleton_prob, connectivity_prob, direction, connectivity_mode):
+    if connectivity_mode == "symmetric":
+        keypoint_connectivity = module.build_symmetric_connectivity(connectivity_prob)
+    elif connectivity_mode == "raw":
+        keypoint_connectivity = connectivity_prob
+    else:
+        raise ValueError(f"Unsupported connectivity_mode: {connectivity_mode}")
+
+    scores = raw_keypoint_scores(module, skeleton_prob, keypoint_connectivity)
     pre_counts = (scores > 0).sum(dim=(2, 3))
     coords, node_types, valid, values = module.extract_keypoints(
         skeleton_prob,
-        symmetric,
+        keypoint_connectivity,
         direction,
     )
     post_counts = torch.stack(
@@ -265,6 +271,15 @@ def main():
         default=None,
         help="Temporarily override global_topology.connectivity_threshold for diagnostics only.",
     )
+    parser.add_argument(
+        "--connectivity_mode",
+        choices=("symmetric", "raw"),
+        default="symmetric",
+        help=(
+            "Use symmetric two-sided C8 connectivity, or raw one-sided C8 "
+            "connectivity, for keypoint extraction diagnostics."
+        ),
+    )
     parser.add_argument("--max_batches", type=int, default=0)
     parser.add_argument("--cfg", default="./configs/swin_tiny_patch4_window7_224_lite.yaml")
     args = parser.parse_args()
@@ -291,11 +306,12 @@ def main():
     effective_skeleton_threshold = float(module.skeleton_threshold)
     effective_connectivity_threshold = float(module.connectivity_threshold)
     print(
-        "keypoint thresholds: skeleton {:.4f} -> {:.4f}, connectivity {:.4f} -> {:.4f}".format(
+        "keypoint thresholds: skeleton {:.4f} -> {:.4f}, connectivity {:.4f} -> {:.4f}; connectivity_mode={}".format(
             original_skeleton_threshold,
             effective_skeleton_threshold,
             original_connectivity_threshold,
             effective_connectivity_threshold,
+            args.connectivity_mode,
         ),
         flush=True,
     )
@@ -377,12 +393,14 @@ def main():
                 pred_skeleton,
                 pred_connectivity,
                 pred_direction,
+                args.connectivity_mode,
             )
             gt_coords, gt_types, gt_valid, gt_pre, gt_post = extract_with_counts(
                 module,
                 gt_skeleton_stage,
                 gt_connectivity,
                 gt_direction,
+                args.connectivity_mode,
             )
 
             pred_points = pred_coords[pred_valid].float()
@@ -465,6 +483,7 @@ def main():
     summary["effective_skeleton_threshold"] = effective_skeleton_threshold
     summary["original_connectivity_threshold"] = original_connectivity_threshold
     summary["effective_connectivity_threshold"] = effective_connectivity_threshold
+    summary["connectivity_mode"] = args.connectivity_mode
 
     summary_path = os.path.join(args.output_dir, "keypoint_extraction_summary.csv")
     with open(summary_path, "w", newline="") as handle:
