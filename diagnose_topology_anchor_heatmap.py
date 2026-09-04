@@ -174,6 +174,41 @@ def extract_topology_anchors(anchor_score, topk_values, nms_radius, local_max_wi
     return {topk: selected[:topk] for topk in topk_values}
 
 
+def fps_from_threshold(anchor_score, threshold, topk_values):
+    score_2d = anchor_score[0, 0]
+    ys, xs = torch.where(score_2d >= float(threshold))
+    if ys.numel() == 0:
+        return {topk: [] for topk in topk_values}
+
+    scores = score_2d[ys, xs]
+    coords = torch.stack([xs.float(), ys.float()], dim=1)
+    max_topk = min(max(topk_values), coords.shape[0])
+    selected_indices = []
+
+    first = int(torch.argmax(scores).item())
+    selected_indices.append(first)
+    min_dist_sq = ((coords - coords[first]) ** 2).sum(dim=1)
+
+    for _ in range(1, max_topk):
+        min_dist_sq[selected_indices] = -1.0
+        next_index = int(torch.argmax(min_dist_sq).item())
+        if min_dist_sq[next_index] < 0:
+            break
+        selected_indices.append(next_index)
+        dist_sq = ((coords - coords[next_index]) ** 2).sum(dim=1)
+        min_dist_sq = torch.minimum(min_dist_sq, dist_sq)
+
+    selected = [
+        (
+            int(xs[index].item()),
+            int(ys[index].item()),
+            float(scores[index].item()),
+        )
+        for index in selected_indices
+    ]
+    return {topk: selected[: min(topk, len(selected))] for topk in topk_values}
+
+
 def tensor_stats(tensor):
     values = tensor.detach().float()
     return {
@@ -294,6 +329,7 @@ def main():
     parser.add_argument("--print_freq", type=int, default=1)
     parser.add_argument("--cfg", default="./configs/swin_tiny_patch4_window7_224_lite.yaml")
     parser.add_argument("--topk", default="16,32,64")
+    parser.add_argument("--fps_thresholds", default="0.1,0.2,0.3,0.5")
     parser.add_argument("--coverage_radii", default="5,10,20")
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.5)
@@ -311,6 +347,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     topk_values = parse_int_list(args.topk)
+    fps_thresholds = [float(value) for value in args.fps_thresholds.split(",") if value.strip()]
     coverage_radii = parse_int_list(args.coverage_radii)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -449,7 +486,9 @@ def main():
                         rows.append(
                             {
                                 "image_id": image_id,
+                                "extraction": "peak",
                                 "mode": mode,
+                                "threshold": "",
                                 "topK": topk,
                                 "num_anchor": len(anchors),
                                 "mean_anchor_score": (
@@ -478,7 +517,9 @@ def main():
                             anchor_rows.append(
                                 {
                                     "image_id": image_id,
+                                    "extraction": "peak",
                                     "mode": mode,
+                                    "threshold": "",
                                     "topK": topk,
                                     "anchor_index": anchor_index,
                                     "x": x,
@@ -501,6 +542,81 @@ def main():
                                 f"{image_id}_mode_{mode}_topK{topk}.png",
                             )
                             save_visualization(image_rgb, anchors, vis_path)
+
+                    for threshold in fps_thresholds:
+                        anchors_by_topk = fps_from_threshold(
+                            sample_score,
+                            threshold=threshold,
+                            topk_values=topk_values,
+                        )
+                        for topk, anchors in anchors_by_topk.items():
+                            anchor_scores = np.asarray(
+                                [score for _, _, score in anchors],
+                                dtype=np.float32,
+                            )
+                            distances = anchor_distance_to_gt(anchors, gt_np)
+                            mean_dist, median_dist, p90_dist = summarize_anchor_distances(distances)
+                            coverage = coverage_from_anchors(anchors, gt_np, coverage_radii)
+
+                            rows.append(
+                                {
+                                    "image_id": image_id,
+                                    "extraction": "threshold_fps",
+                                    "mode": mode,
+                                    "threshold": threshold,
+                                    "topK": topk,
+                                    "num_anchor": len(anchors),
+                                    "mean_anchor_score": (
+                                        float(anchor_scores.mean()) if anchor_scores.size else 0.0
+                                    ),
+                                    "median_anchor_score": (
+                                        float(np.median(anchor_scores)) if anchor_scores.size else 0.0
+                                    ),
+                                    "coverage_5": coverage.get(5, 0.0),
+                                    "coverage_10": coverage.get(10, 0.0),
+                                    "coverage_20": coverage.get(20, 0.0),
+                                    "mean_gt_distance": mean_dist,
+                                    "median_gt_distance": median_dist,
+                                    "p90_gt_distance": p90_dist,
+                                    "skeleton_prob_mean": skeleton_stats["mean"],
+                                    "skeleton_prob_std": skeleton_stats["std"],
+                                    "skeleton_positive_ratio_0.1": skeleton_pos_ratios[0.1],
+                                    "skeleton_positive_ratio_0.3": skeleton_pos_ratios[0.3],
+                                    "skeleton_positive_ratio_0.5": skeleton_pos_ratios[0.5],
+                                    "connectivity_mean": conn_stats["mean"],
+                                    "connectivity_std": conn_stats["std"],
+                                    "direction_confidence_mean": direction_mean,
+                                }
+                            )
+                            for anchor_index, (x, y, anchor_score) in enumerate(anchors):
+                                anchor_rows.append(
+                                    {
+                                        "image_id": image_id,
+                                        "extraction": "threshold_fps",
+                                        "mode": mode,
+                                        "threshold": threshold,
+                                        "topK": topk,
+                                        "anchor_index": anchor_index,
+                                        "x": x,
+                                        "y": y,
+                                        "score": anchor_score,
+                                        "distance_to_gt_skeleton": (
+                                            float(distances[anchor_index])
+                                            if anchor_index < len(distances)
+                                            else float("inf")
+                                        ),
+                                    }
+                                )
+
+                            if topk in (32, 64) and (
+                                args.max_visuals == 0 or visual_count < args.max_visuals
+                            ):
+                                vis_path = os.path.join(
+                                    args.output_dir,
+                                    "visualizations",
+                                    f"{image_id}_mode_{mode}_threshold_fps_thr{threshold:g}_topK{topk}.png",
+                                )
+                                save_visualization(image_rgb, anchors, vis_path)
 
                     if args.max_visuals == 0 or visual_count < args.max_visuals:
                         visual_count += 1
@@ -535,7 +651,9 @@ def main():
     anchors_path = os.path.join(args.output_dir, "topology_anchor_coordinates.csv")
     anchor_fieldnames = [
         "image_id",
+        "extraction",
         "mode",
+        "threshold",
         "topK",
         "anchor_index",
         "x",
@@ -549,28 +667,41 @@ def main():
         writer.writerows(anchor_rows)
 
     print("\nTopology anchor diagnostic", flush=True)
-    for mode in ("A", "B", "C"):
-        for topk in topk_values:
-            selected = [row for row in rows if row["mode"] == mode and row["topK"] == topk]
-            if not selected:
-                continue
-            mean_anchors = np.mean([row["num_anchor"] for row in selected])
-            cov5 = np.mean([row["coverage_5"] for row in selected])
-            cov10 = np.mean([row["coverage_10"] for row in selected])
-            cov20 = np.mean([row["coverage_20"] for row in selected])
-            med_dist = np.mean([row["median_gt_distance"] for row in selected])
-            print(
-                "mode={} topK={}: anchors={:.2f} coverage@5/10/20={:.4f}/{:.4f}/{:.4f} median_dist={:.3f}".format(
-                    mode,
-                    topk,
-                    mean_anchors,
-                    cov5,
-                    cov10,
-                    cov20,
-                    med_dist,
-                ),
-                flush=True,
-            )
+    for extraction in ("peak", "threshold_fps"):
+        thresholds = [""] if extraction == "peak" else fps_thresholds
+        for mode in ("A", "B", "C"):
+            for threshold in thresholds:
+                for topk in topk_values:
+                    selected = [
+                        row
+                        for row in rows
+                        if row["extraction"] == extraction
+                        and row["mode"] == mode
+                        and row["threshold"] == threshold
+                        and row["topK"] == topk
+                    ]
+                    if not selected:
+                        continue
+                    mean_anchors = np.mean([row["num_anchor"] for row in selected])
+                    cov5 = np.mean([row["coverage_5"] for row in selected])
+                    cov10 = np.mean([row["coverage_10"] for row in selected])
+                    cov20 = np.mean([row["coverage_20"] for row in selected])
+                    med_dist = np.mean([row["median_gt_distance"] for row in selected])
+                    threshold_text = "" if threshold == "" else f" threshold={threshold:g}"
+                    print(
+                        "{} mode={}{} topK={}: anchors={:.2f} coverage@5/10/20={:.4f}/{:.4f}/{:.4f} median_dist={:.3f}".format(
+                            extraction,
+                            mode,
+                            threshold_text,
+                            topk,
+                            mean_anchors,
+                            cov5,
+                            cov10,
+                            cov20,
+                            med_dist,
+                        ),
+                        flush=True,
+                    )
     print("saved:", diag_path, flush=True)
     print("saved:", anchors_path, flush=True)
     print("saved visualizations under:", os.path.join(args.output_dir, "visualizations"), flush=True)
