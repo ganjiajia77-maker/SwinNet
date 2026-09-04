@@ -200,6 +200,49 @@ def find_stage3_output(stage_outputs):
     raise RuntimeError("No stage-3 connectivity output found.")
 
 
+def find_highres_structure_skeleton(stage_outputs):
+    for item in reversed(stage_outputs):
+        if item.get("stage") == "highres_structure":
+            skeleton = item.get("highres_structure_skeleton")
+            if skeleton is not None:
+                return skeleton
+    return None
+
+
+def resolve_predicted_skeleton(stage3, stage_outputs, final_skeleton_logits, target_size):
+    if stage3.get("skeleton") is not None:
+        return torch.sigmoid(stage3["skeleton"]), "stage3_skeleton"
+
+    highres_skeleton = find_highres_structure_skeleton(stage_outputs)
+    if highres_skeleton is not None:
+        skeleton = torch.sigmoid(
+            F.interpolate(
+                highres_skeleton,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        return skeleton, "highres_structure_skeleton"
+
+    if final_skeleton_logits is not None:
+        skeleton = torch.sigmoid(
+            F.interpolate(
+                final_skeleton_logits,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        return skeleton, "final_skeleton_fallback"
+
+    raise RuntimeError(
+        "No predicted skeleton source found: stage3 has no 'skeleton', "
+        "stage_outputs has no highres_structure_skeleton, and final skeleton "
+        "logits are unavailable."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diagnose whether extracted topology nodes are real road keypoints.")
     parser.add_argument("--checkpoint", required=True)
@@ -279,11 +322,16 @@ def main():
             outputs = model(images)
             stage3 = find_stage3_output(outputs[4])
 
-            pred_skeleton = torch.sigmoid(stage3["skeleton"])
             pred_connectivity = torch.sigmoid(stage3["connectivity"])
             pred_direction = stage3["direction"]
-
-            height, width = pred_skeleton.shape[-2:]
+            height, width = pred_connectivity.shape[-2:]
+            final_skeleton_logits = outputs[2] if len(outputs) > 2 else None
+            pred_skeleton, pred_skeleton_source = resolve_predicted_skeleton(
+                stage3,
+                outputs[4],
+                final_skeleton_logits,
+                (height, width),
+            )
             gt_skeleton_stage = F.interpolate(
                 (gt_skeleton > 0.5).float(),
                 size=(height, width),
@@ -317,6 +365,7 @@ def main():
 
             row = {
                 "batch_index": batch_index,
+                "pred_skeleton_source": pred_skeleton_source,
                 "pred_node_count": int(pred_valid.sum().item()),
                 "pred_endpoint_count": int(pred_post[:, 0].sum().item()),
                 "pred_junction_count": int(pred_post[:, 1].sum().item()),
