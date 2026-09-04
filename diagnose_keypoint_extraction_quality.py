@@ -3,6 +3,7 @@ import csv
 import math
 import os
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -515,12 +516,17 @@ def main():
         help="Minimum soft keypoint score used only when --extraction_mode soft_topk.",
     )
     parser.add_argument("--max_batches", type=int, default=0)
+    parser.add_argument("--print_freq", type=int, default=1)
     parser.add_argument("--cfg", default="./configs/swin_tiny_patch4_window7_224_lite.yaml")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"[diag] device={device}", flush=True)
+    print(f"[diag] loading checkpoint: {args.checkpoint}", flush=True)
+    start_time = time.perf_counter()
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    print(f"[diag] checkpoint loaded in {time.perf_counter() - start_time:.2f}s", flush=True)
 
     config_args = update_args_from_checkpoint(ConfigArgs(), checkpoint)
     config_args.root_path = args.root_path
@@ -529,7 +535,10 @@ def main():
     config_args.num_workers = args.num_workers
     config_args.cfg = args.cfg
 
+    print("[diag] building model", flush=True)
+    start_time = time.perf_counter()
     model = build_model(config_args, checkpoint, device)
+    print(f"[diag] model ready in {time.perf_counter() - start_time:.2f}s", flush=True)
     module = model.swin_unet.global_topology
     original_skeleton_threshold = float(module.skeleton_threshold)
     original_connectivity_threshold = float(module.connectivity_threshold)
@@ -550,11 +559,14 @@ def main():
         ),
         flush=True,
     )
+    print(f"[diag] loading dataset: root={args.root_path} split={args.split}", flush=True)
+    start_time = time.perf_counter()
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split=args.split,
         image_size=args.img_size,
     )
+    print(f"[diag] dataset size={len(dataset)} loaded in {time.perf_counter() - start_time:.2f}s", flush=True)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -598,10 +610,20 @@ def main():
         for batch_index, batch in enumerate(loader):
             if args.max_batches and batch_index >= args.max_batches:
                 break
+            batch_start = time.perf_counter()
+            should_print = args.print_freq > 0 and batch_index % args.print_freq == 0
+            if should_print:
+                print(f"[diag] batch {batch_index + 1} start", flush=True)
 
             images = batch["image"].to(device)
             gt_skeleton = batch["skeleton"].to(device)
+            if should_print:
+                print(f"[diag] batch {batch_index + 1} forward start", flush=True)
             outputs = model(images)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            if should_print:
+                print(f"[diag] batch {batch_index + 1} forward done", flush=True)
             stage3 = find_stage3_output(outputs[4])
 
             pred_connectivity = torch.sigmoid(stage3["connectivity"])
@@ -749,6 +771,19 @@ def main():
                 aggregate[f"{name}_fn"] += fn
 
             rows.append(row)
+            if should_print:
+                print(
+                    "[diag] batch {} done in {:.2f}s: nodes={} endpoints={} junctions={} bends={} edges={}".format(
+                        batch_index + 1,
+                        time.perf_counter() - batch_start,
+                        row["pred_node_count"],
+                        row["pred_endpoint_count"],
+                        row["pred_junction_count"],
+                        row["pred_bend_count"],
+                        row["pred_edge_count"],
+                    ),
+                    flush=True,
+                )
 
     if not rows:
         raise RuntimeError("No batches were processed.")
