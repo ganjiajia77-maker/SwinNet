@@ -253,6 +253,18 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--match_tol", type=float, default=3.0)
+    parser.add_argument(
+        "--skeleton_threshold_override",
+        type=float,
+        default=None,
+        help="Temporarily override global_topology.skeleton_threshold for diagnostics only.",
+    )
+    parser.add_argument(
+        "--connectivity_threshold_override",
+        type=float,
+        default=None,
+        help="Temporarily override global_topology.connectivity_threshold for diagnostics only.",
+    )
     parser.add_argument("--max_batches", type=int, default=0)
     parser.add_argument("--cfg", default="./configs/swin_tiny_patch4_window7_224_lite.yaml")
     args = parser.parse_args()
@@ -270,6 +282,23 @@ def main():
 
     model = build_model(config_args, checkpoint, device)
     module = model.swin_unet.global_topology
+    original_skeleton_threshold = float(module.skeleton_threshold)
+    original_connectivity_threshold = float(module.connectivity_threshold)
+    if args.skeleton_threshold_override is not None:
+        module.skeleton_threshold = float(args.skeleton_threshold_override)
+    if args.connectivity_threshold_override is not None:
+        module.connectivity_threshold = float(args.connectivity_threshold_override)
+    effective_skeleton_threshold = float(module.skeleton_threshold)
+    effective_connectivity_threshold = float(module.connectivity_threshold)
+    print(
+        "keypoint thresholds: skeleton {:.4f} -> {:.4f}, connectivity {:.4f} -> {:.4f}".format(
+            original_skeleton_threshold,
+            effective_skeleton_threshold,
+            original_connectivity_threshold,
+            effective_connectivity_threshold,
+        ),
+        flush=True,
+    )
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split=args.split,
@@ -432,6 +461,10 @@ def main():
     summary["pred_nn_median_avg"] = sum(nn_medians) / max(len(nn_medians), 1)
     summary["pred_nn_min_avg"] = sum(nn_mins) / max(len(nn_mins), 1)
     summary["match_tol"] = args.match_tol
+    summary["original_skeleton_threshold"] = original_skeleton_threshold
+    summary["effective_skeleton_threshold"] = effective_skeleton_threshold
+    summary["original_connectivity_threshold"] = original_connectivity_threshold
+    summary["effective_connectivity_threshold"] = effective_connectivity_threshold
 
     summary_path = os.path.join(args.output_dir, "keypoint_extraction_summary.csv")
     with open(summary_path, "w", newline="") as handle:
