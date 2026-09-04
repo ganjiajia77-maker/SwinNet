@@ -162,6 +162,25 @@ class KeypointGuidedGlobalTopology(nn.Module):
         logits = logits + topology_bias
         logits = logits.masked_fill(~valid[:, None, None, :], -torch.finfo(logits.dtype).max)
         attention = torch.softmax(logits, dim=-1)
+        if self.capture_diagnostics:
+            with torch.no_grad():
+                pair_attention = attention.mean(dim=1)
+                eye = torch.eye(nodes, device=attention.device, dtype=torch.bool).unsqueeze(0)
+                valid_pair = valid.unsqueeze(1) & valid.unsqueeze(2) & ~eye
+                same_pair = (adjacency > 1e-6) & valid_pair
+                different_pair = (adjacency <= 1e-6) & valid_pair
+
+                def masked_mean(values, mask):
+                    count = mask.sum(dim=(1, 2))
+                    total = (values * mask.float()).sum(dim=(1, 2))
+                    mean = total / count.clamp_min(1).float()
+                    return torch.where(count > 0, mean, torch.full_like(mean, float("nan")))
+
+                self.last_attention_same_mean = masked_mean(pair_attention, same_pair).detach()
+                self.last_attention_different_mean = masked_mean(pair_attention, different_pair).detach()
+                self.last_attention_delta = (
+                    self.last_attention_same_mean - self.last_attention_different_mean
+                ).detach()
         attended = torch.matmul(attention, value).transpose(1, 2).reshape(batch, nodes, channels)
         attended = self.output_projection(attended)
         attended = attended * valid.unsqueeze(-1).float()
@@ -215,6 +234,9 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "alpha_global": self.alpha_global.detach(),
                     "global_residual_relative_norm": (torch.linalg.vector_norm(output - feature) / (torch.linalg.vector_norm(feature) + 1e-6)).detach(),
                     "node_feature_relative_change": (torch.linalg.vector_norm(attended - node_feature) / (torch.linalg.vector_norm(node_feature) + 1e-6)).detach(),
+                    "attention_same_mean": self.last_attention_same_mean.detach(),
+                    "attention_different_mean": self.last_attention_different_mean.detach(),
+                    "attention_delta": self.last_attention_delta.detach(),
                 }
         return output
 
