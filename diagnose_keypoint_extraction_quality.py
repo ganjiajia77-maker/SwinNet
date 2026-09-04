@@ -4,6 +4,8 @@ import math
 import os
 import sys
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -237,6 +239,137 @@ def extract_keypoints_for_diagnostic(
     raise ValueError(f"Unsupported extraction_mode: {extraction_mode}")
 
 
+def thinning_binary(mask):
+    mask_uint8 = (mask.astype(np.uint8) > 0).astype(np.uint8) * 255
+    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
+        return (cv2.ximgproc.thinning(mask_uint8) > 0).astype(np.uint8)
+
+    skeleton = np.zeros_like(mask_uint8)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    working = mask_uint8.copy()
+    while cv2.countNonZero(working) > 0:
+        eroded = cv2.erode(working, element)
+        opened = cv2.dilate(eroded, element)
+        skeleton = cv2.bitwise_or(skeleton, cv2.subtract(working, opened))
+        working = eroded
+    return (skeleton > 0).astype(np.uint8)
+
+
+def thin_skeleton_keypoints_single(module, skeleton_prob_2d, connectivity_prob, score_threshold):
+    height, width = skeleton_prob_2d.shape
+    binary = (skeleton_prob_2d >= module.skeleton_threshold).detach().cpu().numpy().astype(np.uint8)
+    thin = thinning_binary(binary)
+    thin_t = torch.from_numpy(thin).to(device=connectivity_prob.device, dtype=torch.bool)
+
+    degree = torch.zeros((height, width), device=connectivity_prob.device, dtype=torch.long)
+    edge_count = 0
+    edge_weight_sum = 0.0
+    for direction_index, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
+        neighbor = torch.zeros_like(thin_t)
+        y_src_start = max(-dy, 0)
+        y_src_end = height - max(dy, 0)
+        x_src_start = max(-dx, 0)
+        x_src_end = width - max(dx, 0)
+        y_dst_start = max(dy, 0)
+        y_dst_end = height - max(-dy, 0)
+        x_dst_start = max(dx, 0)
+        x_dst_end = width - max(-dx, 0)
+        neighbor[y_dst_start:y_dst_end, x_dst_start:x_dst_end] = thin_t[
+            y_src_start:y_src_end,
+            x_src_start:x_src_end,
+        ]
+        linked = thin_t & neighbor
+        degree += linked.long()
+        if direction_index in (2, 3, 4, 5):
+            edge_weight = connectivity_prob[direction_index]
+            edge_mask = linked & (edge_weight >= module.connectivity_threshold)
+            edge_count += int(edge_mask.sum().item())
+            edge_weight_sum += float(edge_weight[edge_mask].sum().item()) if edge_mask.any() else 0.0
+
+    endpoint = thin_t & (degree == 1)
+    junction = thin_t & (degree >= 3)
+    bend = torch.zeros_like(thin_t)
+    vectors = torch.tensor(CONNECTIVITY_DIRECTIONS, device=connectivity_prob.device, dtype=torch.float32)
+    ys, xs = torch.where(thin_t & (degree == 2))
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        dirs = []
+        for index, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
+            yy = y + dy
+            xx = x + dx
+            if 0 <= yy < height and 0 <= xx < width and bool(thin_t[yy, xx]):
+                dirs.append(index)
+        if len(dirs) == 2:
+            dot = float(torch.abs((vectors[dirs[0]] * vectors[dirs[1]]).sum()).item())
+            if dot < math.cos(math.radians(module.bend_angle_threshold)):
+                bend[y, x] = True
+
+    scores = torch.stack(
+        [
+            skeleton_prob_2d * endpoint.float(),
+            skeleton_prob_2d * junction.float(),
+            skeleton_prob_2d * bend.float(),
+        ],
+        dim=0,
+    )
+    scores = scores * (scores >= score_threshold).float()
+    return scores, edge_count, edge_weight_sum
+
+
+def extract_thin_skeleton_256_with_counts(module, skeleton_prob, connectivity_prob, score_threshold):
+    batch, _, height, width = skeleton_prob.shape
+    if connectivity_prob.shape[-2:] != (height, width):
+        connectivity_prob = F.interpolate(
+            connectivity_prob,
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    score_items = []
+    edge_counts = []
+    edge_weight_sums = []
+    for batch_index in range(batch):
+        scores, edge_count, edge_weight_sum = thin_skeleton_keypoints_single(
+            module,
+            skeleton_prob[batch_index, 0],
+            connectivity_prob[batch_index],
+            score_threshold,
+        )
+        score_items.append(scores)
+        edge_counts.append(edge_count)
+        edge_weight_sums.append(edge_weight_sum)
+
+    scores = torch.stack(score_items, dim=0)
+    pre_counts = (scores > 0).sum(dim=(2, 3))
+    pooled = F.max_pool2d(
+        scores.reshape(batch * 3, 1, height, width),
+        2 * module.nms_radius + 1,
+        1,
+        module.nms_radius,
+    ).reshape(batch, 3, height, width)
+    candidates = scores * (scores >= pooled).float()
+    flat_scores = candidates.reshape(batch, -1)
+    count = min(module.max_nodes, flat_scores.shape[1])
+    values, indices = flat_scores.topk(count, dim=1)
+    valid = values > 0
+    node_types = indices // (height * width)
+    flat = indices % (height * width)
+    ys = flat // width
+    xs = flat % width
+    coords = torch.stack([ys, xs], dim=-1)
+    post_counts = torch.stack(
+        [
+            ((node_types == 0) & valid).sum(dim=1),
+            ((node_types == 1) & valid).sum(dim=1),
+            ((node_types == 2) & valid).sum(dim=1),
+        ],
+        dim=1,
+    )
+    edge_counts = torch.tensor(edge_counts, device=skeleton_prob.device, dtype=torch.long)
+    edge_weight_sums = torch.tensor(edge_weight_sums, device=skeleton_prob.device, dtype=skeleton_prob.dtype)
+    return coords, node_types, valid, pre_counts, post_counts, edge_counts, edge_weight_sums
+
+
 def coords_by_type(coords, node_types, valid, type_index):
     mask = (node_types == type_index) & valid
     return coords[mask].float()
@@ -368,9 +501,12 @@ def main():
     )
     parser.add_argument(
         "--extraction_mode",
-        choices=("hard", "soft_topk"),
+        choices=("hard", "soft_topk", "thin_skeleton_256"),
         default="hard",
-        help="Use the original hard rule extraction or a diagnostic-only soft-score topK extractor.",
+        help=(
+            "Use the original hard rule extraction, a diagnostic-only soft-score "
+            "topK extractor, or 256px threshold/thinning skeleton nodes."
+        ),
     )
     parser.add_argument(
         "--soft_score_threshold",
@@ -442,6 +578,8 @@ def main():
         "gt_post_endpoint": 0,
         "gt_post_junction": 0,
         "gt_post_bend": 0,
+        "pred_edge_count": 0,
+        "gt_edge_count": 0,
         "endpoint_tp": 0,
         "endpoint_fp": 0,
         "endpoint_fn": 0,
@@ -470,41 +608,87 @@ def main():
             pred_direction = stage3["direction"]
             height, width = pred_connectivity.shape[-2:]
             final_skeleton_logits = outputs[2] if len(outputs) > 2 else None
-            pred_skeleton, pred_skeleton_source = resolve_predicted_skeleton(
-                stage3,
-                outputs[4],
-                final_skeleton_logits,
-                (height, width),
-            )
-            gt_skeleton_stage = F.interpolate(
-                (gt_skeleton > 0.5).float(),
-                size=(height, width),
-                mode="nearest",
-            )
-            gt_connectivity = build_connectivity_target(
-                gt_skeleton_stage,
-                erode_kernel_size=1,
-            ).to(device)
-            gt_direction = torch.zeros(gt_skeleton_stage.shape[0], 2, height, width, device=device)
+            pred_edge_count = 0
+            gt_edge_count = 0
+            if args.extraction_mode == "thin_skeleton_256":
+                target_size = gt_skeleton.shape[-2:]
+                pred_skeleton, pred_skeleton_source = resolve_predicted_skeleton(
+                    stage3,
+                    outputs[4],
+                    final_skeleton_logits,
+                    target_size,
+                )
+                gt_skeleton_stage = (gt_skeleton > 0.5).float()
+                gt_connectivity = build_connectivity_target(
+                    gt_skeleton_stage,
+                    erode_kernel_size=1,
+                ).to(device)
+                (
+                    pred_coords,
+                    pred_types,
+                    pred_valid,
+                    pred_pre,
+                    pred_post,
+                    pred_edges,
+                    pred_edge_weights,
+                ) = extract_thin_skeleton_256_with_counts(
+                    module,
+                    pred_skeleton,
+                    pred_connectivity,
+                    args.soft_score_threshold,
+                )
+                (
+                    gt_coords,
+                    gt_types,
+                    gt_valid,
+                    gt_pre,
+                    gt_post,
+                    gt_edges,
+                    gt_edge_weights,
+                ) = extract_thin_skeleton_256_with_counts(
+                    module,
+                    gt_skeleton_stage,
+                    gt_connectivity,
+                    args.soft_score_threshold,
+                )
+                pred_edge_count = int(pred_edges.sum().item())
+                gt_edge_count = int(gt_edges.sum().item())
+            else:
+                pred_skeleton, pred_skeleton_source = resolve_predicted_skeleton(
+                    stage3,
+                    outputs[4],
+                    final_skeleton_logits,
+                    (height, width),
+                )
+                gt_skeleton_stage = F.interpolate(
+                    (gt_skeleton > 0.5).float(),
+                    size=(height, width),
+                    mode="nearest",
+                )
+                gt_connectivity = build_connectivity_target(
+                    gt_skeleton_stage,
+                    erode_kernel_size=1,
+                ).to(device)
+                gt_direction = torch.zeros(gt_skeleton_stage.shape[0], 2, height, width, device=device)
 
-            pred_coords, pred_types, pred_valid, pred_pre, pred_post = extract_keypoints_for_diagnostic(
-                module,
-                pred_skeleton,
-                pred_connectivity,
-                pred_direction,
-                args.connectivity_mode,
-                args.extraction_mode,
-                args.soft_score_threshold,
-            )
-            gt_coords, gt_types, gt_valid, gt_pre, gt_post = extract_keypoints_for_diagnostic(
-                module,
-                gt_skeleton_stage,
-                gt_connectivity,
-                gt_direction,
-                args.connectivity_mode,
-                args.extraction_mode,
-                args.soft_score_threshold,
-            )
+                pred_coords, pred_types, pred_valid, pred_pre, pred_post = extract_keypoints_for_diagnostic(
+                    module,
+                    pred_skeleton,
+                    pred_connectivity,
+                    pred_direction,
+                    args.connectivity_mode,
+                    args.extraction_mode,
+                    args.soft_score_threshold,
+                )
+                gt_coords, gt_types, gt_valid, gt_pre, gt_post = extract_keypoints_for_diagnostic(
+                    module,
+                    gt_skeleton_stage,
+                    gt_connectivity,
+                    gt_direction,
+                    args.connectivity_mode,
+                    args.extraction_mode,
+                    args.soft_score_threshold,
+                )
 
             pred_points = pred_coords[pred_valid].float()
             nn_mean, nn_median, nn_min = nearest_neighbor_stats(pred_points)
@@ -523,6 +707,7 @@ def main():
                 "pred_pre_endpoint": int(pred_pre[:, 0].sum().item()),
                 "pred_pre_junction": int(pred_pre[:, 1].sum().item()),
                 "pred_pre_bend": int(pred_pre[:, 2].sum().item()),
+                "pred_edge_count": pred_edge_count,
                 "gt_node_count": int(gt_valid.sum().item()),
                 "gt_endpoint_count": int(gt_post[:, 0].sum().item()),
                 "gt_junction_count": int(gt_post[:, 1].sum().item()),
@@ -530,6 +715,7 @@ def main():
                 "gt_pre_endpoint": int(gt_pre[:, 0].sum().item()),
                 "gt_pre_junction": int(gt_pre[:, 1].sum().item()),
                 "gt_pre_bend": int(gt_pre[:, 2].sum().item()),
+                "gt_edge_count": gt_edge_count,
                 "pred_nn_mean": nn_mean,
                 "pred_nn_median": nn_median,
                 "pred_nn_min": nn_min,
@@ -537,6 +723,8 @@ def main():
 
             aggregate["pred_nodes"] += row["pred_node_count"]
             aggregate["gt_nodes"] += row["gt_node_count"]
+            aggregate["pred_edge_count"] += row["pred_edge_count"]
+            aggregate["gt_edge_count"] += row["gt_edge_count"]
             for name in ("endpoint", "junction", "bend"):
                 aggregate[f"pred_pre_{name}"] += row[f"pred_pre_{name}"]
                 aggregate[f"pred_post_{name}"] += row[f"pred_{name}_count"]
