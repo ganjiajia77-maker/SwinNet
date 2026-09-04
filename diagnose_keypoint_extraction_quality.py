@@ -151,6 +151,92 @@ def extract_with_counts(module, skeleton_prob, connectivity_prob, direction, con
     return coords, node_types, valid, pre_counts, post_counts
 
 
+def soft_keypoint_scores(module, skeleton_prob, keypoint_connectivity):
+    topk = keypoint_connectivity.topk(k=min(3, keypoint_connectivity.shape[1]), dim=1)
+    top_values = topk.values
+    top_indices = topk.indices
+    top1 = top_values[:, 0]
+    top2 = top_values[:, 1] if top_values.shape[1] > 1 else torch.zeros_like(top1)
+    top3 = top_values[:, 2] if top_values.shape[1] > 2 else torch.zeros_like(top1)
+
+    vectors = torch.tensor(
+        CONNECTIVITY_DIRECTIONS,
+        device=skeleton_prob.device,
+        dtype=torch.float32,
+    )
+    first = vectors[top_indices[:, 0]]
+    second = vectors[top_indices[:, 1]] if top_indices.shape[1] > 1 else torch.zeros_like(first)
+    bendness = 1.0 - (first * second).sum(dim=-1).abs().clamp(0.0, 1.0)
+
+    skeleton = skeleton_prob[:, 0]
+    endpoint_score = skeleton * top1 * (1.0 - top2).clamp_min(0.0)
+    junction_score = skeleton * torch.minimum(torch.minimum(top1, top2), top3)
+    bend_score = skeleton * torch.minimum(top1, top2) * bendness
+    return torch.stack([endpoint_score, junction_score, bend_score], dim=1)
+
+
+def extract_soft_topk_with_counts(module, skeleton_prob, connectivity_prob, direction, connectivity_mode, score_threshold):
+    if connectivity_mode == "symmetric":
+        keypoint_connectivity = module.build_symmetric_connectivity(connectivity_prob)
+    elif connectivity_mode == "raw":
+        keypoint_connectivity = connectivity_prob
+    else:
+        raise ValueError(f"Unsupported connectivity_mode: {connectivity_mode}")
+
+    batch, _, height, width = skeleton_prob.shape
+    scores = soft_keypoint_scores(module, skeleton_prob, keypoint_connectivity)
+    scores = scores * (scores >= score_threshold).float()
+    pre_counts = (scores > 0).sum(dim=(2, 3))
+    pooled = F.max_pool2d(
+        scores.reshape(batch * 3, 1, height, width),
+        2 * module.nms_radius + 1,
+        1,
+        module.nms_radius,
+    ).reshape(batch, 3, height, width)
+    candidates = scores * (scores >= pooled).float()
+    flat_scores = candidates.reshape(batch, -1)
+    count = min(module.max_nodes, flat_scores.shape[1])
+    values, indices = flat_scores.topk(count, dim=1)
+    valid = values > 0
+    node_types = indices // (height * width)
+    flat = indices % (height * width)
+    ys = flat // width
+    xs = flat % width
+    coords = torch.stack([ys, xs], dim=-1)
+    post_counts = torch.stack(
+        [
+            ((node_types == 0) & valid).sum(dim=1),
+            ((node_types == 1) & valid).sum(dim=1),
+            ((node_types == 2) & valid).sum(dim=1),
+        ],
+        dim=1,
+    )
+    return coords, node_types, valid, pre_counts, post_counts
+
+
+def extract_keypoints_for_diagnostic(
+    module,
+    skeleton_prob,
+    connectivity_prob,
+    direction,
+    connectivity_mode,
+    extraction_mode,
+    soft_score_threshold,
+):
+    if extraction_mode == "hard":
+        return extract_with_counts(module, skeleton_prob, connectivity_prob, direction, connectivity_mode)
+    if extraction_mode == "soft_topk":
+        return extract_soft_topk_with_counts(
+            module,
+            skeleton_prob,
+            connectivity_prob,
+            direction,
+            connectivity_mode,
+            soft_score_threshold,
+        )
+    raise ValueError(f"Unsupported extraction_mode: {extraction_mode}")
+
+
 def coords_by_type(coords, node_types, valid, type_index):
     mask = (node_types == type_index) & valid
     return coords[mask].float()
@@ -280,6 +366,18 @@ def main():
             "connectivity, for keypoint extraction diagnostics."
         ),
     )
+    parser.add_argument(
+        "--extraction_mode",
+        choices=("hard", "soft_topk"),
+        default="hard",
+        help="Use the original hard rule extraction or a diagnostic-only soft-score topK extractor.",
+    )
+    parser.add_argument(
+        "--soft_score_threshold",
+        type=float,
+        default=1e-6,
+        help="Minimum soft keypoint score used only when --extraction_mode soft_topk.",
+    )
     parser.add_argument("--max_batches", type=int, default=0)
     parser.add_argument("--cfg", default="./configs/swin_tiny_patch4_window7_224_lite.yaml")
     args = parser.parse_args()
@@ -306,12 +404,13 @@ def main():
     effective_skeleton_threshold = float(module.skeleton_threshold)
     effective_connectivity_threshold = float(module.connectivity_threshold)
     print(
-        "keypoint thresholds: skeleton {:.4f} -> {:.4f}, connectivity {:.4f} -> {:.4f}; connectivity_mode={}".format(
+        "keypoint thresholds: skeleton {:.4f} -> {:.4f}, connectivity {:.4f} -> {:.4f}; connectivity_mode={}; extraction_mode={}".format(
             original_skeleton_threshold,
             effective_skeleton_threshold,
             original_connectivity_threshold,
             effective_connectivity_threshold,
             args.connectivity_mode,
+            args.extraction_mode,
         ),
         flush=True,
     )
@@ -388,19 +487,23 @@ def main():
             ).to(device)
             gt_direction = torch.zeros(gt_skeleton_stage.shape[0], 2, height, width, device=device)
 
-            pred_coords, pred_types, pred_valid, pred_pre, pred_post = extract_with_counts(
+            pred_coords, pred_types, pred_valid, pred_pre, pred_post = extract_keypoints_for_diagnostic(
                 module,
                 pred_skeleton,
                 pred_connectivity,
                 pred_direction,
                 args.connectivity_mode,
+                args.extraction_mode,
+                args.soft_score_threshold,
             )
-            gt_coords, gt_types, gt_valid, gt_pre, gt_post = extract_with_counts(
+            gt_coords, gt_types, gt_valid, gt_pre, gt_post = extract_keypoints_for_diagnostic(
                 module,
                 gt_skeleton_stage,
                 gt_connectivity,
                 gt_direction,
                 args.connectivity_mode,
+                args.extraction_mode,
+                args.soft_score_threshold,
             )
 
             pred_points = pred_coords[pred_valid].float()
@@ -484,6 +587,8 @@ def main():
     summary["original_connectivity_threshold"] = original_connectivity_threshold
     summary["effective_connectivity_threshold"] = effective_connectivity_threshold
     summary["connectivity_mode"] = args.connectivity_mode
+    summary["extraction_mode"] = args.extraction_mode
+    summary["soft_score_threshold"] = args.soft_score_threshold
 
     summary_path = os.path.join(args.output_dir, "keypoint_extraction_summary.csv")
     with open(summary_path, "w", newline="") as handle:

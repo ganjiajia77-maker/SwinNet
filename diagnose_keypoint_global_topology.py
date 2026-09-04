@@ -192,6 +192,31 @@ def patch_global_topology_capture(module):
     module.forward = types.MethodType(wrapped, module)
 
 
+def configure_diagnostic_topology(module, args):
+    original_skeleton_threshold = float(module.skeleton_threshold)
+    original_connectivity_threshold = float(module.connectivity_threshold)
+    if args.skeleton_threshold_override is not None:
+        module.skeleton_threshold = float(args.skeleton_threshold_override)
+    if args.connectivity_threshold_override is not None:
+        module.connectivity_threshold = float(args.connectivity_threshold_override)
+
+    if args.connectivity_mode == "raw":
+        def raw_connectivity(self, connectivity_prob):
+            return connectivity_prob
+
+        module.build_symmetric_connectivity = types.MethodType(raw_connectivity, module)
+    elif args.connectivity_mode != "symmetric":
+        raise ValueError(f"Unsupported connectivity_mode: {args.connectivity_mode}")
+
+    return {
+        "original_skeleton_threshold": original_skeleton_threshold,
+        "effective_skeleton_threshold": float(module.skeleton_threshold),
+        "original_connectivity_threshold": original_connectivity_threshold,
+        "effective_connectivity_threshold": float(module.connectivity_threshold),
+        "connectivity_mode": args.connectivity_mode,
+    }
+
+
 def update_args_from_checkpoint(args, checkpoint):
     saved_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     if isinstance(saved_args, dict):
@@ -260,11 +285,22 @@ def run_coverage(args):
     model = build_model(config_args, checkpoint, device)
     global_topology = model.swin_unet.global_topology
     global_topology.capture_diagnostics = True
+    threshold_state = configure_diagnostic_topology(global_topology, args)
     patch_global_topology_capture(global_topology)
 
     alpha = float(global_topology.alpha_global.detach().cpu())
     raw_alpha = float(global_topology.raw_alpha.detach().cpu())
     print("raw_alpha={:.8f} alpha_global={:.8f}".format(raw_alpha, alpha))
+    print(
+        "keypoint thresholds: skeleton {:.4f} -> {:.4f}, connectivity {:.4f} -> {:.4f}; connectivity_mode={}".format(
+            threshold_state["original_skeleton_threshold"],
+            threshold_state["effective_skeleton_threshold"],
+            threshold_state["original_connectivity_threshold"],
+            threshold_state["effective_connectivity_threshold"],
+            threshold_state["connectivity_mode"],
+        ),
+        flush=True,
+    )
 
     dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
@@ -380,6 +416,7 @@ def run_coverage(args):
         "global_threshold": args.global_threshold,
         "raw_alpha": raw_alpha,
         "alpha_global": alpha,
+        **threshold_state,
         "attention_same_mean": sum(attention_same_values) / max(len(attention_same_values), 1),
         "attention_different_mean": sum(attention_different_values) / max(len(attention_different_values), 1),
         "attention_delta": sum(attention_delta_values) / max(len(attention_delta_values), 1),
@@ -446,6 +483,13 @@ def build_parser():
     coverage_parser.add_argument("--num_workers", type=int, default=0)
     coverage_parser.add_argument("--pred_threshold", type=float, default=0.5)
     coverage_parser.add_argument("--global_threshold", type=float, default=0.1)
+    coverage_parser.add_argument("--skeleton_threshold_override", type=float, default=None)
+    coverage_parser.add_argument("--connectivity_threshold_override", type=float, default=None)
+    coverage_parser.add_argument(
+        "--connectivity_mode",
+        choices=("symmetric", "raw"),
+        default="symmetric",
+    )
     coverage_parser.add_argument("--max_batches", type=int, default=0)
     coverage_parser.set_defaults(func=run_coverage)
     return parser
