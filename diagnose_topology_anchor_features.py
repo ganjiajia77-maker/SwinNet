@@ -12,21 +12,158 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from diagnose_topology_anchor_heatmap import (
-    ConfigArgs,
-    anchor_distance_to_gt,
-    build_model,
-    coverage_from_anchors,
-    extract_topology_anchors,
-    find_highres_structure_skeleton,
-    gaussian_smooth,
-    parse_int_list,
-    save_visualization,
-    summarize_anchor_distances,
-    unnormalize_image,
-    update_args_from_checkpoint,
-)
+from networks.vision_transformer import SwinUnet as ViT_seg
+from networks.vision_transformer import load_topology_checkpoint_state
+
+
+class ConfigArgs:
+    root_path = "./data1"
+    dataset = "ImageData"
+    list_dir = "./lists/lists_Synapse"
+    num_classes = 2
+    cfg = "./configs/swin_tiny_patch4_window7_224_lite.yaml"
+    img_size = 256
+    batch_size = 1
+    num_workers = 0
+    zip = False
+    cache_mode = ""
+    resume = ""
+    accumulation_steps = 0
+    use_checkpoint = False
+    amp_opt_level = ""
+    tag = ""
+    eval = True
+    throughput = False
+    n_class = 2
+    opts = None
+
+
+def update_args_from_checkpoint(args, checkpoint):
+    saved_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    if isinstance(saved_args, dict):
+        for name, value in saved_args.items():
+            setattr(args, name, value)
+    return args
+
+
+def build_model(args, checkpoint, device):
+    config = get_config(args)
+    model = ViT_seg(
+        config=config,
+        img_size=args.img_size,
+        num_classes=1,
+        use_asterisk=True,
+        return_skeleton=True,
+        bottleneck_type=getattr(args, "bottleneck_type", "global_local"),
+        structure_profile=getattr(args, "structure_profile", "full"),
+        use_msfe_skip=not getattr(args, "disable_msfe_skip", False),
+        enable_highres_structure_stream=getattr(args, "enable_highres_structure_stream", False),
+        highres_structure_channels=getattr(args, "highres_structure_channels", 64),
+        highres_structure_fuse_stages=getattr(args, "highres_structure_fuse_stages", "stage23"),
+        highres_structure_fusion_mode=getattr(args, "highres_structure_fusion_mode", "stage23"),
+        enable_post_refine_structure_interaction=getattr(
+            args,
+            "enable_post_refine_structure_interaction",
+            False,
+        ),
+        enable_global_topology=getattr(args, "enable_global_topology", True),
+        global_topology_max_nodes=getattr(args, "global_topology_max_nodes", 32),
+        global_topology_heads=getattr(args, "global_topology_heads", 4),
+        global_topology_reach_hops=getattr(args, "global_topology_reach_hops", 12),
+        global_topology_nms_radius=getattr(args, "global_topology_nms_radius", 2),
+        global_topology_skeleton_threshold=getattr(args, "global_topology_skeleton_threshold", 0.5),
+        global_topology_connectivity_threshold=getattr(args, "global_topology_connectivity_threshold", 0.25),
+        global_topology_bend_angle_threshold=getattr(args, "global_topology_bend_angle_threshold", 45.0),
+        global_topology_alpha_max=getattr(args, "global_topology_alpha_max", 0.05),
+    )
+    load_topology_checkpoint_state(
+        model,
+        checkpoint["model_state_dict"],
+        checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+        strict=True,
+    )
+    return model.to(device).eval()
+
+
+def find_highres_structure_skeleton(stage_outputs):
+    for item in reversed(stage_outputs):
+        if item.get("stage") == "highres_structure":
+            skeleton = item.get("highres_structure_skeleton")
+            if skeleton is not None:
+                return skeleton
+    raise RuntimeError("No highres_structure_skeleton found in stage outputs.")
+
+
+def parse_int_list(raw):
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            values.append(int(item))
+    if not values:
+        raise ValueError("Expected at least one integer value.")
+    return values
+
+
+def gaussian_smooth(score, kernel_size=5, sigma=1.0):
+    if kernel_size <= 1:
+        return score
+    if kernel_size % 2 == 0:
+        raise ValueError("--smooth_kernel must be odd.")
+    radius = kernel_size // 2
+    coords = torch.arange(
+        -radius,
+        radius + 1,
+        device=score.device,
+        dtype=score.dtype,
+    )
+    kernel_1d = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
+    kernel_1d = kernel_1d / kernel_1d.sum().clamp_min(1e-6)
+    kernel_2d = torch.outer(kernel_1d, kernel_1d).view(1, 1, kernel_size, kernel_size)
+    return F.conv2d(score, kernel_2d, padding=radius)
+
+
+def local_maxima_candidates(score, window_size=5):
+    if window_size % 2 == 0:
+        raise ValueError("--local_max_window must be odd.")
+    pooled = F.max_pool2d(score, kernel_size=window_size, stride=1, padding=window_size // 2)
+    maxima = (score >= pooled) & (score > 0)
+    values = score[0, 0][maxima[0, 0]]
+    ys, xs = torch.where(maxima[0, 0])
+    if values.numel() == 0:
+        return []
+    order = torch.argsort(values, descending=True)
+    candidates = []
+    for idx in order.tolist():
+        candidates.append((int(xs[idx].item()), int(ys[idx].item()), float(values[idx].item())))
+    return candidates
+
+
+def greedy_nms(candidates, max_count, radius):
+    selected = []
+    radius_sq = float(radius * radius)
+    for x, y, score in candidates:
+        keep = True
+        for sx, sy, _ in selected:
+            dx = float(x - sx)
+            dy = float(y - sy)
+            if dx * dx + dy * dy <= radius_sq:
+                keep = False
+                break
+        if keep:
+            selected.append((x, y, score))
+            if len(selected) >= max_count:
+                break
+    return selected
+
+
+def extract_topology_anchors(anchor_score, topk_values, nms_radius, local_max_window):
+    max_topk = max(topk_values)
+    candidates = local_maxima_candidates(anchor_score, window_size=local_max_window)
+    selected = greedy_nms(candidates, max_topk, nms_radius)
+    return {topk: selected[:topk] for topk in topk_values}
 
 
 def minmax_normalize(score, eps=1e-6):
@@ -128,6 +265,59 @@ def anchor_distance_to_mask(anchors, mask):
         y = min(max(int(y), 0), height - 1)
         values.append(float(distance[y, x]))
     return np.asarray(values, dtype=np.float32)
+
+
+def unnormalize_image(image_tensor):
+    image = image_tensor.detach().float().cpu().numpy()
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+    image = image * std + mean
+    image = np.clip(image, 0.0, 1.0)
+    image = np.transpose(image, (1, 2, 0))
+    return (image * 255.0).astype(np.uint8)
+
+
+def save_visualization(image_rgb, anchors, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    canvas = image_rgb.copy()
+    for x, y, _ in anchors:
+        cv2.circle(canvas, (int(x), int(y)), radius=3, color=(255, 0, 0), thickness=-1)
+        cv2.circle(canvas, (int(x), int(y)), radius=5, color=(255, 255, 255), thickness=1)
+    cv2.imwrite(path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+
+
+def anchor_distance_to_gt(anchors, gt_skeleton):
+    return anchor_distance_to_mask(anchors, gt_skeleton)
+
+
+def coverage_from_anchors(anchors, gt_skeleton, radii):
+    gt = (gt_skeleton > 0.5).astype(np.uint8)
+    gt_count = int(gt.sum())
+    if gt_count == 0:
+        return {radius: 0.0 for radius in radii}
+    anchor_mask = np.zeros_like(gt, dtype=np.uint8)
+    for x, y, _ in anchors:
+        x = min(max(int(x), 0), gt.shape[1] - 1)
+        y = min(max(int(y), 0), gt.shape[0] - 1)
+        anchor_mask[y, x] = 1
+    if anchor_mask.sum() == 0:
+        return {radius: 0.0 for radius in radii}
+    distance_to_anchor = cv2.distanceTransform((1 - anchor_mask).astype(np.uint8), cv2.DIST_L2, 3)
+    return {
+        radius: float(((distance_to_anchor <= radius) & (gt > 0)).sum() / max(gt_count, 1))
+        for radius in radii
+    }
+
+
+def summarize_anchor_distances(distances):
+    finite = distances[np.isfinite(distances)]
+    if finite.size == 0:
+        return float("inf"), float("inf"), float("inf")
+    return (
+        float(np.mean(finite)),
+        float(np.median(finite)),
+        float(np.percentile(finite, 90)),
+    )
 
 
 def main():
