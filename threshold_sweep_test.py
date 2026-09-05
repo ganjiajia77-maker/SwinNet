@@ -151,12 +151,14 @@ def main():
             skeleton_masks = batch['skeleton'].to(device)
             
             outputs = model(images)
+            skeleton_logits = None
             
             if isinstance(outputs, tuple):
                 surface_logits = outputs[0]
+                if len(outputs) > 2 and torch.is_tensor(outputs[2]):
+                    skeleton_logits = outputs[2]
             else:
                 surface_logits = outputs
-                skeleton_logits = None
             
             all_surface_logits.append(surface_logits.cpu())
             all_surface_targets.append(masks.cpu())
