@@ -4,6 +4,7 @@ import os
 import sys
 import time
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -83,6 +84,52 @@ def get_z_struct(model):
             "highres structure stream."
         )
     return z_struct
+
+
+def anchor_pair_distance_stats(anchors):
+    if len(anchors) < 2:
+        return float("inf"), float("inf")
+    coords = np.asarray([(x, y) for x, y, _ in anchors], dtype=np.float32)
+    diff = coords[:, None, :] - coords[None, :, :]
+    distance = np.sqrt((diff * diff).sum(axis=-1))
+    upper = distance[np.triu_indices(len(anchors), k=1)]
+    return float(upper.mean()), float(upper.min())
+
+
+def gt_endpoint_junction_masks(gt_skeleton):
+    skel = (gt_skeleton > 0.5).astype(np.uint8)
+    if skel.sum() == 0:
+        return np.zeros_like(skel), np.zeros_like(skel)
+    padded = np.pad(skel, 1, mode="constant")
+    neighbors = (
+        padded[:-2, 1:-1]
+        + padded[:-2, 2:]
+        + padded[1:-1, 2:]
+        + padded[2:, 2:]
+        + padded[2:, 1:-1]
+        + padded[2:, :-2]
+        + padded[1:-1, :-2]
+        + padded[:-2, :-2]
+    )
+    endpoint = ((skel > 0) & (neighbors == 1)).astype(np.uint8)
+    junction = ((skel > 0) & (neighbors >= 3)).astype(np.uint8)
+    return endpoint, junction
+
+
+def anchor_distance_to_mask(anchors, mask):
+    if not anchors:
+        return np.array([], dtype=np.float32)
+    target = (mask > 0).astype(np.uint8)
+    if target.sum() == 0:
+        return np.full((len(anchors),), np.inf, dtype=np.float32)
+    distance = cv2.distanceTransform((1 - target).astype(np.uint8), cv2.DIST_L2, 3)
+    height, width = target.shape
+    values = []
+    for x, y, _ in anchors:
+        x = min(max(int(x), 0), width - 1)
+        y = min(max(int(y), 0), height - 1)
+        values.append(float(distance[y, x]))
+    return np.asarray(values, dtype=np.float32)
 
 
 def main():
@@ -200,6 +247,7 @@ def main():
                 image_id = os.path.splitext(str(image_names[sample_index]))[0]
                 image_rgb = unnormalize_image(images[sample_index])
                 gt_np = gt_skeleton[sample_index, 0].detach().cpu().numpy()
+                gt_endpoint, gt_junction = gt_endpoint_junction_masks(gt_np)
                 save_this_visual = args.max_visuals == 0 or visual_count < args.max_visuals
 
                 for mode, score_map in scores.items():
@@ -219,6 +267,15 @@ def main():
                         )
                         distances = anchor_distance_to_gt(anchors, gt_np)
                         mean_dist, median_dist, p90_dist = summarize_anchor_distances(distances)
+                        pair_mean_dist, pair_min_dist = anchor_pair_distance_stats(anchors)
+                        endpoint_distances = anchor_distance_to_mask(anchors, gt_endpoint)
+                        junction_distances = anchor_distance_to_mask(anchors, gt_junction)
+                        endpoint_mean_dist, endpoint_median_dist, endpoint_p90_dist = (
+                            summarize_anchor_distances(endpoint_distances)
+                        )
+                        junction_mean_dist, junction_median_dist, junction_p90_dist = (
+                            summarize_anchor_distances(junction_distances)
+                        )
                         coverage = coverage_from_anchors(anchors, gt_np, coverage_radii)
 
                         rows.append(
@@ -239,6 +296,16 @@ def main():
                                 "mean_gt_distance": mean_dist,
                                 "median_gt_distance": median_dist,
                                 "p90_gt_distance": p90_dist,
+                                "mean_pair_distance": pair_mean_dist,
+                                "min_pair_distance": pair_min_dist,
+                                "gt_endpoint_count": int(gt_endpoint.sum()),
+                                "gt_junction_count": int(gt_junction.sum()),
+                                "mean_endpoint_distance": endpoint_mean_dist,
+                                "median_endpoint_distance": endpoint_median_dist,
+                                "p90_endpoint_distance": endpoint_p90_dist,
+                                "mean_junction_distance": junction_mean_dist,
+                                "median_junction_distance": junction_median_dist,
+                                "p90_junction_distance": junction_p90_dist,
                                 "score_mean": score_stats["mean"],
                                 "score_std": score_stats["std"],
                                 "score_max": score_stats["max"],
@@ -263,6 +330,16 @@ def main():
                                     "distance_to_gt_skeleton": (
                                         float(distances[anchor_index])
                                         if anchor_index < len(distances)
+                                        else float("inf")
+                                    ),
+                                    "distance_to_gt_endpoint": (
+                                        float(endpoint_distances[anchor_index])
+                                        if anchor_index < len(endpoint_distances)
+                                        else float("inf")
+                                    ),
+                                    "distance_to_gt_junction": (
+                                        float(junction_distances[anchor_index])
+                                        if anchor_index < len(junction_distances)
                                         else float("inf")
                                     ),
                                 }
@@ -309,6 +386,8 @@ def main():
         "y",
         "score",
         "distance_to_gt_skeleton",
+        "distance_to_gt_endpoint",
+        "distance_to_gt_junction",
     ]
     with open(anchors_path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=anchor_fieldnames)
@@ -328,8 +407,13 @@ def main():
             cov10 = np.mean([row["coverage_10"] for row in selected])
             cov20 = np.mean([row["coverage_20"] for row in selected])
             med_dist = np.mean([row["median_gt_distance"] for row in selected])
+            min_pair = np.mean([row["min_pair_distance"] for row in selected])
+            mean_pair = np.mean([row["mean_pair_distance"] for row in selected])
+            med_endpoint = np.mean([row["median_endpoint_distance"] for row in selected])
+            med_junction = np.mean([row["median_junction_distance"] for row in selected])
             print(
-                "{} topK={}: anchors={:.2f} coverage@5/10/20={:.4f}/{:.4f}/{:.4f} median_dist={:.3f}".format(
+                "{} topK={}: anchors={:.2f} coverage@5/10/20={:.4f}/{:.4f}/{:.4f} "
+                "median_dist={:.3f} pair_mean/min={:.3f}/{:.3f} endpoint/junction_median={:.3f}/{:.3f}".format(
                     mode,
                     topk,
                     mean_anchors,
@@ -337,6 +421,10 @@ def main():
                     cov10,
                     cov20,
                     med_dist,
+                    mean_pair,
+                    min_pair,
+                    med_endpoint,
+                    med_junction,
                 ),
                 flush=True,
             )
