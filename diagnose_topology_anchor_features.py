@@ -1,5 +1,6 @@
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -19,6 +20,7 @@ from diagnose_topology_anchor_heatmap import (
     build_model,
     coverage_from_anchors,
     extract_topology_anchors,
+    find_stage3_output,
     gaussian_smooth,
     parse_int_list,
     save_visualization,
@@ -35,23 +37,42 @@ def minmax_normalize(score, eps=1e-6):
     return (score - min_value) / (max_value - min_value).clamp_min(eps)
 
 
-def build_feature_scores(z_struct, surface_prob, random_seed=1234):
+def connectivity_entropy_score(conn_prob, target_size):
+    if conn_prob.shape[-2:] != target_size:
+        conn_prob = F.interpolate(
+            conn_prob,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+    total = conn_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    prob = conn_prob / total
+    entropy = -(prob * torch.log(prob.clamp_min(1e-8))).sum(dim=1, keepdim=True)
+    return (entropy / math.log(max(conn_prob.shape[1], 2))).clamp(0.0, 1.0)
+
+
+def direction_variation_score(direction_logits, target_size):
+    if direction_logits is None:
+        return None
+    if direction_logits.shape[-2:] != target_size:
+        direction_logits = F.interpolate(
+            direction_logits,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+    direction = F.normalize(direction_logits.float(), dim=1, eps=1e-6)
+    local_mean = F.avg_pool2d(direction, kernel_size=3, stride=1, padding=1)
+    coherence = torch.linalg.vector_norm(local_mean, dim=1, keepdim=True).clamp(0.0, 1.0)
+    confidence = torch.linalg.vector_norm(direction_logits.float(), dim=1, keepdim=True)
+    confidence = minmax_normalize(confidence)
+    return ((1.0 - coherence) * confidence).clamp(0.0, 1.0)
+
+
+def build_feature_scores(z_struct, surface_prob, conn_prob, direction_logits, lambda_boost):
     z = z_struct.float()
     norm_score = torch.linalg.vector_norm(z, dim=1, keepdim=True)
-
-    generator = torch.Generator(device=z.device)
-    generator.manual_seed(int(random_seed))
-    weight = torch.randn(
-        z.shape[1],
-        device=z.device,
-        dtype=z.dtype,
-        generator=generator,
-    )
-    weight = weight / weight.norm().clamp_min(1e-6)
-    projection = (z * weight.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
-
     norm_score = minmax_normalize(norm_score)
-    projection = minmax_normalize(projection)
     if surface_prob.shape[-2:] != norm_score.shape[-2:]:
         surface_prob = F.interpolate(
             surface_prob,
@@ -60,11 +81,17 @@ def build_feature_scores(z_struct, surface_prob, random_seed=1234):
             align_corners=False,
         )
 
+    a0 = norm_score * surface_prob
+    conn_entropy = connectivity_entropy_score(conn_prob, norm_score.shape[-2:])
+    direction_variation = direction_variation_score(direction_logits, norm_score.shape[-2:])
+    if direction_variation is None:
+        direction_variation = torch.zeros_like(a0)
+
     return {
-        "feature_norm": norm_score,
-        "feature_norm_x_surface": norm_score * surface_prob,
-        "random_projection_x_surface": projection * surface_prob,
-    }
+        "A0_norm_x_surface": a0,
+        "A0_conn_entropy": a0 * (1.0 + float(lambda_boost) * conn_entropy),
+        "A0_direction_variation": a0 * (1.0 + float(lambda_boost) * direction_variation),
+    }, conn_entropy, direction_variation
 
 
 def tensor_stats(tensor):
@@ -152,7 +179,7 @@ def main():
     parser.add_argument("--smooth_sigma", type=float, default=1.0)
     parser.add_argument("--local_max_window", type=int, default=5)
     parser.add_argument("--nms_radius", type=int, default=4)
-    parser.add_argument("--random_seed", type=int, default=1234)
+    parser.add_argument("--lambda_boost", type=float, default=1.0)
     parser.add_argument(
         "--max_visuals",
         type=int,
@@ -197,7 +224,7 @@ def main():
     )
     print(f"[feature-anchor] dataset size={len(dataset)}", flush=True)
     print(
-        "[feature-anchor] scores: feature_norm, feature_norm_x_surface, random_projection_x_surface",
+        "[feature-anchor] scores: A0_norm_x_surface, A0_conn_entropy, A0_direction_variation",
         flush=True,
     )
 
@@ -219,12 +246,18 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
+            stage_outputs = outputs[4] if len(outputs) > 4 else []
+            stage3 = find_stage3_output(stage_outputs)
             z_struct = get_z_struct(model)
             surface_prob = torch.sigmoid(outputs[0])
-            scores = build_feature_scores(
+            conn_prob = torch.sigmoid(stage3["connectivity"])
+            direction_logits = stage3.get("direction")
+            scores, conn_entropy, direction_variation = build_feature_scores(
                 z_struct,
                 surface_prob,
-                random_seed=args.random_seed,
+                conn_prob,
+                direction_logits,
+                lambda_boost=args.lambda_boost,
             )
             target_size = gt_skeleton.shape[-2:]
             scores = {
@@ -241,6 +274,8 @@ def main():
                 for mode, score in scores.items()
             }
             z_stats = tensor_stats(z_struct)
+            conn_entropy_stats = tensor_stats(conn_entropy)
+            direction_variation_stats = tensor_stats(direction_variation)
 
             image_names = batch.get("image_name", [""] * images.shape[0])
             for sample_index in range(images.shape[0]):
@@ -315,6 +350,11 @@ def main():
                                 "z_struct_height": int(z_struct.shape[-2]),
                                 "z_struct_width": int(z_struct.shape[-1]),
                                 "z_struct_channels": int(z_struct.shape[1]),
+                                "connectivity_entropy_mean": conn_entropy_stats["mean"],
+                                "connectivity_entropy_std": conn_entropy_stats["std"],
+                                "direction_variation_mean": direction_variation_stats["mean"],
+                                "direction_variation_std": direction_variation_stats["std"],
+                                "lambda_boost": float(args.lambda_boost),
                             }
                         )
                         for anchor_index, (x, y, anchor_score) in enumerate(anchors):
@@ -358,11 +398,14 @@ def main():
 
             if should_print:
                 print(
-                    "[feature-anchor] batch {} done: z_shape={} z_mean={:.6f} z_std={:.6f}".format(
+                    "[feature-anchor] batch {} done: z_shape={} z_mean={:.6f} z_std={:.6f} "
+                    "conn_entropy_mean={:.6f} direction_variation_mean={:.6f}".format(
                         batch_index + 1,
                         tuple(z_struct.shape),
                         z_stats["mean"],
                         z_stats["std"],
+                        conn_entropy_stats["mean"],
+                        direction_variation_stats["mean"],
                     ),
                     flush=True,
                 )
@@ -395,7 +438,7 @@ def main():
         writer.writerows(anchor_rows)
 
     print("\nTopology feature anchor diagnostic", flush=True)
-    for mode in ("feature_norm", "feature_norm_x_surface", "random_projection_x_surface"):
+    for mode in ("A0_norm_x_surface", "A0_conn_entropy", "A0_direction_variation"):
         for topk in topk_values:
             selected = [
                 row for row in rows if row["score_type"] == mode and row["topK"] == topk
