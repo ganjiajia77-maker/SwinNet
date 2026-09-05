@@ -3145,6 +3145,40 @@ class SwinTransformerSys(nn.Module):
 
         return x, structure_outputs
 
+    def _surface_prior_for_global_topology(self, x, z_struct):
+        prior_modules = (
+            self.guided_head.surface_proj,
+            self.guided_head.surface_branch,
+            self.guided_head.surface_refine,
+            self.guided_head.surface_head,
+        )
+        if getattr(
+            self.guided_head,
+            "enable_post_refine_structure_interaction",
+            False,
+        ):
+            prior_modules = (
+                *prior_modules,
+                self.guided_head.post_refine_structure_interaction,
+            )
+        prior_training = [module.training for module in prior_modules]
+        for module in prior_modules:
+            module.eval()
+        try:
+            with torch.no_grad():
+                surface_feat = self.guided_head.surface_branch(
+                    self.guided_head.surface_proj(x)
+                )
+                surface_feat = self.guided_head.surface_refine(surface_feat)
+                surface_feat = self.guided_head._apply_post_refine_structure_interaction(
+                    surface_feat,
+                    z_struct,
+                )
+                return torch.sigmoid(self.guided_head.surface_head(surface_feat))
+        finally:
+            for module, was_training in zip(prior_modules, prior_training):
+                module.train(was_training)
+
     def up_x4(self, x, structure_outputs=None, z_struct=None):
         H, W = self.patches_resolution
         B, L, C = x.shape
@@ -3155,6 +3189,16 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
+                if self.enable_global_topology and z_struct is not None:
+                    surface_prob = self._surface_prior_for_global_topology(
+                        x,
+                        z_struct,
+                    )
+                    x = self.global_topology.forward_feature_anchors(
+                        x,
+                        z_struct,
+                        surface_prob,
+                    )
                 x = self.guided_head(x, z_struct=z_struct)
             else:
                 x = self.output(x)
@@ -3185,43 +3229,6 @@ class SwinTransformerSys(nn.Module):
             z_struct=z_struct,
             highres_structure_skeleton=highres_structure_skeleton,
         )
-        if self.enable_global_topology and self.return_skeleton:
-            stage3_output = next(
-                (
-                    item
-                    for item in reversed(structure_outputs)
-                    if item.get("stage") == 3 and item.get("connectivity") is not None
-                ),
-                None,
-            )
-            if stage3_output is not None:
-                feature_map = x.transpose(1, 2).reshape(
-                    x.shape[0], self.embed_dim, *self.patches_resolution
-                )
-                target_hw = feature_map.shape[-2:]
-                skeleton_logits = stage3_output.get("skeleton")
-                if skeleton_logits is None and highres_structure_skeleton is not None:
-                    skeleton_prob = torch.sigmoid(
-                        F.interpolate(
-                            highres_structure_skeleton,
-                            size=target_hw,
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                    )
-                elif skeleton_logits is not None:
-                    skeleton_prob = torch.sigmoid(skeleton_logits)
-                else:
-                    skeleton_prob = None
-                connectivity_prob = torch.sigmoid(stage3_output["connectivity"])
-                direction = stage3_output.get("direction")
-                if skeleton_prob is not None and direction is not None:
-                    x = self.global_topology(
-                        feature_map,
-                        skeleton_prob,
-                        connectivity_prob,
-                        direction,
-                    ).flatten(2).transpose(1, 2)
         if self.return_skeleton and highres_structure_skeleton is not None:
             structure_outputs.append(
                 {

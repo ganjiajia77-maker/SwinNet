@@ -152,6 +152,190 @@ class KeypointGuidedGlobalTopology(nn.Module):
         index = (coords[..., 0] * width + coords[..., 1]).unsqueeze(-1).expand(-1, -1, channels)
         return torch.gather(flat, 1, index)
 
+    @staticmethod
+    def _minmax_normalize_map(score):
+        flat = score.flatten(1)
+        low = flat.amin(dim=1).view(-1, 1, 1, 1)
+        high = flat.amax(dim=1).view(-1, 1, 1, 1)
+        return (score - low) / (high - low).clamp_min(1e-6)
+
+    @torch.no_grad()
+    def _extract_fps_anchors(self, anchor_score):
+        batch, _, height, width = anchor_score.shape
+        flat_score = anchor_score.flatten(1)
+        candidate_count = min(max(256, self.max_nodes), flat_score.shape[1])
+        values, flat_indices = flat_score.topk(candidate_count, dim=1)
+        ys = flat_indices // width
+        xs = flat_indices % width
+        candidate_coords = torch.stack([ys, xs], dim=-1)
+
+        coords = torch.zeros(
+            batch,
+            self.max_nodes,
+            2,
+            device=anchor_score.device,
+            dtype=torch.long,
+        )
+        scores = torch.zeros(
+            batch,
+            self.max_nodes,
+            device=anchor_score.device,
+            dtype=anchor_score.dtype,
+        )
+        valid = torch.zeros(
+            batch,
+            self.max_nodes,
+            device=anchor_score.device,
+            dtype=torch.bool,
+        )
+
+        for batch_index in range(batch):
+            candidate_valid = values[batch_index] > 0
+            num_candidates = int(candidate_valid.sum().item())
+            if num_candidates == 0:
+                continue
+            sample_coords = candidate_coords[batch_index, :num_candidates]
+            sample_scores = values[batch_index, :num_candidates]
+            sample_coords_float = sample_coords.float()
+
+            selected = [0]
+            min_dist_sq = (
+                (sample_coords_float - sample_coords_float[0:1]).square().sum(dim=1)
+            )
+            max_select = min(self.max_nodes, num_candidates)
+            for _ in range(1, max_select):
+                min_dist_sq[selected] = -1.0
+                next_index = int(torch.argmax(min_dist_sq).item())
+                if min_dist_sq[next_index] < 0:
+                    break
+                selected.append(next_index)
+                dist_sq = (
+                    (sample_coords_float - sample_coords_float[next_index:next_index + 1])
+                    .square()
+                    .sum(dim=1)
+                )
+                min_dist_sq = torch.minimum(min_dist_sq, dist_sq)
+
+            selected_tensor = torch.as_tensor(
+                selected,
+                device=anchor_score.device,
+                dtype=torch.long,
+            )
+            count = selected_tensor.numel()
+            coords[batch_index, :count] = sample_coords[selected_tensor]
+            scores[batch_index, :count] = sample_scores[selected_tensor]
+            valid[batch_index, :count] = True
+        return coords, valid, scores, candidate_count
+
+    def _cross_attention_from_tokens(self, feature, node_feature, valid):
+        batch, channels, height, width = feature.shape
+        grid_tokens = feature.flatten(2).transpose(1, 2)
+        grid_qkv = self.qkv(grid_tokens).reshape(
+            batch,
+            height * width,
+            3,
+            self.heads,
+            channels // self.heads,
+        ).permute(2, 0, 3, 1, 4)
+        node_qkv = self.qkv(node_feature).reshape(
+            batch,
+            self.max_nodes,
+            3,
+            self.heads,
+            channels // self.heads,
+        ).permute(2, 0, 3, 1, 4)
+
+        query = grid_qkv[0]
+        key = node_qkv[1]
+        value = node_qkv[2]
+        logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
+            channels // self.heads
+        )
+        logits = logits.masked_fill(
+            ~valid[:, None, None, :],
+            -torch.finfo(logits.dtype).max,
+        )
+        attention = torch.softmax(logits, dim=-1)
+        context = torch.matmul(attention, value).transpose(1, 2).reshape(
+            batch,
+            height * width,
+            channels,
+        )
+        context = self.output_projection(context)
+        context = context.transpose(1, 2).reshape(batch, channels, height, width)
+        has_anchor = valid.any(dim=1).to(dtype=context.dtype).view(batch, 1, 1, 1)
+        return context * has_anchor
+
+    def forward_feature_anchors(self, feature, z_struct, surface_prob):
+        batch, channels, height, width = feature.shape
+        if not self.enable_global_topology or z_struct is None or surface_prob is None:
+            return feature
+
+        with torch.no_grad():
+            z_score = torch.linalg.vector_norm(z_struct.detach().float(), dim=1, keepdim=True)
+            z_score = self._minmax_normalize_map(z_score).to(dtype=feature.dtype)
+            if z_score.shape[-2:] != (height, width):
+                z_score = F.interpolate(
+                    z_score,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            surface_gate = surface_prob.detach().to(dtype=feature.dtype)
+            if surface_gate.shape[-2:] != (height, width):
+                surface_gate = F.interpolate(
+                    surface_gate,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            anchor_score = z_score * surface_gate.clamp(0.0, 1.0)
+            coords, valid, scores, candidate_count = self._extract_fps_anchors(anchor_score)
+
+        sampled_feature = self._sample_features(feature, coords)
+        zeros_direction = sampled_feature.new_zeros(batch, self.max_nodes, 2)
+        node_types = torch.zeros(
+            batch,
+            self.max_nodes,
+            device=feature.device,
+            dtype=torch.long,
+        )
+        coords_norm = coords.float() / feature.new_tensor(
+            [max(height - 1, 1), max(width - 1, 1)]
+        )
+        node_input = torch.cat(
+            [
+                sampled_feature,
+                zeros_direction,
+                self.node_type_embedding(node_types),
+                coords_norm,
+            ],
+            dim=-1,
+        )
+        node_feature = self.node_projection(node_input)
+        context = self._cross_attention_from_tokens(feature, node_feature, valid)
+        delta = self.grid_projection(context)
+        output = feature + self.alpha_global * delta
+
+        if self.capture_diagnostics:
+            with torch.no_grad():
+                self.last_diagnostics = {
+                    "anchor_count": valid.sum(dim=1).float().detach(),
+                    "candidate_count": feature.new_full(
+                        (batch,),
+                        float(candidate_count),
+                    ).detach(),
+                    "anchor_score_mean": scores.masked_fill(~valid, 0.0).sum(dim=1)
+                    / valid.sum(dim=1).clamp_min(1).float(),
+                    "anchor_score_max": scores.amax(dim=1).detach(),
+                    "alpha_global": self.alpha_global.detach(),
+                    "global_residual_relative_norm": (
+                        torch.linalg.vector_norm(output - feature)
+                        / (torch.linalg.vector_norm(feature) + 1e-6)
+                    ).detach(),
+                }
+        return output
+
     def _node_attention(self, node_features, valid, adjacency):
         batch, nodes, channels = node_features.shape
         qkv = self.qkv(node_features).reshape(batch, nodes, 3, self.heads, channels // self.heads).permute(2, 0, 3, 1, 4)
