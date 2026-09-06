@@ -315,6 +315,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         node_feature = self.node_projection(node_input)
         context = self._cross_attention_from_tokens(feature, node_feature, valid)
         delta = self.grid_projection(context)
+        delta = delta * surface_gate.clamp(0.0, 1.0)
         output = feature + self.alpha_global * delta
 
         if self.capture_diagnostics:
@@ -329,6 +330,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     / valid.sum(dim=1).clamp_min(1).float(),
                     "anchor_score_max": scores.amax(dim=1).detach(),
                     "alpha_global": self.alpha_global.detach(),
+                    "surface_gate_mean": surface_gate.mean(dim=(1, 2, 3)).detach(),
+                    "surface_gate_max": surface_gate.amax(dim=(1, 2, 3)).detach(),
                     "global_residual_relative_norm": (
                         torch.linalg.vector_norm(output - feature)
                         / (torch.linalg.vector_norm(feature) + 1e-6)
