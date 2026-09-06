@@ -283,6 +283,12 @@ parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modi
 parser.add_argument('--zip', action='store_true', help='use zipped dataset')
 parser.add_argument('--cache_mode', type=str, default='', help='cache mode for dataset')
 parser.add_argument('--resume', type=str, default='', help='resume from checkpoint')
+parser.add_argument(
+    '--resume_output_dir',
+    type=str,
+    default='',
+    help='write resumed training outputs to this directory instead of the resume checkpoint directory',
+)
 parser.add_argument('--accumulation_steps', type=int, default=0, help='gradient accumulation steps')
 parser.add_argument('--use_checkpoint', action='store_true', help='use gradient checkpointing')
 parser.add_argument('--amp_opt_level', type=str, default='', help='AMP opt level')
@@ -1037,13 +1043,13 @@ if __name__ == "__main__":
     base_output_dir = args.output_dir
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name.strip() if args.run_name.strip() else f"train_skeleton_{timestamp}"
-    resume_output_dir = None
+    resume_output_dir = args.resume_output_dir.strip() or None
     if args.resume:
         resume_path = os.path.abspath(args.resume)
         resume_dir = os.path.dirname(resume_path)
         if os.path.basename(resume_dir).lower() == "checkpoints":
             resume_dir = os.path.dirname(resume_dir)
-        if os.path.isfile(resume_path):
+        if resume_output_dir is None and os.path.isfile(resume_path):
             resume_output_dir = resume_dir
     args.output_dir = resume_output_dir or make_unique_dir(base_output_dir, run_name)
     os.makedirs(args.output_dir, exist_ok=True)
