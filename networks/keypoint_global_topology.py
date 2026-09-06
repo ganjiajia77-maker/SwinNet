@@ -319,6 +319,9 @@ class KeypointGuidedGlobalTopology(nn.Module):
 
         if self.capture_diagnostics:
             with torch.no_grad():
+                attention_norm = torch.linalg.vector_norm(context).detach()
+                delta_norm = torch.linalg.vector_norm(delta).detach()
+                feature_norm = torch.linalg.vector_norm(feature).detach()
                 self.last_diagnostics = {
                     "anchor_count": valid.sum(dim=1).float().detach(),
                     "candidate_count": feature.new_full(
@@ -329,6 +332,15 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     / valid.sum(dim=1).clamp_min(1).float(),
                     "anchor_score_max": scores.amax(dim=1).detach(),
                     "alpha_global": self.alpha_global.detach(),
+                    "attention_output_norm": attention_norm,
+                    "delta_feature_norm": delta_norm,
+                    "feature_norm": feature_norm,
+                    "attention_output_relative_norm": (
+                        attention_norm / (feature_norm + 1e-6)
+                    ).detach(),
+                    "delta_feature_relative_norm": (
+                        delta_norm / (feature_norm + 1e-6)
+                    ).detach(),
                     "global_residual_relative_norm": (
                         torch.linalg.vector_norm(output - feature)
                         / (torch.linalg.vector_norm(feature) + 1e-6)
@@ -403,6 +415,9 @@ class KeypointGuidedGlobalTopology(nn.Module):
         if capture:
             with torch.no_grad():
                 active = valid.sum(dim=1).float()
+                attention_norm = torch.linalg.vector_norm(global_context).detach()
+                delta_norm = torch.linalg.vector_norm(delta).detach()
+                feature_norm = torch.linalg.vector_norm(feature).detach()
                 self.last_diagnostics = {
                     "node_count": active.detach(),
                     "endpoint_count": ((node_types == 0) & valid).sum(dim=1).detach(),
@@ -416,6 +431,15 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "attention_topology_bias_mean": topology_bias.mean().detach(),
                     "attention_topology_bias_max": topology_bias.amax().detach(),
                     "alpha_global": self.alpha_global.detach(),
+                    "attention_output_norm": attention_norm,
+                    "delta_feature_norm": delta_norm,
+                    "feature_norm": feature_norm,
+                    "attention_output_relative_norm": (
+                        attention_norm / (feature_norm + 1e-6)
+                    ).detach(),
+                    "delta_feature_relative_norm": (
+                        delta_norm / (feature_norm + 1e-6)
+                    ).detach(),
                     "global_residual_relative_norm": (torch.linalg.vector_norm(output - feature) / (torch.linalg.vector_norm(feature) + 1e-6)).detach(),
                     "node_feature_relative_change": (torch.linalg.vector_norm(attended - node_feature) / (torch.linalg.vector_norm(node_feature) + 1e-6)).detach(),
                     "attention_same_mean": self.last_attention_same_mean.detach(),
