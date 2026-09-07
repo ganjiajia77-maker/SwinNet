@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class KeypointGuidedGlobalTopology(nn.Module):
-    """Sparse global residual using structure-selected anchors and structure tokens."""
+    """Sparse global residual using structure-selected anchors and decoder tokens."""
 
     def __init__(
         self,
@@ -27,7 +27,16 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.alpha_max = float(alpha_max)
         self.enable_global_topology = bool(enabled)
         self.node_type_embedding = nn.Embedding(1, 8)
-        self.node_projection = nn.Linear(self.struct_channels + 2 + 8 + 2, channels)
+        self.node_projection = nn.Linear(channels + 2 + 8 + 2, channels)
+        relation_hidden = max(channels // 4, 32)
+        self.token_relation_qkv = nn.Linear(channels, channels * 3)
+        self.token_relation_projection = nn.Linear(channels, channels)
+        self.token_relation_bias = nn.Sequential(
+            nn.Linear(4, relation_hidden),
+            nn.GELU(),
+            nn.Linear(relation_hidden, heads),
+        )
+        self.token_relation_scale = nn.Parameter(torch.tensor(0.1))
         self.grid_q = nn.Linear(channels, channels)
         self.node_kv = nn.Linear(channels, channels * 2)
         self.output_projection = nn.Linear(channels, channels)
@@ -131,6 +140,57 @@ class KeypointGuidedGlobalTopology(nn.Module):
         index = (y * width + x).unsqueeze(-1).expand(-1, -1, channels)
         return torch.gather(flat, 1, index)
 
+    def _relative_topology_bias(self, coords, valid, anchor_hw):
+        anchor_height, anchor_width = anchor_hw
+        coords_float = coords.float()
+        y = coords_float[..., 0] / float(max(anchor_height - 1, 1))
+        x = coords_float[..., 1] / float(max(anchor_width - 1, 1))
+        dy = y[:, :, None] - y[:, None, :]
+        dx = x[:, :, None] - x[:, None, :]
+        distance = torch.sqrt(dx.square() + dy.square() + 1e-6)
+        inv_distance = 1.0 / (1.0 + distance)
+        relation = torch.stack(
+            [
+                dx,
+                dy,
+                torch.log1p(distance),
+                inv_distance,
+            ],
+            dim=-1,
+        )
+        bias = self.token_relation_bias(relation).permute(0, 3, 1, 2)
+        valid_pair = valid[:, None, :, None] & valid[:, None, None, :]
+        return bias.masked_fill(~valid_pair, 0.0)
+
+    def _refine_tokens_with_relative_topology(self, node_feature, coords, valid, anchor_hw):
+        batch, nodes, channels = node_feature.shape
+        qkv = self.token_relation_qkv(node_feature).reshape(
+            batch,
+            nodes,
+            3,
+            self.heads,
+            channels // self.heads,
+        ).permute(2, 0, 3, 1, 4)
+        query, key, value = qkv[0], qkv[1], qkv[2]
+        logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
+            channels // self.heads
+        )
+        topology_bias = self._relative_topology_bias(coords, valid, anchor_hw)
+        logits = logits + self.token_relation_scale * topology_bias
+        logits = logits.masked_fill(
+            ~valid[:, None, None, :],
+            -torch.finfo(logits.dtype).max,
+        )
+        attention = torch.softmax(logits, dim=-1)
+        attended = torch.matmul(attention, value).transpose(1, 2).reshape(
+            batch,
+            nodes,
+            channels,
+        )
+        attended = self.token_relation_projection(attended)
+        refined = node_feature + attended
+        return refined * valid.unsqueeze(-1).to(dtype=refined.dtype), topology_bias
+
     def _cross_attention_from_structure_tokens(self, feature, node_feature, valid):
         batch, channels, height, width = feature.shape
         grid_tokens = feature.flatten(2).transpose(1, 2)
@@ -197,12 +257,12 @@ class KeypointGuidedGlobalTopology(nn.Module):
             anchor_score = z_score * surface_gate.clamp(0.0, 1.0)
             coords, valid, scores, candidate_count = self._extract_fps_anchors(anchor_score)
 
-        sampled_struct = self._sample_features_at_anchor_coords(
-            z_struct,
+        sampled_feature = self._sample_features_at_anchor_coords(
+            feature,
             coords,
             anchor_hw=(height, width),
         )
-        zeros_direction = sampled_struct.new_zeros(batch, self.max_nodes, 2)
+        zeros_direction = sampled_feature.new_zeros(batch, self.max_nodes, 2)
         node_types = torch.zeros(
             batch,
             self.max_nodes,
@@ -214,7 +274,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         )
         node_input = torch.cat(
             [
-                sampled_struct,
+                sampled_feature,
                 zeros_direction,
                 self.node_type_embedding(node_types),
                 coords_norm,
@@ -222,6 +282,12 @@ class KeypointGuidedGlobalTopology(nn.Module):
             dim=-1,
         )
         node_feature = self.node_projection(node_input)
+        node_feature, topology_bias = self._refine_tokens_with_relative_topology(
+            node_feature,
+            coords,
+            valid,
+            anchor_hw=(height, width),
+        )
         context = self._cross_attention_from_structure_tokens(
             feature,
             node_feature,
@@ -245,6 +311,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "alpha_global": self.alpha_global.detach(),
                     "surface_gate_mean": surface_gate.mean(dim=(1, 2, 3)).detach(),
                     "surface_gate_max": surface_gate.amax(dim=(1, 2, 3)).detach(),
+                    "token_relation_scale": self.token_relation_scale.detach(),
+                    "token_relation_bias_abs_mean": topology_bias.abs().mean().detach(),
                     "global_residual_relative_norm": (
                         torch.linalg.vector_norm(output - feature)
                         / (torch.linalg.vector_norm(feature) + 1e-6)

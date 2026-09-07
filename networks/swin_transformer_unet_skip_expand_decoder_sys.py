@@ -2178,7 +2178,7 @@ class SwinTransformerSys(nn.Module):
                 if self.enable_global_topology:
                     print(
                         "[INFO] Global topology residual: anchors=z_struct*surface, "
-                        "tokens=z_struct"
+                        "tokens=decoder_feature, relation_bias=relative_xy_distance"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)

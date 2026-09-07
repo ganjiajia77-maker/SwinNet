@@ -146,7 +146,7 @@ parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0
 parser.add_argument(
     '--enable_global_topology',
     action='store_true',
-    help='enable sparse global topology residual with anchors=z_struct*surface and tokens=z_struct',
+    help='enable sparse global topology residual with anchors=z_struct*surface and decoder-feature tokens',
 )
 parser.add_argument('--global_topology_max_nodes', type=int, default=32)
 parser.add_argument('--global_topology_heads', type=int, default=4)
@@ -414,7 +414,7 @@ def format_training_config_lines(args, loss_weights):
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=z_struct, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Global topology residual: {}, anchors=z_struct*surface, tokens=decoder_feature, relation_bias=relative_xy_distance, max_nodes={}, heads={}, alpha_max={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
                 args.global_topology_max_nodes,
                 args.global_topology_heads,
