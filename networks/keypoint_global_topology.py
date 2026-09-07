@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class KeypointGuidedGlobalTopology(nn.Module):
-    """Sparse global residual using structure-selected anchors and decoder tokens."""
+    """Sparse global residual using structure-selected anchors and fused topology tokens."""
 
     def __init__(
         self,
@@ -16,6 +16,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
         heads=4,
         alpha_max=0.05,
         enabled=False,
+        connectivity_channels=8,
+        direction_channels=2,
     ):
         super().__init__()
         if channels % heads != 0:
@@ -26,8 +28,18 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.heads = int(heads)
         self.alpha_max = float(alpha_max)
         self.enable_global_topology = bool(enabled)
+        self.connectivity_channels = int(connectivity_channels)
+        self.direction_channels = int(direction_channels)
         self.node_type_embedding = nn.Embedding(1, 8)
-        self.node_projection = nn.Linear(channels + 2 + 8 + 2, channels)
+        token_input_channels = (
+            self.struct_channels
+            + self.channels
+            + self.connectivity_channels
+            + self.direction_channels
+            + 8
+            + 2
+        )
+        self.node_projection = nn.Linear(token_input_channels, channels)
         relation_hidden = max(channels // 4, 32)
         self.token_relation_qkv = nn.Linear(channels, channels * 3)
         self.token_relation_projection = nn.Linear(channels, channels)
@@ -140,6 +152,46 @@ class KeypointGuidedGlobalTopology(nn.Module):
         index = (y * width + x).unsqueeze(-1).expand(-1, -1, channels)
         return torch.gather(flat, 1, index)
 
+    def _prepare_token_map(
+        self,
+        feature,
+        batch,
+        target_hw,
+        expected_channels,
+        dtype,
+        device,
+    ):
+        target_height, target_width = target_hw
+        if feature is None:
+            return torch.zeros(
+                batch,
+                expected_channels,
+                target_height,
+                target_width,
+                device=device,
+                dtype=dtype,
+            )
+        feature = feature.to(device=device, dtype=dtype)
+        if feature.shape[-2:] != target_hw:
+            feature = F.interpolate(
+                feature,
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+        channels = feature.shape[1]
+        if channels == expected_channels:
+            return feature
+        if channels > expected_channels:
+            return feature[:, :expected_channels]
+        pad = feature.new_zeros(
+            feature.shape[0],
+            expected_channels - channels,
+            target_height,
+            target_width,
+        )
+        return torch.cat([feature, pad], dim=1)
+
     def _relative_topology_bias(self, coords, valid, anchor_hw):
         anchor_height, anchor_width = anchor_hw
         coords_float = coords.float()
@@ -227,7 +279,14 @@ class KeypointGuidedGlobalTopology(nn.Module):
         has_anchor = valid.any(dim=1).to(dtype=context.dtype).view(batch, 1, 1, 1)
         return context * has_anchor
 
-    def forward_feature_anchors(self, feature, z_struct, surface_prob):
+    def forward_feature_anchors(
+        self,
+        feature,
+        z_struct,
+        surface_prob,
+        connectivity_feature=None,
+        direction_feature=None,
+    ):
         batch, channels, height, width = feature.shape
         if not self.enable_global_topology or z_struct is None or surface_prob is None:
             return feature
@@ -257,12 +316,42 @@ class KeypointGuidedGlobalTopology(nn.Module):
             anchor_score = z_score * surface_gate.clamp(0.0, 1.0)
             coords, valid, scores, candidate_count = self._extract_fps_anchors(anchor_score)
 
+        sampled_struct = self._sample_features_at_anchor_coords(
+            z_struct.to(dtype=feature.dtype),
+            coords,
+            anchor_hw=(height, width),
+        )
         sampled_feature = self._sample_features_at_anchor_coords(
             feature,
             coords,
             anchor_hw=(height, width),
         )
-        zeros_direction = sampled_feature.new_zeros(batch, self.max_nodes, 2)
+        connectivity_map = self._prepare_token_map(
+            connectivity_feature,
+            batch,
+            (height, width),
+            self.connectivity_channels,
+            feature.dtype,
+            feature.device,
+        )
+        direction_map = self._prepare_token_map(
+            direction_feature,
+            batch,
+            (height, width),
+            self.direction_channels,
+            feature.dtype,
+            feature.device,
+        )
+        sampled_connectivity = self._sample_features_at_anchor_coords(
+            connectivity_map,
+            coords,
+            anchor_hw=(height, width),
+        )
+        sampled_direction = self._sample_features_at_anchor_coords(
+            direction_map,
+            coords,
+            anchor_hw=(height, width),
+        )
         node_types = torch.zeros(
             batch,
             self.max_nodes,
@@ -274,8 +363,10 @@ class KeypointGuidedGlobalTopology(nn.Module):
         )
         node_input = torch.cat(
             [
+                sampled_struct,
                 sampled_feature,
-                zeros_direction,
+                sampled_connectivity,
+                sampled_direction,
                 self.node_type_embedding(node_types),
                 coords_norm,
             ],
@@ -313,6 +404,10 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "surface_gate_max": surface_gate.amax(dim=(1, 2, 3)).detach(),
                     "token_relation_scale": self.token_relation_scale.detach(),
                     "token_relation_bias_abs_mean": topology_bias.abs().mean().detach(),
+                    "connectivity_token_abs_mean": (
+                        sampled_connectivity.abs().mean()
+                    ).detach(),
+                    "direction_token_abs_mean": sampled_direction.abs().mean().detach(),
                     "global_residual_relative_norm": (
                         torch.linalg.vector_norm(output - feature)
                         / (torch.linalg.vector_norm(feature) + 1e-6)

@@ -2144,6 +2144,8 @@ class SwinTransformerSys(nn.Module):
                     heads=global_topology_heads,
                     alpha_max=global_topology_alpha_max,
                     enabled=self.enable_global_topology,
+                    connectivity_channels=8,
+                    direction_channels=2,
                 )
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,
@@ -2178,7 +2180,8 @@ class SwinTransformerSys(nn.Module):
                 if self.enable_global_topology:
                     print(
                         "[INFO] Global topology residual: anchors=z_struct*surface, "
-                        "tokens=decoder_feature, relation_bias=relative_xy_distance"
+                        "tokens=[z_struct,decoder_feature,connectivity,direction], "
+                        "relation_bias=relative_xy_distance"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
@@ -2468,6 +2471,26 @@ class SwinTransformerSys(nn.Module):
     @staticmethod
     def _decoder_connectivity_used(connectivity_logits, teacher_forcing_ratio=0.0):
         return torch.sigmoid(connectivity_logits).detach()
+
+    @staticmethod
+    def _latest_local_topology_features(structure_outputs):
+        if not structure_outputs:
+            return None, None
+        for item in reversed(structure_outputs):
+            if not isinstance(item, dict):
+                continue
+            connectivity = item.get("connectivity")
+            direction = item.get("direction")
+            if connectivity is None and direction is None:
+                continue
+            connectivity_feature = (
+                torch.sigmoid(connectivity).detach()
+                if connectivity is not None
+                else None
+            )
+            direction_feature = direction.detach() if direction is not None else None
+            return connectivity_feature, direction_feature
+        return None, None
 
     def _apply_stage_topology_config(self):
         for inx, layer_up in enumerate(self.layers_up):
@@ -2883,10 +2906,16 @@ class SwinTransformerSys(nn.Module):
                         x,
                         z_struct,
                     )
+                    (
+                        connectivity_feature,
+                        direction_feature,
+                    ) = self._latest_local_topology_features(structure_outputs)
                     x = self.global_topology.forward_feature_anchors(
                         x,
                         z_struct,
                         surface_prob,
+                        connectivity_feature=connectivity_feature,
+                        direction_feature=direction_feature,
                     )
                 x = self.guided_head(x, z_struct=z_struct)
             else:
