@@ -22,7 +22,8 @@ from networks.vision_transformer import (
     print_topology_coefficients,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from losses.road_losses import SurfaceStructureLoss
+from losses.cldice_loss import soft_skeletonize
+from losses.road_losses import SurfaceStructureLoss, build_connectivity_target
 from config import get_config
 from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
 
@@ -106,6 +107,16 @@ parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_windo
 parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--model_path', type=str, required=True, help='path to model checkpoint')
 parser.add_argument('--num_workers', default=4, type=int)
+parser.add_argument('--enable_global_topology', action='store_true')
+parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+parser.add_argument('--global_topology_heads', type=int, default=4)
+parser.add_argument('--global_topology_reach_hops', type=int, default=12)
+parser.add_argument('--global_topology_nms_radius', type=int, default=2)
+parser.add_argument('--global_topology_skeleton_threshold', type=float, default=0.5)
+parser.add_argument('--global_topology_connectivity_threshold', type=float, default=0.25)
+parser.add_argument('--global_topology_bend_angle_threshold', type=float, default=45.0)
+parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
+parser.add_argument('--connectivity_threshold', type=float, default=0.5)
 # Options expected by config.update_config
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
 parser.add_argument('--zip', action='store_true', help='use zipped dataset')
@@ -196,6 +207,28 @@ def dice_loss(pred, target, threshold=0.5):
     return 1 - dice_score
 
 
+def hard_cldice_scores(pred, targets, iter_num=10):
+    pred = pred.float().clamp(0.0, 1.0)
+    targets = targets.float().clamp(0.0, 1.0)
+    pred_skel = soft_skeletonize(pred, iter_num=iter_num)
+    target_skel = soft_skeletonize(targets, iter_num=iter_num)
+    tprec = (pred_skel * targets).sum(dim=(1, 2, 3)) / (
+        pred_skel.sum(dim=(1, 2, 3)) + 1e-8
+    )
+    tsens = (target_skel * pred).sum(dim=(1, 2, 3)) / (
+        target_skel.sum(dim=(1, 2, 3)) + 1e-8
+    )
+    return (2.0 * tprec * tsens) / (tprec + tsens + 1e-8)
+
+
+def metrics_from_counts(tp, fp, fn):
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2.0 * precision * recall / (precision + recall + 1e-8)
+    iou = tp / (tp + fp + fn + 1e-8)
+    return iou, f1, precision, recall
+
+
 if __name__ == "__main__":
     if not args.deterministic:
         cudnn.benchmark = True
@@ -244,6 +277,15 @@ if __name__ == "__main__":
                 "highres_structure_fuse_stages",
                 "highres_structure_fusion_mode",
                 "enable_post_refine_structure_interaction",
+                "enable_global_topology",
+                "global_topology_max_nodes",
+                "global_topology_heads",
+                "global_topology_reach_hops",
+                "global_topology_nms_radius",
+                "global_topology_skeleton_threshold",
+                "global_topology_connectivity_threshold",
+                "global_topology_bend_angle_threshold",
+                "global_topology_alpha_max",
             ):
                 if name in saved_args:
                     setattr(args, name, saved_args[name])
@@ -272,7 +314,16 @@ if __name__ == "__main__":
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,
                     enable_post_refine_structure_interaction=(
                         args.enable_post_refine_structure_interaction
-                    )).cuda()
+                    ),
+                    enable_global_topology=args.enable_global_topology,
+                    global_topology_max_nodes=args.global_topology_max_nodes,
+                    global_topology_heads=args.global_topology_heads,
+                    global_topology_reach_hops=args.global_topology_reach_hops,
+                    global_topology_nms_radius=args.global_topology_nms_radius,
+                    global_topology_skeleton_threshold=args.global_topology_skeleton_threshold,
+                    global_topology_connectivity_threshold=args.global_topology_connectivity_threshold,
+                    global_topology_bend_angle_threshold=args.global_topology_bend_angle_threshold,
+                    global_topology_alpha_max=args.global_topology_alpha_max).cuda()
     device = next(model.parameters()).device
     
     # 加载模型
@@ -327,6 +378,8 @@ if __name__ == "__main__":
 
     total_loss = 0
     tp = fp = fn = 0
+    conn_tp = conn_fp = conn_fn = 0
+    cldice_values = []
     total_samples = 0
 
     if args.overlap_infer:
@@ -538,6 +591,7 @@ if __name__ == "__main__":
             
             pred = (torch.sigmoid(surface_logits) >= args.threshold).float()
             masks = (masks > 0.5).float()
+            cldice_values.extend(hard_cldice_scores(pred, masks).detach().cpu().tolist())
             
             case_tp = int((pred * masks).sum().item())
             case_fp = int((pred * (1.0 - masks)).sum().item())
@@ -545,6 +599,24 @@ if __name__ == "__main__":
             tp += case_tp
             fp += case_fp
             fn += case_fn
+            if connectivity_logits is not None:
+                connectivity_gt = build_connectivity_target(skeletons.float()).to(
+                    device=connectivity_logits.device,
+                    dtype=connectivity_logits.dtype,
+                )
+                if connectivity_gt.shape[-2:] != connectivity_logits.shape[-2:]:
+                    connectivity_gt = F.interpolate(
+                        connectivity_gt,
+                        size=connectivity_logits.shape[-2:],
+                        mode='nearest',
+                    )
+                conn_pred = (
+                    torch.sigmoid(connectivity_logits) >= args.connectivity_threshold
+                ).float()
+                connectivity_gt = (connectivity_gt > 0.5).float()
+                conn_tp += int((conn_pred * connectivity_gt).sum().item())
+                conn_fp += int((conn_pred * (1.0 - connectivity_gt)).sum().item())
+                conn_fn += int(((1.0 - conn_pred) * connectivity_gt).sum().item())
             
             total_samples += 1
             
@@ -608,6 +680,12 @@ if __name__ == "__main__":
     recall = tp / (tp + fn + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
     iou = tp / (tp + fp + fn + 1e-8)
+    cldice = float(np.mean(cldice_values)) if cldice_values else float('nan')
+    conn_iou, conn_f1, conn_precision, conn_recall = metrics_from_counts(
+        conn_tp,
+        conn_fp,
+        conn_fn,
+    )
     
     # 打印到控制台和 txt 日志
     result_lines = []
@@ -617,6 +695,12 @@ if __name__ == "__main__":
     result_lines.append(f"  F1: {f1:.4f}")
     result_lines.append(f"  Precision: {precision:.4f}")
     result_lines.append(f"  Recall: {recall:.4f}")
+    result_lines.append(f"  clDice: {cldice:.4f}")
+    result_lines.append(f"  Connectivity threshold: {args.connectivity_threshold:.2f}")
+    result_lines.append(f"  Connectivity IoU: {conn_iou:.4f}")
+    result_lines.append(f"  Connectivity F1: {conn_f1:.4f}")
+    result_lines.append(f"  Connectivity Precision: {conn_precision:.4f}")
+    result_lines.append(f"  Connectivity Recall: {conn_recall:.4f}")
     result_lines.append(f"  Final skeleton threshold: {args.skeleton_threshold:.2f}")
     result_lines.append(f"  总测试样本: {len(test_loader)}")
     result_lines.append(f"  预测掩码保存位置: {pred_dir}")
