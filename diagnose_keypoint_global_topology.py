@@ -372,8 +372,16 @@ def run_coverage(args):
                 (baseline_pred & (~global_pred) & (~gt_mask)).sum().item()
             )
 
-            delta_before_gate = global_topology.last_delta_before_gate
-            delta_after_gate = global_topology.last_delta_after_gate
+            delta_before_gate = getattr(
+                global_topology,
+                "last_delta_before_gate",
+                None,
+            )
+            delta_after_gate = getattr(
+                global_topology,
+                "last_delta_after_gate",
+                None,
+            )
             if delta_before_gate is not None and delta_after_gate is not None:
                 background = ~gt_mask
                 if background.shape[-2:] != delta_before_gate.shape[-2:]:

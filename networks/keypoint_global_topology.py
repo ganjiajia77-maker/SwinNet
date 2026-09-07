@@ -42,8 +42,11 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.output_projection = nn.Linear(channels, channels)
         self.grid_projection = nn.Conv2d(channels, channels, kernel_size=1)
         self.raw_alpha = nn.Parameter(torch.tensor(0.0))
+        self.use_surface_residual_gate = True
         self.capture_diagnostics = False
         self.last_diagnostics = None
+        self.last_delta_before_gate = None
+        self.last_delta_after_gate = None
 
     @property
     def alpha_global(self):
@@ -314,12 +317,17 @@ class KeypointGuidedGlobalTopology(nn.Module):
         )
         node_feature = self.node_projection(node_input)
         context = self._cross_attention_from_tokens(feature, node_feature, valid)
-        delta = self.grid_projection(context)
-        delta = delta * surface_gate.clamp(0.0, 1.0)
+        delta_before_gate = self.grid_projection(context)
+        if getattr(self, "use_surface_residual_gate", True):
+            delta = delta_before_gate * surface_gate.clamp(0.0, 1.0)
+        else:
+            delta = delta_before_gate
         output = feature + self.alpha_global * delta
 
         if self.capture_diagnostics:
             with torch.no_grad():
+                self.last_delta_before_gate = delta_before_gate.detach()
+                self.last_delta_after_gate = delta.detach()
                 self.last_diagnostics = {
                     "anchor_count": valid.sum(dim=1).float().detach(),
                     "candidate_count": feature.new_full(
@@ -332,11 +340,18 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "alpha_global": self.alpha_global.detach(),
                     "surface_gate_mean": surface_gate.mean(dim=(1, 2, 3)).detach(),
                     "surface_gate_max": surface_gate.amax(dim=(1, 2, 3)).detach(),
+                    "surface_residual_gate_enabled": feature.new_full(
+                        (batch,),
+                        float(getattr(self, "use_surface_residual_gate", True)),
+                    ).detach(),
                     "global_residual_relative_norm": (
                         torch.linalg.vector_norm(output - feature)
                         / (torch.linalg.vector_norm(feature) + 1e-6)
                     ).detach(),
                 }
+        else:
+            self.last_delta_before_gate = None
+            self.last_delta_after_gate = None
         return output
 
     def _node_attention(self, node_features, valid, adjacency):
