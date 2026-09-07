@@ -319,6 +319,8 @@ class SurfaceStructureLoss(nn.Module):
         use_legacy_stage_connectivity_loss=False,
         use_masked_connectivity_center_experiment=False,
         connectivity_pos_weight=1.0,
+        directional_pos_weight_cardinal=1.0,
+        directional_pos_weight_diagonal=2.5,
         connectivity_focal_gamma=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
@@ -361,6 +363,8 @@ class SurfaceStructureLoss(nn.Module):
             use_masked_connectivity_center_experiment
         )
         self.connectivity_pos_weight = float(connectivity_pos_weight)
+        self.directional_pos_weight_cardinal = float(directional_pos_weight_cardinal)
+        self.directional_pos_weight_diagonal = float(directional_pos_weight_diagonal)
         self.connectivity_focal_gamma = float(connectivity_focal_gamma)
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
@@ -463,11 +467,34 @@ class SurfaceStructureLoss(nn.Module):
         use_skeleton_center_mask=False,
         symmetry_weight=0.20,
     ):
+        def apply_directional_pos_weight(loss_map):
+            if connectivity_logits.shape[1] != 8:
+                return loss_map
+            channel_weights = connectivity_logits.new_tensor(
+                [
+                    self.directional_pos_weight_cardinal,
+                    self.directional_pos_weight_diagonal,
+                    self.directional_pos_weight_cardinal,
+                    self.directional_pos_weight_diagonal,
+                    self.directional_pos_weight_cardinal,
+                    self.directional_pos_weight_diagonal,
+                    self.directional_pos_weight_cardinal,
+                    self.directional_pos_weight_diagonal,
+                ]
+            ).view(1, 8, 1, 1)
+            return loss_map * torch.where(
+                connectivity_gt > 0.5,
+                channel_weights,
+                torch.ones_like(channel_weights),
+            )
+
         if self.use_legacy_stage_connectivity_loss and not use_skeleton_center_mask:
-            return F.binary_cross_entropy_with_logits(
+            legacy_bce = F.binary_cross_entropy_with_logits(
                 connectivity_logits,
                 connectivity_gt,
+                reduction="none",
             )
+            return apply_directional_pos_weight(legacy_bce).mean()
 
         corridor = skeleton_dilate_gt.clamp(0.0, 1.0)
         if corridor.sum() <= 0:
@@ -483,6 +510,7 @@ class SurfaceStructureLoss(nn.Module):
             connectivity_gt,
             reduction="none",
         )
+        bce_map = apply_directional_pos_weight(bce_map)
         if self.connectivity_pos_weight != 1.0:
             pos_weight_map = torch.where(
                 connectivity_gt > 0.5,
@@ -619,6 +647,8 @@ class SurfaceStructureLoss(nn.Module):
             try:
                 stage_index = int(stage_output.get("stage", idx))
             except (TypeError, ValueError):
+                continue
+            if stage_index == 3 and int(stage_output.get("refinement_step", 1)) == 0:
                 continue
             if stage_index >= len(self.stage_structure_weights):
                 continue

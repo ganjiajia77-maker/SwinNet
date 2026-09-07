@@ -23,35 +23,12 @@ logger = logging.getLogger(__name__)
 TOPOLOGY_ATTENTION_VERSION = "stage-topology-roadness-gap-v1"
 STRUCTURE_PROFILE_FULL = "full"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 = "stage23_boundary_0626"
+STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE = "stage23_boundary_0626_final_ske"
 
 
 def _core_swin_unet(model):
     module = model.module if hasattr(model, "module") else model
     return module.swin_unet
-
-
-def set_soft_graph_eval_mode(
-    model,
-    use_soft_graph=True,
-    lambda_scale=1.0,
-    lambda_override=None,
-    identity_dir_convs=False,
-):
-    return {
-        "use_soft_graph": False,
-        "lambda_scale": float(lambda_scale),
-        "lambda_override": lambda_override,
-        "lambda_eff": 0.0,
-        "identity_dir_convs": bool(identity_dir_convs),
-    }
-
-
-def configure_graph_diagnostics(model, enabled=True):
-    return None
-
-
-def get_graph_propagation_state(model):
-    return None
 
 
 def get_topology_coefficients(model):
@@ -61,14 +38,14 @@ def get_topology_coefficients(model):
     coefficients = {
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
-        "graph_prop_enabled": False,
         "highres_structure_stream": {
             "enabled": bool(getattr(swin_unet, "enable_highres_structure_stream", False)),
-            "source": getattr(swin_unet, "highres_structure_source", "prepatch"),
+            "source": "prepatch",
             "channels": int(getattr(swin_unet, "highres_structure_channels", 0)),
             "fuse_stages": getattr(swin_unet, "highres_structure_fuse_stages", "stage23"),
             "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),
         },
+        "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
         "stage_topology_stages": getattr(swin_unet, "stage_topology_stages", "none"),
         "stage_topology_active": {
             f"stage{stage}": bool(swin_unet._stage_topology_enabled(stage))
@@ -145,7 +122,6 @@ def format_topology_coefficients(model):
         f"version={TOPOLOGY_ATTENTION_VERSION}",
         f"profile={coefficients['structure_profile']}",
         f"final_structure={'on' if coefficients['final_structure_enabled'] else 'off'}",
-        f"graph_prop={'on' if coefficients['graph_prop_enabled'] else 'off'}",
     ]
     highres_values = coefficients["highres_structure_stream"]
     fields.append(
@@ -155,6 +131,11 @@ def format_topology_coefficients(model):
             highres_values["channels"],
             highres_values["fuse_stages"],
             highres_values["fusion_mode"],
+        )
+    )
+    fields.append(
+        "global_topology={}".format(
+            "on" if coefficients["global_topology_enabled"] else "off"
         )
     )
     for stage in (
@@ -248,6 +229,20 @@ def load_topology_checkpoint_state(
         "swin_unet.encoder_stage1_road_attention_head.",
         "swin_unet.guided_head.surface_selective_fusion.",
     )
+    removed_direction_embedding_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.directional_embedding.",
+        "swin_unet.decoder_structure_blocks.1.directional_embedding.",
+        "swin_unet.decoder_structure_blocks.2.directional_embedding.",
+        "swin_unet.decoder_structure_blocks.3.directional_embedding.",
+        "swin_unet.stage2_topology_source.directional_embedding.",
+    )
+    removed_surface_uncertainty_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
+        "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
+        "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
+        "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
+        "swin_unet.stage2_topology_source.surface_uncertainty_head.",
+    )
     filtered_state_dict = {}
     skipped_obsolete_keys = []
     skipped_shape_keys = []
@@ -257,6 +252,8 @@ def load_topology_checkpoint_state(
             and (
                 key.endswith(obsolete_unexpected_suffixes)
                 or key.startswith(obsolete_unexpected_prefixes)
+                or key.startswith(removed_direction_embedding_prefixes)
+                or key.startswith(removed_surface_uncertainty_prefixes)
                 or key.startswith(highres_structure_missing_prefixes)
             )
         ):
@@ -306,8 +303,8 @@ def load_topology_checkpoint_state(
             "swin_unet.guided_head.raw_rho_gap",
             "swin_unet.guided_head.fixed_rho_gap",
             "swin_unet.stage_topology_scales.",
+            "swin_unet.global_topology.",
             "swin_unet.stage2_topology_source.",
-            "swin_unet.guided_head.graph_propagation.",
             "swin_unet.encoder_road_attention_head.",
             "swin_unet.encoder_stage1_road_attention_head.",
             "swin_unet.encoder_stage2_road_attention_head.",
@@ -444,6 +441,7 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.1.gate_branch.",
         "swin_unet.decoder_structure_blocks.2.gate_branch.",
         "swin_unet.decoder_structure_blocks.3.gate_branch.",
+        "swin_unet.global_topology.",
         "swin_unet.stage2_topology_source.direction_head.",
         "swin_unet.stage2_topology_source.connectivity_context.",
         "swin_unet.stage2_topology_source.direction_gate.",
@@ -474,7 +472,7 @@ def load_topology_checkpoint_state(
         "swin_unet.guided_head.final_topology_attention.",
         "swin_unet.guided_head.structure_fusion.",
         "swin_unet.guided_head.structure_residual.",
-    )
+    ) + removed_direction_embedding_prefixes + removed_surface_uncertainty_prefixes
     if strict:
         result = model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
@@ -526,7 +524,7 @@ def load_state_dict_ignore_mismatch(model, state_dict, prefix=""):
 
 class SwinUnet(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
-                 use_asterisk=False, return_skeleton=False, bottleneck_type="global_local",
+                 return_skeleton=False, bottleneck_type="global_local",
                  final_topology_eta_init=0.005, final_gap_rho_init=0.005,
                  stage_topology_stages="none",
                  stage_topology_alpha_max=1.0,
@@ -535,7 +533,6 @@ class SwinUnet(nn.Module):
                  stage_topology_ratio=0.08,
                  stage_topology_topo_clip=4.0,
                  structure_profile=STRUCTURE_PROFILE_FULL,
-                 enable_final_graph_prop=False,
                  use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
@@ -544,7 +541,11 @@ class SwinUnet(nn.Module):
                  highres_structure_channels=64,
                  highres_structure_fuse_stages="stage23",
                  highres_structure_fusion_mode="stage23",
-                 enable_post_refine_structure_interaction=False):
+                 enable_post_refine_structure_interaction=False,
+                 enable_global_topology=False,
+                 global_topology_max_nodes=32,
+                 global_topology_heads=4,
+                 global_topology_alpha_max=0.05):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -589,7 +590,11 @@ class SwinUnet(nn.Module):
                                 highres_structure_fusion_mode=highres_structure_fusion_mode,
                                 enable_post_refine_structure_interaction=(
                                     enable_post_refine_structure_interaction
-                                ))
+                                ),
+                                enable_global_topology=enable_global_topology,
+                                global_topology_max_nodes=global_topology_max_nodes,
+                                global_topology_heads=global_topology_heads,
+                                global_topology_alpha_max=global_topology_alpha_max)
     def forward(
         self,
         x,

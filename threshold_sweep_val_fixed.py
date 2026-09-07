@@ -16,6 +16,7 @@ from networks.vision_transformer import (
     print_topology_coefficients as print_topology_coefficients_standard,
     STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+    STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
 )
 from networks.vision_transformer_selective_fusion import (
     SwinUnet as ViTSelective,
@@ -126,7 +127,11 @@ def main():
         '--structure_profile',
         type=str,
         default=STRUCTURE_PROFILE_FULL,
-        choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
+        choices=[
+            STRUCTURE_PROFILE_FULL,
+            STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+            STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
+        ],
     )
     parser.add_argument(
         '--disable_msfe_skip',
@@ -154,6 +159,10 @@ def main():
         ],
     )
     parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
+    parser.add_argument('--enable_global_topology', action='store_true')
+    parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+    parser.add_argument('--global_topology_heads', type=int, default=4)
+    parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
     args = parser.parse_args()
     
     checkpoint = None
@@ -181,6 +190,10 @@ def main():
                     "highres_structure_fuse_stages",
                     "highres_structure_fusion_mode",
                     "enable_post_refine_structure_interaction",
+                    "enable_global_topology",
+                    "global_topology_max_nodes",
+                    "global_topology_heads",
+                    "global_topology_alpha_max",
                     "bottleneck_type",
                 ):
                     if name in saved_args:
@@ -200,7 +213,7 @@ def main():
         loader = load_topology_checkpoint_state_standard
         printer = print_topology_coefficients_standard
 
-    model = vit_cls(
+    model_kwargs = dict(
         config=config,
         img_size=args.img_size,
         num_classes=1,
@@ -219,6 +232,14 @@ def main():
         highres_structure_fusion_mode=args.highres_structure_fusion_mode,
         enable_post_refine_structure_interaction=args.enable_post_refine_structure_interaction,
     )
+    if args.model_impl == 'standard':
+        model_kwargs.update(
+            enable_global_topology=args.enable_global_topology,
+            global_topology_max_nodes=args.global_topology_max_nodes,
+            global_topology_heads=args.global_topology_heads,
+            global_topology_alpha_max=args.global_topology_alpha_max,
+        )
+    model = vit_cls(**model_kwargs)
     if checkpoint is None:
         checkpoint = torch.load(args.model_path, map_location=device)
     adapt_connectivity_modules_for_checkpoint(

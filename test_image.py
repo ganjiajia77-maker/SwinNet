@@ -16,6 +16,7 @@ from networks.vision_transformer import (
     TOPOLOGY_ATTENTION_VERSION,
     STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+    STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
     SwinUnet as ViT_seg,
     format_topology_coefficients,
     load_topology_checkpoint_state,
@@ -70,7 +71,11 @@ parser.add_argument(
     '--structure_profile',
     type=str,
     default=STRUCTURE_PROFILE_FULL,
-    choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
+    choices=[
+        STRUCTURE_PROFILE_FULL,
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
+    ],
 )
 parser.add_argument(
     '--disable_msfe_skip',
@@ -98,6 +103,10 @@ parser.add_argument(
     ],
 )
 parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
+parser.add_argument('--enable_global_topology', action='store_true')
+parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+parser.add_argument('--global_topology_heads', type=int, default=4)
+parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -244,6 +253,10 @@ if __name__ == "__main__":
                 "highres_structure_fuse_stages",
                 "highres_structure_fusion_mode",
                 "enable_post_refine_structure_interaction",
+                "enable_global_topology",
+                "global_topology_max_nodes",
+                "global_topology_heads",
+                "global_topology_alpha_max",
             ):
                 if name in saved_args:
                     setattr(args, name, saved_args[name])
@@ -272,7 +285,11 @@ if __name__ == "__main__":
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,
                     enable_post_refine_structure_interaction=(
                         args.enable_post_refine_structure_interaction
-                    )).cuda()
+                    ),
+                    enable_global_topology=args.enable_global_topology,
+                    global_topology_max_nodes=args.global_topology_max_nodes,
+                    global_topology_heads=args.global_topology_heads,
+                    global_topology_alpha_max=args.global_topology_alpha_max).cuda()
     device = next(model.parameters()).device
     
     # 加载模型

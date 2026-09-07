@@ -7,9 +7,11 @@ import random
 import sys
 import tempfile
 import time
+import cv2
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from datetime import datetime
 from PIL import Image
 from torch.utils.data import DataLoader, Subset
@@ -18,21 +20,15 @@ from networks.vision_transformer import (
     TOPOLOGY_ATTENTION_VERSION,
     STRUCTURE_PROFILE_FULL,
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+    STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
     SwinUnet as ViT_seg,
     get_topology_coefficients,
     load_topology_checkpoint_state,
     print_topology_coefficients,
 )
-try:
-    from networks.vision_transformer import freeze_backbone_train_graph_only
-except ImportError:
-    def freeze_backbone_train_graph_only(model):
-        raise RuntimeError(
-            "--freeze_0626_backbone is unavailable because graph propagation "
-            "training has been removed from this cleaned model."
-        )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
+from losses.cldice_loss import soft_skeletonize
 from config import get_config
 
 
@@ -79,6 +75,11 @@ parser.add_argument('--print_freq', default=10, type=int, help='print loss every
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
 parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final skeleton threshold for validation')
 parser.add_argument('--val_interval', type=int, default=1, help='run validation every N epochs; always validates on final epoch')
+parser.add_argument('--finetune_epochs', type=int, default=0, help='when resuming, stop after this many extra epochs while keeping the original LR schedule length')
+parser.add_argument('--trend_val_every_steps', type=int, default=0, help='run fixed-subset topology validation every N training batches; 0 disables it')
+parser.add_argument('--trend_val_max_batches', type=int, default=0, help='number of validation batches used by trend validation; 0 uses the full val loader')
+parser.add_argument('--trend_val_short_area_threshold', type=int, default=20, help='short-component area threshold for trend fragmentation metrics')
+parser.add_argument('--trend_val_csv', type=str, default='', help='CSV path for step-wise trend validation metrics')
 parser.add_argument(
     '--surface_loss',
     type=str,
@@ -143,6 +144,14 @@ parser.add_argument(
 )
 parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
 parser.add_argument(
+    '--enable_global_topology',
+    action='store_true',
+    help='enable sparse global topology residual with anchors=z_struct*surface and tokens=z_struct',
+)
+parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+parser.add_argument('--global_topology_heads', type=int, default=4)
+parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
+parser.add_argument(
     '--enable_post_refine_structure_interaction',
     action='store_true',
     help='enable detached z_struct -> post surface_refine interaction module',
@@ -183,13 +192,12 @@ parser.add_argument(
     '--structure_profile',
     type=str,
     default=STRUCTURE_PROFILE_FULL,
-    choices=[STRUCTURE_PROFILE_FULL, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626],
-    help='0626 profile: stage2/3 structure only, final skeleton/connectivity off',
-)
-parser.add_argument(
-    '--enable_graph_prop',
-    action='store_true',
-    help='final surface delta-logit soft graph propagation (stage2/3 priors)',
+    choices=[
+        STRUCTURE_PROFILE_FULL,
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
+    ],
+    help='structure profile: full, stage2/3 only, or stage2/3 plus final skeleton aux',
 )
 parser.add_argument(
     '--masked_connectivity_center_experiment',
@@ -203,6 +211,18 @@ parser.add_argument(
     help='positive class weight for connectivity BCE/focal BCE',
 )
 parser.add_argument(
+    '--directional_pos_weight_cardinal',
+    type=float,
+    default=1.0,
+    help='positive connectivity loss multiplier for N/E/S/W directions',
+)
+parser.add_argument(
+    '--directional_pos_weight_diagonal',
+    type=float,
+    default=2.5,
+    help='positive connectivity loss multiplier for NE/SE/SW/NW directions',
+)
+parser.add_argument(
     '--connectivity_focal_gamma',
     type=float,
     default=1.5,
@@ -212,62 +232,6 @@ parser.add_argument(
     '--disable_msfe_skip',
     action='store_true',
     help='ablate MSFE blocks on decoder skip stages inx=2,3; DCA-FPN remains enabled',
-)
-parser.add_argument(
-    '--freeze_0626_backbone',
-    action='store_true',
-    help='freeze 0626 encoder/decoder/heads; train graph_propagation only',
-)
-parser.add_argument(
-    '--graph_corr_weight',
-    type=float,
-    default=0.05,
-    help='continuous baseline-error correction loss weight',
-)
-parser.add_argument(
-    '--graph_corr_k',
-    type=float,
-    default=1.0,
-    help='scale for target_delta = k * (GT - P_base)',
-)
-parser.add_argument(
-    '--graph_corr_m_pos',
-    type=float,
-    default=0.15,
-    help='max positive target delta for graph residual',
-)
-parser.add_argument(
-    '--graph_corr_m_neg',
-    type=float,
-    default=0.15,
-    help='max negative target delta magnitude for graph residual',
-)
-parser.add_argument(
-    '--graph_fn_push_weight',
-    type=float,
-    default=0.0,
-    help='deprecated; use --graph_corr_weight',
-)
-parser.add_argument(
-    '--graph_fp_suppress_weight',
-    type=float,
-    default=0.0,
-    help='deprecated; use --graph_corr_weight',
-)
-parser.add_argument(
-    '--graph_delta_sparse_weight',
-    type=float,
-    default=0.0,
-    help='deprecated; use --graph_corr_weight',
-)
-parser.add_argument(
-    '--graph_base_lr',
-    type=float,
-    default=3e-4,
-    help='learning rate for graph-only training when backbone is frozen',
-)
-DEFAULT_0626_CHECKPOINT = (
-    './model_out/train_stage23_structure_final_boundary_nw0_20260626/best.pth'
 )
 # Options expected by the original config updater
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
@@ -292,7 +256,10 @@ def _cli_has(flag):
 
 
 def apply_structure_profile_defaults(args):
-    if args.structure_profile != STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
+    if args.structure_profile not in {
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
+    }:
         return
 
     args.stage_topology_stages = "none"
@@ -311,20 +278,24 @@ def apply_structure_profile_defaults(args):
 
 apply_structure_profile_defaults(args)
 
-if args.freeze_0626_backbone and not args.enable_graph_prop:
-    parser.error("--freeze_0626_backbone requires --enable_graph_prop")
-if args.freeze_0626_backbone and not args.resume:
-    args.resume = DEFAULT_0626_CHECKPOINT
 if args.freeze_post_refine_interaction_only:
     if not args.enable_highres_structure_stream:
         parser.error("--freeze_post_refine_interaction_only requires --enable_highres_structure_stream")
     args.enable_post_refine_structure_interaction = True
+if args.enable_global_topology and not args.enable_highres_structure_stream:
+    parser.error("--enable_global_topology requires --enable_highres_structure_stream")
 
 
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         weights = {
             "skeleton_weight": 0.0,
+            "connectivity_weight": 0.0,
+            "boundary_weight": 0.0,
+        }
+    elif args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE:
+        weights = {
+            "skeleton_weight": 0.10,
             "connectivity_weight": 0.0,
             "boundary_weight": 0.0,
         }
@@ -337,7 +308,17 @@ def get_final_loss_weights(args):
     if args.final_skeleton_weight is not None:
         weights["skeleton_weight"] = float(args.final_skeleton_weight)
     if args.final_connectivity_weight is not None:
-        weights["connectivity_weight"] = float(args.final_connectivity_weight)
+        if args.structure_profile in {
+            STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+            STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
+        }:
+            print(
+                "[WARN] --final_connectivity_weight is ignored for stage23 profiles; "
+                "final connectivity is removed.",
+                flush=True,
+            )
+        else:
+            weights["connectivity_weight"] = float(args.final_connectivity_weight)
     if args.boundary_weight is not None and float(args.boundary_weight) != 0.0:
         print("[WARN] --boundary_weight is ignored because boundary auxiliary loss is disabled.")
     return weights
@@ -353,8 +334,8 @@ def get_graph_outputs_from_model(model):
 
 
 def build_criterion(args, loss_weights, device):
-    stage2_weight = 0.0 if args.freeze_0626_backbone else args.stage2_skeleton_weight
-    stage3_weight = 0.0 if args.freeze_0626_backbone else args.stage3_skeleton_weight
+    stage2_weight = args.stage2_skeleton_weight
+    stage3_weight = args.stage3_skeleton_weight
     boundary_weight = 0.0
 
     return SurfaceStructureLoss(
@@ -371,19 +352,24 @@ def build_criterion(args, loss_weights, device):
             stage2_weight,
             stage3_weight,
         ),
-        road_attention_weight=0.0 if args.freeze_0626_backbone else args.road_attention_weight,
+        road_attention_weight=args.road_attention_weight,
         stage_connectivity_factor=args.stage_connectivity_factor,
         stage_direction_factor=args.stage_direction_factor,
         stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
         stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
         highres_structure_skeleton_weight=(
-            0.0 if args.freeze_0626_backbone else args.highres_structure_skeleton_weight
+            args.highres_structure_skeleton_weight
         ),
         use_legacy_stage_connectivity_loss=(
-            args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
+            args.structure_profile in {
+                STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+                STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
+            }
         ),
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
+        directional_pos_weight_cardinal=args.directional_pos_weight_cardinal,
+        directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
     ).to(device)
 
@@ -392,10 +378,18 @@ def format_training_config_lines(args, loss_weights):
     lines = [
         f"  结构配置: {args.structure_profile}",
     ]
-    if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
+    if args.structure_profile in {
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
+        STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
+    }:
         lines.extend([
             "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            "  Final head: surface branch + boundary residual only; final skeleton/connectivity removed",
+            (
+                "  Final head: surface branch + boundary residual + final skeleton auxiliary only; "
+                "final connectivity removed"
+                if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE
+                else "  Final head: surface branch + boundary residual only; final skeleton/connectivity removed"
+            ),
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
             "  Stage2/Stage3 skeleton gradient ratio: {:.3f}/{:.3f}".format(
@@ -413,27 +407,25 @@ def format_training_config_lines(args, loss_weights):
             "  Encoder stage1 road prior: residual PatchMerging path",
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
-            "  Decoder direction-aware connectivity attention bias: enabled before gate, C + 0.5(C*Dsoft)^2 + 0.25(C*Dsoft)^3 with Dsoft=0.5+0.5D, 1/(1+0.2d) decay, lambda_init=0.1",
+            "  Decoder stage3 step0: removed; only post-upsampling refinement is active",
+            "  Decoder gate input: [decoder gate feature, Skeleton, Connectivity]",
             "  Decoder gate: structure gate plus local+dilated semantic context and direction-confidence reliability correction",
+            "  Connectivity directional positive weight: cardinal={:.3f}, diagonal={:.3f}".format(
+                args.directional_pos_weight_cardinal,
+                args.directional_pos_weight_diagonal,
+            ),
+            "  Global topology residual: {}, anchors=z_struct*surface, tokens=z_struct, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+                "enabled" if args.enable_global_topology else "disabled",
+                args.global_topology_max_nodes,
+                args.global_topology_heads,
+                args.global_topology_alpha_max,
+            ),
         ])
         if args.masked_connectivity_center_experiment:
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
                 f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}",
             ])
-        if args.enable_graph_prop:
-            lines.extend([
-                "  Final graph propagation: stage2/3 priors -> delta-logit residual",
-                "  Graph propagation lambda: init=0.05, max=0.10, edge_beta=0.7",
-                "  Graph delta_logit: clamp(-0.3, 0.3) before lambda*G residual",
-                "  Graph G: learned gate_mlp(P, weak, two_sided_support, near_H, H, S, C)",
-                "  Graph support: sqrt(H_l*H_r) * mean(C_l,C_r); candidate=weak*(1-H)",
-                "  Graph correction loss: weighted SmoothL1(delta_logit, k*(GT-P_base))",
-            ])
-            if args.freeze_0626_backbone:
-                lines.append(
-                    "  Backbone: frozen 0626 (train graph_propagation + lambda only)"
-                )
     else:
         lines.extend([
             "  Decoder structure gates: restored 0621 stages 0/1/2/3",
@@ -567,13 +559,22 @@ def inherit_resume_architecture_args(args):
         )
     if "highres_structure_skeleton_weight" in saved_args and not _cli_has("--highres_structure_skeleton_weight"):
         args.highres_structure_skeleton_weight = float(saved_args["highres_structure_skeleton_weight"])
+    if "enable_global_topology" in saved_args and not _cli_has("--enable_global_topology"):
+        args.enable_global_topology = bool(saved_args["enable_global_topology"])
+    if "global_topology_max_nodes" in saved_args and not _cli_has("--global_topology_max_nodes"):
+        args.global_topology_max_nodes = int(saved_args["global_topology_max_nodes"])
+    if "global_topology_heads" in saved_args and not _cli_has("--global_topology_heads"):
+        args.global_topology_heads = int(saved_args["global_topology_heads"])
+    if "global_topology_alpha_max" in saved_args and not _cli_has("--global_topology_alpha_max"):
+        args.global_topology_alpha_max = float(saved_args["global_topology_alpha_max"])
     print(
         "[INFO] Resume architecture args: "
         f"profile={args.structure_profile}, "
         f"disable_msfe_skip={args.disable_msfe_skip}, "
         f"direct_resize_train={args.direct_resize_train}, "
         f"img_size={args.img_size}, source_patch_size={args.source_patch_size}, "
-        f"highres_structure={args.enable_highres_structure_stream}",
+        f"highres_structure={args.enable_highres_structure_stream}, "
+        f"global_topology={args.enable_global_topology}",
         flush=True,
     )
 
@@ -1000,6 +1001,123 @@ def evaluate_overlap_full_images(
         'image_count': image_count,
     }
 
+
+def component_stats(mask_bool, short_area_threshold):
+    num, _, stats, _ = cv2.connectedComponentsWithStats(
+        mask_bool.astype(np.uint8),
+        connectivity=8,
+    )
+    areas = stats[1:, cv2.CC_STAT_AREA] if num > 1 else np.empty((0,), dtype=np.int32)
+    total = float(areas.sum()) if areas.size else 0.0
+    return {
+        "components": float(num - 1),
+        "short_components": float((areas < short_area_threshold).sum()) if areas.size else 0.0,
+        "largest_ratio": float(areas.max() / total) if total > 0 else 0.0,
+    }
+
+
+def cldice_scores(surface_prob, surface_gt):
+    pred_skel = soft_skeletonize(surface_prob.float().clamp(0.0, 1.0), iter_num=10)
+    gt_skel = soft_skeletonize(surface_gt.float().clamp(0.0, 1.0), iter_num=10)
+    tprec = (pred_skel * surface_gt).sum(dim=(1, 2, 3)) / (
+        pred_skel.sum(dim=(1, 2, 3)) + 1e-8
+    )
+    tsens = (gt_skel * surface_prob).sum(dim=(1, 2, 3)) / (
+        gt_skel.sum(dim=(1, 2, 3)) + 1e-8
+    )
+    return ((2.0 * tprec * tsens) / (tprec + tsens + 1e-8)).detach().cpu().numpy()
+
+
+def evaluate_trend_topology_subset(
+    model,
+    loader,
+    threshold=0.2,
+    max_batches=0,
+    short_area_threshold=20,
+    stage_topology_alpha_scale=1.0,
+):
+    was_training = model.training
+    model.eval()
+    tp = fp = fn = 0.0
+    cldice_values = []
+    pred_components = []
+    gt_components = []
+    frag_indices = []
+    extra_components = []
+    pred_short = []
+    gt_short = []
+    pred_largest = []
+    gt_largest = []
+    n_images = 0
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
+            images = batch['image'].to(device)
+            masks = batch['mask'].to(device).float()
+            images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
+            outputs = model(
+                images_padded,
+                topology_alpha_scale=stage_topology_alpha_scale,
+                teacher_forcing_ratio=0.0,
+            )
+            surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            surface_logits = crop_to_shape(surface_logits, orig_shape)
+            if masks.shape[-2:] != surface_logits.shape[-2:]:
+                masks = F.interpolate(
+                    masks,
+                    size=surface_logits.shape[-2:],
+                    mode="nearest",
+                )
+            surface_prob = torch.sigmoid(surface_logits)
+            pred = surface_prob >= threshold
+            gt = masks > 0.5
+
+            tp += float((pred & gt).sum().item())
+            fp += float((pred & (~gt)).sum().item())
+            fn += float(((~pred) & gt).sum().item())
+            cldice_values.extend(cldice_scores(surface_prob, masks).tolist())
+
+            pred_np = pred.detach().cpu().numpy()[:, 0]
+            gt_np = gt.detach().cpu().numpy()[:, 0]
+            for pred_mask, gt_mask in zip(pred_np, gt_np):
+                ps = component_stats(pred_mask, short_area_threshold)
+                gs = component_stats(gt_mask, short_area_threshold)
+                gt_components_safe = max(gs["components"], 1.0)
+                pred_components.append(ps["components"])
+                gt_components.append(gs["components"])
+                frag_indices.append(ps["components"] / gt_components_safe)
+                extra_components.append(max(ps["components"] - gs["components"], 0.0))
+                pred_short.append(ps["short_components"])
+                gt_short.append(gs["short_components"])
+                pred_largest.append(ps["largest_ratio"])
+                gt_largest.append(gs["largest_ratio"])
+                n_images += 1
+
+    if was_training:
+        model.train()
+
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    iou = tp / (tp + fp + fn + 1e-8)
+    return {
+        "iou": iou,
+        "precision": precision,
+        "recall": recall,
+        "cldice": float(np.mean(cldice_values)) if cldice_values else float("nan"),
+        "pred_comp": float(np.mean(pred_components)) if pred_components else float("nan"),
+        "gt_comp": float(np.mean(gt_components)) if gt_components else float("nan"),
+        "frag_idx": float(np.mean(frag_indices)) if frag_indices else float("nan"),
+        "extra_comp": float(np.mean(extra_components)) if extra_components else float("nan"),
+        "pred_short": float(np.mean(pred_short)) if pred_short else float("nan"),
+        "gt_short": float(np.mean(gt_short)) if gt_short else float("nan"),
+        "pred_largest_ratio": float(np.mean(pred_largest)) if pred_largest else float("nan"),
+        "gt_largest_ratio": float(np.mean(gt_largest)) if gt_largest else float("nan"),
+        "n_images": n_images,
+    }
+
+
 if __name__ == "__main__":
     # 自动检测可用设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1066,7 +1184,7 @@ if __name__ == "__main__":
     args.num_classes = 1
     loss_weights = get_final_loss_weights(args)
     model = ViT_seg(config=config, img_size=args.img_size,
-                    num_classes=args.num_classes, use_asterisk=True,
+                    num_classes=args.num_classes,
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
                     final_topology_eta_init=args.final_topology_eta_init,
                     final_gap_rho_init=args.final_gap_rho_init,
@@ -1077,7 +1195,6 @@ if __name__ == "__main__":
                     stage_topology_ratio=args.stage_topology_ratio,
                     stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    enable_final_graph_prop=args.enable_graph_prop,
                     use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
@@ -1088,7 +1205,11 @@ if __name__ == "__main__":
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,
                     enable_post_refine_structure_interaction=(
                         args.enable_post_refine_structure_interaction
-                    )).to(device)
+                    ),
+                    enable_global_topology=args.enable_global_topology,
+                    global_topology_max_nodes=args.global_topology_max_nodes,
+                    global_topology_heads=args.global_topology_heads,
+                    global_topology_alpha_max=args.global_topology_alpha_max).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
@@ -1287,42 +1408,63 @@ if __name__ == "__main__":
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
             checkpoint_state = checkpoint["model_state_dict"]
-            if not args.freeze_0626_backbone:
-                model_state = model.state_dict()
-                filtered_checkpoint_state = {}
-                skipped_gate_keys = []
-                for key, value in checkpoint_state.items():
-                    if (
-                        key in model_state
-                        and value.shape != model_state[key].shape
-                        and key.endswith("structure_gate.0.weight")
-                    ):
-                        skipped_gate_keys.append(key)
-                        continue
-                    filtered_checkpoint_state[key] = value
-                if skipped_gate_keys:
-                    print(
-                        "[WARN] Reinitialized direction-gate input weights: "
-                        + ", ".join(skipped_gate_keys),
-                        flush=True,
-                    )
-                    checkpoint_state = filtered_checkpoint_state
-            if args.freeze_0626_backbone:
-                load_topology_checkpoint_state(
-                    model,
-                    checkpoint_state,
-                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+            model_state = model.state_dict()
+            filtered_checkpoint_state = {}
+            skipped_gate_keys = []
+            skipped_removed_keys = []
+            removed_direction_embedding_prefixes = (
+                "swin_unet.decoder_structure_blocks.0.directional_embedding.",
+                "swin_unet.decoder_structure_blocks.1.directional_embedding.",
+                "swin_unet.decoder_structure_blocks.2.directional_embedding.",
+                "swin_unet.decoder_structure_blocks.3.directional_embedding.",
+                "swin_unet.stage2_topology_source.directional_embedding.",
+            )
+            removed_surface_uncertainty_prefixes = (
+                "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
+                "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
+                "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
+                "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
+                "swin_unet.stage2_topology_source.surface_uncertainty_head.",
+            )
+            for key, value in checkpoint_state.items():
+                if key not in model_state and key.startswith(
+                    removed_direction_embedding_prefixes
+                    + removed_surface_uncertainty_prefixes
+                ):
+                    skipped_removed_keys.append(key)
+                    continue
+                if (
+                    key in model_state
+                    and value.shape != model_state[key].shape
+                    and key.endswith("structure_gate.0.weight")
+                ):
+                    skipped_gate_keys.append(key)
+                    continue
+                filtered_checkpoint_state[key] = value
+            if skipped_gate_keys:
+                print(
+                    "[WARN] Reinitialized structure-gate input weights: "
+                    + ", ".join(skipped_gate_keys),
+                    flush=True,
                 )
-            else:
-                strict_load = args.bottleneck_type == 'global_local'
-                try:
-                    model.load_state_dict(checkpoint_state, strict=strict_load)
-                except RuntimeError as exc:
-                    allowed_missing_prefixes = (
+            if skipped_removed_keys:
+                print(
+                    "[WARN] Ignored removed checkpoint keys: "
+                    + ", ".join(skipped_removed_keys[:12])
+                    + (" ..." if len(skipped_removed_keys) > 12 else ""),
+                    flush=True,
+                )
+            if skipped_gate_keys or skipped_removed_keys:
+                checkpoint_state = filtered_checkpoint_state
+            strict_load = args.bottleneck_type == 'global_local'
+            try:
+                model.load_state_dict(checkpoint_state, strict=strict_load)
+            except RuntimeError as exc:
+                allowed_missing_prefixes = (
                         "swin_unet.stage2_topology_source.",
                         "swin_unet.stage_topology_scales.",
+                        "swin_unet.global_topology.",
                         "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
-                        "swin_unet.guided_head.graph_propagation.",
                         "swin_unet.highres_structure_encoder.",
                         "swin_unet.prepatch_structure_encoder.",
                         "swin_unet.highres_structure_skeleton_head.",
@@ -1374,56 +1516,64 @@ if __name__ == "__main__":
                         "swin_unet.stage2_topology_source.gate_branch.",
                         "swin_unet.guided_head.detached_skeleton_refine.",
                         "swin_unet.guided_head.detached_skeleton_head.",
+                        "swin_unet.guided_head.final_skeleton_aux_head.",
                         "swin_unet.guided_head.post_refine_structure_interaction.",
-                    )
-                    allowed_unexpected_prefixes = (
+                )
+                allowed_unexpected_prefixes = (
                         "swin_unet.decoder_structure_blocks.0.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.1.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.2.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.3.reliability_correction.",
                         "swin_unet.stage2_topology_source.reliability_correction.",
-                    )
-                    result = model.load_state_dict(
-                        checkpoint_state,
-                        strict=False,
-                    )
-                    invalid_missing = [
-                        key
-                        for key in result.missing_keys
-                        if not key.startswith(allowed_missing_prefixes)
-                    ]
-                    invalid_unexpected = [
-                        key
-                        for key in result.unexpected_keys
-                        if not key.startswith(allowed_unexpected_prefixes)
-                    ]
-                    if invalid_missing or invalid_unexpected:
-                        raise RuntimeError(
-                            "Checkpoint mismatch on resume: "
-                            f"missing={invalid_missing}, unexpected={invalid_unexpected}"
-                        ) from exc
-                    print(
-                        "[WARN] Loaded checkpoint with strict=False; "
-                        "some modules use fresh initialization.",
-                        flush=True,
-                    )
-            if args.freeze_0626_backbone:
-                trainable = freeze_backbone_train_graph_only(model)
+                        "swin_unet.guided_head.skeleton_proj.",
+                        "swin_unet.guided_head.structure_branch.",
+                        "swin_unet.guided_head.skeleton_head.",
+                        "swin_unet.guided_head.detached_skeleton_refine.",
+                        "swin_unet.guided_head.detached_skeleton_head.",
+                        "swin_unet.guided_head.connectivity_context.",
+                        "swin_unet.guided_head.connectivity_head.",
+                        "swin_unet.guided_head.structure_to_surface.",
+                        "swin_unet.guided_head.structure_to_surface_gamma",
+                        "swin_unet.guided_head.final_topology_attention.",
+                        "swin_unet.guided_head.structure_fusion.",
+                        "swin_unet.guided_head.structure_residual.",
+                        "swin_unet.decoder_structure_blocks.0.directional_embedding.",
+                        "swin_unet.decoder_structure_blocks.1.directional_embedding.",
+                        "swin_unet.decoder_structure_blocks.2.directional_embedding.",
+                        "swin_unet.decoder_structure_blocks.3.directional_embedding.",
+                        "swin_unet.stage2_topology_source.directional_embedding.",
+                        "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
+                        "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
+                        "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
+                        "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
+                        "swin_unet.stage2_topology_source.surface_uncertainty_head.",
+                )
+                result = model.load_state_dict(
+                    checkpoint_state,
+                    strict=False,
+                )
+                invalid_missing = [
+                    key
+                    for key in result.missing_keys
+                    if not key.startswith(allowed_missing_prefixes)
+                ]
+                invalid_unexpected = [
+                    key
+                    for key in result.unexpected_keys
+                    if not key.startswith(allowed_unexpected_prefixes)
+                ]
+                if invalid_missing or invalid_unexpected:
+                    raise RuntimeError(
+                        "Checkpoint mismatch on resume: "
+                        f"missing={invalid_missing}, unexpected={invalid_unexpected}"
+                    ) from exc
                 print(
-                    "[INFO] Frozen 0626 backbone; trainable graph params: "
-                    f"{len(trainable)} tensors",
+                    "[WARN] Loaded checkpoint with strict=False; "
+                    "some modules use fresh initialization.",
                     flush=True,
                 )
-                # 0626 ckpt epoch 可能 > max_epochs；graph-only 是新实验，从 0 开始
-                start_epoch = 0
-                print(
-                    "[INFO] Graph-only fine-tune: reset start_epoch to 0 "
-                    f"(checkpoint had epoch={checkpoint.get('epoch', '?')})",
-                    flush=True,
-                )
-            else:
-                start_epoch = checkpoint.get('epoch', 0)
-            if not args.freeze_0626_backbone and not args.freeze_post_refine_interaction_only:
+            start_epoch = checkpoint.get('epoch', 0)
+            if not args.freeze_post_refine_interaction_only:
                 try:
                     loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
                     optimizer = build_layerwise_optimizer()
@@ -1444,15 +1594,7 @@ if __name__ == "__main__":
         optimizer = None
 
     if optimizer is None:
-        if args.freeze_0626_backbone:
-            graph_params = [p for p in model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                graph_params,
-                lr=args.graph_base_lr,
-                weight_decay=0.0001,
-            )
-        else:
-            optimizer = build_layerwise_optimizer()
+        optimizer = build_layerwise_optimizer()
 
     ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     if ema is not None and args.resume and 'checkpoint' in locals():
@@ -1468,6 +1610,15 @@ if __name__ == "__main__":
                     f"Detail: {exc}",
                     flush=True,
                 )
+
+    end_epoch = args.max_epochs
+    if args.finetune_epochs > 0:
+        end_epoch = min(args.max_epochs, start_epoch + int(args.finetune_epochs))
+        print(
+            f"[INFO] Fine-tune window: epochs {start_epoch + 1}-{end_epoch} "
+            f"(LR schedule still uses max_epochs={args.max_epochs})",
+            flush=True,
+        )
 
     # 训练循环
     print("\n开始训练...")
@@ -1486,6 +1637,13 @@ if __name__ == "__main__":
     print(f"  验证阈值: {args.threshold}")
     if args.max_train_batches > 0:
         print(f"  每轮最多训练batch数: {args.max_train_batches}")
+    if args.trend_val_every_steps > 0:
+        print(
+            f"  Trend validation: every {args.trend_val_every_steps} step(s), "
+            f"max_val_batches={args.trend_val_max_batches or 'all'}, "
+            f"short_area<{args.trend_val_short_area_threshold}",
+            flush=True,
+        )
     if args.resume:
         print(f"  从checkpoint恢复: {args.resume}")
         print(f"  起始epoch: {start_epoch}")
@@ -1583,7 +1741,35 @@ if __name__ == "__main__":
             loss_log_file.flush()
             batch_loss_log_file.flush()
 
-        for epoch in range(start_epoch, args.max_epochs):
+        trend_val_csv = args.trend_val_csv or os.path.join(args.output_dir, "trend_val_metrics.csv")
+        if args.trend_val_every_steps > 0:
+            os.makedirs(os.path.dirname(trend_val_csv), exist_ok=True)
+            if not os.path.exists(trend_val_csv) or os.path.getsize(trend_val_csv) == 0:
+                with open(trend_val_csv, "w", newline="", encoding="utf-8") as trend_file:
+                    csv.writer(trend_file).writerow([
+                        "epoch",
+                        "batch",
+                        "global_step",
+                        "lr",
+                        "threshold",
+                        "n_images",
+                        "iou",
+                        "recall",
+                        "precision",
+                        "cldice",
+                        "pred_comp",
+                        "gt_comp",
+                        "frag_idx",
+                        "extra_comp",
+                        "pred_short",
+                        "gt_short",
+                        "pred_largest_ratio",
+                        "gt_largest_ratio",
+                    ])
+            print(f"[INFO] Trend validation CSV: {trend_val_csv}", flush=True)
+
+        global_train_step = 0
+        for epoch in range(start_epoch, end_epoch):
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
             current_lr = get_cosine_warmup_lr(
@@ -1739,6 +1925,50 @@ if __name__ == "__main__":
                     f"{ms_per_batch:.3f}",
                 ])
                 batch_loss_log_file.flush()
+
+                global_train_step += 1
+                if (
+                    args.trend_val_every_steps > 0
+                    and global_train_step % args.trend_val_every_steps == 0
+                ):
+                    eval_model = ema.ema if ema is not None else model
+                    trend_metrics = evaluate_trend_topology_subset(
+                        eval_model,
+                        val_loader,
+                        threshold=args.threshold,
+                        max_batches=args.trend_val_max_batches,
+                        short_area_threshold=args.trend_val_short_area_threshold,
+                        stage_topology_alpha_scale=stage_topology_alpha_scale,
+                    )
+                    with open(trend_val_csv, "a", newline="", encoding="utf-8") as trend_file:
+                        csv.writer(trend_file).writerow([
+                            epoch + 1,
+                            i + 1,
+                            global_train_step,
+                            f"{current_lr:.8f}",
+                            f"{args.threshold:.6f}",
+                            trend_metrics["n_images"],
+                            f"{trend_metrics['iou']:.6f}",
+                            f"{trend_metrics['recall']:.6f}",
+                            f"{trend_metrics['precision']:.6f}",
+                            f"{trend_metrics['cldice']:.6f}",
+                            f"{trend_metrics['pred_comp']:.6f}",
+                            f"{trend_metrics['gt_comp']:.6f}",
+                            f"{trend_metrics['frag_idx']:.6f}",
+                            f"{trend_metrics['extra_comp']:.6f}",
+                            f"{trend_metrics['pred_short']:.6f}",
+                            f"{trend_metrics['gt_short']:.6f}",
+                            f"{trend_metrics['pred_largest_ratio']:.6f}",
+                            f"{trend_metrics['gt_largest_ratio']:.6f}",
+                        ])
+                    print(
+                        f"[TREND_VAL] epoch={epoch+1} batch={i+1} step={global_train_step} "
+                        f"IoU={trend_metrics['iou']:.4f} R={trend_metrics['recall']:.4f} "
+                        f"P={trend_metrics['precision']:.4f} clDice={trend_metrics['cldice']:.4f} "
+                        f"frag={trend_metrics['frag_idx']:.3f} extra={trend_metrics['extra_comp']:.2f}",
+                        flush=True,
+                    )
+                    model.train()
 
                 if (i + 1) % args.print_freq == 0 or i == 0:
                     print(

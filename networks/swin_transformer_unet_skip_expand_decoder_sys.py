@@ -8,6 +8,7 @@ from .dca_fpn_lite import DCAFPNLite
 from .msfe_block import MSFEBlock
 from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
+from .keypoint_global_topology import KeypointGuidedGlobalTopology
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
 from .skeleton_guided_head import (
@@ -16,24 +17,6 @@ from .skeleton_guided_head import (
     STAGE3_GLOBAL_CONTEXT_CHANNELS,
     SkeletonGuidedHead,
 )
-
-
-class MoEFFNGating(nn.Module):
-    def __init__(self, dim, hidden_dim, num_experts):
-        super(MoEFFNGating, self).__init__()
-        self.gating_network = nn.Linear(dim, dim)
-        self.experts = nn.ModuleList([nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim)) for _ in range(num_experts)])
-
-    def forward(self, x):
-        weights = self.gating_network(x)
-        weights = torch.nn.functional.softmax(weights, dim=-1)
-        outputs = [expert(x) for expert in self.experts]
-        outputs = torch.stack(outputs, dim=0)
-        outputs = (weights.unsqueeze(0) * outputs).sum(dim=0)
-        return outputs
 
 
 class Mlp(nn.Module):
@@ -344,43 +327,6 @@ def map_to_token(x):
     x = x.permute(0, 2, 3, 1).contiguous()
     x = x.view(B, H * W, C)
     return x
-
-
-class HighResStructureEncoder(nn.Module):
-    def __init__(self, in_channels, struct_channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, struct_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(struct_channels),
-            nn.GELU(),
-            nn.Conv2d(
-                struct_channels,
-                struct_channels,
-                kernel_size=3,
-                padding=1,
-                groups=struct_channels,
-                bias=False,
-            ),
-            nn.BatchNorm2d(struct_channels),
-            nn.GELU(),
-            nn.Conv2d(struct_channels, struct_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(struct_channels),
-            nn.GELU(),
-        )
-        self._init_weights()
-
-    def forward(self, x):
-        return self.net(x)
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
 
 
 def _largest_group_divisor(channels, candidates=(8, 4, 2, 1)):
@@ -1605,7 +1551,6 @@ class BasicLayer_up(nn.Module):
         connectivity_prob=None,
         topology_alpha=None,
         roadness_prob=None,
-        topology_gate=None,
         decoder_skeleton_prob=None,
         decoder_connectivity_prob=None,
         decoder_direction_prob=None,
@@ -1657,14 +1602,6 @@ class BasicLayer_up(nn.Module):
                     decoder_connectivity_prob=decoder_connectivity_prob,
                     decoder_direction_prob=decoder_direction_prob,
                 )
-        if topology_gate is not None:
-            if skeleton_prob is None or connectivity_prob is None:
-                raise ValueError("Topology gate requires skeleton/connectivity probabilities.")
-            x = topology_gate(
-                x,
-                skeleton_prob,
-                connectivity_prob,
-            )
         if self.upsample is not None:
             x = self.upsample(x)
         return x
@@ -1767,267 +1704,6 @@ class TopologyAttentionScale(nn.Module):
         return self.alpha_max * torch.sigmoid(self.topology_alpha)
 
 
-class _UnusedLegacyTopologyAwareSwinBlock(nn.Module):
-    """Legacy extra-block implementation; retained only for checkpoint archaeology."""
-
-    def __init__(
-        self,
-        dim,
-        input_resolution,
-        num_heads,
-        window_size=8,
-        shift_size=0,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path=0.0,
-        norm_layer=nn.LayerNorm,
-        topology_alpha_max=0.20,
-        topology_alpha_init=0.02,
-        topology_alpha_trainable=False,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.window_size = min(window_size, min(input_resolution))
-        self.shift_size = 0 if min(input_resolution) <= window_size else shift_size
-
-        self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim,
-            window_size=to_2tuple(self.window_size),
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-        )
-        self.topology_alpha_max = float(topology_alpha_max)
-        alpha_ratio = float(topology_alpha_init) / self.topology_alpha_max
-        if not 0.0 < alpha_ratio < 1.0:
-            raise ValueError("topology_alpha_init must be between 0 and topology_alpha_max")
-        raw_alpha_init = torch.logit(torch.tensor(alpha_ratio))
-        # Keep the state-dict key for checkpoint compatibility; this stores raw alpha.
-        self.topology_alpha = nn.Parameter(
-            raw_alpha_init,
-            requires_grad=bool(topology_alpha_trainable),
-        )
-        self.capture_topology_diagnostics = False
-        self.last_topology_diagnostics = None
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
-            act_layer=nn.GELU,
-            drop=drop,
-        )
-
-        self._register_topology_buffers()
-        self._register_attention_mask()
-
-    def _register_topology_buffers(self):
-        coords_h = torch.arange(self.window_size)
-        coords_w = torch.arange(self.window_size)
-        coords = torch.stack(
-            torch.meshgrid(coords_h, coords_w, indexing="ij"),
-            dim=-1,
-        ).view(-1, 2)
-        delta = coords.unsqueeze(0) - coords.unsqueeze(1)
-        dy = delta[..., 0]
-        dx = delta[..., 1]
-
-        target_dy = -dy
-        target_dx = -dx
-        direction = torch.zeros_like(dy, dtype=torch.long)
-        direction[(target_dy < 0) & (target_dx == 0)] = 0
-        direction[(target_dy < 0) & (target_dx > 0)] = 1
-        direction[(target_dy == 0) & (target_dx > 0)] = 2
-        direction[(target_dy > 0) & (target_dx > 0)] = 3
-        direction[(target_dy > 0) & (target_dx == 0)] = 4
-        direction[(target_dy > 0) & (target_dx < 0)] = 5
-        direction[(target_dy == 0) & (target_dx < 0)] = 6
-        direction[(target_dy < 0) & (target_dx < 0)] = 7
-
-        opposite = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.long)
-        direction_one_hot = F.one_hot(direction, num_classes=8).float()
-        opposite_one_hot = F.one_hot(opposite[direction], num_classes=8).float()
-        distance = torch.maximum(dy.abs(), dx.abs()).float()
-        distance_decay = 1.0 / (1.0 + distance)
-        distance_decay[distance == 0] = 0.0
-
-        self.register_buffer("direction_one_hot", direction_one_hot)
-        self.register_buffer("opposite_direction_one_hot", opposite_one_hot)
-        self.register_buffer("topology_distance_decay", distance_decay)
-
-    def _register_attention_mask(self):
-        if self.shift_size == 0:
-            self.register_buffer("attn_mask", None)
-            return
-
-        height, width = self.input_resolution
-        img_mask = torch.zeros((1, height, width, 1))
-        h_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
-        w_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
-        count = 0
-        for h_slice in h_slices:
-            for w_slice in w_slices:
-                img_mask[:, h_slice, w_slice, :] = count
-                count += 1
-
-        mask_windows = window_partition(img_mask, self.window_size).view(
-            -1,
-            self.window_size * self.window_size,
-        )
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(
-            attn_mask != 0,
-            float(-100.0),
-        ).masked_fill(attn_mask == 0, 0.0)
-        self.register_buffer("attn_mask", attn_mask)
-
-    def _topology_bias(self, skeleton_windows, connectivity_windows):
-        conn_forward = torch.einsum(
-            "bik,ijk->bij",
-            connectivity_windows,
-            self.direction_one_hot,
-        )
-        conn_backward = torch.einsum(
-            "bjk,ijk->bij",
-            connectivity_windows,
-            self.opposite_direction_one_hot,
-        )
-        skeleton_pair = skeleton_windows * skeleton_windows.transpose(1, 2)
-        return (
-            skeleton_pair
-            * 0.5
-            * (conn_forward + conn_backward)
-            * self.topology_distance_decay.unsqueeze(0)
-        )
-
-    def effective_topology_alpha(self):
-        return self.topology_alpha_max * torch.sigmoid(self.topology_alpha)
-
-    def _prepare_topology_windows(self, x, skeleton, connectivity):
-        if self.shift_size > 0:
-            shifts = (-self.shift_size, -self.shift_size)
-            x = torch.roll(x, shifts=shifts, dims=(1, 2))
-            skeleton = torch.roll(skeleton, shifts=shifts, dims=(1, 2))
-            connectivity = torch.roll(connectivity, shifts=shifts, dims=(1, 2))
-
-        channels = x.shape[-1]
-        x_windows = window_partition(x, self.window_size).view(
-            -1,
-            self.window_size * self.window_size,
-            channels,
-        )
-        skeleton_windows = window_partition(skeleton, self.window_size).view(
-            -1,
-            self.window_size * self.window_size,
-            1,
-        )
-        connectivity_windows = window_partition(connectivity, self.window_size).view(
-            -1,
-            self.window_size * self.window_size,
-            8,
-        )
-        return x_windows, skeleton_windows, connectivity_windows
-
-    def forward(self, x, skeleton_prob, connectivity_prob):
-        height, width = self.input_resolution
-        batch, length, channels = x.shape
-        if length != height * width:
-            raise ValueError("topology-aware block input feature has wrong size")
-
-        shortcut = x
-        x = self.norm1(x).view(batch, height, width, channels)
-        skeleton = skeleton_prob.permute(0, 2, 3, 1).contiguous()
-        connectivity = connectivity_prob.permute(0, 2, 3, 1).contiguous()
-
-        x_windows, skeleton_windows, connectivity_windows = (
-            self._prepare_topology_windows(
-                x,
-                skeleton,
-                connectivity,
-            )
-        )
-        topology_bias = self._topology_bias(
-            skeleton_windows,
-            connectivity_windows,
-        )
-        alpha_eff = self.effective_topology_alpha()
-        attended = self.attn(
-            x_windows,
-            mask=self.attn_mask,
-            topology_bias=topology_bias,
-            topology_alpha=alpha_eff,
-        )
-        if self.capture_topology_diagnostics:
-            with torch.no_grad():
-                topology_term = alpha_eff * topology_bias
-                baseline_attended = self.attn(
-                    x_windows,
-                    mask=self.attn_mask,
-                    topology_bias=topology_bias,
-                    topology_alpha=alpha_eff.new_zeros(()),
-                )
-                output_diff = (attended - baseline_attended).abs().mean()
-                relative_diff = output_diff / (
-                    baseline_attended.abs().mean() + 1e-6
-                )
-                conn_strength = connectivity_prob.topk(
-                    k=min(2, connectivity_prob.shape[1]),
-                    dim=1,
-                ).values.mean(dim=1)
-                self.last_topology_diagnostics = {
-                    "alpha_eff": float(alpha_eff.detach().cpu()),
-                    "topology_bias_mean": float(topology_bias.mean().detach().cpu()),
-                    "topology_bias_max": float(topology_bias.max().detach().cpu()),
-                    "topology_bias_min": float(topology_bias.min().detach().cpu()),
-                    "topology_term_mean": float(topology_term.mean().detach().cpu()),
-                    "topology_term_max": float(topology_term.max().detach().cpu()),
-                    "topology_term_min": float(topology_term.min().detach().cpu()),
-                    "attention_output_diff": float(output_diff.detach().cpu()),
-                    "attention_relative_diff": float(relative_diff.detach().cpu()),
-                    "skeleton_prob_mean": float(skeleton_prob.mean().detach().cpu()),
-                    "skeleton_prob_max": float(skeleton_prob.max().detach().cpu()),
-                    "skeleton_prob_min": float(skeleton_prob.min().detach().cpu()),
-                    "conn_strength_mean": float(conn_strength.mean().detach().cpu()),
-                    "conn_strength_max": float(conn_strength.max().detach().cpu()),
-                    "conn_strength_min": float(conn_strength.min().detach().cpu()),
-                }
-        attended = attended.view(
-            -1,
-            self.window_size,
-            self.window_size,
-            channels,
-        )
-        x = window_reverse(attended, self.window_size, height, width)
-
-        if self.shift_size > 0:
-            x = torch.roll(
-                x,
-                shifts=(self.shift_size, self.shift_size),
-                dims=(1, 2),
-            )
-
-        x = x.view(batch, height * width, channels)
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
-
-
 class SwinTransformerSys(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -2055,7 +1731,7 @@ class SwinTransformerSys(nn.Module):
     """
 
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
-                 embed_dim=96, depths=[2, 2, 2, 2], depths_decoder=[1, 2, 2, 2], num_heads=[3, 6, 12, 24],
+                 embed_dim=96, depths=[2, 2, 2, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
@@ -2069,7 +1745,6 @@ class SwinTransformerSys(nn.Module):
                  stage_topology_ratio=DEFAULT_STAGE_TOPOLOGY_RATIO,
                  stage_topology_topo_clip=DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP,
                  structure_profile="full",
-                 enable_final_graph_prop=False,
                  use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
@@ -2079,13 +1754,20 @@ class SwinTransformerSys(nn.Module):
                  highres_structure_fuse_stages="stage23",
                  highres_structure_fusion_mode="stage23",
                  enable_post_refine_structure_interaction=False,
+                 enable_global_topology=False,
+                 global_topology_max_nodes=32,
+                 global_topology_heads=4,
+                 global_topology_alpha_max=0.05,
                  **kwargs):
         super().__init__()
 
         print(
-            "SwinTransformerSys expand initial----depths:{};depths_decoder:{};drop_path_rate:{};num_classes:{}".format(
+            "SwinTransformerSys expand initial----depths:{};drop_path_rate:{};num_classes:{}".format(
                 depths,
-                depths_decoder, drop_path_rate, num_classes))
+                drop_path_rate,
+                num_classes,
+            )
+        )
 
         self.num_classes = num_classes
         self.num_layers = len(depths)
@@ -2111,20 +1793,28 @@ class SwinTransformerSys(nn.Module):
         self.stage_topology_ratio = float(stage_topology_ratio)
         self.stage_topology_topo_clip = float(stage_topology_topo_clip)
         self.structure_profile = structure_profile.lower()
-        if self.structure_profile not in {"full", "stage23_boundary_0626"}:
+        if self.structure_profile not in {
+            "full",
+            "stage23_boundary_0626",
+            "stage23_boundary_0626_final_ske",
+        }:
             raise ValueError(
-                "structure_profile must be one of: full, stage23_boundary_0626"
+                "structure_profile must be one of: full, stage23_boundary_0626, "
+                "stage23_boundary_0626_final_ske"
             )
         self.use_stage3_global_context = (
-            self.structure_profile == "stage23_boundary_0626"
+            self.structure_profile in {
+                "stage23_boundary_0626",
+                "stage23_boundary_0626_final_ske",
+            }
         )
         self.use_msfe_skip = bool(use_msfe_skip)
         self.stage2_skeleton_gradient_ratio = float(stage2_skeleton_gradient_ratio)
         self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
         self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
-        self.highres_structure_source = "prepatch"
         self.highres_structure_channels = int(highres_structure_channels)
+        self.enable_global_topology = bool(enable_global_topology)
         self.highres_structure_fuse_stages = str(highres_structure_fuse_stages).lower()
         self._highres_structure_shape_logged = False
         self.last_highres_z_struct = None
@@ -2359,10 +2049,6 @@ class SwinTransformerSys(nn.Module):
                 for stage_index, channels in enumerate(decoder_structure_channels)
             ]
         )
-        self.highres_structure_encoder = HighResStructureEncoder(
-            in_channels=self.embed_dim,
-            struct_channels=self.highres_structure_channels,
-        )
         self.prepatch_structure_encoder = PrePatchStructureEncoder(
             struct_channels=self.highres_structure_channels,
         )
@@ -2382,15 +2068,17 @@ class SwinTransformerSys(nn.Module):
             self.highres_structure_channels,
         )
         print(
-            "[INFO] High-res structure stream: {}, source={}, channels={}, fuse_stages={}, fusion_mode={}".format(
+            "[INFO] High-res structure stream: {}, source=prepatch, channels={}, fuse_stages={}, fusion_mode={}".format(
                 "enabled" if self.enable_highres_structure_stream else "disabled",
-                self.highres_structure_source,
                 self.highres_structure_channels,
                 self.highres_structure_fuse_stages,
                 self.highres_structure_fusion_mode,
             )
         )
-        if self.structure_profile == "stage23_boundary_0626":
+        if self.structure_profile in {
+            "stage23_boundary_0626",
+            "stage23_boundary_0626_final_ske",
+        }:
             print(
                 "[INFO] Decoder structure gates: stage2/stage3 only "
                 "(0626 profile), channels={}".format(
@@ -2400,6 +2088,10 @@ class SwinTransformerSys(nn.Module):
             print(
                 "[INFO] Stage2 direct topology feature residual enabled; "
                 "stage2 structure gate can refine decoder features"
+            )
+            print(
+                "[INFO] Decoder structure gate input: gate feature + skeleton "
+                "+ connectivity; stage3 step0 removed"
             )
             print(
                 "[INFO] Global context calibration: bottleneck GAP -> "
@@ -2445,6 +2137,14 @@ class SwinTransformerSys(nn.Module):
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
             if self.return_skeleton:
+                self.global_topology = KeypointGuidedGlobalTopology(
+                    channels=embed_dim,
+                    struct_channels=self.highres_structure_channels,
+                    max_nodes=global_topology_max_nodes,
+                    heads=global_topology_heads,
+                    alpha_max=global_topology_alpha_max,
+                    enabled=self.enable_global_topology,
+                )
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,
                     hidden_channels=max(embed_dim // 2, 32),
@@ -2453,6 +2153,10 @@ class SwinTransformerSys(nn.Module):
                     gap_rho_init=final_gap_rho_init,
                     enable_final_structure=(
                         self.structure_profile != "stage23_boundary_0626"
+                        and self.structure_profile != "stage23_boundary_0626_final_ske"
+                    ),
+                    enable_final_skeleton_aux=(
+                        self.structure_profile == "stage23_boundary_0626_final_ske"
                     ),
                     final_skeleton_gradient_ratio=self.final_skeleton_gradient_ratio,
                     enable_post_refine_structure_interaction=(
@@ -2464,6 +2168,17 @@ class SwinTransformerSys(nn.Module):
                     print(
                         "[INFO] Final head: surface + boundary residual only "
                         "(0626 profile; final skeleton/connectivity removed)"
+                    )
+                elif self.structure_profile == "stage23_boundary_0626_final_ske":
+                    print(
+                        "[INFO] Final head: surface + boundary residual + "
+                        "final skeleton auxiliary only "
+                        "(0626 profile; final connectivity removed)"
+                    )
+                if self.enable_global_topology:
+                    print(
+                        "[INFO] Global topology residual: anchors=z_struct*surface, "
+                        "tokens=z_struct"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
@@ -2497,7 +2212,6 @@ class SwinTransformerSys(nn.Module):
         road_attentions = []
         stage1_road_attention = None
         stage2_road_attention = None
-        stage1_tokens = None
 
         for i_layer, layer in enumerate(self.layers):
             x_downsample.append(x)
@@ -2509,8 +2223,6 @@ class SwinTransformerSys(nn.Module):
                     else None
                 ),
             )
-            if i_layer == 0:
-                stage1_tokens = layer.last_pre_downsample
             if i_layer == 0 and layer.last_road_attention is not None:
                 stage1_road_attention = layer.last_road_attention
                 road_attentions.append(
@@ -2532,7 +2244,7 @@ class SwinTransformerSys(nn.Module):
         x = self.bottleneck_swin_block(x)
         x = self.norm(x)  # B L C
 
-        return x, x_downsample, road_attentions, stage1_tokens
+        return x, x_downsample, road_attentions
 
     def _highres_structure_stage_enabled(self, stage):
         if not self.enable_highres_structure_stream:
@@ -2550,13 +2262,7 @@ class SwinTransformerSys(nn.Module):
     def _build_highres_structure_outputs(self, structure_input):
         if not self.enable_highres_structure_stream or structure_input is None:
             return None, None
-        if self.highres_structure_source == "stage1_tokens":
-            if structure_input.dim() == 3:
-                height, width = self.patches_resolution
-                structure_input = token_to_map(structure_input, height, width)
-            z_struct = self.highres_structure_encoder(structure_input)
-        else:
-            z_struct = self.prepatch_structure_encoder(structure_input)
+        z_struct = self.prepatch_structure_encoder(structure_input)
         if not self._highres_structure_shape_logged:
             expected_stage1_shape = (
                 structure_input.shape[0],
@@ -2565,8 +2271,7 @@ class SwinTransformerSys(nn.Module):
                 self.patches_resolution[1],
             )
             print(
-                "[HighRes Structure] source={} expected_stage1_z_struct={} z_struct={}".format(
-                    self.highres_structure_source,
+                "[HighRes Structure] source=prepatch expected_stage1_z_struct={} z_struct={}".format(
                     expected_stage1_shape,
                     tuple(z_struct.shape),
                 ),
@@ -2623,7 +2328,10 @@ class SwinTransformerSys(nn.Module):
         return False
 
     def _decoder_structure_enabled(self, stage):
-        if self.structure_profile == "stage23_boundary_0626":
+        if self.structure_profile in {
+            "stage23_boundary_0626",
+            "stage23_boundary_0626_final_ske",
+        }:
             return stage in (2, 3)
         return True
 
@@ -3126,6 +2834,40 @@ class SwinTransformerSys(nn.Module):
 
         return x, structure_outputs
 
+    def _surface_prior_for_global_topology(self, x, z_struct):
+        prior_modules = (
+            self.guided_head.surface_proj,
+            self.guided_head.surface_branch,
+            self.guided_head.surface_refine,
+            self.guided_head.surface_head,
+        )
+        if getattr(
+            self.guided_head,
+            "enable_post_refine_structure_interaction",
+            False,
+        ):
+            prior_modules = (
+                *prior_modules,
+                self.guided_head.post_refine_structure_interaction,
+            )
+        prior_training = [module.training for module in prior_modules]
+        for module in prior_modules:
+            module.eval()
+        try:
+            with torch.no_grad():
+                surface_feat = self.guided_head.surface_branch(
+                    self.guided_head.surface_proj(x)
+                )
+                surface_feat = self.guided_head.surface_refine(surface_feat)
+                surface_feat = self.guided_head._apply_post_refine_structure_interaction(
+                    surface_feat,
+                    z_struct,
+                )
+                return torch.sigmoid(self.guided_head.surface_head(surface_feat))
+        finally:
+            for module, was_training in zip(prior_modules, prior_training):
+                module.train(was_training)
+
     def up_x4(self, x, structure_outputs=None, z_struct=None):
         H, W = self.patches_resolution
         B, L, C = x.shape
@@ -3136,6 +2878,16 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
+                if self.enable_global_topology and z_struct is not None:
+                    surface_prob = self._surface_prior_for_global_topology(
+                        x,
+                        z_struct,
+                    )
+                    x = self.global_topology.forward_feature_anchors(
+                        x,
+                        z_struct,
+                        surface_prob,
+                    )
                 x = self.guided_head(x, z_struct=z_struct)
             else:
                 x = self.output(x)
@@ -3150,9 +2902,7 @@ class SwinTransformerSys(nn.Module):
         teacher_forcing_ratio=0.0,
     ):
         structure_input = x
-        x, x_downsample, road_attentions, stage1_tokens = self.forward_features(x)
-        if self.highres_structure_source == "stage1_tokens":
-            structure_input = stage1_tokens
+        x, x_downsample, road_attentions = self.forward_features(x)
         z_struct, highres_structure_skeleton = self._build_highres_structure_outputs(
             structure_input
         )
