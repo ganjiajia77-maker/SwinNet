@@ -88,6 +88,7 @@ def main():
     parser.add_argument('--root_path', type=str, default='./data1')
     parser.add_argument('--model_path', type=str, 
                        default='./model_out/train_skeleton_20260521_200553/checkpoints/epoch_100.pth')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'])
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--img_size', type=int, default=224)
@@ -170,10 +171,10 @@ def main():
     model.eval()
     print('Model loaded')
     
-    print('\nLoading test dataset')
+    print('\nLoading {} dataset'.format(args.split))
     test_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
-        split='test',
+        split=args.split,
         image_size=args.img_size,
         source_patch_size=args.source_patch_size,
     )
@@ -183,7 +184,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
     )
-    print('Test set size: {}'.format(len(test_dataset)))
+    print('{} set size: {}'.format(args.split, len(test_dataset)))
     
     print('\nRunning inference on test set')
     all_surface_logits = []
@@ -223,7 +224,7 @@ def main():
     print('Inference complete')
     
     print('\n' + '='*80)
-    print('SURFACE SEGMENTATION - THRESHOLD SWEEP (TEST SET)')
+    print('SURFACE SEGMENTATION - THRESHOLD SWEEP ({} SET)'.format(args.split.upper()))
     print('='*80)
     print('Input pipeline: 1024 center crop/pad -> resize256 -> model -> threshold -> global TP/FP/FN')
     print('{:<12} {:<12} {:<12} {:<12} {:<12} {:<12}'.format('Threshold', 'IoU', 'F1', 'Precision', 'Recall', 'clDice'))
@@ -255,7 +256,7 @@ def main():
     
     if all_skeleton_logits:
         print('\n' + '='*80)
-        print('SKELETON SEGMENTATION - THRESHOLD SWEEP (TEST SET)')
+        print('SKELETON SEGMENTATION - THRESHOLD SWEEP ({} SET)'.format(args.split.upper()))
         print('='*80)
         print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format('Threshold', 'IoU', 'F1', 'Precision', 'Recall'))
         print('-'*60)
