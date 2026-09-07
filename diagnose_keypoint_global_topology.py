@@ -322,6 +322,17 @@ def run_coverage(args):
         "fn_pixels": 0,
         "fn_hit": 0,
     }
+    transition_totals = {
+        "FN_to_TP": 0,
+        "TP_to_FN": 0,
+        "TN_to_FP": 0,
+        "FP_to_TN": 0,
+    }
+    background_delta_norm = {
+        "before_gate_sum": 0.0,
+        "after_gate_sum": 0.0,
+        "pixels": 0,
+    }
     attention_same_values = []
     attention_different_values = []
     attention_delta_values = []
@@ -346,6 +357,46 @@ def run_coverage(args):
             global_topology.enable_global_topology = True
             global_logits = model(images)[0]
             global_topology.enable_global_topology = old_enabled
+
+            global_pred = torch.sigmoid(global_logits) > args.pred_threshold
+            transition_totals["FN_to_TP"] += int(
+                ((~baseline_pred) & global_pred & gt_mask).sum().item()
+            )
+            transition_totals["TP_to_FN"] += int(
+                (baseline_pred & (~global_pred) & gt_mask).sum().item()
+            )
+            transition_totals["TN_to_FP"] += int(
+                ((~baseline_pred) & global_pred & (~gt_mask)).sum().item()
+            )
+            transition_totals["FP_to_TN"] += int(
+                (baseline_pred & (~global_pred) & (~gt_mask)).sum().item()
+            )
+
+            delta_before_gate = global_topology.last_delta_before_gate
+            delta_after_gate = global_topology.last_delta_after_gate
+            if delta_before_gate is not None and delta_after_gate is not None:
+                background = ~gt_mask
+                if background.shape[-2:] != delta_before_gate.shape[-2:]:
+                    background = F.interpolate(
+                        background.float(),
+                        size=delta_before_gate.shape[-2:],
+                        mode="nearest",
+                    ).bool()
+                before_norm = torch.linalg.vector_norm(
+                    delta_before_gate.float(), dim=1, keepdim=True
+                )
+                after_norm = torch.linalg.vector_norm(
+                    delta_after_gate.float(), dim=1, keepdim=True
+                )
+                pixel_count = int(background.sum().item())
+                if pixel_count:
+                    background_delta_norm["before_gate_sum"] += float(
+                        before_norm[background].sum().item()
+                    )
+                    background_delta_norm["after_gate_sum"] += float(
+                        after_norm[background].sum().item()
+                    )
+                    background_delta_norm["pixels"] += pixel_count
 
             g_global = global_topology.last_g_global.to(device)
             if g_global.shape[-2:] != gt_mask.shape[-2:]:
@@ -423,6 +474,16 @@ def run_coverage(args):
         "tp_coverage": total_rate("tp_hit", "tp_pixels"),
         "fp_coverage": total_rate("fp_hit", "fp_pixels"),
         "fn_coverage": total_rate("fn_hit", "fn_pixels"),
+        **transition_totals,
+        "background_delta_norm_before_gate": (
+            background_delta_norm["before_gate_sum"]
+            / max(background_delta_norm["pixels"], 1)
+        ),
+        "background_delta_norm_after_gate": (
+            background_delta_norm["after_gate_sum"]
+            / max(background_delta_norm["pixels"], 1)
+        ),
+        "background_delta_pixels": background_delta_norm["pixels"],
         **totals,
     }
 
