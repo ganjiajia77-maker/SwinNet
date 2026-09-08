@@ -229,6 +229,12 @@ parser.add_argument(
     help='gamma for focal weighting on connectivity BCE; 0 disables focal weighting',
 )
 parser.add_argument(
+    '--edge_contrastive_margin',
+    type=float,
+    default=0.0,
+    help='margin for connectivity edge discrimination loss max(0, margin - C_pos + C_neg); 0 disables',
+)
+parser.add_argument(
     '--disable_msfe_skip',
     action='store_true',
     help='ablate MSFE blocks on decoder skip stages inx=2,3; DCA-FPN remains enabled',
@@ -371,6 +377,7 @@ def build_criterion(args, loss_weights, device):
         directional_pos_weight_cardinal=args.directional_pos_weight_cardinal,
         directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
+        edge_contrastive_margin=args.edge_contrastive_margin,
     ).to(device)
 
 
@@ -424,7 +431,7 @@ def format_training_config_lines(args, loss_weights):
         if args.masked_connectivity_center_experiment:
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
-                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}",
+                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}, edge_contrastive_margin={args.edge_contrastive_margin:.3f}",
             ])
     else:
         lines.extend([

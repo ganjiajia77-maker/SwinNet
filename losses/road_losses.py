@@ -322,6 +322,7 @@ class SurfaceStructureLoss(nn.Module):
         directional_pos_weight_cardinal=1.0,
         directional_pos_weight_diagonal=2.5,
         connectivity_focal_gamma=0.0,
+        edge_contrastive_margin=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -366,6 +367,7 @@ class SurfaceStructureLoss(nn.Module):
         self.directional_pos_weight_cardinal = float(directional_pos_weight_cardinal)
         self.directional_pos_weight_diagonal = float(directional_pos_weight_diagonal)
         self.connectivity_focal_gamma = float(connectivity_focal_gamma)
+        self.edge_contrastive_margin = float(edge_contrastive_margin)
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
 
@@ -457,6 +459,26 @@ class SurfaceStructureLoss(nn.Module):
         x0 = max(dx, 0)
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
+    @staticmethod
+    def _edge_contrastive_loss(conn_prob, connectivity_gt, valid, margin):
+        margin = float(margin)
+        if margin <= 0.0:
+            return conn_prob.sum() * 0.0
+        losses = []
+        for batch_index in range(conn_prob.shape[0]):
+            valid_i = valid[batch_index] > 0.5
+            gt_i = connectivity_gt[batch_index] > 0.5
+            pos = conn_prob[batch_index][valid_i & gt_i]
+            neg = conn_prob[batch_index][valid_i & (~gt_i)]
+            if pos.numel() == 0 or neg.numel() == 0:
+                continue
+            hard_count = min(int(pos.numel()), int(neg.numel()))
+            hard_neg = neg.topk(k=hard_count, largest=True).values
+            losses.append(F.relu(conn_prob.new_tensor(margin) - pos.mean() + hard_neg.mean()))
+        if not losses:
+            return conn_prob.sum() * 0.0
+        return torch.stack(losses).mean()
+
     def stage_connectivity_loss(
         self,
         connectivity_logits,
@@ -535,6 +557,12 @@ class SurfaceStructureLoss(nn.Module):
             loss_bce = (bce_map * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
 
         conn_prob = torch.sigmoid(connectivity_logits)
+        loss_edge_contrastive = self._edge_contrastive_loss(
+            conn_prob,
+            connectivity_gt,
+            valid,
+            self.edge_contrastive_margin,
+        )
         if use_skeleton_center_mask:
             loss_edge_dice = conn_prob.sum() * 0.0
         else:
@@ -570,8 +598,17 @@ class SurfaceStructureLoss(nn.Module):
         loss_symmetry = torch.stack(symmetry_terms).mean()
 
         if use_skeleton_center_mask:
-            return loss_bce + (float(symmetry_weight) * loss_symmetry)
-        return loss_bce + 0.30 * loss_edge_dice + (float(symmetry_weight) * loss_symmetry)
+            return (
+                loss_bce
+                + loss_edge_contrastive
+                + (float(symmetry_weight) * loss_symmetry)
+            )
+        return (
+            loss_bce
+            + 0.30 * loss_edge_dice
+            + loss_edge_contrastive
+            + (float(symmetry_weight) * loss_symmetry)
+        )
 
     def stage_skeleton_loss(self, stage_outputs, skeleton_gt, skeleton_dilate_gt):
         if not stage_outputs:

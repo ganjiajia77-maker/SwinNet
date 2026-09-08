@@ -103,7 +103,6 @@ def main():
         config=config,
         img_size=args.img_size,
         num_classes=1,
-        use_asterisk=True,
         return_skeleton=True,
         structure_profile=args.structure_profile,
         use_msfe_skip=not args.disable_msfe_skip,

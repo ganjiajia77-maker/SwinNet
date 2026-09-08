@@ -49,6 +49,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
             nn.Linear(relation_hidden, heads),
         )
         self.token_relation_scale = nn.Parameter(torch.tensor(0.1))
+        self.connectivity_topology_bias_scale = nn.Parameter(torch.tensor(0.1))
+        self.direction_topology_bias_scale = nn.Parameter(torch.tensor(0.1))
         self.grid_q = nn.Linear(channels, channels)
         self.node_kv = nn.Linear(channels, channels * 2)
         self.output_projection = nn.Linear(channels, channels)
@@ -214,7 +216,29 @@ class KeypointGuidedGlobalTopology(nn.Module):
         valid_pair = valid[:, None, :, None] & valid[:, None, None, :]
         return bias.masked_fill(~valid_pair, 0.0)
 
-    def _refine_tokens_with_relative_topology(self, node_feature, coords, valid, anchor_hw):
+    def _local_topology_bias(self, connectivity_feature, direction_feature, valid):
+        batch, nodes, _ = connectivity_feature.shape
+        bias = connectivity_feature.new_zeros(batch, self.heads, nodes, nodes)
+        valid_pair = valid[:, None, :, None] & valid[:, None, None, :]
+        if connectivity_feature is not None and connectivity_feature.numel() > 0:
+            conn = F.normalize(connectivity_feature.float(), dim=-1, eps=1e-6)
+            conn_similarity = torch.matmul(conn, conn.transpose(1, 2))
+            bias = bias + self.connectivity_topology_bias_scale * conn_similarity[:, None]
+        if direction_feature is not None and direction_feature.numel() > 0:
+            direction = F.normalize(direction_feature.float(), dim=-1, eps=1e-6)
+            direction_similarity = torch.matmul(direction, direction.transpose(1, 2))
+            bias = bias + self.direction_topology_bias_scale * direction_similarity[:, None]
+        return bias.to(dtype=connectivity_feature.dtype).masked_fill(~valid_pair, 0.0)
+
+    def _refine_tokens_with_relative_topology(
+        self,
+        node_feature,
+        coords,
+        valid,
+        anchor_hw,
+        connectivity_feature=None,
+        direction_feature=None,
+    ):
         batch, nodes, channels = node_feature.shape
         qkv = self.token_relation_qkv(node_feature).reshape(
             batch,
@@ -228,7 +252,14 @@ class KeypointGuidedGlobalTopology(nn.Module):
             channels // self.heads
         )
         topology_bias = self._relative_topology_bias(coords, valid, anchor_hw)
-        logits = logits + self.token_relation_scale * topology_bias
+        local_topology_bias = node_feature.new_zeros(batch, self.heads, nodes, nodes)
+        if connectivity_feature is not None and direction_feature is not None:
+            local_topology_bias = self._local_topology_bias(
+                connectivity_feature,
+                direction_feature,
+                valid,
+            )
+        logits = logits + self.token_relation_scale * topology_bias + local_topology_bias
         logits = logits.masked_fill(
             ~valid[:, None, None, :],
             -torch.finfo(logits.dtype).max,
@@ -241,7 +272,11 @@ class KeypointGuidedGlobalTopology(nn.Module):
         )
         attended = self.token_relation_projection(attended)
         refined = node_feature + attended
-        return refined * valid.unsqueeze(-1).to(dtype=refined.dtype), topology_bias
+        return (
+            refined * valid.unsqueeze(-1).to(dtype=refined.dtype),
+            topology_bias,
+            local_topology_bias,
+        )
 
     def _cross_attention_from_structure_tokens(self, feature, node_feature, valid):
         batch, channels, height, width = feature.shape
@@ -373,11 +408,17 @@ class KeypointGuidedGlobalTopology(nn.Module):
             dim=-1,
         )
         node_feature = self.node_projection(node_input)
-        node_feature, topology_bias = self._refine_tokens_with_relative_topology(
+        (
+            node_feature,
+            topology_bias,
+            local_topology_bias,
+        ) = self._refine_tokens_with_relative_topology(
             node_feature,
             coords,
             valid,
             anchor_hw=(height, width),
+            connectivity_feature=sampled_connectivity,
+            direction_feature=sampled_direction,
         )
         context = self._cross_attention_from_structure_tokens(
             feature,
@@ -404,6 +445,15 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "surface_gate_max": surface_gate.amax(dim=(1, 2, 3)).detach(),
                     "token_relation_scale": self.token_relation_scale.detach(),
                     "token_relation_bias_abs_mean": topology_bias.abs().mean().detach(),
+                    "connectivity_topology_bias_scale": (
+                        self.connectivity_topology_bias_scale.detach()
+                    ),
+                    "direction_topology_bias_scale": (
+                        self.direction_topology_bias_scale.detach()
+                    ),
+                    "local_topology_bias_abs_mean": (
+                        local_topology_bias.abs().mean().detach()
+                    ),
                     "connectivity_token_abs_mean": (
                         sampled_connectivity.abs().mean()
                     ).detach(),
