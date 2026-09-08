@@ -116,6 +116,31 @@ def apply_structure_profile_runtime(model):
     guided_head.raw_rho_gap.requires_grad_(False)
 
 
+def upgrade_global_topology_projection_if_needed(model, state_dict, missing_keys):
+    old_weight = "swin_unet.global_topology.node_projection.weight"
+    old_bias = "swin_unet.global_topology.node_projection.bias"
+    new_weight = "swin_unet.global_topology.struct_token_projection.weight"
+    if (
+        old_weight not in state_dict
+        or old_bias not in state_dict
+        or new_weight not in missing_keys
+    ):
+        return
+    module = model.module if hasattr(model, "module") else model
+    global_topology = getattr(module.swin_unet, "global_topology", None)
+    if global_topology is None or not hasattr(
+        global_topology,
+        "initialize_sum_projections_from_concat",
+    ):
+        return
+    global_topology.initialize_sum_projections_from_concat()
+    print(
+        "[TOPOLOGY] Converted legacy concat topology token projection "
+        "to summed per-branch projections.",
+        flush=True,
+    )
+
+
 def format_topology_coefficients(model):
     coefficients = get_topology_coefficients(model)
     fields = [
@@ -298,6 +323,11 @@ def load_topology_checkpoint_state(
     )
     if is_legacy_structure_checkpoint:
         result = model.load_state_dict(state_dict, strict=False)
+        upgrade_global_topology_projection_if_needed(
+            model,
+            state_dict,
+            result.missing_keys,
+        )
         allowed_missing_prefixes = (
             "swin_unet.guided_head.final_topology_attention.",
             "swin_unet.guided_head.raw_rho_gap",
@@ -475,6 +505,11 @@ def load_topology_checkpoint_state(
     ) + removed_direction_embedding_prefixes + removed_surface_uncertainty_prefixes
     if strict:
         result = model.load_state_dict(state_dict, strict=False)
+        upgrade_global_topology_projection_if_needed(
+            model,
+            state_dict,
+            result.missing_keys,
+        )
         invalid_missing = [
             key
             for key in result.missing_keys
@@ -498,6 +533,11 @@ def load_topology_checkpoint_state(
         )
     else:
         result = model.load_state_dict(state_dict, strict=strict)
+        upgrade_global_topology_projection_if_needed(
+            model,
+            state_dict,
+            result.missing_keys,
+        )
     apply_structure_profile_runtime(model)
     return result
 

@@ -217,18 +217,42 @@ def force_global_topology_mode(model, mode):
         coords_norm = coords.float() / feature.new_tensor(
             [max(height - 1, 1), max(width - 1, 1)]
         )
-        node_input = torch.cat(
-            [
-                sampled_struct,
-                sampled_feature,
-                sampled_connectivity,
-                sampled_direction,
-                self.node_type_embedding(node_types),
-                coords_norm,
-            ],
+        meta_input = torch.cat(
+            [self.node_type_embedding(node_types), coords_norm],
             dim=-1,
         )
-        node_feature = self.node_projection(node_input)
+        if all(
+            hasattr(
+                self,
+                name,
+            )
+            for name in (
+                "struct_token_projection",
+                "decoder_token_projection",
+                "connectivity_token_projection",
+                "direction_token_projection",
+                "meta_token_projection",
+            )
+        ):
+            node_feature = (
+                self.struct_token_projection(sampled_struct)
+                + self.decoder_token_projection(sampled_feature)
+                + self.connectivity_token_projection(sampled_connectivity)
+                + self.direction_token_projection(sampled_direction)
+                + self.meta_token_projection(meta_input)
+            )
+        else:
+            node_input = torch.cat(
+                [
+                    sampled_struct,
+                    sampled_feature,
+                    sampled_connectivity,
+                    sampled_direction,
+                    meta_input,
+                ],
+                dim=-1,
+            )
+            node_feature = self.node_projection(node_input)
         if hasattr(self, "_refine_tokens_with_relative_topology"):
             node_feature, _ = self._refine_tokens_with_relative_topology(
                 node_feature,
@@ -284,6 +308,51 @@ def force_global_topology_mode(model, mode):
                     :,
                     first_valid,
                 ].reshape(batch, height, width)
+                attention_mean = attention.mean(dim=1)
+                grid_y, grid_x = torch.meshgrid(
+                    torch.linspace(0.0, 1.0, height, device=feature.device),
+                    torch.linspace(0.0, 1.0, width, device=feature.device),
+                    indexing="ij",
+                )
+                grid_coords = torch.stack([grid_y, grid_x], dim=-1).reshape(
+                    1,
+                    height * width,
+                    1,
+                    2,
+                )
+                anchor_coords = coords_norm[:, None, :, :]
+                spatial_distance = torch.sqrt(
+                    (grid_coords - anchor_coords).square().sum(dim=-1) + 1e-8
+                )
+                valid_pair = valid[:, None, :].expand_as(attention_mean)
+                conn_grid = F.normalize(
+                    connectivity_map.flatten(2).transpose(1, 2),
+                    dim=-1,
+                    eps=1e-6,
+                )
+                conn_anchor = F.normalize(
+                    sampled_connectivity,
+                    dim=-1,
+                    eps=1e-6,
+                )
+                conn_similarity = torch.matmul(
+                    conn_grid,
+                    conn_anchor.transpose(1, 2),
+                )
+                dir_grid = F.normalize(
+                    direction_map.flatten(2).transpose(1, 2),
+                    dim=-1,
+                    eps=1e-6,
+                )
+                dir_anchor = F.normalize(
+                    sampled_direction,
+                    dim=-1,
+                    eps=1e-6,
+                )
+                direction_similarity = torch.matmul(
+                    dir_grid,
+                    dir_anchor.transpose(1, 2),
+                )
                 self.last_diagnostics = {
                     "anchor_count": valid.sum(dim=1).float().detach(),
                     "candidate_count": feature.new_full(
@@ -301,6 +370,21 @@ def force_global_topology_mode(model, mode):
                         / (torch.linalg.vector_norm(feature) + 1e-6)
                     ).detach(),
                     "feature_delta_abs_mean": (output - feature).abs().mean().detach(),
+                    "attention_connectivity_corr": pearson_corr(
+                        attention_mean,
+                        conn_similarity,
+                        valid_pair,
+                    ).detach(),
+                    "attention_direction_corr": pearson_corr(
+                        attention_mean,
+                        direction_similarity,
+                        valid_pair,
+                    ).detach(),
+                    "attention_spatial_distance_corr": pearson_corr(
+                        attention_mean,
+                        spatial_distance,
+                        valid_pair,
+                    ).detach(),
                     "attention_map": attention_map.detach().cpu(),
                     "anchor_coords": coords.detach().cpu(),
                     "anchor_valid": valid.detach().cpu(),
@@ -394,6 +478,17 @@ def normalize_to_uint8(array):
     if high <= low + 1e-8:
         return np.zeros_like(array, dtype=np.uint8)
     return ((array - low) * 255.0 / (high - low)).astype(np.uint8)
+
+
+def pearson_corr(x, y, mask):
+    x = x[mask].float()
+    y = y[mask].float()
+    if x.numel() < 2:
+        return x.new_tensor(0.0)
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = torch.sqrt((x.square().sum() * y.square().sum()).clamp_min(1e-12))
+    return (x * y).sum() / denom
 
 
 def save_attention_visuals(output_dir, mode, batch, diagnostics, start_index, max_visuals):
@@ -554,6 +649,9 @@ def main():
             "feature_delta": [],
             "surface_gate_mean": [],
             "anchor_count": [],
+            "attention_connectivity_corr": [],
+            "attention_direction_corr": [],
+            "attention_spatial_distance_corr": [],
         }
         for mode in MODES
     }
@@ -594,6 +692,15 @@ def main():
                         diag_values[mode]["anchor_count"].append(
                             float(diag["anchor_count"].mean().cpu())
                         )
+                    for name in (
+                        "attention_connectivity_corr",
+                        "attention_direction_corr",
+                        "attention_spatial_distance_corr",
+                    ):
+                        if name in diag:
+                            diag_values[mode][name].append(
+                                float(diag[name].mean().cpu())
+                            )
                     if mode != "baseline" and args.max_visuals > 0:
                         visual_counts[mode] = save_attention_visuals(
                             args.output_dir,
@@ -700,6 +807,35 @@ def main():
     if args.output_dir:
         print(f"\nSaved attention maps under: {os.path.join(args.output_dir, 'attention_maps')}")
 
+    print("\nAttention Correlation")
+    print("mode                  conn_corr   dir_corr    distance_corr")
+    diag_rows = []
+    for mode, gt in global_modules.items():
+        raw_alpha = float(gt.raw_alpha.detach().cpu())
+        alpha = float(gt.alpha_global.detach().cpu())
+        residual_norm = mean_or_zero(diag_values[mode]["residual_norm"])
+        feature_delta = mean_or_zero(diag_values[mode]["feature_delta"])
+        surface_gate_mean = mean_or_zero(diag_values[mode]["surface_gate_mean"])
+        anchor_count = mean_or_zero(diag_values[mode]["anchor_count"])
+        conn_corr = mean_or_zero(diag_values[mode]["attention_connectivity_corr"])
+        dir_corr = mean_or_zero(diag_values[mode]["attention_direction_corr"])
+        dist_corr = mean_or_zero(diag_values[mode]["attention_spatial_distance_corr"])
+        print(f"{mode:<21} {conn_corr:.6f}    {dir_corr:.6f}    {dist_corr:.6f}")
+        diag_rows.append(
+            {
+                "mode": mode,
+                "raw_alpha": raw_alpha,
+                "alpha_global": alpha,
+                "residual_norm": residual_norm,
+                "feature_delta": feature_delta,
+                "surface_gate_mean": surface_gate_mean,
+                "anchor_count": anchor_count,
+                "attention_connectivity_corr": conn_corr,
+                "attention_direction_corr": dir_corr,
+                "attention_spatial_distance_corr": dist_corr,
+            }
+        )
+
     if args.output_csv:
         os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
         with open(args.output_csv, "w", newline="", encoding="utf-8") as handle:
@@ -722,6 +858,12 @@ def main():
             )
             writer.writerows(rows)
         print(f"\nSaved CSV: {args.output_csv}")
+        diag_csv = os.path.splitext(args.output_csv)[0] + "_global_diagnostics.csv"
+        with open(diag_csv, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(diag_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(diag_rows)
+        print(f"Saved diagnostics CSV: {diag_csv}")
 
 
 if __name__ == "__main__":

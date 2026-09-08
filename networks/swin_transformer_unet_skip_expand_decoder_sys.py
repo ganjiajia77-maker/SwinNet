@@ -2180,7 +2180,7 @@ class SwinTransformerSys(nn.Module):
                 if self.enable_global_topology:
                     print(
                         "[INFO] Global topology residual: anchors=z_struct*surface, "
-                        "tokens=[z_struct,decoder_feature,connectivity,direction], "
+                        "tokens=sum(project(z_struct,decoder_feature,connectivity,direction)), "
                         "relation_bias=relative_xy_distance"
                     )
             else:

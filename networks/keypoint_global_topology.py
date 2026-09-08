@@ -31,6 +31,12 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.connectivity_channels = int(connectivity_channels)
         self.direction_channels = int(direction_channels)
         self.node_type_embedding = nn.Embedding(1, 8)
+        self.struct_token_projection = nn.Linear(self.struct_channels, channels)
+        self.decoder_token_projection = nn.Linear(self.channels, channels)
+        self.connectivity_token_projection = nn.Linear(self.connectivity_channels, channels)
+        self.direction_token_projection = nn.Linear(self.direction_channels, channels)
+        self.meta_token_projection = nn.Linear(8 + 2, channels)
+        # Kept only for loading older concat-projection checkpoints.
         token_input_channels = (
             self.struct_channels
             + self.channels
@@ -56,6 +62,32 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.raw_alpha = nn.Parameter(torch.tensor(0.0))
         self.capture_diagnostics = False
         self.last_diagnostics = None
+
+    def initialize_sum_projections_from_concat(self):
+        """Make summed branch projections equivalent to a loaded concat projection."""
+        with torch.no_grad():
+            weight = self.node_projection.weight
+            bias = self.node_projection.bias
+            start = 0
+            end = start + self.struct_channels
+            self.struct_token_projection.weight.copy_(weight[:, start:end])
+            self.struct_token_projection.bias.zero_()
+            start = end
+            end = start + self.channels
+            self.decoder_token_projection.weight.copy_(weight[:, start:end])
+            self.decoder_token_projection.bias.zero_()
+            start = end
+            end = start + self.connectivity_channels
+            self.connectivity_token_projection.weight.copy_(weight[:, start:end])
+            self.connectivity_token_projection.bias.zero_()
+            start = end
+            end = start + self.direction_channels
+            self.direction_token_projection.weight.copy_(weight[:, start:end])
+            self.direction_token_projection.bias.zero_()
+            start = end
+            end = start + 8 + 2
+            self.meta_token_projection.weight.copy_(weight[:, start:end])
+            self.meta_token_projection.bias.copy_(bias)
 
     @property
     def alpha_global(self):
@@ -361,18 +393,17 @@ class KeypointGuidedGlobalTopology(nn.Module):
         coords_norm = coords.float() / feature.new_tensor(
             [max(height - 1, 1), max(width - 1, 1)]
         )
-        node_input = torch.cat(
-            [
-                sampled_struct,
-                sampled_feature,
-                sampled_connectivity,
-                sampled_direction,
-                self.node_type_embedding(node_types),
-                coords_norm,
-            ],
+        meta_input = torch.cat(
+            [self.node_type_embedding(node_types), coords_norm],
             dim=-1,
         )
-        node_feature = self.node_projection(node_input)
+        node_feature = (
+            self.struct_token_projection(sampled_struct)
+            + self.decoder_token_projection(sampled_feature)
+            + self.connectivity_token_projection(sampled_connectivity)
+            + self.direction_token_projection(sampled_direction)
+            + self.meta_token_projection(meta_input)
+        )
         node_feature, topology_bias = self._refine_tokens_with_relative_topology(
             node_feature,
             coords,
