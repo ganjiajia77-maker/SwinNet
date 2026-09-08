@@ -118,7 +118,14 @@ def force_global_topology_mode(model, mode):
     if mode == "both":
         return gt
 
-    def ablated_forward(self, feature, z_struct, surface_prob):
+    def ablated_forward(
+        self,
+        feature,
+        z_struct,
+        surface_prob,
+        connectivity_feature=None,
+        direction_feature=None,
+    ):
         batch, channels, height, width = feature.shape
         if not self.enable_global_topology or z_struct is None or surface_prob is None:
             return feature
@@ -180,11 +187,41 @@ def force_global_topology_mode(model, mode):
             )
 
         sampled_struct = self._sample_features_at_anchor_coords(
-            z_struct,
+            z_struct.to(dtype=feature.dtype),
             coords,
             anchor_hw=(height, width),
         )
-        zeros_direction = sampled_struct.new_zeros(batch, self.max_nodes, 2)
+        sampled_feature = self._sample_features_at_anchor_coords(
+            feature,
+            coords,
+            anchor_hw=(height, width),
+        )
+        connectivity_map = self._prepare_token_map(
+            connectivity_feature,
+            batch,
+            (height, width),
+            self.connectivity_channels,
+            feature.dtype,
+            feature.device,
+        )
+        direction_map = self._prepare_token_map(
+            direction_feature,
+            batch,
+            (height, width),
+            self.direction_channels,
+            feature.dtype,
+            feature.device,
+        )
+        sampled_connectivity = self._sample_features_at_anchor_coords(
+            connectivity_map,
+            coords,
+            anchor_hw=(height, width),
+        )
+        sampled_direction = self._sample_features_at_anchor_coords(
+            direction_map,
+            coords,
+            anchor_hw=(height, width),
+        )
         node_types = torch.zeros(
             batch,
             self.max_nodes,
@@ -197,13 +234,22 @@ def force_global_topology_mode(model, mode):
         node_input = torch.cat(
             [
                 sampled_struct,
-                zeros_direction,
+                sampled_feature,
+                sampled_connectivity,
+                sampled_direction,
                 self.node_type_embedding(node_types),
                 coords_norm,
             ],
             dim=-1,
         )
         node_feature = self.node_projection(node_input)
+        if hasattr(self, "_refine_tokens_with_relative_topology"):
+            node_feature, _ = self._refine_tokens_with_relative_topology(
+                node_feature,
+                coords,
+                valid,
+                anchor_hw=(height, width),
+            )
         context = self._cross_attention_from_structure_tokens(
             feature,
             node_feature,
