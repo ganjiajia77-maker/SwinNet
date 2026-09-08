@@ -5,6 +5,7 @@ import os
 import sys
 import types
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -26,7 +27,7 @@ from networks.vision_transformer import (
 )
 
 
-MODES = ("baseline", "topology_only", "gate_only", "both")
+MODES = ("baseline", "z_struct", "z_struct_connectivity", "z_struct_direction", "full")
 
 
 def _cli_has(name):
@@ -115,9 +116,6 @@ def force_global_topology_mode(model, mode):
     gt.enable_global_topology = True
     gt._diagnose_mode = mode
 
-    if mode == "both":
-        return gt
-
     def ablated_forward(
         self,
         feature,
@@ -138,34 +136,8 @@ def force_global_topology_mode(model, mode):
                     mode="bilinear",
                     align_corners=False,
                 )
-            if mode == "topology_only":
-                surface_gate_for_anchor = torch.ones_like(surface_gate)
-                surface_gate_for_residual = torch.ones_like(surface_gate)
-            elif mode == "gate_only":
-                surface_gate_for_anchor = surface_gate.clamp(0.0, 1.0)
-                surface_gate_for_residual = surface_gate.clamp(0.0, 1.0)
-            else:
-                raise RuntimeError(f"Unknown ablation mode: {mode}")
-
-        if mode == "gate_only":
-            delta = self.grid_projection(feature)
-            output = feature + self.alpha_global * delta * surface_gate_for_residual
-            if self.capture_diagnostics:
-                with torch.no_grad():
-                    self.last_diagnostics = {
-                        "anchor_count": feature.new_zeros((batch,)),
-                        "candidate_count": feature.new_zeros((batch,)),
-                        "anchor_score_mean": feature.new_zeros((batch,)),
-                        "anchor_score_max": feature.new_zeros((batch,)),
-                        "alpha_global": self.alpha_global.detach(),
-                        "surface_gate_mean": surface_gate.mean(dim=(1, 2, 3)).detach(),
-                        "surface_gate_max": surface_gate.amax(dim=(1, 2, 3)).detach(),
-                        "global_residual_relative_norm": (
-                            torch.linalg.vector_norm(output - feature)
-                            / (torch.linalg.vector_norm(feature) + 1e-6)
-                        ).detach(),
-                    }
-            return output
+            surface_gate_for_anchor = surface_gate.clamp(0.0, 1.0)
+            surface_gate_for_residual = surface_gate.clamp(0.0, 1.0)
 
         with torch.no_grad():
             z_score = torch.linalg.vector_norm(
@@ -222,6 +194,20 @@ def force_global_topology_mode(model, mode):
             coords,
             anchor_hw=(height, width),
         )
+        if mode == "z_struct":
+            sampled_feature = torch.zeros_like(sampled_feature)
+            sampled_connectivity = torch.zeros_like(sampled_connectivity)
+            sampled_direction = torch.zeros_like(sampled_direction)
+        elif mode == "z_struct_connectivity":
+            sampled_feature = torch.zeros_like(sampled_feature)
+            sampled_direction = torch.zeros_like(sampled_direction)
+        elif mode == "z_struct_direction":
+            sampled_feature = torch.zeros_like(sampled_feature)
+            sampled_connectivity = torch.zeros_like(sampled_connectivity)
+        elif mode == "full":
+            pass
+        else:
+            raise RuntimeError(f"Unknown ablation mode: {mode}")
         node_types = torch.zeros(
             batch,
             self.max_nodes,
@@ -250,15 +236,54 @@ def force_global_topology_mode(model, mode):
                 valid,
                 anchor_hw=(height, width),
             )
-        context = self._cross_attention_from_structure_tokens(
-            feature,
-            node_feature,
-            valid,
+        grid_tokens = feature.flatten(2).transpose(1, 2)
+        query = self.grid_q(grid_tokens).reshape(
+            batch,
+            height * width,
+            self.heads,
+            channels // self.heads,
+        ).permute(0, 2, 1, 3)
+        node_kv = self.node_kv(node_feature).reshape(
+            batch,
+            self.max_nodes,
+            2,
+            self.heads,
+            channels // self.heads,
+        ).permute(2, 0, 3, 1, 4)
+        key, value = node_kv[0], node_kv[1]
+        logits = torch.matmul(query, key.transpose(-2, -1)) / np.sqrt(
+            channels // self.heads
         )
+        logits = logits.masked_fill(
+            ~valid[:, None, None, :],
+            -torch.finfo(logits.dtype).max,
+        )
+        attention = torch.softmax(logits, dim=-1)
+        context = torch.matmul(attention, value).transpose(1, 2).reshape(
+            batch,
+            height * width,
+            channels,
+        )
+        context = self.output_projection(context)
+        context = context.transpose(1, 2).reshape(batch, channels, height, width)
+        has_anchor = valid.any(dim=1).to(dtype=context.dtype).view(batch, 1, 1, 1)
+        context = context * has_anchor
         delta = self.grid_projection(context)
         output = feature + self.alpha_global * delta * surface_gate_for_residual
         if self.capture_diagnostics:
             with torch.no_grad():
+                valid_counts = valid.sum(dim=1).clamp_min(1)
+                first_valid = torch.zeros(batch, device=valid.device, dtype=torch.long)
+                for batch_index in range(batch):
+                    valid_indices = torch.nonzero(valid[batch_index], as_tuple=False)
+                    if valid_indices.numel() > 0:
+                        first_valid[batch_index] = valid_indices[0, 0]
+                batch_indices = torch.arange(batch, device=valid.device)
+                attention_map = attention.mean(dim=1)[
+                    batch_indices,
+                    :,
+                    first_valid,
+                ].reshape(batch, height, width)
                 self.last_diagnostics = {
                     "anchor_count": valid.sum(dim=1).float().detach(),
                     "candidate_count": feature.new_full(
@@ -275,6 +300,11 @@ def force_global_topology_mode(model, mode):
                         torch.linalg.vector_norm(output - feature)
                         / (torch.linalg.vector_norm(feature) + 1e-6)
                     ).detach(),
+                    "feature_delta_abs_mean": (output - feature).abs().mean().detach(),
+                    "attention_map": attention_map.detach().cpu(),
+                    "anchor_coords": coords.detach().cpu(),
+                    "anchor_valid": valid.detach().cpu(),
+                    "first_valid_anchor": first_valid.detach().cpu(),
                 }
         return output
 
@@ -349,6 +379,74 @@ def mean_or_zero(values):
     return float(np.mean(values))
 
 
+def image_tensor_to_uint8(image):
+    array = image.detach().cpu().float().numpy().transpose(1, 2, 0)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    array = np.clip((array * std + mean) * 255.0, 0, 255).astype(np.uint8)
+    return array
+
+
+def normalize_to_uint8(array):
+    array = array.astype(np.float32)
+    low = float(array.min())
+    high = float(array.max())
+    if high <= low + 1e-8:
+        return np.zeros_like(array, dtype=np.uint8)
+    return ((array - low) * 255.0 / (high - low)).astype(np.uint8)
+
+
+def save_attention_visuals(output_dir, mode, batch, diagnostics, start_index, max_visuals):
+    if not output_dir or start_index >= max_visuals:
+        return start_index
+    attention_map = diagnostics.get("attention_map")
+    coords = diagnostics.get("anchor_coords")
+    valid = diagnostics.get("anchor_valid")
+    if attention_map is None or coords is None or valid is None:
+        return start_index
+    visual_dir = os.path.join(output_dir, "attention_maps", mode)
+    os.makedirs(visual_dir, exist_ok=True)
+    names = batch.get("case_name", batch.get("image_name", None))
+    images = batch["image"]
+    batch_size = images.shape[0]
+    for item_index in range(batch_size):
+        if start_index >= max_visuals:
+            break
+        rgb = image_tensor_to_uint8(images[item_index])
+        heat = attention_map[item_index].numpy()
+        heat = cv2.resize(
+            heat,
+            (rgb.shape[1], rgb.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        heat_color = cv2.applyColorMap(normalize_to_uint8(heat), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            0.60,
+            heat_color,
+            0.40,
+            0,
+        )
+        valid_coords = coords[item_index][valid[item_index]].numpy()
+        anchor_h = max(int(attention_map.shape[1]) - 1, 1)
+        anchor_w = max(int(attention_map.shape[2]) - 1, 1)
+        for y, x in valid_coords[:64]:
+            yy = int(round(float(y) * (rgb.shape[0] - 1) / anchor_h))
+            xx = int(round(float(x) * (rgb.shape[1] - 1) / anchor_w))
+            cv2.circle(overlay, (xx, yy), 3, (0, 0, 255), -1)
+        if names is None:
+            case_name = f"sample_{start_index:04d}"
+        elif isinstance(names, (list, tuple)):
+            case_name = str(names[item_index])
+        else:
+            case_name = str(names)
+        safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in case_name)
+        path = os.path.join(visual_dir, f"{start_index:04d}_{safe_name}.png")
+        cv2.imwrite(path, overlay)
+        start_index += 1
+    return start_index
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, default="./data1")
@@ -362,6 +460,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--max_batches", type=int, default=0)
     parser.add_argument("--output_csv", type=str, default="")
+    parser.add_argument("--output_dir", type=str, default="")
+    parser.add_argument("--max_visuals", type=int, default=4)
     parser.add_argument("--final_topology_eta_init", type=float, default=0.005)
     parser.add_argument("--final_gap_rho_init", type=float, default=0.005)
     parser.add_argument("--stage_topology_stages", type=str, default="none")
@@ -409,9 +509,9 @@ def main():
     print(f"Using device: {device}")
     print(f"Checkpoint: {args.model_path}")
     print(
-        "Ablations: baseline=global off; topology_only=z_struct anchors/tokens "
-        "without surface gate; gate_only=surface-gated local projection without "
-        "anchor/token attention; both=current z_struct token + surface gate.",
+        "Ablations: baseline=global off; z_struct=only structure token; "
+        "z_struct_connectivity=structure+local connectivity token; "
+        "z_struct_direction=structure+direction token; full=current fused token.",
         flush=True,
     )
 
@@ -449,9 +549,15 @@ def main():
 
     stats = ShiftStats()
     diag_values = {
-        mode: {"residual_norm": [], "surface_gate_mean": [], "anchor_count": []}
+        mode: {
+            "residual_norm": [],
+            "feature_delta": [],
+            "surface_gate_mean": [],
+            "anchor_count": [],
+        }
         for mode in MODES
     }
+    visual_counts = {mode: 0 for mode in MODES}
     batches = 0
     with torch.no_grad():
         for batch in tqdm(loader, desc="diagnose"):
@@ -476,6 +582,10 @@ def main():
                         diag_values[mode]["residual_norm"].append(
                             float(diag["global_residual_relative_norm"].mean().cpu())
                         )
+                    if "feature_delta_abs_mean" in diag:
+                        diag_values[mode]["feature_delta"].append(
+                            float(diag["feature_delta_abs_mean"].mean().cpu())
+                        )
                     if "surface_gate_mean" in diag:
                         diag_values[mode]["surface_gate_mean"].append(
                             float(diag["surface_gate_mean"].mean().cpu())
@@ -483,6 +593,15 @@ def main():
                     if "anchor_count" in diag:
                         diag_values[mode]["anchor_count"].append(
                             float(diag["anchor_count"].mean().cpu())
+                        )
+                    if mode != "baseline" and args.max_visuals > 0:
+                        visual_counts[mode] = save_attention_visuals(
+                            args.output_dir,
+                            mode,
+                            batch,
+                            diag,
+                            visual_counts[mode],
+                            args.max_visuals,
                         )
             baseline_logits = logits_by_mode["baseline"]
             for mode in MODES:
@@ -566,17 +685,20 @@ def main():
         )
 
     print("\nGlobal Topology Diagnostics")
-    print("mode           raw_alpha   alpha_global  residual_norm  surface_gate_mean  anchor_count")
+    print("mode                  raw_alpha   alpha_global  residual_norm  feature_delta  surface_gate_mean  anchor_count")
     for mode, gt in global_modules.items():
         raw_alpha = float(gt.raw_alpha.detach().cpu())
         alpha = float(gt.alpha_global.detach().cpu())
         residual_norm = mean_or_zero(diag_values[mode]["residual_norm"])
+        feature_delta = mean_or_zero(diag_values[mode]["feature_delta"])
         surface_gate_mean = mean_or_zero(diag_values[mode]["surface_gate_mean"])
         anchor_count = mean_or_zero(diag_values[mode]["anchor_count"])
         print(
-            f"{mode:<14} {raw_alpha:.8f}  {alpha:.8f}  {residual_norm:.8f}  "
-            f"{surface_gate_mean:.8f}  {anchor_count:.2f}"
+            f"{mode:<21} {raw_alpha:.8f}  {alpha:.8f}  {residual_norm:.8f}  "
+            f"{feature_delta:.8f}  {surface_gate_mean:.8f}  {anchor_count:.2f}"
         )
+    if args.output_dir:
+        print(f"\nSaved attention maps under: {os.path.join(args.output_dir, 'attention_maps')}")
 
     if args.output_csv:
         os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
