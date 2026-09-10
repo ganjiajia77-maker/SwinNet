@@ -142,7 +142,7 @@ parser.add_argument(
         'structure after surface_refine; none: skeleton-only high-res stream'
     ),
 )
-parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
+parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.01)
 parser.add_argument(
     '--enable_global_topology',
     action='store_true',
@@ -171,7 +171,7 @@ parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--final_skeleton_weight', type=float, default=None, help='override final skeleton auxiliary loss weight')
 parser.add_argument('--final_connectivity_weight', type=float, default=None, help='override final connectivity auxiliary loss weight')
 parser.add_argument('--boundary_weight', type=float, default=None, help='deprecated; boundary auxiliary loss is disabled')
-parser.add_argument('--road_attention_weight', type=float, default=0.003)
+parser.add_argument('--road_attention_weight', type=float, default=0.0)
 parser.add_argument('--max_train_batches', type=int, default=0, help='limit training to the first N batches per epoch; 0 means no limit')
 parser.add_argument('--no_pretrain', action='store_true', help='do not load pretrained weights')
 parser.add_argument('--pretrain_ckpt', type=str, default='', help='optional ImageNet Swin checkpoint path')
@@ -233,6 +233,12 @@ parser.add_argument(
     type=float,
     default=0.0,
     help='margin for connectivity edge discrimination loss max(0, margin - C_pos + C_neg); 0 disables',
+)
+parser.add_argument(
+    '--edge_contrastive_weight',
+    type=float,
+    default=0.05,
+    help='lambda for pairwise hard-negative raw-logit connectivity ranking loss',
 )
 parser.add_argument(
     '--disable_msfe_skip',
@@ -378,6 +384,7 @@ def build_criterion(args, loss_weights, device):
         directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
         edge_contrastive_margin=args.edge_contrastive_margin,
+        edge_contrastive_weight=args.edge_contrastive_weight,
     ).to(device)
 
 
@@ -431,7 +438,7 @@ def format_training_config_lines(args, loss_weights):
         if args.masked_connectivity_center_experiment:
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
-                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}, edge_contrastive_margin={args.edge_contrastive_margin:.3f}",
+                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}, edge_contrastive_margin={args.edge_contrastive_margin:.3f}, edge_contrastive_weight={args.edge_contrastive_weight:.3f}",
             ])
     else:
         lines.extend([

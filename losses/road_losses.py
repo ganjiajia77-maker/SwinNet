@@ -323,6 +323,7 @@ class SurfaceStructureLoss(nn.Module):
         directional_pos_weight_diagonal=2.5,
         connectivity_focal_gamma=0.0,
         edge_contrastive_margin=0.0,
+        edge_contrastive_weight=0.05,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
     ):
@@ -368,6 +369,7 @@ class SurfaceStructureLoss(nn.Module):
         self.directional_pos_weight_diagonal = float(directional_pos_weight_diagonal)
         self.connectivity_focal_gamma = float(connectivity_focal_gamma)
         self.edge_contrastive_margin = float(edge_contrastive_margin)
+        self.edge_contrastive_weight = float(edge_contrastive_weight)
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
 
@@ -460,24 +462,32 @@ class SurfaceStructureLoss(nn.Module):
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
     @staticmethod
-    def _edge_contrastive_loss(conn_prob, connectivity_gt, valid, margin):
+    def _edge_contrastive_loss(connectivity_logits, connectivity_gt, valid, margin, weight):
         margin = float(margin)
-        if margin <= 0.0:
-            return conn_prob.sum() * 0.0
+        weight = float(weight)
+        if margin <= 0.0 or weight <= 0.0:
+            return connectivity_logits.sum() * 0.0
         losses = []
-        for batch_index in range(conn_prob.shape[0]):
+        for batch_index in range(connectivity_logits.shape[0]):
             valid_i = valid[batch_index] > 0.5
             gt_i = connectivity_gt[batch_index] > 0.5
-            pos = conn_prob[batch_index][valid_i & gt_i]
-            neg = conn_prob[batch_index][valid_i & (~gt_i)]
-            if pos.numel() == 0 or neg.numel() == 0:
+            pos_logits = connectivity_logits[batch_index][valid_i & gt_i]
+            hard_negative_pool = connectivity_logits[batch_index][valid_i & (~gt_i)]
+            if pos_logits.numel() == 0 or hard_negative_pool.numel() == 0:
                 continue
-            hard_count = min(int(pos.numel()), int(neg.numel()))
-            hard_neg = neg.topk(k=hard_count, largest=True).values
-            losses.append(F.relu(conn_prob.new_tensor(margin) - pos.mean() + hard_neg.mean()))
+            hard_count = min(int(pos_logits.numel()), int(hard_negative_pool.numel()))
+            pos_pair = pos_logits.topk(k=hard_count, largest=False).values
+            hard_neg_pair = hard_negative_pool.topk(k=hard_count, largest=True).values
+            losses.append(
+                F.relu(
+                    connectivity_logits.new_tensor(margin)
+                    - pos_pair
+                    + hard_neg_pair
+                ).mean()
+            )
         if not losses:
-            return conn_prob.sum() * 0.0
-        return torch.stack(losses).mean()
+            return connectivity_logits.sum() * 0.0
+        return weight * torch.stack(losses).mean()
 
     def stage_connectivity_loss(
         self,
@@ -557,11 +567,16 @@ class SurfaceStructureLoss(nn.Module):
             loss_bce = (bce_map * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
 
         conn_prob = torch.sigmoid(connectivity_logits)
+        corridor_valid = valid * (skeleton_dilate_gt > 0.5).to(
+            device=valid.device,
+            dtype=valid.dtype,
+        ).expand_as(valid)
         loss_edge_contrastive = self._edge_contrastive_loss(
-            conn_prob,
+            connectivity_logits,
             connectivity_gt,
-            valid,
+            corridor_valid,
             self.edge_contrastive_margin,
+            self.edge_contrastive_weight,
         )
         if use_skeleton_center_mask:
             loss_edge_dice = conn_prob.sum() * 0.0
@@ -752,7 +767,11 @@ class SurfaceStructureLoss(nn.Module):
                     device=direction_logits.device,
                     dtype=direction_logits.dtype,
                 )
-                direction_valid = direction_valid * self._spatial_boundary_mask(
+                direction_confidence = self.build_direction_confidence(stage_skel).to(
+                    device=direction_logits.device,
+                    dtype=direction_logits.dtype,
+                )
+                direction_valid = direction_valid * direction_confidence * self._spatial_boundary_mask(
                     direction_logits,
                     valid_mask,
                 )
@@ -781,6 +800,21 @@ class SurfaceStructureLoss(nn.Module):
         )
         return target, direction_valid
 
+    def build_direction_confidence(self, skeleton):
+        skel = (skeleton > 0.5).to(dtype=skeleton.dtype)
+        connectivity = build_connectivity_target(skel).to(dtype=skeleton.dtype)
+        neighbor_count = connectivity.sum(dim=1, keepdim=True)
+        confidence = torch.where(
+            neighbor_count <= 2.0,
+            torch.ones_like(neighbor_count),
+            torch.where(
+                neighbor_count <= 3.0,
+                neighbor_count.new_full((), 0.5),
+                neighbor_count.new_full((), 0.2),
+            ),
+        )
+        return confidence * skel
+
     def direction_field_loss(self, direction_logits, skeleton_gt):
         direction_target, skeleton_mask = self.build_direction_target(skeleton_gt)
         direction_pred = F.normalize(direction_logits, dim=1, eps=1e-6)
@@ -792,6 +826,11 @@ class SurfaceStructureLoss(nn.Module):
             device=direction_pred.device,
             dtype=direction_pred.dtype,
         )
+        direction_confidence = self.build_direction_confidence(skeleton_gt).to(
+            device=direction_pred.device,
+            dtype=direction_pred.dtype,
+        )
+        skeleton_mask = skeleton_mask * direction_confidence
         cosine = (direction_pred * direction_target).sum(dim=1, keepdim=True)
         loss_map = (1.0 - cosine) * skeleton_mask
         return loss_map.sum() / skeleton_mask.sum().clamp_min(1.0)
@@ -1040,7 +1079,7 @@ class SurfaceStructureLoss(nn.Module):
             direction_gt=direction_gt,
             valid_mask=valid_mask,
         )
-        loss_road_attention = self.road_attention_loss(stage_outputs, surface_gt)
+        loss_road_attention = surface_logits.sum() * 0.0
         loss_highres_structure_skeleton, highres_stats = self.highres_structure_skeleton_loss(
             stage_outputs,
             skeleton_gt,
@@ -1059,7 +1098,6 @@ class SurfaceStructureLoss(nn.Module):
             + self.connectivity_weight * loss_connectivity
             + self.skeleton_stage_weight * loss_skeleton_stage
             + loss_stage_structure
-            + loss_road_attention
             + loss_highres_structure_skeleton
         )
 

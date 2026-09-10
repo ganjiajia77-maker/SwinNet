@@ -49,8 +49,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
             nn.Linear(relation_hidden, heads),
         )
         self.token_relation_scale = nn.Parameter(torch.tensor(0.1))
-        self.connectivity_topology_bias_scale = nn.Parameter(torch.tensor(0.1))
-        self.direction_topology_bias_scale = nn.Parameter(torch.tensor(0.1))
+        self.connectivity_topology_bias_scale = nn.Parameter(torch.tensor(0.5))
+        self.direction_topology_bias_scale = nn.Parameter(torch.tensor(0.5))
         self.grid_q = nn.Linear(channels, channels)
         self.node_kv = nn.Linear(channels, channels * 2)
         self.output_projection = nn.Linear(channels, channels)
