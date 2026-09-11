@@ -37,6 +37,69 @@ def compute_metrics_all_samples(logits_list, targets_list, threshold):
     }
 
 
+def metrics_from_counts(tp, fp, fn):
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2.0 * precision * recall / (precision + recall + 1e-8)
+    iou = tp / (tp + fp + fn + 1e-8)
+    return {
+        'iou': iou,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall,
+    }
+
+
+def run_fixed_crop_sweep(model, loader, thresholds, tile_size, stride, device):
+    positions = RoadSkeletonDataset.sliding_positions
+    counts = {
+        threshold: {'tp': 0, 'fp': 0, 'fn': 0}
+        for threshold in thresholds
+    }
+    with torch.no_grad():
+        for batch in tqdm(loader, desc='Fixed-crop inference'):
+            images = batch['image'].to(device)
+            masks = (batch['mask'].to(device) > 0.5)
+            if images.shape[0] != 1:
+                raise ValueError('--fixed_crop_eval expects batch_size=1.')
+            _, _, height, width = images.shape
+            logit_canvas = torch.zeros((1, 1, height, width), device=device)
+            weight_canvas = torch.zeros_like(logit_canvas)
+
+            for top in positions(height, tile_size, stride):
+                for left in positions(width, tile_size, stride):
+                    bottom = min(top + tile_size, height)
+                    right = min(left + tile_size, width)
+                    tile = images[:, :, top:bottom, left:right]
+                    pad_h = tile_size - tile.shape[-2]
+                    pad_w = tile_size - tile.shape[-1]
+                    if pad_h > 0 or pad_w > 0:
+                        tile = torch.nn.functional.pad(tile, (0, pad_w, 0, pad_h))
+                    outputs = model(tile)
+                    surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                    tile_logits = surface_logits[:, :, :bottom - top, :right - left]
+                    logit_canvas[:, :, top:bottom, left:right] += tile_logits
+                    weight_canvas[:, :, top:bottom, left:right] += 1.0
+
+            if weight_canvas.min().item() <= 0:
+                raise RuntimeError('Fixed-crop sweep left uncovered pixels.')
+            prob = torch.sigmoid(logit_canvas / weight_canvas.clamp_min(1e-8))
+            for threshold in thresholds:
+                pred = prob >= threshold
+                counts[threshold]['tp'] += int((pred & masks).sum().item())
+                counts[threshold]['fp'] += int((pred & (~masks)).sum().item())
+                counts[threshold]['fn'] += int(((~pred) & masks).sum().item())
+
+    return {
+        threshold: metrics_from_counts(
+            values['tp'],
+            values['fp'],
+            values['fn'],
+        )
+        for threshold, values in counts.items()
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root_path', type=str, default='./data1')
@@ -46,6 +109,10 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--img_size', type=int, default=224)
     parser.add_argument('--source_patch_size', type=int, default=1024)
+    parser.add_argument('--fixed_crop_eval', action='store_true',
+                        help='evaluate full source patches by tiled img_size crops and global TP/FP/FN')
+    parser.add_argument('--overlap_stride', type=int, default=0,
+                        help='stride for --fixed_crop_eval; default uses img_size')
     parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'])
     parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml')
     parser.add_argument(
@@ -122,12 +189,24 @@ def main():
     print('Model loaded')
     
     print('\nLoading {} dataset'.format(args.split))
-    test_dataset = RoadSkeletonDataset(
-        root_dir=args.root_path,
-        split=args.split,
-        image_size=args.img_size,
-        source_patch_size=args.source_patch_size,
-    )
+    if args.fixed_crop_eval:
+        test_dataset = RoadSkeletonDataset(
+            root_dir=args.root_path,
+            split=args.split,
+            image_size=None,
+            source_patch_size=args.source_patch_size,
+            return_full_image=True,
+        )
+        if args.batch_size != 1:
+            print('[INFO] --fixed_crop_eval uses batch_size=1 for full-image tiling.')
+        args.batch_size = 1
+    else:
+        test_dataset = RoadSkeletonDataset(
+            root_dir=args.root_path,
+            split=args.split,
+            image_size=args.img_size,
+            source_patch_size=args.source_patch_size,
+        )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -136,6 +215,45 @@ def main():
     )
     print('{} set size: {}'.format(args.split.capitalize(), len(test_dataset)))
     
+    thresholds = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+    if args.fixed_crop_eval:
+        stride = args.overlap_stride if args.overlap_stride > 0 else args.img_size
+        print('\nRunning fixed-crop sweep on {} set: source={} tile={} stride={}'.format(
+            args.split,
+            args.source_patch_size,
+            args.img_size,
+            stride,
+        ))
+        surface_results = run_fixed_crop_sweep(
+            model,
+            test_loader,
+            thresholds,
+            args.img_size,
+            stride,
+            device,
+        )
+        print('\n' + '='*80)
+        print('SURFACE SEGMENTATION - FIXED-CROP THRESHOLD SWEEP ({} SET)'.format(args.split.upper()))
+        print('='*80)
+        print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format('Threshold', 'IoU', 'F1', 'Precision', 'Recall'))
+        print('-'*60)
+        for threshold in thresholds:
+            metrics = surface_results[threshold]
+            print('{:<12.2f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f}'.format(
+                threshold, metrics['iou'], metrics['f1'], metrics['precision'], metrics['recall']
+            ))
+        best_threshold_iou = max(surface_results.keys(), key=lambda t: surface_results[t]['iou'])
+        best_threshold_f1 = max(surface_results.keys(), key=lambda t: surface_results[t]['f1'])
+        print('\nBest threshold (IoU): {:.2f} -> IoU: {:.4f}'.format(
+            best_threshold_iou, surface_results[best_threshold_iou]['iou']))
+        print('Best threshold (F1):  {:.2f} -> F1: {:.4f}'.format(
+            best_threshold_f1, surface_results[best_threshold_f1]['f1']))
+        print('\n' + '='*80)
+        print('Threshold sweep complete!')
+        print('='*80)
+        return
+
     print('\nRunning inference on {} set'.format(args.split))
     all_surface_logits = []
     all_skeleton_logits = []
@@ -173,7 +291,6 @@ def main():
     print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format('Threshold', 'IoU', 'F1', 'Precision', 'Recall'))
     print('-'*60)
     
-    thresholds = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
     surface_results = {}
     
     for threshold in thresholds:

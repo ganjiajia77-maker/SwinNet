@@ -365,8 +365,6 @@ class RoadSkeletonDataset(Dataset):
             image = self._augment_color_degrade(image, rng=rng)
 
         mask = (mask > 127).astype(np.float32)
-        skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
-        skeleton_dilate = (self._dilate_skeleton(skeleton_hard * 255, iterations=1) > 127).astype(np.float32)
 
         if self.random_crop_train:
             crop_size = self.tile_size or self.image_size
@@ -386,13 +384,19 @@ class RoadSkeletonDataset(Dataset):
             right = left + crop_size
             image = image[top:bottom, left:right]
             mask = mask[top:bottom, left:right]
-            skeleton_hard = skeleton_hard[top:bottom, left:right]
-            skeleton_dilate = skeleton_dilate[top:bottom, left:right]
 
         if self.image_size is not None and image.shape[:2] != (self.image_size, self.image_size):
             size = (self.image_size, self.image_size)
             image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
             mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+            mask = (mask > 0.5).astype(np.float32)
+
+        # Build topology labels after the final crop/resize so image, mask,
+        # skeleton, connectivity, and direction targets share one coordinate frame.
+        skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
+        skeleton_dilate = (
+            self._dilate_skeleton(skeleton_hard * 255, iterations=1) > 127
+        ).astype(np.float32)
 
         image = image.astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
