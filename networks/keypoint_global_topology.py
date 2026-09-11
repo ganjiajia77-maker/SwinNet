@@ -230,6 +230,25 @@ class KeypointGuidedGlobalTopology(nn.Module):
             bias = bias + self.direction_topology_bias_scale * direction_similarity[:, None]
         return bias.to(dtype=connectivity_feature.dtype).masked_fill(~valid_pair, 0.0)
 
+    @staticmethod
+    def _masked_corr(x, y, mask):
+        values = []
+        for batch_index in range(x.shape[0]):
+            mask_i = mask[batch_index]
+            if mask_i.sum() < 2:
+                continue
+            x_i = x[batch_index][mask_i].float()
+            y_i = y[batch_index][mask_i].float()
+            x_i = x_i - x_i.mean()
+            y_i = y_i - y_i.mean()
+            denom = x_i.square().mean().sqrt() * y_i.square().mean().sqrt()
+            if denom <= 1e-6:
+                continue
+            values.append((x_i * y_i).mean() / denom)
+        if not values:
+            return x.new_tensor(0.0)
+        return torch.stack(values).mean()
+
     def _refine_tokens_with_relative_topology(
         self,
         node_feature,
@@ -251,6 +270,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
             channels // self.heads
         )
+        qk_logits = logits
         topology_bias = self._relative_topology_bias(coords, valid, anchor_hw)
         local_topology_bias = node_feature.new_zeros(batch, self.heads, nodes, nodes)
         if connectivity_feature is not None and direction_feature is not None:
@@ -259,7 +279,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
                 direction_feature,
                 valid,
             )
-        logits = logits + self.token_relation_scale * topology_bias + local_topology_bias
+        b_topology = self.token_relation_scale * topology_bias + local_topology_bias
+        logits = logits + b_topology
         logits = logits.masked_fill(
             ~valid[:, None, None, :],
             -torch.finfo(logits.dtype).max,
@@ -272,10 +293,47 @@ class KeypointGuidedGlobalTopology(nn.Module):
         )
         attended = self.token_relation_projection(attended)
         refined = node_feature + attended
+        relation_diagnostics = {}
+        if self.capture_diagnostics:
+            with torch.no_grad():
+                valid_pair = valid[:, :, None] & valid[:, None, :]
+                eye = torch.eye(nodes, device=valid.device, dtype=torch.bool).unsqueeze(0)
+                valid_pair = valid_pair & (~eye)
+                valid_pair_heads = valid_pair[:, None, :, :].expand_as(qk_logits)
+                if valid_pair_heads.any():
+                    qk_valid = qk_logits.detach()[valid_pair_heads]
+                    bias_valid = b_topology.detach()[valid_pair_heads]
+                    qk_std = qk_valid.float().std(unbiased=False)
+                    btopo_std = bias_valid.float().std(unbiased=False)
+                else:
+                    qk_std = qk_logits.detach().float().sum() * 0.0
+                    btopo_std = b_topology.detach().float().sum() * 0.0
+
+                attention_mean = attention.detach().mean(dim=1)
+                conn_corr = qk_std.new_tensor(0.0)
+                dir_corr = qk_std.new_tensor(0.0)
+                if connectivity_feature is not None and connectivity_feature.numel() > 0:
+                    conn = F.normalize(connectivity_feature.detach().float(), dim=-1, eps=1e-6)
+                    conn_similarity = torch.matmul(conn, conn.transpose(1, 2))
+                    conn_corr = self._masked_corr(attention_mean, conn_similarity, valid_pair)
+                if direction_feature is not None and direction_feature.numel() > 0:
+                    direction = F.normalize(direction_feature.detach().float(), dim=-1, eps=1e-6)
+                    direction_similarity = torch.matmul(direction, direction.transpose(1, 2))
+                    dir_corr = self._masked_corr(attention_mean, direction_similarity, valid_pair)
+                relation_diagnostics = {
+                    "token_qk_std": qk_std.detach(),
+                    "token_btopo_std": btopo_std.detach(),
+                    "token_btopo_qk_std_ratio": (
+                        btopo_std / qk_std.clamp_min(1e-6)
+                    ).detach(),
+                    "attention_conn_corr": conn_corr.detach(),
+                    "attention_dir_corr": dir_corr.detach(),
+                }
         return (
             refined * valid.unsqueeze(-1).to(dtype=refined.dtype),
             topology_bias,
             local_topology_bias,
+            relation_diagnostics,
         )
 
     def _cross_attention_from_structure_tokens(self, feature, node_feature, valid):
@@ -412,6 +470,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
             node_feature,
             topology_bias,
             local_topology_bias,
+            relation_diagnostics,
         ) = self._refine_tokens_with_relative_topology(
             node_feature,
             coords,
@@ -454,6 +513,26 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "local_topology_bias_abs_mean": (
                         local_topology_bias.abs().mean().detach()
                     ),
+                    "token_qk_std": relation_diagnostics.get(
+                        "token_qk_std",
+                        feature.new_tensor(0.0),
+                    ).detach(),
+                    "token_btopo_std": relation_diagnostics.get(
+                        "token_btopo_std",
+                        feature.new_tensor(0.0),
+                    ).detach(),
+                    "token_btopo_qk_std_ratio": relation_diagnostics.get(
+                        "token_btopo_qk_std_ratio",
+                        feature.new_tensor(0.0),
+                    ).detach(),
+                    "attention_conn_corr": relation_diagnostics.get(
+                        "attention_conn_corr",
+                        feature.new_tensor(0.0),
+                    ).detach(),
+                    "attention_dir_corr": relation_diagnostics.get(
+                        "attention_dir_corr",
+                        feature.new_tensor(0.0),
+                    ).detach(),
                     "connectivity_token_abs_mean": (
                         sampled_connectivity.abs().mean()
                     ).detach(),
