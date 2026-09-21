@@ -38,8 +38,7 @@ class Data1Random512(Dataset):
         if not self.images:
             raise RuntimeError("No images found in " + self.image_dir)
         for name in self.images:
-            if not os.path.isfile(os.path.join(self.mask_dir, self._mask_name(name))):
-                raise FileNotFoundError("Missing mask for " + name)
+            self._resolve_mask(name)
         print("Number of images in {}: {:d}".format(split, len(self.images)))
 
     def _find_mask_dir(self, split):
