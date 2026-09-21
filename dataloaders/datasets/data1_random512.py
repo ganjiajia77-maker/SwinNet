@@ -127,7 +127,7 @@ class Data1Random512(Dataset):
         con3 = self._connectivity(mask_np, 3)
         for group, array in (("connect", con1), ("connect_d1", con3)):
             for index, channel in enumerate(np.array_split(array, 3, axis=0)):
-                sample[group + str(index)] = Image.fromarray((channel.transpose(1, 2, 0) * 255).astype(np.uint8))
+                sample[group + "_" + str(index)] = Image.fromarray((channel.transpose(1, 2, 0) * 255).astype(np.uint8))
         return sample, image_name
 
     def set_epoch(self, epoch):
