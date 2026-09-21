@@ -37,6 +37,8 @@ parser.add_argument('--img_size', type=int, default=256, help='network input siz
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--test_crop_list', type=str, default='', help='fixed test crop list: one line per crop, image: x=..., y=...')
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
+parser.add_argument('--overlap_stride', type=int, default=0,
+                    help='tile stride for --overlap_infer; default uses img_size // 2')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
 parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final skeleton')
 parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final topology repair coefficient')
@@ -357,7 +359,7 @@ if __name__ == "__main__":
         surface_dir = os.path.join(pred_dir, 'surface')
         os.makedirs(surface_dir, exist_ok=True)
 
-        stride = args.img_size // 2
+        stride = args.overlap_stride if args.overlap_stride > 0 else args.img_size // 2
         tile_size = args.img_size
         positions = RoadSkeletonDataset.sliding_positions
         weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
@@ -386,6 +388,11 @@ if __name__ == "__main__":
                 img_path = os.path.join(test_image_dir, image_name)
                 img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
                 img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                if args.source_patch_size:
+                    img = RoadSkeletonDataset._center_crop_or_pad(
+                        img,
+                        (args.source_patch_size, args.source_patch_size),
+                    )
                 h, w, _ = img.shape
 
                 logit_canvas = torch.zeros((1, 1, h, w), device=device)
@@ -432,6 +439,11 @@ if __name__ == "__main__":
                 if label_name is not None:
                     mask = cv2.imread(os.path.join(test_label_dir, label_name), cv2.IMREAD_GRAYSCALE)
                     if mask is not None:
+                        if args.source_patch_size:
+                            mask = RoadSkeletonDataset._center_crop_or_pad(
+                                mask,
+                                (args.source_patch_size, args.source_patch_size),
+                            )
                         mask = mask[:avg_prob.shape[0], :avg_prob.shape[1]]
                         pred_bool = avg_prob >= args.threshold
                         mask_bool = mask > 127
