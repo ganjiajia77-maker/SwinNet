@@ -21,7 +21,7 @@ class Saver(object):
     def save_checkpoint(self, state, is_best, filename='checkpoint.pth.tar'):
         """Saves checkpoint to disk"""
         filename = os.path.join(self.experiment_dir, filename)
-        torch.save(state, filename)
+        torch.save(state, os.path.join(self.directory, 'last.pth'))
         if is_best:
             best_pred = state['best_pred']
             with open(os.path.join(self.experiment_dir, 'best_pred.txt'), 'w') as f:
@@ -40,8 +40,10 @@ class Saver(object):
                 max_miou = max(previous_miou)
                 if best_pred > max_miou:
                     shutil.copyfile(filename, os.path.join(self.directory, 'model_best.pth.tar'))
+                shutil.copyfile(filename, os.path.join(self.directory, 'best.pth'))
             else:
                 shutil.copyfile(filename, os.path.join(self.directory, 'model_best.pth.tar'))
+                shutil.copyfile(filename, os.path.join(self.directory, 'best.pth'))
 
     def save_experiment_config(self):
         logfile = os.path.join(self.experiment_dir, 'parameters.txt')
