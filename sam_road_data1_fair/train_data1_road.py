@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from data1_road_dataset import Data1RoadDataset
 from model import SAMRoad
@@ -69,10 +70,10 @@ def evaluate(model, loader, device, tile=512, stride=256):
     tile_weight = (weight_1d[:, None] * weight_1d[None, :]).view(1, 1, tile, tile)
     tp = fp = fn = 0
     total_loss = 0.0
-    for batch in loader:
+    for batch in tqdm(loader, total=len(loader), desc="Validation", leave=False):
         image = batch["image"].to(device, non_blocking=True)
         target = batch["mask"].to(device, non_blocking=True)
-        _, _, h, w = image.shape
+        _, h, w, _ = image.shape
         canvas = torch.zeros((1, 1, h, w), device=device)
         weights = torch.zeros_like(canvas)
         for top in range(0, h - tile + 1, stride):
@@ -177,7 +178,13 @@ def main():
         optimizer.param_groups[0]["lr"] = lr_enc
         optimizer.param_groups[1]["lr"] = lr_dec
         running = 0.0
-        for batch in train_loader:
+        train_progress = tqdm(
+            train_loader,
+            total=len(train_loader),
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            dynamic_ncols=True,
+        )
+        for batch in train_progress:
             images = batch["image"].to(device, non_blocking=True)
             target = batch["mask"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -188,6 +195,11 @@ def main():
             if ema is not None:
                 update_ema(ema, model, args.ema_decay)
             running += loss.item()
+            train_progress.set_postfix(
+                loss=f"{loss.item():.4f}",
+                avg=f"{running / max(1, train_progress.n):.4f}",
+                lr=f"{lr_dec:.2e}",
+            )
 
         eval_model = model
         backup = None

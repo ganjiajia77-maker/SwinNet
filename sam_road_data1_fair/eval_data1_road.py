@@ -4,6 +4,7 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from data1_road_dataset import Data1RoadDataset
 from model import SAMRoad
@@ -18,10 +19,10 @@ def collect(model, loader, device, tile=512, stride=256):
     weight_1d = (1.0 - weight_1d).clamp_min(0.1)
     tile_weight = (weight_1d[:, None] * weight_1d[None, :]).view(1, 1, tile, tile)
     values = []
-    for batch in loader:
+    for batch in tqdm(loader, total=len(loader), desc="Evaluation", leave=False):
         image = batch["image"].to(device)
         target = batch["mask"].to(device)
-        _, _, h, w = image.shape
+        _, h, w, _ = image.shape
         canvas = torch.zeros((1, 1, h, w), device=device)
         weights = torch.zeros_like(canvas)
         for top in range(0, h - tile + 1, stride):
