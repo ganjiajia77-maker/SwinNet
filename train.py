@@ -101,6 +101,11 @@ class Trainer(object):
         train_loss3 = 0.0
         train_loss = 0.0
         self.model.train()
+        if self.args.freeze_bn:
+            if self.args.cuda:
+                self.model.module.freeze_bn()
+            else:
+                self.model.freeze_bn()
         self.evaluator.reset()
         tbar = tqdm(self.train_loader)
         num_img_tr = len(self.train_loader)
