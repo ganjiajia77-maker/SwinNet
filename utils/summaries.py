@@ -16,8 +16,8 @@ class TensorboardSummary(object):
         grid_image = make_grid(image[:3].clone().cpu().data, 3, normalize=True)
         writer.add_image(split + 'Image', grid_image, global_step)
         grid_image = make_grid(decode_seg_map_sequence(torch.max(output[:3], 1)[1].detach().cpu().numpy(),
-                                                       dataset=dataset), 3, normalize=False, range=(0, 255))
+                                                       dataset=dataset), 3, normalize=False, value_range=(0, 255))
         writer.add_image(split + 'Predicted label', grid_image, global_step)
         grid_image = make_grid(decode_seg_map_sequence(torch.squeeze(target[:3], 1).detach().cpu().numpy(),
-                                                       dataset=dataset), 3, normalize=False, range=(0, 255))
+                                                       dataset=dataset), 3, normalize=False, value_range=(0, 255))
         writer.add_image(split + 'Groundtruth label', grid_image, global_step)
