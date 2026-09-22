@@ -162,15 +162,13 @@ class Trainer(object):
               .format(Acc, Acc_class, mIoU, IoU, Precision, Recall, F1))
         print('Loss: %.3f, Loss1: %.6f, Loss2: %.3f, Loss3: %.3f' % (train_loss, train_loss1, train_loss2, train_loss2))
 
-        if self.args.no_val:
-            # save checkpoint every epoch
-            is_best = False
-            self.saver.save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': self.model.module.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'best_pred': self.best_pred,
-            }, is_best)
+        self.saver.append_epoch_losses({'epoch': epoch + 1, 'split': 'train', 'total_loss': train_loss, 'loss1': train_loss1, 'loss2': train_loss2, 'loss3': train_loss3, 'iou': IoU, 'precision': Precision, 'recall': Recall, 'f1': F1})
+        self.saver.save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': self.model.module.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'best_pred': self.best_pred,
+        }, False)
 
 
     def validation(self, epoch):
@@ -239,6 +237,8 @@ class Trainer(object):
         print("Acc:{}, Acc_class:{}, mIoU:{}, IoU:{}, Precision:{}, Recall:{}, F1:{}"
               .format(Acc, Acc_class, mIoU, IoU, Precision, Recall, F1))
         print('Loss: %.3f, Loss1: %.3f, Loss2: %.3f, Loss3: %.3f' % (test_loss, test_loss1, test_loss2, test_loss3))
+
+        self.saver.append_epoch_losses({'epoch': epoch + 1, 'split': 'val', 'total_loss': test_loss, 'loss1': test_loss1, 'loss2': test_loss2, 'loss3': test_loss3, 'iou': IoU, 'precision': Precision, 'recall': Recall, 'f1': F1})
 
         new_pred = IoU
         if new_pred > self.best_pred:
