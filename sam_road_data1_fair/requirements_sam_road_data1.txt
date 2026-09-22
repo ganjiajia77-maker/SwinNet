@@ -1,0 +1,26 @@
+# Install torch and torchvision separately from a CUDA-matched PyTorch index.
+# Do not use this file to replace an existing GPU PyTorch installation.
+numpy<2
+scipy
+opencv-python-headless
+scikit-image
+scikit-learn
+shapely
+matplotlib
+networkx
+python-igraph
+rtree
+addict
+PyYAML
+imageio
+tcod
+torchmetrics
+lightning
+pytorch-lightning
+wandb
+tqdm
+h5py
+medpy
+SimpleITK
+timm
+einops
