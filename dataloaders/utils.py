@@ -24,7 +24,7 @@ def decode_segmap(label_mask, dataset, plot=False):
     if dataset == 'spacenet':
         n_classes = 2
         label_colours = get_spacenet_labels()
-    elif dataset == 'DeepGlobe':
+    elif dataset in ('DeepGlobe', 'data1'):
         n_classes = 2
         label_colours = get_deepglobe_labels()
     else:
