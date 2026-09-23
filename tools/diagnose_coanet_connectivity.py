@@ -27,10 +27,14 @@ def parse_args():
     parser.add_argument("--gt_dir", required=True, help="Directory containing ground-truth road masks")
     parser.add_argument("--output_dir", required=True, help="Directory for CSV summaries")
     parser.add_argument("--threshold", type=int, default=127, help="Foreground threshold for 8-bit masks")
-    parser.add_argument("--topology_tolerance", type=int, default=2, help="Pixel tolerance for topology P/R")
+    parser.add_argument("--centerline_tolerance", type=float, default=1.5,
+                        help="Uncovered centerline distance tolerance in pixels")
     parser.add_argument("--apls_snap_tolerance", type=int, default=3, help="Maximum GT-to-prediction graph snap distance")
-    parser.add_argument("--max_apls_nodes", type=int, default=48, help="Maximum sampled GT graph nodes per image")
-    parser.add_argument("--short_component_area", type=int, default=20, help="Components smaller than this pixel area count as fragments")
+    parser.add_argument("--max_apls_nodes", type=int, default=12, help="Maximum sampled GT graph nodes per image")
+    parser.add_argument("--min_component_length", type=int, default=5,
+                        help="Minimum skeleton component pixels counted in components/img")
+    parser.add_argument("--min_gap_length", type=int, default=5,
+                        help="Minimum uncovered centerline pixels counted as a gap")
     return parser.parse_args()
 
 
@@ -100,30 +104,24 @@ def skeletonize(mask):
     return image.astype(bool)
 
 
-def topology_prf(pred_skel, gt_skel, tolerance):
-    if not pred_skel.any() and not gt_skel.any():
-        return 1.0, 1.0, 1.0
-    if not pred_skel.any() or not gt_skel.any():
-        return 0.0, 0.0, 0.0
-    structure = np.ones((2 * tolerance + 1, 2 * tolerance + 1), dtype=bool)
-    gt_near = ndimage.binary_dilation(gt_skel, structure=structure)
-    pred_near = ndimage.binary_dilation(pred_skel, structure=structure)
-    precision = float((pred_skel & gt_near).sum()) / float(pred_skel.sum())
-    recall = float((gt_skel & pred_near).sum()) / float(gt_skel.sum())
+def topology_pr(pred_skel, gt_skel, pred_mask, gt_mask):
+    precision = float((pred_skel & gt_mask).sum()) / float(pred_skel.sum() + 1e-12)
+    recall = float((gt_skel & pred_mask).sum()) / float(gt_skel.sum() + 1e-12)
     f1 = 2 * precision * recall / (precision + recall + 1e-12)
     return precision, recall, f1
 
 
-def component_metrics(mask, short_area):
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+def skeleton_component_metrics(skeleton, min_length):
+    count, _, stats, _ = cv2.connectedComponentsWithStats(skeleton.astype(np.uint8), connectivity=8)
     areas = stats[1:, cv2.CC_STAT_AREA].astype(np.int64) if count > 1 else np.empty((0,), dtype=np.int64)
-    foreground = int(areas.sum())
+    qualified = areas[areas >= min_length]
+    qualified_pixels = int(qualified.sum())
     return {
-        "components": int(areas.size),
-        "fragments": int((areas < short_area).sum()),
-        "fragment_density_per_mpix": float((areas < short_area).sum()) * 1e6 / mask.size,
-        "largest_component_ratio": float(areas.max()) / foreground if foreground else 0.0,
-        "foreground_pixels": foreground,
+        "components": int(qualified.size),
+        "short_components": int((areas < min_length).sum()),
+        "short_component_density_per_mpix": float((areas < min_length).sum()) * 1e6 / skeleton.size,
+        "largest_share": float(qualified.max()) / qualified_pixels if qualified_pixels else 0.0,
+        "qualified_pixels": qualified_pixels,
     }
 
 
@@ -198,12 +196,17 @@ def evaluate_one(pred_path, gt_path, args):
     if pred.shape != gt.shape:
         gt = cv2.resize(gt.astype(np.uint8), (pred.shape[1], pred.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
     pred_skel, gt_skel = skeletonize(pred), skeletonize(gt)
-    tprec, trecall, tf1 = topology_prf(pred_skel, gt_skel, args.topology_tolerance)
-    pred_comp, gt_comp = component_metrics(pred, args.short_component_area), component_metrics(gt, args.short_component_area)
-    gt_near_pred = ndimage.binary_dilation(pred_skel, structure=np.ones((2 * args.topology_tolerance + 1,) * 2, dtype=bool))
-    gap_mask = gt_skel & ~gt_near_pred
+    tprec, trecall, tf1 = topology_pr(pred_skel, gt_skel, pred, gt)
+    pred_comp = skeleton_component_metrics(pred_skel, args.min_component_length)
+    gt_comp = skeleton_component_metrics(gt_skel, args.min_component_length)
+    if pred.any():
+        distance_to_pred = ndimage.distance_transform_edt(~pred)
+    else:
+        distance_to_pred = np.full(pred.shape, np.inf, dtype=np.float32)
+    gap_mask = gt_skel & (distance_to_pred > args.centerline_tolerance)
     gap_count, _, gap_stats, _ = cv2.connectedComponentsWithStats(gap_mask.astype(np.uint8), connectivity=8)
     gap_areas = gap_stats[1:, cv2.CC_STAT_AREA] if gap_count > 1 else np.empty((0,), dtype=np.int32)
+    valid_gaps = gap_areas[gap_areas >= args.min_gap_length]
     apls, apls_pairs = raster_apls(gt_skel, pred_skel, args.apls_snap_tolerance, args.max_apls_nodes)
     tp = int((pred & gt).sum())
     fp = int((pred & ~gt).sum())
@@ -213,22 +216,24 @@ def evaluate_one(pred_path, gt_path, args):
     cldice = 2 * p_skel_gt * r_skel_pred / (p_skel_gt + r_skel_pred + 1e-12)
     return {
         "image": Path(pred_path).name,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
         "pixel_precision": tp / (tp + fp + 1e-12),
         "pixel_recall": tp / (tp + fn + 1e-12),
+        "pixel_f1": 2 * tp / (2 * tp + fp + fn + 1e-12),
         "cldice": cldice,
         "topo_precision": tprec,
         "topo_recall": trecall,
         "topo_f1": tf1,
-        "pred_fragments": pred_comp["fragments"],
-        "pred_fragment_density_per_mpix": pred_comp["fragment_density_per_mpix"],
-        "pred_components": pred_comp["components"],
-        "gt_components": gt_comp["components"],
-        "component_excess": max(0, pred_comp["components"] - gt_comp["components"]),
-        "pred_largest_component_ratio": pred_comp["largest_component_ratio"],
-        "gt_largest_component_ratio": gt_comp["largest_component_ratio"],
-        "gap_count": int((gap_areas >= 2).sum()),
-        "gap_unmatched_skeleton_pixels": int(gap_areas.sum()) if gap_areas.size else 0,
-        "gap_mean_length_px": float(gap_areas[gap_areas >= 2].mean()) if (gap_areas >= 2).any() else 0.0,
+        "components_img": pred_comp["components"],
+        "delta_beta0": abs(pred_comp["components"] - gt_comp["components"]),
+        "uncovered_centerline": float(gap_mask.sum()) / float(gt_skel.sum() + 1e-12),
+        "gaps_img": int(valid_gaps.size),
+        "mean_gap_px": float(valid_gaps.mean()) if valid_gaps.size else 0.0,
+        "short_components_img": pred_comp["short_components"],
+        "fragment_density_per_mpix": pred_comp["short_component_density_per_mpix"],
+        "largest_share": pred_comp["largest_share"],
         "raster_apls": apls,
         "apls_path_pairs": apls_pairs,
     }
@@ -249,6 +254,12 @@ def main():
             f"Supported extensions: {', '.join(sorted(IMAGE_EXTS))}. "
             f"Top-level entries: {sample_entries or '[empty directory]'}"
         )
+    if extra:
+        raise RuntimeError(
+            f"Only {len(pred_files)}/{len(gt_files)} GT images have predictions; "
+            f"missing predictions for {len(extra)} image(s), e.g. {extra[:5]}. "
+            "The prediction run likely stopped early; finish inference before reporting metrics."
+        )
     rows = [evaluate_one(pred_files[key], gt_files[key], args) for key in sorted(pred_files)]
     os.makedirs(args.output_dir, exist_ok=True)
     per_image = os.path.join(args.output_dir, "coanet_connectivity_per_image.csv")
@@ -258,17 +269,32 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    metric_fields = [k for k in fields if k != "image"]
+    metric_fields = [k for k in fields if k not in ("image", "tp", "fp", "fn")]
     avg = {"images": len(rows)}
-    avg.update({key: float(np.mean([float(row[key]) for row in rows])) for key in metric_fields})
+    tp, fp, fn = (sum(row[key] for row in rows) for key in ("tp", "fp", "fn"))
+    avg["pixel_precision_micro"] = tp / (tp + fp + 1e-12)
+    avg["pixel_recall_micro"] = tp / (tp + fn + 1e-12)
+    avg["pixelF1"] = 2 * tp / (2 * tp + fp + fn + 1e-12)
+    avg.update({key: float(np.mean([float(row[key]) for row in rows])) for key in metric_fields
+                if key not in ("pixel_precision", "pixel_recall", "pixel_f1")})
     with open(summary, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=list(avg))
         writer.writeheader()
         writer.writerow(avg)
-    print(f"Evaluated {len(rows)} images; unmatched GT files: {len(extra)}")
-    for key, value in avg.items():
-        if key != "images":
-            print(f"{key}: {value:.6f}")
+    print(f"Evaluated all {len(rows)} matched images")
+    print(f"pixelF1={avg['pixelF1']:.4f}")
+    print(f"clDice={avg['cldice']:.4f}")
+    print(f"topoP={avg['topo_precision']:.4f}")
+    print(f"topoR={avg['topo_recall']:.4f}")
+    print(f"topoF1={2 * avg['topo_precision'] * avg['topo_recall'] / (avg['topo_precision'] + avg['topo_recall'] + 1e-12):.4f}")
+    print(f"components/img={avg['components_img']:.2f}")
+    print(f"|Δbeta0|={avg['delta_beta0']:.2f}")
+    print(f"uncovered_centerline={avg['uncovered_centerline']:.4f}")
+    print(f"gaps/img={avg['gaps_img']:.2f}")
+    print(f"mean_gap_px={avg['mean_gap_px']:.2f}")
+    print(f"largest_share={avg['largest_share']:.4f}")
+    print(f"fragment_density_per_mpix={avg['fragment_density_per_mpix']:.2f}")
+    print(f"raster_apls_approx={avg['raster_apls']:.4f}")
     print(f"Per-image CSV: {per_image}")
     print(f"Summary CSV: {summary}")
     print("Note: raster_apls is a pixel-graph approximation; report the definition with results.")
