@@ -167,9 +167,9 @@ def main():
         # save imgs
         out_image = make_grid(image[0,:].clone().cpu().data, 3, normalize=True)
         out_GT = make_grid(decode_seg_map_sequence(torch.squeeze(target[:3], 1).detach().cpu().numpy(),
-                                                       dataset=args.dataset), 3, normalize=False, range=(0, 255))
+                                                       dataset=args.dataset), 3, normalize=False, value_range=(0, 1))
         out_pred_label_sum = make_grid(decode_seg_map_sequence(su,
-                                                       dataset=args.dataset), 3, normalize=False, range=(0, 255))
+                                                       dataset=args.dataset), 3, normalize=False, value_range=(0, 1))
 
         save_image(out_image, out_path + img_name + '_sat.png')
         save_image(out_GT, out_path + img_name + '_GT' + '.png')
