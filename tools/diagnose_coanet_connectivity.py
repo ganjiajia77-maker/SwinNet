@@ -46,7 +46,10 @@ def normalized_stem(path):
 
 
 def index_images(directory):
-    files = [p for p in Path(directory).iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    root = Path(directory)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Image directory does not exist: {root}")
+    files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
     indexed = {}
     for path in sorted(files):
         key = normalized_stem(path)
@@ -233,7 +236,13 @@ def main():
     if missing:
         raise RuntimeError(f"Missing GT masks for {len(missing)} prediction(s), e.g. {missing[:5]}")
     if not pred_files:
-        raise RuntimeError(f"No image predictions found in {args.pred_dir}")
+        root = Path(args.pred_dir)
+        sample_entries = [str(p.relative_to(root)) for p in list(root.iterdir())[:12]]
+        raise RuntimeError(
+            f"No supported image predictions found under {args.pred_dir} (searched recursively). "
+            f"Supported extensions: {', '.join(sorted(IMAGE_EXTS))}. "
+            f"Top-level entries: {sample_entries or '[empty directory]'}"
+        )
     rows = [evaluate_one(pred_files[key], gt_files[key], args) for key in sorted(pred_files)]
     os.makedirs(args.output_dir, exist_ok=True)
     per_image = os.path.join(args.output_dir, "coanet_connectivity_per_image.csv")
