@@ -36,12 +36,18 @@ def parse_args():
 
 def normalized_stem(path):
     stem = Path(path).stem
-    for suffix in (
+    suffixes = (
         "_surface_pred", "_mask_pred", "_prediction", "_pred", "_surface", "_mask",
         "_sat", "_image", "_img",
-    ):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                changed = True
+                break
     return stem
 
 
