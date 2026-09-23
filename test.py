@@ -25,7 +25,7 @@ def save_image(tensor, filename, nrow=8, padding=2,
     """
     from PIL import Image
     grid = make_grid(tensor, nrow=nrow, padding=padding, pad_value=pad_value,
-                     normalize=normalize, range=range, scale_each=scale_each)
+                     normalize=normalize, value_range=range, scale_each=scale_each)
     # Add 0.5 after unnormalizing to [0, 255] to round to nearest integer
     ndarr = grid.mul_(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
     im = Image.fromarray(ndarr)
@@ -36,6 +36,8 @@ def main():
     parser = argparse.ArgumentParser(description="PyTorch CoANet Training")
     parser.add_argument('--out-path', type=str, default='./run/spacenet/CoANet-resnet',
                         help='mask image to save')
+    parser.add_argument('--save-preview', action='store_true', default=False,
+                        help='save large visualization grids in addition to raw prediction masks')
     parser.add_argument('--backbone', type=str, default='resnet',
                         help='backbone name (default: resnet)')
     parser.add_argument('--batch-size', type=int, default=1,
@@ -94,8 +96,8 @@ def main():
     model.load_state_dict(ckpt['state_dict'])
 
     out_path = os.path.join(args.out_path, 'out_imgs_1300/')
-    if not os.path.exists(out_path):
-        os.makedirs(out_path)
+    if args.save_preview:
+        os.makedirs(out_path, exist_ok=True)
     pred_mask_path = os.path.join(args.out_path, 'pred_masks')
     os.makedirs(pred_mask_path, exist_ok=True)
 
@@ -164,16 +166,16 @@ def main():
 
         evaluator.add_batch(target_n, su.astype(int))#
 
-        # save imgs
-        out_image = make_grid(image[0,:].clone().cpu().data, 3, normalize=True)
-        out_GT = make_grid(decode_seg_map_sequence(torch.squeeze(target[:3], 1).detach().cpu().numpy(),
-                                                       dataset=args.dataset), 3, normalize=False, value_range=(0, 1))
-        out_pred_label_sum = make_grid(decode_seg_map_sequence(su,
-                                                       dataset=args.dataset), 3, normalize=False, value_range=(0, 1))
+        if args.save_preview:
+            out_image = make_grid(image[0, :].clone().cpu().data, 3, normalize=True)
+            out_GT = make_grid(decode_seg_map_sequence(torch.squeeze(target[:3], 1).detach().cpu().numpy(),
+                                                           dataset=args.dataset), 3, normalize=False, value_range=(0, 1))
+            out_pred_label_sum = make_grid(decode_seg_map_sequence(su,
+                                                           dataset=args.dataset), 3, normalize=False, value_range=(0, 1))
 
-        save_image(out_image, out_path + img_name + '_sat.png')
-        save_image(out_GT, out_path + img_name + '_GT' + '.png')
-        save_image(out_pred_label_sum, out_path + img_name + '_pred' + '.png')
+            save_image(out_image, out_path + img_name + '_sat.png')
+            save_image(out_GT, out_path + img_name + '_GT' + '.png')
+            save_image(out_pred_label_sum, out_path + img_name + '_pred' + '.png')
 
     # Fast test during the training
     Acc = evaluator.Pixel_Accuracy()
