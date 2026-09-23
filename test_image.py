@@ -363,7 +363,7 @@ if __name__ == "__main__":
         tile_size = args.img_size
         positions = RoadSkeletonDataset.sliding_positions
         weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
-        tile_weight = (1.0 - weight_1d).clamp_min(0.05)
+        tile_weight = (1.0 - weight_1d).clamp_min(0.1)
         tile_weight = torch.outer(tile_weight, tile_weight).view(1, 1, tile_size, tile_size)
         image_list = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'))])
         def find_label_name(image_name):

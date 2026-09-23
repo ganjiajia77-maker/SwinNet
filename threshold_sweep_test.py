@@ -52,6 +52,11 @@ def metrics_from_counts(tp, fp, fn):
 
 def run_fixed_crop_sweep(model, loader, thresholds, tile_size, stride, device):
     positions = RoadSkeletonDataset.sliding_positions
+    weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
+    weight_1d = (1.0 - weight_1d).clamp_min(0.1)
+    tile_weight = (weight_1d[:, None] * weight_1d[None, :]).view(
+        1, 1, tile_size, tile_size
+    )
     counts = {
         threshold: {'tp': 0, 'fp': 0, 'fn': 0}
         for threshold in thresholds
@@ -77,9 +82,12 @@ def run_fixed_crop_sweep(model, loader, thresholds, tile_size, stride, device):
                         tile = torch.nn.functional.pad(tile, (0, pad_w, 0, pad_h))
                     outputs = model(tile)
                     surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                    tile_logits = surface_logits[:, :, :bottom - top, :right - left]
-                    logit_canvas[:, :, top:bottom, left:right] += tile_logits
-                    weight_canvas[:, :, top:bottom, left:right] += 1.0
+                    tile_height = bottom - top
+                    tile_width = right - left
+                    tile_logits = surface_logits[:, :, :tile_height, :tile_width]
+                    weight = tile_weight[:, :, :tile_height, :tile_width]
+                    logit_canvas[:, :, top:bottom, left:right] += tile_logits * weight
+                    weight_canvas[:, :, top:bottom, left:right] += weight
 
             if weight_canvas.min().item() <= 0:
                 raise RuntimeError('Fixed-crop sweep left uncovered pixels.')
