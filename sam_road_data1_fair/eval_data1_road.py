@@ -66,7 +66,16 @@ def main():
     # Checkpoints produced by this training script include NumPy metadata,
     # so PyTorch 2.6+ must load them with weights_only=False. Only use trusted files.
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt.get("model_state_dict", ckpt["state_dict"]), strict=False)
+    if "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    elif "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+    else:
+        raise KeyError(
+            "Checkpoint has neither 'model_state_dict' nor 'state_dict'. "
+            f"Available keys: {list(ckpt)[:20]}"
+        )
+    model.load_state_dict(state_dict, strict=False)
     ds = Data1RoadDataset(args.data_root, args.split, random_crop=False, augment=False)
     values = collect(model, DataLoader(ds, batch_size=1, shuffle=False), device)
     thresholds = [args.threshold] if args.threshold is not None else [float(x) for x in args.thresholds.split(",")]
