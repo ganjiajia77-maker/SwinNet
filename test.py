@@ -48,6 +48,12 @@ def main():
                         choices=['ce', 'con_ce', 'focal'],
                         help='loss func type')
     parser.add_argument('--data-root', type=str, default='/home/gjj/Swin-Unet-main/data1')
+    # Data1Random512 is constructed for all splits by make_data_loader, even though
+    # this script only iterates over test_loader. Keep its train-only options present.
+    parser.add_argument('--random-crop-train', action='store_true', default=False,
+                        help='required by the shared data loader; unused for evaluation')
+    parser.add_argument('--seed', type=int, default=1,
+                        help='seed required by the shared data loader')
     parser.add_argument('--workers', type=int, default=16,
                         metavar='N', help='dataloader threads')
     parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -90,6 +96,8 @@ def main():
     out_path = os.path.join(args.out_path, 'out_imgs_1300/')
     if not os.path.exists(out_path):
         os.makedirs(out_path)
+    pred_mask_path = os.path.join(args.out_path, 'pred_masks')
+    os.makedirs(pred_mask_path, exist_ok=True)
 
     evaluator = Evaluator(2)
     model.eval()
@@ -147,6 +155,12 @@ def main():
 
         su = pred_full + pred_connect + pred_connect_d1
         su[su > 0] = 1
+
+        # Save the unscaled binary mask separately from the colorized 1300px preview.
+        # Connectivity diagnostics must consume this original-resolution mask.
+        raw_mask = (np.squeeze(su) > 0).astype(np.uint8) * 255
+        Image.fromarray(raw_mask, mode='L').save(
+            os.path.join(pred_mask_path, img_name + '_pred.png'))
 
         evaluator.add_batch(target_n, su.astype(int))#
 
