@@ -147,7 +147,8 @@ def main():
     best_f1 = -1.0
     ema = copy.deepcopy(model.state_dict()) if not args.no_ema else None
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
+        # Resume checkpoints include NumPy metadata; support PyTorch 2.6+.
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt.get("training_model_state_dict", ckpt["model_state_dict"]))
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])

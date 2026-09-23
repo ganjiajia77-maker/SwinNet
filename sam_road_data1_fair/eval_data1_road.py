@@ -63,7 +63,9 @@ def main():
     config.SAM_CKPT_PATH = args.sam_ckpt or config.SAM_CKPT_PATH
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SAMRoad(config).to(device)
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    # Checkpoints produced by this training script include NumPy metadata,
+    # so PyTorch 2.6+ must load them with weights_only=False. Only use trusted files.
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt.get("model_state_dict", ckpt["state_dict"]), strict=False)
     ds = Data1RoadDataset(args.data_root, args.split, random_crop=False, augment=False)
     values = collect(model, DataLoader(ds, batch_size=1, shuffle=False), device)
