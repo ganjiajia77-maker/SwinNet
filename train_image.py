@@ -89,33 +89,7 @@ parser.add_argument(
 )
 parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help='initial final topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
-parser.add_argument(
-    '--stage_topology_stages',
-    type=str,
-    default='none',
-    choices=['none', 'stage3', 'stage23'],
-    help='which decoder stages get topology attention',
-)
-parser.add_argument('--stage_topology_alpha_max', type=float, default=1.0)
-parser.add_argument('--stage_topology_alpha_init', type=float, default=0.1)
-parser.add_argument(
-    '--stage_topology_bias_mode',
-    type=str,
-    default='pairwise_skeleton',
-    choices=['pairwise_skeleton', 'gap_query'],
-    help='stage topology bias construction mode',
-)
-parser.add_argument('--stage_topology_ratio', type=float, default=0.08)
-parser.add_argument('--stage_topology_topo_clip', type=float, default=4.0)
-parser.add_argument('--stage_topology_warmup_epochs', type=int, default=5)
-parser.add_argument(
-    '--stage_topology_teacher_forcing_end',
-    type=int,
-    default=15,
-    help='epoch at which teacher forcing ratio drops to 0',
-)
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
-parser.add_argument('--stage3_roadness_weight', type=float, default=0.003)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
@@ -164,10 +138,10 @@ parser.add_argument(
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
+parser.add_argument('--skeleton_pos_weight', type=float, default=None,
+                    help='positive-class weight for skeleton BCE losses')
 parser.add_argument('--stage_direction_factor', type=float, default=0.1)
 parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
-parser.add_argument('--stage_sc_s2c_weight', type=float, default=1.0)
-parser.add_argument('--stage_sc_c2s_weight', type=float, default=0.2)
 parser.add_argument('--final_skeleton_weight', type=float, default=None, help='override final skeleton auxiliary loss weight')
 parser.add_argument('--final_connectivity_weight', type=float, default=None, help='override final connectivity auxiliary loss weight')
 parser.add_argument('--boundary_weight', type=float, default=None, help='deprecated; boundary auxiliary loss is disabled')
@@ -234,11 +208,6 @@ parser.add_argument(
     default=0.0,
     help='margin for connectivity edge discrimination loss max(0, margin - C_pos + C_neg); 0 disables',
 )
-parser.add_argument(
-    '--disable_msfe_skip',
-    action='store_true',
-    help='ablate MSFE blocks on decoder skip stages inx=2,3; DCA-FPN remains enabled',
-)
 # Options expected by the original config updater
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
 parser.add_argument('--zip', action='store_true', help='use zipped dataset')
@@ -268,12 +237,10 @@ def apply_structure_profile_defaults(args):
     }:
         return
 
-    args.stage_topology_stages = "none"
     if not _cli_has("--stage2_skeleton_weight"):
         args.stage2_skeleton_weight = 0.008
     if not _cli_has("--stage3_skeleton_weight"):
         args.stage3_skeleton_weight = 0.012
-    args.stage3_roadness_weight = 0.0
     args.final_topology_eta_init = 0.0
     args.final_gap_rho_init = 0.0
     if args.warmup_epochs == 3:
@@ -361,8 +328,6 @@ def build_criterion(args, loss_weights, device):
         road_attention_weight=args.road_attention_weight,
         stage_connectivity_factor=args.stage_connectivity_factor,
         stage_direction_factor=args.stage_direction_factor,
-        stage_skeleton_connectivity_s2c_weight=args.stage_sc_s2c_weight,
-        stage_skeleton_connectivity_c2s_weight=args.stage_sc_c2s_weight,
         highres_structure_skeleton_weight=(
             args.highres_structure_skeleton_weight
         ),
@@ -374,6 +339,7 @@ def build_criterion(args, loss_weights, device):
         ),
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
+        skeleton_pos_weight=args.skeleton_pos_weight,
         directional_pos_weight_cardinal=args.directional_pos_weight_cardinal,
         directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
@@ -399,6 +365,9 @@ def format_training_config_lines(args, loss_weights):
             ),
             "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
             "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
+            "  Stage skeleton target: Gaussian soft heatmap; skeleton BCE pos_weight={}".format(
+                args.skeleton_pos_weight
+            ),
             "  Stage2/Stage3 skeleton gradient ratio: {:.3f}/{:.3f}".format(
                 args.stage2_skeleton_gradient_ratio,
                 args.stage3_skeleton_gradient_ratio,
@@ -440,14 +409,6 @@ def format_training_config_lines(args, loss_weights):
             f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4",
             "  Localized gap repair: "
             f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap",
-            "  Stage topology attention: "
-            f"{args.stage_topology_stages}, mode={args.stage_topology_bias_mode}, "
-            f"ratio={args.stage_topology_ratio}, topo_clip={args.stage_topology_topo_clip}, "
-            f"alpha_init={args.stage_topology_alpha_init}, "
-            f"alpha_max={args.stage_topology_alpha_max}, "
-            f"warmup={args.stage_topology_warmup_epochs}",
-            "  Stage topology teacher forcing: "
-            f"epoch 0 -> {args.stage_topology_teacher_forcing_end}",
         ])
     lines.extend([
         "  Stage structure weights: "
@@ -458,9 +419,6 @@ def format_training_config_lines(args, loss_weights):
         f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
         f"connectivity_factor={args.stage_connectivity_factor}, "
         f"direction_factor={args.stage_direction_factor}, "
-        f"sc_s2c={args.stage_sc_s2c_weight}, "
-        f"sc_c2s={args.stage_sc_c2s_weight}, "
-        f"stage3_roadness={args.stage3_roadness_weight}, "
         f"road_attention={args.road_attention_weight}",
         "  High-res structure stream: "
         f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
@@ -497,7 +455,6 @@ def format_training_config_lines(args, loss_weights):
         "  Final connectivity loss weight: {:.2f}".format(loss_weights["connectivity_weight"]),
         "  Edge loss: disabled",
         "  Edge skip enhance: disabled",
-        f"  Decoder skip MSFE: {'disabled' if args.disable_msfe_skip else 'enabled'}",
     ])
     return lines
 
@@ -539,8 +496,6 @@ def inherit_resume_architecture_args(args):
     saved_args = checkpoint["args"]
     if "structure_profile" in saved_args and not _cli_has("--structure_profile"):
         args.structure_profile = saved_args["structure_profile"]
-    if "disable_msfe_skip" in saved_args and not _cli_has("--disable_msfe_skip"):
-        args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
     if "direct_resize_train" in saved_args and not _cli_has("--direct_resize_train"):
         args.direct_resize_train = bool(saved_args["direct_resize_train"])
     if "img_size" in saved_args and not _cli_has("--img_size"):
@@ -577,7 +532,6 @@ def inherit_resume_architecture_args(args):
     print(
         "[INFO] Resume architecture args: "
         f"profile={args.structure_profile}, "
-        f"disable_msfe_skip={args.disable_msfe_skip}, "
         f"direct_resize_train={args.direct_resize_train}, "
         f"img_size={args.img_size}, source_patch_size={args.source_patch_size}, "
         f"highres_structure={args.enable_highres_structure_stream}, "
@@ -635,24 +589,6 @@ def get_stage_distill_scale(epoch):
     if epoch_number < 10:
         return (epoch_number - 5) / 5.0
     return 1.0
-
-
-def get_stage_topology_alpha_scale(epoch, warmup_epochs=5):
-    if warmup_epochs <= 0:
-        return 1.0
-    if epoch < warmup_epochs:
-        return 0.0
-    return min(1.0, (epoch - warmup_epochs + 1) / warmup_epochs)
-
-
-def get_teacher_forcing_ratio(epoch, tf_start=0, tf_end=15):
-    if tf_end <= tf_start:
-        return 0.0 if epoch >= tf_end else 1.0
-    if epoch < tf_start:
-        return 1.0
-    if epoch >= tf_end:
-        return 0.0
-    return 1.0 - (epoch - tf_start) / (tf_end - tf_start)
 
 
 def pad_to_window_multiple(x, window_size=7):
@@ -807,7 +743,6 @@ def evaluate_skeleton(
     threshold=0.2,
     skeleton_threshold=0.5,
     stage_distill_scale=1.0,
-    stage_topology_alpha_scale=1.0,
 ):
     model.eval()
     total_loss = 0.0
@@ -826,11 +761,7 @@ def evaluate_skeleton(
             skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=1)
             skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=1)
             
-            outputs = model(
-                images_padded,
-                topology_alpha_scale=stage_topology_alpha_scale,
-                teacher_forcing_ratio=0.0,
-            )
+            outputs = model(images_padded)
 
             if isinstance(outputs, tuple):
                 (
@@ -911,7 +842,6 @@ def evaluate_overlap_full_images(
     skeleton_threshold=0.5,
     tile_size=512,
     stride=256,
-    stage_topology_alpha_scale=1.0,
 ):
     model.eval()
     total_loss = 0.0
@@ -942,11 +872,7 @@ def evaluate_overlap_full_images(
                 for top in positions(height, tile_size, stride):
                     for left in positions(width, tile_size, stride):
                         tile = image[:, :, top:top + tile_size, left:left + tile_size]
-                        outputs = model(
-                            tile,
-                            topology_alpha_scale=stage_topology_alpha_scale,
-                            teacher_forcing_ratio=0.0,
-                        )
+                        outputs = model(tile)
                         surface_logits = outputs[0]
                         skeleton_logits = outputs[2]
                         tile_height, tile_width = surface_logits.shape[-2:]
@@ -1041,7 +967,6 @@ def evaluate_trend_topology_subset(
     threshold=0.2,
     max_batches=0,
     short_area_threshold=20,
-    stage_topology_alpha_scale=1.0,
 ):
     was_training = model.training
     model.eval()
@@ -1064,11 +989,7 @@ def evaluate_trend_topology_subset(
             images = batch['image'].to(device)
             masks = batch['mask'].to(device).float()
             images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
-            outputs = model(
-                images_padded,
-                topology_alpha_scale=stage_topology_alpha_scale,
-                teacher_forcing_ratio=0.0,
-            )
+            outputs = model(images_padded)
             surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
             surface_logits = crop_to_shape(surface_logits, orig_shape)
             if masks.shape[-2:] != surface_logits.shape[-2:]:
@@ -1195,14 +1116,7 @@ if __name__ == "__main__":
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
                     final_topology_eta_init=args.final_topology_eta_init,
                     final_gap_rho_init=args.final_gap_rho_init,
-                    stage_topology_stages=args.stage_topology_stages,
-                    stage_topology_alpha_max=args.stage_topology_alpha_max,
-                    stage_topology_alpha_init=args.stage_topology_alpha_init,
-                    stage_topology_bias_mode=args.stage_topology_bias_mode,
-                    stage_topology_ratio=args.stage_topology_ratio,
-                    stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
@@ -1808,15 +1722,6 @@ if __name__ == "__main__":
             }
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
-            stage_topology_alpha_scale = get_stage_topology_alpha_scale(
-                epoch,
-                args.stage_topology_warmup_epochs,
-            )
-            teacher_forcing_ratio = get_teacher_forcing_ratio(
-                epoch,
-                tf_start=0,
-                tf_end=args.stage_topology_teacher_forcing_end,
-            )
 
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
@@ -1835,9 +1740,6 @@ if __name__ == "__main__":
 
                 outputs = model(
                     images_padded,
-                    gt_skeleton=skeletons_padded,
-                    topology_alpha_scale=stage_topology_alpha_scale,
-                    teacher_forcing_ratio=teacher_forcing_ratio,
                 )
 
                 if isinstance(outputs, tuple):
@@ -1945,7 +1847,6 @@ if __name__ == "__main__":
                         threshold=args.threshold,
                         max_batches=args.trend_val_max_batches,
                         short_area_threshold=args.trend_val_short_area_threshold,
-                        stage_topology_alpha_scale=stage_topology_alpha_scale,
                     )
                     with open(trend_val_csv, "a", newline="", encoding="utf-8") as trend_file:
                         csv.writer(trend_file).writerow([
@@ -1987,8 +1888,6 @@ if __name__ == "__main__":
                         f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
                         f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
-                        f"TopoAlphaScale: {stage_topology_alpha_scale:.2f}, "
-                        f"TF: {teacher_forcing_ratio:.2f}, "
                         f"ms/batch: {ms_per_batch:.1f}",
                         flush=True
                     )
@@ -2026,7 +1925,6 @@ if __name__ == "__main__":
                         criterion,
                         threshold=args.threshold,
                         skeleton_threshold=args.skeleton_threshold,
-                        stage_topology_alpha_scale=stage_topology_alpha_scale,
                     )
                 else:
                     val_metrics = evaluate_overlap_full_images(
@@ -2037,7 +1935,6 @@ if __name__ == "__main__":
                         skeleton_threshold=args.skeleton_threshold,
                         tile_size=args.img_size,
                         stride=args.overlap_stride,
-                        stage_topology_alpha_scale=stage_topology_alpha_scale,
                     )
                 val_loss = val_metrics['loss']
                 val_iou = val_metrics['surface_iou']
@@ -2116,14 +2013,6 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
                 log_f.write(highres_skeleton_msg + "\n")
                 log_f.write(structure_delta_msg + "\n")
-                log_f.write(
-                    f"  Stage topology alpha scale: "
-                    f"{stage_topology_alpha_scale:.6f}\n"
-                )
-                log_f.write(
-                    f"  Stage topology teacher forcing ratio: "
-                    f"{teacher_forcing_ratio:.6f}\n"
-                )
                 log_f.write(f"  Skipped non-finite batches: {skipped_batches}\n")
                 log_f.write(topology_msg + "\n")
                 log_f.write("-"*100 + "\n")
@@ -2159,8 +2048,6 @@ if __name__ == "__main__":
                 'topology_attention_version': TOPOLOGY_ATTENTION_VERSION,
                 'structure_profile': args.structure_profile,
                 'topology_coefficients': get_topology_coefficients(model),
-                'stage_topology_alpha_scale': stage_topology_alpha_scale,
-                'stage_topology_teacher_forcing_ratio': teacher_forcing_ratio,
                 'loaded_pretrained_names': sorted(loaded_pretrained_names),
                 'args': vars(args),
             }
@@ -2194,7 +2081,6 @@ if __name__ == "__main__":
                 criterion,
                 threshold=args.threshold,
                 skeleton_threshold=args.skeleton_threshold,
-                stage_topology_alpha_scale=1.0,
             )
         else:
             best_val_metrics = evaluate_overlap_full_images(
@@ -2205,7 +2091,6 @@ if __name__ == "__main__":
                 skeleton_threshold=args.skeleton_threshold,
                 tile_size=args.img_size,
                 stride=args.overlap_stride,
-                stage_topology_alpha_scale=1.0,
             )
 
         best_eval_msg = (

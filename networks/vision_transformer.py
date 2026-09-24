@@ -46,14 +46,10 @@ def get_topology_coefficients(model):
             "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),
         },
         "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
-        "stage_topology_stages": getattr(swin_unet, "stage_topology_stages", "none"),
-        "stage_topology_active": {
-            f"stage{stage}": bool(swin_unet._stage_topology_enabled(stage))
-            for stage in range(swin_unet.num_layers)
-        },
     }
 
-    for stage, structure_block in enumerate(swin_unet.decoder_structure_blocks):
+    for stage in (2, 3):
+        structure_block = swin_unet.decoder_structure_blocks[str(stage)]
         coefficients[f"decoder_stage{stage}"] = {
             "gamma1": float(structure_block.gamma1.detach().cpu()),
             "structure_enabled": bool(swin_unet._decoder_structure_enabled(stage)),
@@ -76,22 +72,6 @@ def get_topology_coefficients(model):
             "raw_rho_gap": 0.0,
             "rho_gap_eff": 0.0,
         }
-
-    coefficients["stage_topology"] = {
-        "enabled": swin_unet.stage_topology_stages != "none",
-        "bias_mode": getattr(swin_unet, "stage_topology_bias_mode", "pairwise_skeleton"),
-        "ratio": float(getattr(swin_unet, "stage_topology_ratio", 0.08)),
-        "topo_clip": float(getattr(swin_unet, "stage_topology_topo_clip", 4.0)),
-        **{
-            f"stage{stage}_alpha_base": float(
-                swin_unet.stage_topology_scales[str(stage)]
-                .effective_topology_alpha()
-                .detach()
-                .cpu()
-            )
-            for stage in (2, 3)
-        },
-    }
 
     return coefficients
 
@@ -138,12 +118,7 @@ def format_topology_coefficients(model):
             "on" if coefficients["global_topology_enabled"] else "off"
         )
     )
-    for stage in (
-        "decoder_stage0",
-        "decoder_stage1",
-        "decoder_stage2",
-        "decoder_stage3",
-    ):
+    for stage in ("decoder_stage2", "decoder_stage3"):
         values = coefficients[stage]
         enabled = "active" if values.get("structure_enabled") else "bypass"
         fields.append(
@@ -166,19 +141,6 @@ def format_topology_coefficients(model):
         )
     else:
         fields.append("final_topology=disabled")
-    stage_values = coefficients["stage_topology"]
-    fields.append(
-        "stage_topology stages={} enabled={} mode={} ratio={:.4f} "
-        "topo_clip={:.2f} stage2_alpha_base={:.6f} stage3_alpha_base={:.6f}".format(
-            coefficients["stage_topology_stages"],
-            stage_values["enabled"],
-            stage_values["bias_mode"],
-            stage_values["ratio"],
-            stage_values["topo_clip"],
-            stage_values["stage2_alpha_base"],
-            stage_values["stage3_alpha_base"],
-        )
-    )
     return " | ".join(fields)
 
 
@@ -243,6 +205,12 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
         "swin_unet.stage2_topology_source.surface_uncertainty_head.",
     )
+    removed_model_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.",
+        "swin_unet.decoder_structure_blocks.1.",
+        "swin_unet.stage_topology_scales.",
+        "swin_unet.msce_blocks.",
+    )
     filtered_state_dict = {}
     skipped_obsolete_keys = []
     skipped_shape_keys = []
@@ -254,6 +222,7 @@ def load_topology_checkpoint_state(
                 or key.startswith(obsolete_unexpected_prefixes)
                 or key.startswith(removed_direction_embedding_prefixes)
                 or key.startswith(removed_surface_uncertainty_prefixes)
+                or key.startswith(removed_model_prefixes)
                 or key.startswith(highres_structure_missing_prefixes)
             )
         ):
@@ -302,7 +271,6 @@ def load_topology_checkpoint_state(
             "swin_unet.guided_head.final_topology_attention.",
             "swin_unet.guided_head.raw_rho_gap",
             "swin_unet.guided_head.fixed_rho_gap",
-            "swin_unet.stage_topology_scales.",
             "swin_unet.global_topology.",
             "swin_unet.stage2_topology_source.",
             "swin_unet.encoder_road_attention_head.",
@@ -325,24 +293,14 @@ def load_topology_checkpoint_state(
             "swin_unet.layers_up.3.blocks.1.decoder_connectivity_bias_scale",
             "swin_unet.bottleneck_context_fusion.scale_projections.",
             "swin_unet.bottleneck_context_fusion.scale_attention.",
-            "swin_unet.decoder_structure_blocks.0.direction_head.",
-            "swin_unet.decoder_structure_blocks.1.direction_head.",
             "swin_unet.decoder_structure_blocks.2.direction_head.",
             "swin_unet.decoder_structure_blocks.3.direction_head.",
-            "swin_unet.decoder_structure_blocks.0.connectivity_context.",
-            "swin_unet.decoder_structure_blocks.1.connectivity_context.",
             "swin_unet.decoder_structure_blocks.2.connectivity_context.",
             "swin_unet.decoder_structure_blocks.3.connectivity_context.",
-            "swin_unet.decoder_structure_blocks.0.direction_gate.",
-            "swin_unet.decoder_structure_blocks.1.direction_gate.",
             "swin_unet.decoder_structure_blocks.2.direction_gate.",
             "swin_unet.decoder_structure_blocks.3.direction_gate.",
-            "swin_unet.decoder_structure_blocks.0.direction_gate_beta",
-            "swin_unet.decoder_structure_blocks.1.direction_gate_beta",
             "swin_unet.decoder_structure_blocks.2.direction_gate_beta",
             "swin_unet.decoder_structure_blocks.3.direction_gate_beta",
-            "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
-            "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
             "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
             "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
             "swin_unet.stage2_topology_source.direction_head.",
@@ -417,28 +375,16 @@ def load_topology_checkpoint_state(
         "swin_unet.layers_up.3.blocks.0.decoder_connectivity_bias_scale",
         "swin_unet.layers_up.3.blocks.1.decoder_skeleton_bias_scale",
         "swin_unet.layers_up.3.blocks.1.decoder_connectivity_bias_scale",
-        "swin_unet.decoder_structure_blocks.0.direction_head.",
-        "swin_unet.decoder_structure_blocks.1.direction_head.",
         "swin_unet.decoder_structure_blocks.2.direction_head.",
         "swin_unet.decoder_structure_blocks.3.direction_head.",
-        "swin_unet.decoder_structure_blocks.0.connectivity_context.",
-        "swin_unet.decoder_structure_blocks.1.connectivity_context.",
         "swin_unet.decoder_structure_blocks.2.connectivity_context.",
         "swin_unet.decoder_structure_blocks.3.connectivity_context.",
-        "swin_unet.decoder_structure_blocks.0.direction_gate.",
-        "swin_unet.decoder_structure_blocks.1.direction_gate.",
         "swin_unet.decoder_structure_blocks.2.direction_gate.",
         "swin_unet.decoder_structure_blocks.3.direction_gate.",
-        "swin_unet.decoder_structure_blocks.0.direction_gate_beta",
-        "swin_unet.decoder_structure_blocks.1.direction_gate_beta",
         "swin_unet.decoder_structure_blocks.2.direction_gate_beta",
         "swin_unet.decoder_structure_blocks.3.direction_gate_beta",
-        "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
-        "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
         "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
         "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
-        "swin_unet.decoder_structure_blocks.0.gate_branch.",
-        "swin_unet.decoder_structure_blocks.1.gate_branch.",
         "swin_unet.decoder_structure_blocks.2.gate_branch.",
         "swin_unet.decoder_structure_blocks.3.gate_branch.",
         "swin_unet.global_topology.",
@@ -472,7 +418,7 @@ def load_topology_checkpoint_state(
         "swin_unet.guided_head.final_topology_attention.",
         "swin_unet.guided_head.structure_fusion.",
         "swin_unet.guided_head.structure_residual.",
-    ) + removed_direction_embedding_prefixes + removed_surface_uncertainty_prefixes
+    ) + removed_direction_embedding_prefixes + removed_surface_uncertainty_prefixes + removed_model_prefixes
     if strict:
         result = model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
@@ -526,14 +472,7 @@ class SwinUnet(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
                  return_skeleton=False, bottleneck_type="global_local",
                  final_topology_eta_init=0.005, final_gap_rho_init=0.005,
-                 stage_topology_stages="none",
-                 stage_topology_alpha_max=1.0,
-                 stage_topology_alpha_init=0.1,
-                 stage_topology_bias_mode="pairwise_skeleton",
-                 stage_topology_ratio=0.08,
-                 stage_topology_topo_clip=4.0,
                  structure_profile=STRUCTURE_PROFILE_FULL,
-                 use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
                  final_skeleton_gradient_ratio=0.0,
@@ -573,14 +512,7 @@ class SwinUnet(nn.Module):
                                 bottleneck_type=self.bottleneck_type,
                                 final_topology_eta_init=final_topology_eta_init,
                                 final_gap_rho_init=final_gap_rho_init,
-                                stage_topology_stages=stage_topology_stages,
-                                stage_topology_alpha_max=stage_topology_alpha_max,
-                                stage_topology_alpha_init=stage_topology_alpha_init,
-                                stage_topology_bias_mode=stage_topology_bias_mode,
-                                stage_topology_ratio=stage_topology_ratio,
-                                stage_topology_topo_clip=stage_topology_topo_clip,
                                 structure_profile=structure_profile,
-                                use_msfe_skip=use_msfe_skip,
                                 stage2_skeleton_gradient_ratio=stage2_skeleton_gradient_ratio,
                                 stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
                                 final_skeleton_gradient_ratio=final_skeleton_gradient_ratio,
@@ -598,18 +530,10 @@ class SwinUnet(nn.Module):
     def forward(
         self,
         x,
-        gt_skeleton=None,
-        topology_alpha_scale=1.0,
-        teacher_forcing_ratio=0.0,
     ):
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)
-        outputs = self.swin_unet(
-            x,
-            gt_skeleton=gt_skeleton,
-            topology_alpha_scale=topology_alpha_scale,
-            teacher_forcing_ratio=teacher_forcing_ratio,
-        )
+        outputs = self.swin_unet(x)
 
         if isinstance(outputs, tuple):
             logits = outputs[0]

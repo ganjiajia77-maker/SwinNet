@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -297,6 +299,28 @@ def build_stage_skeleton_target(skeleton_gt, target_size):
     return F.interpolate(skeleton, size=target_size, mode="nearest").clamp(0.0, 1.0)
 
 
+def build_soft_stage_skeleton_target(skeleton_gt, target_size, sigma=1.5):
+    hard = build_stage_skeleton_target(skeleton_gt, target_size)
+    soft = hard.clone()
+    previous = hard > 0.5
+    max_distance_sq = (1, 2, 4, 5, 8, 9)
+    radius = 3
+    yy, xx = torch.meshgrid(
+        torch.arange(-radius, radius + 1, device=hard.device),
+        torch.arange(-radius, radius + 1, device=hard.device),
+        indexing="ij",
+    )
+    distance_sq = yy.square() + xx.square()
+    for max_dist_sq in max_distance_sq:
+        kernel = (distance_sq <= max_dist_sq).to(dtype=hard.dtype)
+        dilated = F.conv2d(hard, kernel.view(1, 1, 7, 7), padding=radius) > 0
+        ring = dilated & ~previous
+        value = math.exp(-max_dist_sq / (2.0 * sigma * sigma))
+        soft = torch.where(ring, soft.new_full((), value), soft)
+        previous = dilated
+    return hard, soft.clamp_(0.0, 1.0)
+
+
 class SurfaceStructureLoss(nn.Module):
     def __init__(
         self,
@@ -312,8 +336,6 @@ class SurfaceStructureLoss(nn.Module):
         stage_structure_weights=None,
         stage_connectivity_factor=0.5,
         stage_direction_factor=0.2,
-        stage_skeleton_connectivity_s2c_weight=1.0,
-        stage_skeleton_connectivity_c2s_weight=0.2,
         road_attention_weight=0.0,
         highres_structure_skeleton_weight=0.0,
         use_legacy_stage_connectivity_loss=False,
@@ -351,12 +373,6 @@ class SurfaceStructureLoss(nn.Module):
         self.stage_structure_weights = tuple(float(w) for w in stage_structure_weights)
         self.stage_connectivity_factor = float(stage_connectivity_factor)
         self.stage_direction_factor = float(stage_direction_factor)
-        self.stage_skeleton_connectivity_s2c_weight = float(
-            stage_skeleton_connectivity_s2c_weight
-        )
-        self.stage_skeleton_connectivity_c2s_weight = float(
-            stage_skeleton_connectivity_c2s_weight
-        )
         self.use_legacy_stage_connectivity_loss = bool(
             use_legacy_stage_connectivity_loss
         )
@@ -446,6 +462,23 @@ class SurfaceStructureLoss(nn.Module):
         dice_skeleton = self.skeleton_loss.dice(skeleton_logits, skeleton_gt)
         loss_skeleton = bce_skeleton + self.skeleton_loss.dice_weight * dice_skeleton
         return loss_skeleton, bce_skeleton, dice_skeleton
+
+    def soft_stage_skeleton_loss(self, skeleton_logits, skeleton_soft_target):
+        skeleton_soft_target = self._match_spatial_size(
+            skeleton_soft_target, skeleton_logits, mode="bilinear"
+        ).to(device=skeleton_logits.device, dtype=skeleton_logits.dtype)
+        skeleton_pos_weight = (
+            self.skeleton_loss.pos_weight.to(skeleton_logits.device)
+            if self.skeleton_loss.pos_weight is not None
+            else None
+        )
+        bce = F.binary_cross_entropy_with_logits(
+            skeleton_logits,
+            skeleton_soft_target,
+            pos_weight=skeleton_pos_weight,
+        )
+        dice = self.skeleton_loss.dice(skeleton_logits, skeleton_soft_target)
+        return bce + self.skeleton_loss.dice_weight * dice
 
     @staticmethod
     def _shift_map(x, dy, dx):
@@ -631,34 +664,6 @@ class SurfaceStructureLoss(nn.Module):
 
         return total
 
-    @staticmethod
-    def _connectivity_neighbor_skeleton(skeleton_prob):
-        padded = F.pad(skeleton_prob, (1, 1, 1, 1))
-        height, width = skeleton_prob.shape[-2:]
-        neighbors = []
-        for dy, dx in CONNECTIVITY_DIRECTIONS:
-            y0 = 1 + dy
-            x0 = 1 + dx
-            neighbors.append(padded[:, :, y0:y0 + height, x0:x0 + width])
-        return torch.cat(neighbors, dim=1)
-
-    def skeleton_connectivity_consistency_loss(
-        self,
-        skeleton_logits,
-        connectivity_logits,
-    ):
-        skeleton_prob = torch.sigmoid(skeleton_logits)
-        connectivity_prob = torch.sigmoid(connectivity_logits)
-        skeleton_pair = skeleton_prob * self._connectivity_neighbor_skeleton(
-            skeleton_prob
-        )
-        loss_s_to_c = (skeleton_pair * (1.0 - connectivity_prob)).mean()
-        loss_c_to_s = (connectivity_prob * (1.0 - skeleton_pair)).mean()
-        return (
-            self.stage_skeleton_connectivity_s2c_weight * loss_s_to_c
-            + self.stage_skeleton_connectivity_c2s_weight * loss_c_to_s
-        )
-
     def stage_structure_loss(
         self,
         stage_outputs,
@@ -718,13 +723,14 @@ class SurfaceStructureLoss(nn.Module):
                 if stage_skeleton_dilate_gt is not None
                 else skeleton_dilate_gt
             )
-            stage_skel = build_stage_skeleton_target(source_stage_skel, target_size)
+            stage_skel, stage_skel_soft = build_soft_stage_skeleton_target(
+                source_stage_skel, target_size
+            )
             stage_skel_dilate = build_stage_skeleton_target(source_stage_skel_dilate, target_size)
             if stage_skeleton_logits is not None:
-                loss_skeleton_stage, _, _ = self.skeleton_pixel_loss(
+                loss_skeleton_stage = self.soft_stage_skeleton_loss(
                     stage_skeleton_logits,
-                    stage_skel,
-                    stage_skel_dilate,
+                    stage_skel_soft,
                 )
             else:
                 loss_skeleton_stage = reference_logits.sum() * 0.0

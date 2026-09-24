@@ -122,7 +122,6 @@ class PairwiseConnectivityHead(nn.Module):
         super().__init__()
         if connectivity_channels != len(CONNECTIVITY_DIRECTIONS):
             raise ValueError("PairwiseConnectivityHead expects 8 connectivity channels.")
-        hidden_channels = hidden_channels or max(channels // 2, 16)
         self.connectivity_channels = connectivity_channels
         self.feature_channels = channels
         self.prior_channels = 16
@@ -131,12 +130,9 @@ class PairwiseConnectivityHead(nn.Module):
             nn.BatchNorm2d(self.prior_channels),
             nn.ReLU(inplace=True),
         )
-        self.edge_mlp = nn.Sequential(
-            nn.Conv2d(2 * channels + self.prior_channels, hidden_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, 1, kernel_size=1),
-        )
+        self.edge_linear = nn.Conv2d(4 * channels + self.prior_channels, 1, kernel_size=1)
+        self.collect_pair_diagnostics = False
+        self.last_pair_diagnostics = None
         self.register_buffer("axis_basis", connectivity_double_angle_basis().view(1, 8, 2, 1, 1))
 
     @staticmethod
@@ -172,6 +168,8 @@ class PairwiseConnectivityHead(nn.Module):
                 feature.shape[-1],
             )
         logits = []
+        diagnostic_neighbors = []
+        diagnostic_priors = []
         for idx, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
             neighbor = self._shift_feature(feature, dy, dx)
             neighbor_skeleton = self._shift_feature(skeleton_prob, dy, dx)
@@ -189,12 +187,25 @@ class PairwiseConnectivityHead(nn.Module):
                 [
                     feature,
                     neighbor,
+                    neighbor - feature,
+                    neighbor * feature,
                     prior_feature,
                 ],
                 dim=1,
             )
-            logits.append(self.edge_mlp(edge_feature))
-        return torch.cat(logits, dim=1)
+            logits.append(self.edge_linear(edge_feature))
+            if self.collect_pair_diagnostics:
+                diagnostic_neighbors.append(neighbor.detach())
+                diagnostic_priors.append(prior_feature.detach())
+        output = torch.cat(logits, dim=1)
+        if self.collect_pair_diagnostics:
+            self.last_pair_diagnostics = {
+                "feature": feature.detach(),
+                "neighbor": torch.stack(diagnostic_neighbors, dim=1),
+                "prior": torch.stack(diagnostic_priors, dim=1),
+                "logits": output.detach(),
+            }
+        return output
 
 
 class LegacyPairwisePriorConnectivityHead(nn.Module):
@@ -701,6 +712,11 @@ class DecoderStructureRefinement(nn.Module):
         self.capture_diagnostics = False
         self.capture_feature_tensors = False
         self.last_diagnostics = None
+        # Inference-only hooks used by structure-input ablations.
+        self.runtime_ablate_skeleton_prior = False
+        self.runtime_ablate_connectivity_gate = False
+        self.runtime_gate_skeleton_override = None
+        self.runtime_connectivity_skeleton_override = None
 
     @property
     def gamma1(self):
@@ -738,21 +754,49 @@ class DecoderStructureRefinement(nn.Module):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
         if disable_skeleton_prediction:
-            skeleton_logits = None
             if skeleton_prior is None:
+                skeleton_logits = None
                 skeleton_prob = x.new_zeros((x.shape[0], 1, x.shape[-2], x.shape[-1]))
             else:
-                skeleton_prob = torch.sigmoid(
-                    F.interpolate(
-                        skeleton_prior,
-                        size=x.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
+                resized_prior_logits = F.interpolate(
+                    skeleton_prior,
+                    size=x.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
                 )
+                skeleton_delta = self.skeleton_head(structure_feat)
+                skeleton_logits = resized_prior_logits + skeleton_delta
+                skeleton_prob = torch.sigmoid(skeleton_logits)
         else:
             skeleton_logits = self.skeleton_head(structure_feat)
             skeleton_prob = torch.sigmoid(skeleton_logits)
+        runtime_skeleton = skeleton_prob
+        runtime_gate_skeleton = skeleton_prob
+        runtime_connectivity_skeleton = skeleton_prob
+        if self.runtime_ablate_skeleton_prior:
+            runtime_gate_skeleton = torch.zeros_like(skeleton_prob)
+            runtime_connectivity_skeleton = torch.zeros_like(skeleton_prob)
+
+        def resize_runtime_skeleton(value):
+            if value is None:
+                return None
+            value = value.to(device=x.device, dtype=x.dtype)
+            return F.interpolate(
+                value,
+                size=x.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).clamp(0.0, 1.0)
+
+        gate_override = resize_runtime_skeleton(self.runtime_gate_skeleton_override)
+        connectivity_override = resize_runtime_skeleton(
+            self.runtime_connectivity_skeleton_override
+        )
+        if gate_override is not None:
+            runtime_gate_skeleton = gate_override
+        if connectivity_override is not None:
+            runtime_connectivity_skeleton = connectivity_override
+
         direction_logits = self.direction_head(structure_feat)
         direction_alignment = self.connectivity_head.direction_alignment(
             direction_logits
@@ -761,18 +805,20 @@ class DecoderStructureRefinement(nn.Module):
         connectivity_logits = self.connectivity_head(
             connectivity_feat,
             direction_alignment,
-            skeleton_prob=skeleton_prob.detach(),
+            skeleton_prob=runtime_connectivity_skeleton.detach(),
         )
 
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
+        if self.runtime_ablate_connectivity_gate:
+            conn_strength = torch.zeros_like(conn_strength)
         gate_feat = self.gate_branch(x)
         structure_gate_old_logits = self.structure_gate(
             torch.cat(
                 [
                     gate_feat,
-                    skeleton_prob.detach(),
+                    runtime_gate_skeleton.detach(),
                     conn_strength.detach(),
                 ],
                 dim=1,

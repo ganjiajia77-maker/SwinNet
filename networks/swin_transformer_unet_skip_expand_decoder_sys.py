@@ -5,7 +5,6 @@ import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from .dca_fpn_lite import DCAFPNLite
-from .msfe_block import MSFEBlock
 from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
 from .keypoint_global_topology import KeypointGuidedGlobalTopology
@@ -80,61 +79,6 @@ def pad_nhwc_to_window(x, window_size):
     return x, H + pad_h, W + pad_w
 
 
-TOPOLOGY_QK_RELATIVE_EPS = 1e-6
-DEFAULT_STAGE_TOPOLOGY_RATIO = 0.08
-DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP = 4.0
-
-
-class GapQueryFormulaConfig:
-    """Eval-time overrides for gap-query topology bias (no new trainable params)."""
-
-    __slots__ = (
-        "topo_conf_threshold",
-        "h_threshold",
-        "h_key_threshold",
-        "g_mode",
-        "pool_kernel",
-        "g_h_max",
-        "directional_mode",
-    )
-
-    def __init__(
-        self,
-        topo_conf_threshold=0.0,
-        h_threshold=0.0,
-        h_key_threshold=0.0,
-        g_mode="pool_gap",
-        pool_kernel=7,
-        g_h_max=1.0,
-        directional_mode="max",
-    ):
-        self.topo_conf_threshold = float(topo_conf_threshold)
-        self.h_threshold = float(h_threshold)
-        self.h_key_threshold = float(h_key_threshold)
-        self.g_mode = str(g_mode)
-        self.pool_kernel = int(pool_kernel)
-        self.g_h_max = float(g_h_max)
-        self.directional_mode = str(directional_mode)
-
-    def copy(self, **overrides):
-        params = {slot: getattr(self, slot) for slot in self.__slots__}
-        params.update(overrides)
-        return GapQueryFormulaConfig(**params)
-
-    def to_dict(self):
-        return {slot: getattr(self, slot) for slot in self.__slots__}
-
-
-DEFAULT_GAP_QUERY_FORMULA = GapQueryFormulaConfig()
-
-
-def _mean_positive(values, eps=TOPOLOGY_QK_RELATIVE_EPS):
-    positive = values[values > 0]
-    if positive.numel() > 0:
-        return positive.mean()
-    return values.abs().mean().clamp_min(eps)
-
-
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
@@ -196,14 +140,8 @@ class WindowAttention(nn.Module):
         self,
         x,
         mask=None,
-        topology_bias=None,
         road_attention_bias=None,
         structure_attention_bias=None,
-        topology_alpha=None,
-        use_qk_relative_topology=True,
-        topology_ratio=DEFAULT_STAGE_TOPOLOGY_RATIO,
-        topo_clip=DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP,
-        eps=TOPOLOGY_QK_RELATIVE_EPS,
     ):
         """
         Args:
@@ -223,36 +161,6 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias_table[self.relative_position_index.view(-1)].view(N, N, -1)
         relative_position_bias = 16 * torch.sigmoid(relative_position_bias.permute(2, 0, 1).contiguous())
         attn = qk_logits + relative_position_bias.unsqueeze(0)
-        if getattr(self, "capture_logits", False):
-            with torch.no_grad():
-                self.last_qk_logits_abs_mean = float(qk_logits.abs().mean().detach().cpu())
-                self.last_logits_before_topology = attn.detach()
-        if topology_bias is not None:
-            if use_qk_relative_topology:
-                qk_scale = qk_logits.abs().mean().detach()
-                topo_scale = _mean_positive(topology_bias, eps=eps).detach()
-                t_unit = (topology_bias / (topo_scale + eps)).clamp(0.0, float(topo_clip))
-                topology_term = float(topology_ratio) * qk_scale * t_unit.unsqueeze(1)
-                active_pair_ratio = float((topology_bias > eps).float().mean().detach().cpu())
-            else:
-                if topology_alpha is None:
-                    raise ValueError("topology_alpha is required for legacy pairwise topology bias")
-                topology_term = topology_alpha * topology_bias.unsqueeze(1)
-                qk_scale = qk_logits.abs().mean().detach()
-                topo_scale = _mean_positive(topology_bias, eps=eps).detach()
-                active_pair_ratio = float((topology_bias > eps).float().mean().detach().cpu())
-            if getattr(self, "capture_logits", False):
-                with torch.no_grad():
-                    qk_mean = qk_logits.abs().mean()
-                    term_mean = topology_term.abs().mean()
-                    self.last_qk_scale = float(qk_scale.detach().cpu())
-                    self.last_topo_scale = float(topo_scale.detach().cpu())
-                    self.last_active_pair_ratio = active_pair_ratio
-                    self.last_topology_term_over_qk_ratio = float(
-                        (term_mean / (qk_mean + eps)).detach().cpu()
-                    )
-                    self.last_topology_term_abs_mean = float(term_mean.detach().cpu())
-            attn = attn + topology_term
         if road_attention_bias is not None:
             if road_attention_bias.dim() == 3:
                 road_attention_bias = road_attention_bias.unsqueeze(1)
@@ -545,11 +453,6 @@ class SwinTransformerBlock(nn.Module):
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-        self.capture_topology_diagnostics = False
-        self.last_topology_diagnostics = None
-        self.topology_bias_mode = "pairwise_skeleton"
-        self.topology_ratio = DEFAULT_STAGE_TOPOLOGY_RATIO
-        self.topology_topo_clip = DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP
         if self.use_road_bias:
             self.road_bias_scale_a1 = nn.Parameter(torch.tensor(0.0))
             self.road_bias_scale_a2 = nn.Parameter(torch.tensor(0.0))
@@ -560,8 +463,7 @@ class SwinTransformerBlock(nn.Module):
             self.decoder_connectivity_bias_scale = nn.Parameter(torch.tensor(0.1))
         else:
             self.register_parameter("decoder_connectivity_bias_scale", None)
-        self.gap_query_formula = GapQueryFormulaConfig()
-        self._register_topology_buffers()
+        self._register_structure_bias_buffers()
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -603,19 +505,13 @@ class SwinTransformerBlock(nn.Module):
             return tuple(self._pad_road_prior(item, H, W, Hp, Wp) for item in road_prior)
         return self._pad_probability_map(road_prior, H, W, Hp, Wp)
 
-    def _register_topology_buffers(self):
+    def _register_structure_bias_buffers(self):
         coords_h = torch.arange(self.window_size)
         coords_w = torch.arange(self.window_size)
-        coords = torch.stack(
-            torch.meshgrid(coords_h, coords_w, indexing="ij"),
-            dim=-1,
-        ).view(-1, 2)
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1).view(-1, 2)
         delta = coords.unsqueeze(0) - coords.unsqueeze(1)
-        dy = delta[..., 0]
-        dx = delta[..., 1]
-
-        target_dy = -dy
-        target_dx = -dx
+        dy, dx = delta[..., 0], delta[..., 1]
+        target_dy, target_dx = -dy, -dx
         direction = torch.zeros_like(dy, dtype=torch.long)
         direction[(target_dy < 0) & (target_dx == 0)] = 0
         direction[(target_dy < 0) & (target_dx > 0)] = 1
@@ -625,213 +521,18 @@ class SwinTransformerBlock(nn.Module):
         direction[(target_dy > 0) & (target_dx < 0)] = 5
         direction[(target_dy == 0) & (target_dx < 0)] = 6
         direction[(target_dy < 0) & (target_dx < 0)] = 7
-
         opposite = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.long)
         distance = torch.maximum(dy.abs(), dx.abs()).float()
-        distance_decay = torch.exp(-distance / 4.0)
-        distance_decay[distance == 0] = 0.0
-        pair_theta = torch.atan2(target_dy.float(), target_dx.float())
         pair_axis = torch.stack(
-            (
-                torch.cos(2.0 * pair_theta),
-                torch.sin(2.0 * pair_theta),
-            ),
-            dim=-1,
+            (torch.cos(2 * torch.atan2(target_dy.float(), target_dx.float())),
+             torch.sin(2 * torch.atan2(target_dy.float(), target_dx.float()))), dim=-1
         )
-        pair_axis[distance == 0] = 0.0
-
-        self.register_buffer(
-            "topology_direction_one_hot",
-            F.one_hot(direction, num_classes=8).float(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "topology_opposite_direction_one_hot",
-            F.one_hot(opposite[direction], num_classes=8).float(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "topology_distance_decay",
-            distance_decay,
-            persistent=False,
-        )
-        self.register_buffer(
-            "topology_pair_distance",
-            distance,
-            persistent=False,
-        )
-        self.register_buffer(
-            "topology_pair_unit_i_to_j",
-            pair_axis,
-            persistent=False,
-        )
-        self.register_buffer(
-            "topology_pair_unit_j_to_i",
-            pair_axis,
-            persistent=False,
-        )
-
-    def _topology_bias_pairwise_skeleton(self, skeleton_windows, connectivity_windows):
-        conn_forward = torch.einsum(
-            "bik,ijk->bij",
-            connectivity_windows,
-            self.topology_direction_one_hot,
-        )
-        conn_backward = torch.einsum(
-            "bjk,ijk->bij",
-            connectivity_windows,
-            self.topology_opposite_direction_one_hot,
-        )
-        skeleton_pair = skeleton_windows * skeleton_windows.transpose(1, 2)
-        return (
-            skeleton_pair
-            * 0.5
-            * (conn_forward + conn_backward)
-            * self.topology_distance_decay.unsqueeze(0)
-        )
-
-    @staticmethod
-    def _compute_gap_query_maps(
-        skeleton,
-        connectivity,
-        roadness=None,
-        formula=None,
-    ):
-        formula = formula or DEFAULT_GAP_QUERY_FORMULA
-        if formula.g_mode == "roadness_gap":
-            if roadness is None:
-                raise ValueError("roadness_gap requires roadness logits")
-            topk = min(2, connectivity.shape[-1])
-            conn_strength = connectivity.topk(k=topk, dim=-1).values.mean(
-                dim=-1,
-                keepdim=True,
-            )
-            topo_conf = skeleton * conn_strength
-            H_topo = topo_conf * torch.sigmoid((topo_conf - 0.15) / 0.05)
-            H_nchw = H_topo.permute(0, 3, 1, 2).contiguous()
-            near_H = F.max_pool2d(
-                H_nchw,
-                kernel_size=5,
-                stride=1,
-                padding=2,
-            )
-            R = torch.sigmoid(roadness).permute(0, 3, 1, 2).contiguous()
-            weak_road = torch.sigmoid((R - 0.03) / 0.03) * torch.sigmoid(
-                (0.85 - R) / 0.12
-            )
-            lowH = torch.sigmoid((0.35 - H_nchw) / 0.05)
-            G_nchw = near_H * lowH * weak_road
-            return H_nchw, G_nchw
-
-        topk = min(2, connectivity.shape[-1])
-        conn_strength = connectivity.topk(k=topk, dim=-1).values.mean(
-            dim=-1,
-            keepdim=True,
-        )
-        topo_conf = skeleton * conn_strength
-        if formula.topo_conf_threshold > 0:
-            topo_conf = topo_conf * (
-                topo_conf >= formula.topo_conf_threshold
-            ).float()
-        if roadness is None:
-            H = topo_conf
-        else:
-            H = 1.0 - (1.0 - topo_conf) * (1.0 - roadness)
-        if formula.h_threshold > 0:
-            H = H * (H >= formula.h_threshold).float()
-        H_nchw = H.permute(0, 3, 1, 2).contiguous()
-        kernel = max(1, int(formula.pool_kernel))
-        padding = kernel // 2
-        pooled = F.max_pool2d(
-            H_nchw,
-            kernel_size=kernel,
-            stride=1,
-            padding=padding,
-        )
-        if formula.g_mode == "pool_gap":
-            G_nchw = pooled * (1.0 - H_nchw)
-        elif formula.g_mode == "local_gap":
-            G_nchw = (1.0 - H_nchw) * (pooled - H_nchw).clamp(min=0.0)
-        elif formula.g_mode == "relu_gap":
-            G_nchw = (pooled - H_nchw).clamp(min=0.0)
-        elif formula.g_mode == "pool_gap_lowH":
-            G_nchw = (
-                pooled
-                * (1.0 - H_nchw)
-                * (H_nchw < formula.g_h_max).float()
-            )
-        else:
-            raise ValueError(f"Unknown gap-query g_mode: {formula.g_mode}")
-        return H_nchw, G_nchw
-
-    def _topology_bias_gap_query(
-        self,
-        H_windows,
-        G_windows,
-        connectivity_windows,
-        formula=None,
-    ):
-        formula = formula or self.gap_query_formula
-        H = H_windows.squeeze(-1)
-        G = G_windows.squeeze(-1)
-        if formula.h_key_threshold > 0:
-            H = H * (H >= formula.h_key_threshold).float()
-        conn_forward = torch.einsum(
-            "bik,ijk->bij",
-            connectivity_windows,
-            self.topology_direction_one_hot,
-        )
-        conn_backward = torch.einsum(
-            "bjk,ijk->bij",
-            connectivity_windows,
-            self.topology_opposite_direction_one_hot,
-        )
-        if formula.directional_mode == "mean":
-            directional = 0.5 * (conn_forward + conn_backward)
-        else:
-            directional = torch.maximum(conn_forward, conn_backward)
-        decay = self.topology_distance_decay.unsqueeze(0)
-        return G.unsqueeze(-1) * H.unsqueeze(-2) * directional * decay
-
-    def _build_topology_bias(
-        self,
-        skeleton,
-        connectivity,
-        roadness=None,
-    ):
-        skeleton_windows = window_partition(
-            skeleton,
-            self.window_size,
-        ).view(-1, self.window_size * self.window_size, 1)
-        connectivity_windows = window_partition(
-            connectivity,
-            self.window_size,
-        ).view(-1, self.window_size * self.window_size, 8)
-        if self.topology_bias_mode == "gap_query":
-            H_map, G_map = self._compute_gap_query_maps(
-                skeleton,
-                connectivity,
-                roadness=roadness,
-                formula=self.gap_query_formula,
-            )
-            H_windows = window_partition(
-                H_map.permute(0, 2, 3, 1).contiguous(),
-                self.window_size,
-            ).view(-1, self.window_size * self.window_size, 1)
-            G_windows = window_partition(
-                G_map.permute(0, 2, 3, 1).contiguous(),
-                self.window_size,
-            ).view(-1, self.window_size * self.window_size, 1)
-            return self._topology_bias_gap_query(
-                H_windows,
-                G_windows,
-                connectivity_windows,
-                formula=self.gap_query_formula,
-            )
-        return self._topology_bias_pairwise_skeleton(
-            skeleton_windows,
-            connectivity_windows,
-        )
+        pair_axis[distance == 0] = 0
+        self.register_buffer("topology_direction_one_hot", F.one_hot(direction, 8).float(), persistent=False)
+        self.register_buffer("topology_opposite_direction_one_hot", F.one_hot(opposite[direction], 8).float(), persistent=False)
+        self.register_buffer("topology_pair_distance", distance, persistent=False)
+        self.register_buffer("topology_pair_unit_i_to_j", pair_axis, persistent=False)
+        self.register_buffer("topology_pair_unit_j_to_i", pair_axis, persistent=False)
 
     def _road_prior_to_pair_bias(self, road_prior):
         H, W = road_prior.shape[-2:]
@@ -978,10 +679,6 @@ class SwinTransformerBlock(nn.Module):
     def forward(
         self,
         x,
-        skeleton_prob=None,
-        connectivity_prob=None,
-        topology_alpha=None,
-        roadness_prob=None,
         road_prior=None,
         decoder_skeleton_prob=None,
         decoder_connectivity_prob=None,
@@ -1002,51 +699,11 @@ class SwinTransformerBlock(nn.Module):
         else:
             shifted_x = x
 
-        topology_bias = None
-        use_qk_relative = self.topology_bias_mode == "gap_query"
-        if skeleton_prob is not None or connectivity_prob is not None:
-            if skeleton_prob is None or connectivity_prob is None:
-                raise ValueError(
-                    "skeleton_prob and connectivity_prob must be provided together"
-                )
-            if not use_qk_relative and topology_alpha is None:
-                raise ValueError(
-                    "topology_alpha is required for pairwise_skeleton topology bias"
-                )
-            skeleton = self._pad_probability_map(skeleton_prob, H, W, Hp, Wp)
-            connectivity = self._pad_probability_map(connectivity_prob, H, W, Hp, Wp)
-            skeleton = skeleton.detach().clamp(0.0, 1.0).permute(
-                0, 2, 3, 1
-            ).contiguous()
-            connectivity = connectivity.detach().clamp(0.0, 1.0).permute(
-                0, 2, 3, 1
-            ).contiguous()
-            roadness = None
-            if roadness_prob is not None:
-                roadness = self._pad_probability_map(roadness_prob, H, W, Hp, Wp).permute(0, 2, 3, 1).contiguous()
-            if self.shift_size > 0:
-                shifts = (-self.shift_size, -self.shift_size)
-                skeleton = torch.roll(skeleton, shifts=shifts, dims=(1, 2))
-                connectivity = torch.roll(
-                    connectivity,
-                    shifts=shifts,
-                    dims=(1, 2),
-                )
-                if roadness is not None:
-                    roadness = torch.roll(roadness, shifts=shifts, dims=(1, 2))
-            topology_bias = self._build_topology_bias(
-                skeleton,
-                connectivity,
-                roadness=roadness,
-            )
-
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        if self.capture_topology_diagnostics and topology_bias is not None:
-            self.attn.capture_logits = True
         road_attention_bias = self._build_road_attention_bias(
             self._pad_road_prior(road_prior, H, W, Hp, Wp)
         )
@@ -1058,144 +715,9 @@ class SwinTransformerBlock(nn.Module):
         attn_windows = self.attn(
             x_windows,
             mask=attention_mask,
-            topology_bias=topology_bias,
             road_attention_bias=road_attention_bias,
             structure_attention_bias=structure_attention_bias,
-            topology_alpha=topology_alpha,
-            use_qk_relative_topology=use_qk_relative,
-            topology_ratio=self.topology_ratio,
-            topo_clip=self.topology_topo_clip,
         )
-        if self.capture_topology_diagnostics and topology_bias is not None:
-            self.attn.capture_logits = False
-        if self.capture_topology_diagnostics and topology_bias is not None:
-            with torch.no_grad():
-                if use_qk_relative:
-                    qk_scale = float(getattr(self.attn, "last_qk_scale", 0.0))
-                    topo_scale = float(getattr(self.attn, "last_topo_scale", 0.0))
-                    active_pair_ratio = float(
-                        getattr(self.attn, "last_active_pair_ratio", 0.0)
-                    )
-                    topology_term = (
-                        float(self.topology_ratio)
-                        * qk_scale
-                        * (topology_bias / (topo_scale + TOPOLOGY_QK_RELATIVE_EPS))
-                        .clamp(0.0, float(self.topology_topo_clip))
-                    )
-                else:
-                    qk_scale = float(
-                        getattr(self.attn, "last_qk_logits_abs_mean", 0.0)
-                    )
-                    topo_scale = float(topology_bias[topology_bias > 0].mean().item()) if (
-                        topology_bias > 0
-                    ).any() else float(topology_bias.abs().mean().item())
-                    active_pair_ratio = float(
-                        (topology_bias > TOPOLOGY_QK_RELATIVE_EPS).float().mean().item()
-                    )
-                    topology_term = topology_alpha * topology_bias
-                baseline_windows = self.attn(
-                    x_windows,
-                    mask=attention_mask,
-                    topology_bias=topology_bias,
-                    topology_alpha=(
-                        topology_alpha.new_zeros(())
-                        if topology_alpha is not None
-                        else None
-                    ),
-                    use_qk_relative_topology=use_qk_relative,
-                    topology_ratio=0.0 if use_qk_relative else self.topology_ratio,
-                    topo_clip=self.topology_topo_clip,
-                )
-                attn_diff = (attn_windows - baseline_windows).abs().mean()
-                attn_rel = attn_diff / (baseline_windows.abs().mean() + 1e-6)
-
-                def _attn_to_tokens(attn_out):
-                    attn_out = attn_out.view(
-                        -1,
-                        self.window_size,
-                        self.window_size,
-                        C,
-                    )
-                    shifted = window_reverse(
-                        attn_out,
-                        self.window_size,
-                        Hp,
-                        Wp,
-                    )
-                    if self.shift_size > 0:
-                        shifted = torch.roll(
-                            shifted,
-                            shifts=(self.shift_size, self.shift_size),
-                            dims=(1, 2),
-                        )
-                    return shifted[:, :H, :W, :].contiguous().view(B, H * W, C)
-
-                tokens_with = shortcut + self.drop_path(_attn_to_tokens(attn_windows))
-                tokens_baseline = shortcut + self.drop_path(
-                    _attn_to_tokens(baseline_windows)
-                )
-                stage_with = tokens_with + self.drop_path(
-                    self.mlp(self.norm2(tokens_with))
-                )
-                stage_baseline = tokens_baseline + self.drop_path(
-                    self.mlp(self.norm2(tokens_baseline))
-                )
-                stage_delta_rel = (
-                    (stage_with - stage_baseline).abs().mean()
-                    / (stage_baseline.abs().mean() + 1e-6)
-                )
-                conn_strength = connectivity_prob.topk(
-                    k=min(2, connectivity_prob.shape[1]),
-                    dim=1,
-                ).values.mean(dim=1)
-                self.last_topology_diagnostics = {
-                    "topology_bias_mode": self.topology_bias_mode,
-                    "topology_ratio": float(self.topology_ratio),
-                    "alpha_eff": float(topology_alpha.detach().cpu()) if topology_alpha is not None else 0.0,
-                    "qk_scale": qk_scale,
-                    "topo_scale": topo_scale,
-                    "active_pair_ratio": active_pair_ratio,
-                    "topology_bias_mean": float(topology_bias.mean().detach().cpu()),
-                    "topology_bias_max": float(topology_bias.max().detach().cpu()),
-                    "topology_bias_min": float(topology_bias.min().detach().cpu()),
-                    "topology_term_mean": float(topology_term.mean().detach().cpu()),
-                    "topology_term_max": float(topology_term.max().detach().cpu()),
-                    "topology_term_min": float(topology_term.min().detach().cpu()),
-                    "qk_logits_abs_mean": float(
-                        getattr(
-                            self.attn,
-                            "last_qk_logits_abs_mean",
-                            0.0,
-                        )
-                    ),
-                    "topology_term_abs_mean": float(
-                        getattr(
-                            self.attn,
-                            "last_topology_term_abs_mean",
-                            0.0,
-                        )
-                    ),
-                    "topology_term_over_qk_ratio": float(
-                        getattr(
-                            self.attn,
-                            "last_topology_term_over_qk_ratio",
-                            0.0,
-                        )
-                    ),
-                    "attention_output_diff": float(attn_diff.detach().cpu()),
-                    "attention_relative_diff": float(attn_rel.detach().cpu()),
-                    "stage_output_delta_relative_norm": float(
-                        stage_delta_rel.detach().cpu()
-                    ),
-                    "skeleton_prob_mean": float(skeleton_prob.mean().detach().cpu()),
-                    "skeleton_prob_max": float(skeleton_prob.max().detach().cpu()),
-                    "skeleton_prob_min": float(skeleton_prob.min().detach().cpu()),
-                    "conn_strength_mean": float(conn_strength.mean().detach().cpu()),
-                    "conn_strength_max": float(conn_strength.max().detach().cpu()),
-                    "conn_strength_min": float(conn_strength.min().detach().cpu()),
-                }
-
-        # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
 
@@ -1738,14 +1260,7 @@ class SwinTransformerSys(nn.Module):
                  use_checkpoint=False, final_upsample="expand_first", return_skeleton=False,
                  bottleneck_type="global_local", final_topology_eta_init=0.005,
                  final_gap_rho_init=0.005,
-                 stage_topology_stages="none",
-                 stage_topology_alpha_max=1.0,
-                 stage_topology_alpha_init=0.1,
-                 stage_topology_bias_mode="pairwise_skeleton",
-                 stage_topology_ratio=DEFAULT_STAGE_TOPOLOGY_RATIO,
-                 stage_topology_topo_clip=DEFAULT_STAGE_TOPOLOGY_TOPO_CLIP,
                  structure_profile="full",
-                 use_msfe_skip=True,
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
                  final_skeleton_gradient_ratio=0.0,
@@ -1780,18 +1295,6 @@ class SwinTransformerSys(nn.Module):
         self.final_upsample = final_upsample
         self.return_skeleton = return_skeleton
         self.bottleneck_type = bottleneck_type.lower()
-        self.stage_topology_stages = stage_topology_stages.lower()
-        if self.stage_topology_stages not in {"none", "stage3", "stage23"}:
-            raise ValueError(
-                "stage_topology_stages must be one of: none, stage3, stage23"
-            )
-        self.stage_topology_bias_mode = stage_topology_bias_mode.lower()
-        if self.stage_topology_bias_mode not in {"pairwise_skeleton", "gap_query"}:
-            raise ValueError(
-                "stage_topology_bias_mode must be pairwise_skeleton or gap_query"
-            )
-        self.stage_topology_ratio = float(stage_topology_ratio)
-        self.stage_topology_topo_clip = float(stage_topology_topo_clip)
         self.structure_profile = structure_profile.lower()
         if self.structure_profile not in {
             "full",
@@ -1808,7 +1311,6 @@ class SwinTransformerSys(nn.Module):
                 "stage23_boundary_0626_final_ske",
             }
         )
-        self.use_msfe_skip = bool(use_msfe_skip)
         self.stage2_skeleton_gradient_ratio = float(stage2_skeleton_gradient_ratio)
         self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
@@ -1965,7 +1467,7 @@ class SwinTransformerSys(nn.Module):
         else:
             raise ValueError(f"Unsupported bottleneck_type: {bottleneck_type}")
 
-        # ===== 仅在 Layer 1、2 上添加 MSFE + DCA-FPN 模块 (inx=2,3) =====
+        # ===== DCA-FPN skip refinement for decoder stages 2 and 3 =====
         self.bottleneck_swin_block = SwinTransformerBlock(
             dim=self.num_features,
             input_resolution=self.bottleneck_resolution,
@@ -1986,16 +1488,11 @@ class SwinTransformerSys(nn.Module):
             )
         )
 
-        self.msce_blocks = nn.ModuleList()
         self.dca_blocks = nn.ModuleList()
         
         for skip_idx in range(2, self.num_layers):  # inx=2,3: Layer2 和 Layer1
             # 通道数: skip_idx=2 → 384 (Layer2), skip_idx=3 → 192 (Layer1)
             skip_channels = int(embed_dim * 2 ** (self.num_layers - 1 - skip_idx))
-            
-            # MSFE 模块（多尺度特征增强）
-            msce_block = MSFEBlock(channel=skip_channels) if self.use_msfe_skip else nn.Identity()
-            self.msce_blocks.append(msce_block)
             
             # DCA-FPN-Lite 模块（轻量级可变形交叉注意）
             dca_block = DCAFPNLite(
@@ -2007,15 +1504,9 @@ class SwinTransformerSys(nn.Module):
             self.dca_blocks.append(dca_block)
             
             layer_name = "Layer 2" if skip_idx == 2 else "Layer 1"
-            print(f"[INFO] MSFE Block {layer_name} (inx={skip_idx}): {'enabled' if self.use_msfe_skip else 'disabled'} ({skip_channels} channels)")
             print(f"[INFO] DCA-FPN-Lite {layer_name} (inx={skip_idx}): {skip_channels} channels")
 
-        decoder_structure_channels = (
-            embed_dim * 4,
-            embed_dim * 2,
-            embed_dim,
-            embed_dim,
-        )
+        decoder_structure_channels = {2: embed_dim, 3: embed_dim}
         if self.use_stage3_global_context:
             self.global_context_head = GlobalContextHead(
                 in_channels=self.num_features,
@@ -2025,8 +1516,9 @@ class SwinTransformerSys(nn.Module):
         else:
             self.global_context_head = None
 
-        self.decoder_structure_blocks = nn.ModuleList(
-            [
+        self.decoder_structure_blocks = nn.ModuleDict(
+            {
+                str(stage_index):
                 DecoderStructureRefinement(
                     channels=channels,
                     context_channels=(
@@ -2046,8 +1538,8 @@ class SwinTransformerSys(nn.Module):
                         else 0.0
                     ),
                 )
-                for stage_index, channels in enumerate(decoder_structure_channels)
-            ]
+                for stage_index, channels in decoder_structure_channels.items()
+            }
         )
         self.prepatch_structure_encoder = PrePatchStructureEncoder(
             struct_channels=self.highres_structure_channels,
@@ -2090,8 +1582,8 @@ class SwinTransformerSys(nn.Module):
                 "stage2 structure gate can refine decoder features"
             )
             print(
-                "[INFO] Decoder structure gate input: gate feature + skeleton "
-                "+ connectivity; stage3 step0 removed"
+                "[INFO] Stage2/3 skeleton logits: resized high-res prior + "
+                "zero-initialized decoder residual; fused probability feeds gate"
             )
             print(
                 "[INFO] Global context calibration: bottleneck GAP -> "
@@ -2108,30 +1600,6 @@ class SwinTransformerSys(nn.Module):
             enable_direct_feature_refinement=False,
             skeleton_gradient_ratio=self.stage2_skeleton_gradient_ratio,
         )
-        self.stage_topology_scales = nn.ModuleDict(
-            {
-                str(stage): TopologyAttentionScale(
-                    alpha_max=stage_topology_alpha_max,
-                    alpha_init=stage_topology_alpha_init,
-                    trainable=True,
-                )
-                for stage in (2, 3)
-            }
-        )
-        print(
-            "[INFO] Native decoder topology attention: stages={}, "
-            "bias_mode={}, ratio={}, topo_clip={}, "
-            "alpha_init={}, alpha_max={}".format(
-                self.stage_topology_stages,
-                self.stage_topology_bias_mode,
-                self.stage_topology_ratio,
-                self.stage_topology_topo_clip,
-                stage_topology_alpha_init,
-                stage_topology_alpha_max,
-            )
-        )
-        self._apply_stage_topology_config()
-
         if self.final_upsample == "expand_first":
             print("---final upsample expand_first---")
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
@@ -2187,6 +1655,12 @@ class SwinTransformerSys(nn.Module):
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
         self.apply(self._init_weights)
+        if self.enable_highres_structure_stream:
+            for stage_index in (2, 3):
+                nn.init.zeros_(self.decoder_structure_blocks[str(stage_index)].skeleton_head.out.weight)
+                nn.init.zeros_(self.decoder_structure_blocks[str(stage_index)].skeleton_head.out.bias)
+            nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.weight)
+            nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.bias)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -2323,20 +1797,8 @@ class SwinTransformerSys(nn.Module):
             )
         return (final_surface_logits, *outputs[1:])
 
-    def _stage_topology_enabled(self, stage):
-        if self.stage_topology_stages == "stage23":
-            return stage in (2, 3)
-        if self.stage_topology_stages == "stage3":
-            return stage == 3
-        return False
-
     def _decoder_structure_enabled(self, stage):
-        if self.structure_profile in {
-            "stage23_boundary_0626",
-            "stage23_boundary_0626_final_ske",
-        }:
-            return stage in (2, 3)
-        return True
+        return stage in (2, 3)
 
     @staticmethod
     def _placeholder_structure_outputs(feature_map):
@@ -2418,7 +1880,7 @@ class SwinTransformerSys(nn.Module):
         block = (
             self.stage2_topology_source
             if block_stage == "stage2_topology_source"
-            else self.decoder_structure_blocks[block_stage]
+            else self.decoder_structure_blocks[str(block_stage)]
         )
         global_context = None
         if self.use_stage3_global_context and stage == 3:
@@ -2469,7 +1931,7 @@ class SwinTransformerSys(nn.Module):
         structure_outputs.append(item)
 
     @staticmethod
-    def _decoder_connectivity_used(connectivity_logits, teacher_forcing_ratio=0.0):
+    def _decoder_connectivity_used(connectivity_logits):
         return torch.sigmoid(connectivity_logits).detach()
 
     @staticmethod
@@ -2492,80 +1954,17 @@ class SwinTransformerSys(nn.Module):
             return connectivity_feature, direction_feature
         return None, None
 
-    def _apply_stage_topology_config(self):
-        for inx, layer_up in enumerate(self.layers_up):
-            if not isinstance(layer_up, BasicLayer_up):
-                continue
-            if not self._stage_topology_enabled(inx):
-                continue
-            use_gap_query = (
-                self.stage_topology_bias_mode == "gap_query" and inx == 3
-            )
-            for blk in layer_up.blocks:
-                if use_gap_query:
-                    blk.topology_bias_mode = "gap_query"
-                    blk.topology_ratio = self.stage_topology_ratio
-                    blk.topology_topo_clip = self.stage_topology_topo_clip
-                    blk.gap_query_formula = GapQueryFormulaConfig(
-                        g_mode="roadness_gap",
-                        pool_kernel=5,
-                    )
-                else:
-                    blk.topology_bias_mode = "pairwise_skeleton"
-
-    @staticmethod
-    def _mix_teacher_topology(
-        predicted_skeleton,
-        predicted_connectivity,
-        gt_skeleton,
-        teacher_forcing_ratio,
-    ):
-        predicted_skeleton = torch.sigmoid(predicted_skeleton).detach()
-        predicted_connectivity = torch.sigmoid(
-            predicted_connectivity
-        ).detach()
-        ratio = float(teacher_forcing_ratio)
-        if ratio <= 0.0:
-            return predicted_skeleton, predicted_connectivity
-        if gt_skeleton is None:
-            raise ValueError(
-                "gt_skeleton is required when teacher_forcing_ratio > 0"
-            )
-
-        gt_stage = F.interpolate(
-            (gt_skeleton > 0.5).to(dtype=predicted_skeleton.dtype),
-            size=predicted_skeleton.shape[-2:],
-            mode="nearest",
-        )
-        gt_connectivity = build_connectivity_target(
-            gt_stage,
-            erode_kernel_size=1,
-        ).to(
-            device=predicted_connectivity.device,
-            dtype=predicted_connectivity.dtype,
-        )
-        skeleton_used = ratio * gt_stage + (1.0 - ratio) * predicted_skeleton
-        connectivity_used = (
-            ratio * gt_connectivity
-            + (1.0 - ratio) * predicted_connectivity
-        )
-        return skeleton_used.detach(), connectivity_used.detach()
-
-    # Decoder and skip connection with DCA-FPN and MSFE.
+    # Decoder and skip connection with DCA-FPN.
     def forward_up_features(
         self,
         x,
         x_downsample,
         bottleneck_tokens=None,
-        gt_skeleton=None,
-        topology_alpha_scale=1.0,
-        teacher_forcing_ratio=0.0,
         z_struct=None,
         highres_structure_skeleton=None,
     ):
         """
-        Decoder with enhanced skip connection fusion using MSFE + DCA-FPN-Lite
-        仅在 Layer 1、2 (inx=2,3) 上应用 MSFE + DCA-FPN
+        Decoder with DCA-FPN-Lite refinement on stage 2 and stage 3 skips.
         
         Args:
             x: bottleneck feature [B, L, C]
@@ -2582,11 +1981,11 @@ class SwinTransformerSys(nn.Module):
                 # Bottleneck layer, no skip connection
                 pass
             elif inx == 1:
-                # inx=1 (Layer 3 skip, 1/16分辨率): 直接 concat，不加 MSFE + DCA
+                # inx=1 (Layer 3 skip, 1/16 resolution): direct concatenation.
                 x = torch.cat([x, x_downsample[3 - inx]], -1)
                 x = self.concat_back_dim[inx](x)
             else:
-                # inx=2,3 (Layer 2,1 skip): 应用 MSFE + DCA-FPN
+                # inx=2,3 (Layer 2,1 skip): apply DCA-FPN.
                 skip = x_downsample[3 - inx]  # [B, L, C]
                 
                 # 计算当前层的空间分辨率
@@ -2597,13 +1996,8 @@ class SwinTransformerSys(nn.Module):
                 skip_map = token_to_map(skip, H, W)  # [B, C, H, W]
                 x_map = token_to_map(x, H, W)  # [B, C, H, W]
                 
-                # 2. MSFE 增强 skip feature
-                # msce_blocks[0] for inx=2 (Layer2), msce_blocks[1] for inx=3 (Layer1)
                 block_idx = inx - 2
-                skip_msce = self.msce_blocks[block_idx](skip_map)  # [B, C, H, W]
-                
-                # 3. DCA-FPN 用 decoder feature 精化 skip
-                skip_refined = self.dca_blocks[block_idx](deep=x_map, shallow=skip_msce)  # [B, C, H, W]
+                skip_refined = self.dca_blocks[block_idx](deep=x_map, shallow=skip_map)  # [B, C, H, W]
                 
                 # 4. Feature Map → Token 转换
                 skip_refined = map_to_token(skip_refined)  # [B, L, C]
@@ -2617,7 +2011,6 @@ class SwinTransformerSys(nn.Module):
                 and isinstance(layer_up, BasicLayer_up)
                 and inx in (2, 3)
             )
-            topology_enabled = self._stage_topology_enabled(inx)
             if decoder_structure_gate_enabled:
                 decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
                 if inx == 3:
@@ -2680,17 +2073,10 @@ class SwinTransformerSys(nn.Module):
                 )
                 if decoder_skeleton_disabled:
                     skeleton_used = None
-                    connectivity_used = self._decoder_connectivity_used(
-                        connectivity_0,
-                        teacher_forcing_ratio,
-                    )
+                    connectivity_used = self._decoder_connectivity_used(connectivity_0)
                 else:
-                    skeleton_used, connectivity_used = self._mix_teacher_topology(
-                        skeleton_0,
-                        connectivity_0,
-                        gt_skeleton,
-                        teacher_forcing_ratio,
-                    )
+                    skeleton_used = torch.sigmoid(skeleton_0).detach()
+                    connectivity_used = torch.sigmoid(connectivity_0).detach()
                 x = layer_up(
                     x,
                     decoder_skeleton_prob=skeleton_used,
@@ -2747,73 +2133,6 @@ class SwinTransformerSys(nn.Module):
                     stage_loss_scale=1.0,
                 )
                 continue
-            elif topology_enabled:
-                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
-                topology_source = (
-                    self.stage2_topology_source
-                    if inx == 2
-                    else self.decoder_structure_blocks[inx]
-                )
-                input_height, input_width = layer_up.input_resolution
-                x_map = token_to_map(x, input_height, input_width)
-                (
-                    x_map,
-                    skeleton_i,
-                    connectivity_i,
-                    direction_i,
-                    structure_gate_i,
-                    roadness_i,
-                ) = self._run_decoder_structure_block(
-                    x_map,
-                    inx,
-                    bottleneck_tokens,
-                    disable_skeleton_prediction=decoder_skeleton_disabled,
-                    skeleton_prior=highres_structure_skeleton,
-                )
-                x = map_to_token(x_map)
-                if decoder_skeleton_disabled:
-                    skeleton_used = None
-                    connectivity_used = self._decoder_connectivity_used(
-                        connectivity_i,
-                        teacher_forcing_ratio,
-                    )
-                else:
-                    skeleton_used, connectivity_used = self._mix_teacher_topology(
-                        skeleton_i,
-                        connectivity_i,
-                        gt_skeleton,
-                        teacher_forcing_ratio,
-                    )
-                use_gap_query = (
-                    self.stage_topology_bias_mode == "gap_query" and inx == 3
-                )
-                topology_alpha = None
-                if not use_gap_query:
-                    topology_alpha = (
-                        self.stage_topology_scales[str(inx)]
-                        .effective_topology_alpha()
-                        * float(topology_alpha_scale)
-                    )
-                roadness_prob = roadness_i if use_gap_query else None
-                if decoder_skeleton_disabled:
-                    x = layer_up(x)
-                else:
-                    x = layer_up(
-                        x,
-                        skeleton_prob=skeleton_used,
-                        connectivity_prob=connectivity_used,
-                        topology_alpha=topology_alpha,
-                        roadness_prob=roadness_prob,
-                    )
-                output_scale = 2 ** max(2 - inx, 0)
-                output_height = self.patches_resolution[0] // output_scale
-                output_width = self.patches_resolution[1] // output_scale
-                x = self._apply_highres_structure_fusion(
-                    x,
-                    z_struct,
-                    inx,
-                    (output_height, output_width),
-                )
             else:
                 decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
                 x = layer_up(x)
@@ -2926,9 +2245,6 @@ class SwinTransformerSys(nn.Module):
     def forward(
         self,
         x,
-        gt_skeleton=None,
-        topology_alpha_scale=1.0,
-        teacher_forcing_ratio=0.0,
     ):
         structure_input = x
         x, x_downsample, road_attentions = self.forward_features(x)
@@ -2939,9 +2255,6 @@ class SwinTransformerSys(nn.Module):
             x,
             x_downsample,
             bottleneck_tokens=x,
-            gt_skeleton=gt_skeleton,
-            topology_alpha_scale=topology_alpha_scale,
-            teacher_forcing_ratio=teacher_forcing_ratio,
             z_struct=z_struct,
             highres_structure_skeleton=highres_structure_skeleton,
         )
