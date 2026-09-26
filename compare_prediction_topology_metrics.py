@@ -5,6 +5,8 @@ import os
 import cv2
 import numpy as np
 
+from compare_connectivity_topology_metrics import apls_score, topology_scores
+
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
@@ -18,6 +20,9 @@ def parse_args():
     parser.add_argument("--current_name", type=str, default="current")
     parser.add_argument("--split", type=str, default="val", choices=["val", "test"])
     parser.add_argument("--short_area_threshold", type=int, default=20)
+    parser.add_argument("--apls_max_nodes", type=int, default=64)
+    parser.add_argument("--apls_snap_radius", type=float, default=5.0)
+    parser.add_argument("--max_images", type=int, default=0)
     parser.add_argument("--output_csv", type=str, default="")
     return parser.parse_args()
 
@@ -184,6 +189,15 @@ def component_stats(mask_bool, short_area_threshold):
     }
 
 
+def largest_component_area(mask_bool):
+    count, _, stats, _ = cv2.connectedComponentsWithStats(
+        mask_bool.astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return 0.0
+    return float(stats[1:, cv2.CC_STAT_AREA].max())
+
+
 def cldice(pred_bool, gt_bool):
     pred_skel = skeletonize(pred_bool)
     gt_skel = skeletonize(gt_bool)
@@ -192,7 +206,15 @@ def cldice(pred_bool, gt_bool):
     return (2.0 * tprec * tsens) / (tprec + tsens + 1e-8)
 
 
-def evaluate_prediction_dir(name, pred_dir, label_dir, short_area_threshold):
+def evaluate_prediction_dir(
+    name,
+    pred_dir,
+    label_dir,
+    short_area_threshold,
+    apls_max_nodes,
+    apls_snap_radius,
+    max_images=0,
+):
     tp = fp = fn = 0.0
     cldice_values = []
     pred_comp = []
@@ -203,7 +225,18 @@ def evaluate_prediction_dir(name, pred_dir, label_dir, short_area_threshold):
     gt_short = []
     pred_largest = []
     gt_largest = []
+    topo_precision_values = []
+    topo_recall_values = []
+    topo_f1_values = []
+    break_pixels = []
+    break_rates = []
+    gap_components = []
+    max_gap_pixels = []
+    fragment_density = []
+    apls_values = []
     files = list_prediction_files(pred_dir)
+    if max_images > 0:
+        files = files[:max_images]
     for pred_path in files:
         case_id = strip_prediction_suffix(pred_path)
         label_path = find_label(label_dir, case_id)
@@ -224,7 +257,24 @@ def evaluate_prediction_dir(name, pred_dir, label_dir, short_area_threshold):
         tp += float((pred_bool & gt_bool).sum())
         fp += float((pred_bool & (~gt_bool)).sum())
         fn += float(((~pred_bool) & gt_bool).sum())
-        cldice_values.append(cldice(pred_bool, gt_bool))
+        topo = topology_scores(pred_bool, gt_bool)
+        pred_skel = topo.pop("pred_skel")
+        gt_skel = topo.pop("gt_skel")
+        missing = gt_skel & ~pred_bool
+        topo_precision_values.append(topo["topo_precision"])
+        topo_recall_values.append(topo["topo_recall"])
+        topo_f1_values.append(topo["topo_f1"])
+        cldice_values.append(topo["cldice"])
+        break_pixels.append(float(missing.sum()))
+        break_rates.append(float(missing.sum()) / (float(gt_skel.sum()) + 1e-8))
+        gap_components.append(float(component_stats(missing, 2)["components"]))
+        max_gap_pixels.append(largest_component_area(missing))
+        fragment_density.append(
+            1000.0 * float(component_stats(pred_bool, short_area_threshold)["components"])
+            / (float(pred_bool.sum()) + 1e-8)
+        )
+        if apls_max_nodes > 0:
+            apls_values.append(apls_score(gt_skel, pred_skel, apls_max_nodes, apls_snap_radius))
         ps = component_stats(pred_bool, short_area_threshold)
         gs = component_stats(gt_bool, short_area_threshold)
         pred_comp.append(ps["components"])
@@ -256,22 +306,42 @@ def evaluate_prediction_dir(name, pred_dir, label_dir, short_area_threshold):
         "gt_short": float(np.mean(gt_short)),
         "pred_largest_ratio": float(np.mean(pred_largest)),
         "gt_largest_ratio": float(np.mean(gt_largest)),
+        "topo_precision": float(np.mean(topo_precision_values)),
+        "topo_recall": float(np.mean(topo_recall_values)),
+        "topo_f1": float(np.mean(topo_f1_values)),
+        "break_pixels": float(np.mean(break_pixels)),
+        "break_rate": float(np.mean(break_rates)),
+        "gap_components": float(np.mean(gap_components)),
+        "max_gap_pixels": float(np.mean(max_gap_pixels)),
+        "fragment_density_per_1000_px": float(np.mean(fragment_density)),
+        "apls": float(np.mean(apls_values)) if apls_values else float("nan"),
     }
 
 
 def print_rows(rows):
-    print("name | images | IoU | F1 | P | R | clDice | frag_idx↓ | extra_comp↓ | pred_comp | gt_comp | pred_short↓ | largest_ratio")
+    print(
+        "name | images | IoU | F1 | P | R | clDice | topoP | topoR | topoF1 | "
+        "frag_idx | frag_density | largest_ratio | break_px | break_rate | "
+        "gap_comp | max_gap | APLS"
+    )
     for row in rows:
         print(
             f"{row['name']} | {row['n_images']} | {row['iou']:.4f} | {row['f1']:.4f} | "
             f"{row['precision']:.4f} | {row['recall']:.4f} | {row['cldice']:.4f} | "
-            f"{row['frag_idx']:.3f} | {row['extra_comp']:.2f} | {row['pred_comp']:.2f} | "
-            f"{row['gt_comp']:.2f} | {row['pred_short']:.2f} | {row['pred_largest_ratio']:.3f}"
+            f"{row['topo_precision']:.4f} | {row['topo_recall']:.4f} | {row['topo_f1']:.4f} | "
+            f"{row['frag_idx']:.3f} | {row['fragment_density_per_1000_px']:.3f} | "
+            f"{row['pred_largest_ratio']:.3f} | {row['break_pixels']:.2f} | "
+            f"{row['break_rate']:.4f} | {row['gap_components']:.2f} | "
+            f"{row['max_gap_pixels']:.2f} | {row['apls']:.4f}"
         )
     if len(rows) == 2:
         base, cur = rows
         print("\nDelta current - baseline")
-        for key in ("iou", "f1", "cldice", "frag_idx", "extra_comp", "pred_short", "pred_largest_ratio"):
+        for key in (
+            "iou", "f1", "cldice", "topo_precision", "topo_recall", "topo_f1",
+            "frag_idx", "fragment_density_per_1000_px", "pred_largest_ratio",
+            "break_pixels", "break_rate", "gap_components", "max_gap_pixels", "apls",
+        ):
             print(f"  {key}: {cur[key] - base[key]:+.4f}")
 
 
@@ -279,8 +349,24 @@ def main():
     args = parse_args()
     label_dir = resolve_label_dir(args.root_path, args.split)
     rows = [
-        evaluate_prediction_dir(args.baseline_name, args.baseline_pred_dir, label_dir, args.short_area_threshold),
-        evaluate_prediction_dir(args.current_name, args.current_pred_dir, label_dir, args.short_area_threshold),
+        evaluate_prediction_dir(
+            args.baseline_name,
+            args.baseline_pred_dir,
+            label_dir,
+            args.short_area_threshold,
+            args.apls_max_nodes,
+            args.apls_snap_radius,
+            args.max_images,
+        ),
+        evaluate_prediction_dir(
+            args.current_name,
+            args.current_pred_dir,
+            label_dir,
+            args.short_area_threshold,
+            args.apls_max_nodes,
+            args.apls_snap_radius,
+            args.max_images,
+        ),
     ]
     print_rows(rows)
     if args.output_csv:

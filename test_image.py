@@ -59,6 +59,7 @@ parser.add_argument('--stage_topology_ratio', type=float, default=0.08)
 parser.add_argument('--stage_topology_topo_clip', type=float, default=4.0)
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
+parser.add_argument('--stage3_gate_topology_gradient_ratio', type=float, default=0.0)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
 parser.add_argument(
     '--bottleneck_type',
@@ -247,6 +248,7 @@ if __name__ == "__main__":
                 "stage_topology_topo_clip",
                 "stage2_skeleton_gradient_ratio",
                 "stage3_skeleton_gradient_ratio",
+                "stage3_gate_topology_gradient_ratio",
                 "final_skeleton_gradient_ratio",
                 "enable_highres_structure_stream",
                 "highres_structure_channels",
@@ -268,16 +270,10 @@ if __name__ == "__main__":
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
                     final_topology_eta_init=args.final_topology_eta_init,
                     final_gap_rho_init=args.final_gap_rho_init,
-                    stage_topology_stages=args.stage_topology_stages,
-                    stage_topology_alpha_max=args.stage_topology_alpha_max,
-                    stage_topology_alpha_init=args.stage_topology_alpha_init,
-                    stage_topology_bias_mode=args.stage_topology_bias_mode,
-                    stage_topology_ratio=args.stage_topology_ratio,
-                    stage_topology_topo_clip=args.stage_topology_topo_clip,
                     structure_profile=args.structure_profile,
-                    use_msfe_skip=not args.disable_msfe_skip,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
+                    stage3_gate_topology_gradient_ratio=args.stage3_gate_topology_gradient_ratio,
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
                     highres_structure_channels=args.highres_structure_channels,
@@ -603,20 +599,18 @@ if __name__ == "__main__":
                 pred_numpy = (prob_numpy >= args.threshold).astype(np.uint8) * 255
                 skeleton_prob_resized = skeleton_prob
             pred_img = Image.fromarray(pred_numpy, mode='L')
-            # 只保存前 30 张到 surface_dir
-            if total_samples <= 30:
-                png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
-                pred_img.save(png_save_path)
-                if skeleton_prob_resized is not None:
-                    skeleton_pred_img = Image.fromarray(
-                        (skeleton_prob_resized >= args.skeleton_threshold).astype(np.uint8) * 255,
-                        mode='L',
-                    )
-                    skeleton_pred_path = os.path.join(
-                        skeleton_dir,
-                        f'{case_name}_skeleton_pred.png',
-                    )
-                    skeleton_pred_img.save(skeleton_pred_path)
+            png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
+            pred_img.save(png_save_path)
+            if skeleton_prob_resized is not None:
+                skeleton_pred_img = Image.fromarray(
+                    (skeleton_prob_resized >= args.skeleton_threshold).astype(np.uint8) * 255,
+                    mode='L',
+                )
+                skeleton_pred_path = os.path.join(
+                    skeleton_dir,
+                    f'{case_name}_skeleton_pred.png',
+                )
+                skeleton_pred_img.save(skeleton_pred_path)
     
     print(f"预测结果已保存到: {pred_dir}")
     

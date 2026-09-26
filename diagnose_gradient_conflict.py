@@ -16,6 +16,7 @@ from losses.road_losses import (
     build_boundary_target,
     build_connectivity_target,
     build_stage_skeleton_target,
+    build_soft_stage_skeleton_target,
 )
 from networks.vision_transformer import (
     STRUCTURE_PROFILE_FULL,
@@ -71,6 +72,10 @@ def parse_args():
     parser.add_argument("--highres_structure_fuse_stages", type=str, default="stage23")
     parser.add_argument("--highres_structure_fusion_mode", type=str, default="stage23")
     parser.add_argument("--enable_post_refine_structure_interaction", action="store_true")
+    parser.add_argument("--enable_global_topology", action="store_true")
+    parser.add_argument("--global_topology_max_nodes", type=int, default=32)
+    parser.add_argument("--global_topology_heads", type=int, default=4)
+    parser.add_argument("--global_topology_alpha_max", type=float, default=0.05)
 
     parser.add_argument("--stage2_skeleton_weight", type=float, default=0.008)
     parser.add_argument("--stage3_skeleton_weight", type=float, default=0.012)
@@ -86,6 +91,8 @@ def parse_args():
     parser.add_argument("--masked_connectivity_center_experiment", action="store_true")
     parser.add_argument("--connectivity_pos_weight", type=float, default=5.0)
     parser.add_argument("--connectivity_focal_gamma", type=float, default=1.5)
+    parser.add_argument("--edge_contrastive_margin", type=float, default=0.0)
+    parser.add_argument("--skeleton_pos_weight", type=float, default=None)
     parser.add_argument("--teacher_forcing_ratio", type=float, default=0.0)
     parser.add_argument("--topology_alpha_scale", type=float, default=1.0)
     parser.add_argument(
@@ -123,6 +130,10 @@ def inherit_checkpoint_args(args, checkpoint):
         "highres_structure_fuse_stages",
         "highres_structure_fusion_mode",
         "enable_post_refine_structure_interaction",
+        "enable_global_topology",
+        "global_topology_max_nodes",
+        "global_topology_heads",
+        "global_topology_alpha_max",
         "stage2_skeleton_weight",
         "stage3_skeleton_weight",
         "highres_structure_skeleton_weight",
@@ -133,6 +144,8 @@ def inherit_checkpoint_args(args, checkpoint):
         "masked_connectivity_center_experiment",
         "connectivity_pos_weight",
         "connectivity_focal_gamma",
+        "edge_contrastive_margin",
+        "skeleton_pos_weight",
     ):
         if name in saved_args:
             setattr(args, name, saved_args[name])
@@ -144,7 +157,6 @@ def build_model(args):
         config=config,
         img_size=args.img_size,
         num_classes=args.num_classes,
-        use_asterisk=True,
         return_skeleton=True,
         bottleneck_type=args.bottleneck_type,
         final_topology_eta_init=0.0,
@@ -156,7 +168,6 @@ def build_model(args):
         stage_topology_ratio=args.stage_topology_ratio,
         stage_topology_topo_clip=args.stage_topology_topo_clip,
         structure_profile=args.structure_profile,
-        enable_final_graph_prop=False,
         use_msfe_skip=not args.disable_msfe_skip,
         stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
         stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
@@ -166,6 +177,10 @@ def build_model(args):
         highres_structure_fuse_stages=args.highres_structure_fuse_stages,
         highres_structure_fusion_mode=args.highres_structure_fusion_mode,
         enable_post_refine_structure_interaction=args.enable_post_refine_structure_interaction,
+        enable_global_topology=args.enable_global_topology,
+        global_topology_max_nodes=args.global_topology_max_nodes,
+        global_topology_heads=args.global_topology_heads,
+        global_topology_alpha_max=args.global_topology_alpha_max,
     ).cuda()
 
 
@@ -189,6 +204,8 @@ def build_criterion(args):
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
+        edge_contrastive_margin=args.edge_contrastive_margin,
+        skeleton_pos_weight=args.skeleton_pos_weight,
     ).cuda()
 
 
@@ -304,11 +321,13 @@ def stage_loss_components(criterion, stage_outputs, skeleton_gt, skeleton_dilate
             else dir_logits
         )
         target_size = reference_logits.shape[-2:]
-        stage_skel = build_stage_skeleton_target(skeleton_gt, target_size)
+        stage_skel, stage_skel_soft = build_soft_stage_skeleton_target(
+            skeleton_gt, target_size
+        )
         stage_skel_dilate = build_stage_skeleton_target(skeleton_dilate_gt, target_size)
 
         if skel_logits is not None:
-            raw_ske, _, _ = criterion.skeleton_pixel_loss(skel_logits, stage_skel, stage_skel_dilate)
+            raw_ske = criterion.soft_stage_skeleton_loss(skel_logits, stage_skel_soft)
             stage_ske = stage_ske + stage_weight * raw_ske
             row["raw_ske"] = float(raw_ske.detach().item())
             row["weighted_ske"] = float((stage_weight * raw_ske).detach().item())
@@ -424,11 +443,17 @@ def main():
     surface_logits, boundary_logits, skeleton_logits, connectivity_logits, stage_outputs = outputs[:5]
 
     masks = criterion._match_spatial_size(masks, surface_logits)
-    skeletons = criterion._match_spatial_size(skeletons, skeleton_logits)
-    skeletons_dilate = criterion._match_spatial_size(skeletons_dilate, skeleton_logits)
+    skeleton_reference = skeleton_logits if skeleton_logits is not None else surface_logits
+    skeletons = criterion._match_spatial_size(skeletons, skeleton_reference)
+    skeletons_dilate = criterion._match_spatial_size(skeletons_dilate, skeleton_reference)
 
     seg, _, _ = criterion.surface_loss(surface_logits, masks)
-    final_ske_raw, _, _ = criterion.skeleton_pixel_loss(skeleton_logits, skeletons, skeletons_dilate)
+    if skeleton_logits is None:
+        final_ske_raw = surface_logits.sum() * 0.0
+    else:
+        final_ske_raw, _, _ = criterion.skeleton_pixel_loss(
+            skeleton_logits, skeletons, skeletons_dilate
+        )
     stage_ske, con, direction, stage_debug_rows = stage_loss_components(
         criterion,
         stage_outputs,
@@ -439,14 +464,21 @@ def main():
     )
     ske = criterion.skeleton_weight * final_ske_raw + stage_ske
 
-    if boundary_gt is None:
-        boundary_gt = build_boundary_target(masks, radius=criterion.boundary_radius)
-    boundary_gt = criterion._match_spatial_size(boundary_gt, boundary_logits)
-    boundary_raw, _, _ = criterion.boundary_loss(
-        boundary_logits,
-        boundary_gt.to(device=boundary_logits.device, dtype=boundary_logits.dtype),
-    )
-    boundary = criterion.boundary_weight * boundary_raw
+    if (
+        boundary_logits is None
+        or criterion.boundary_loss is None
+        or criterion.boundary_weight == 0
+    ):
+        boundary = surface_logits.sum() * 0.0
+    else:
+        if boundary_gt is None:
+            boundary_gt = build_boundary_target(masks, radius=criterion.boundary_radius)
+        boundary_gt = criterion._match_spatial_size(boundary_gt, boundary_logits)
+        boundary_raw, _, _ = criterion.boundary_loss(
+            boundary_logits,
+            boundary_gt.to(device=boundary_logits.device, dtype=boundary_logits.dtype),
+        )
+        boundary = criterion.boundary_weight * boundary_raw
 
     high, _ = criterion.highres_structure_skeleton_loss(stage_outputs, skeletons, skeletons_dilate)
     losses = {

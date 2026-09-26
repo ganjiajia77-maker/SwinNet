@@ -660,6 +660,8 @@ class DecoderStructureRefinement(nn.Module):
         context_strength=0.03,
         enable_direct_feature_refinement=True,
         skeleton_gradient_ratio=0.5,
+        gate_topology_gradient_ratio=0.0,
+        previous_structure_channels=None,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -668,11 +670,24 @@ class DecoderStructureRefinement(nn.Module):
         self.context_strength = float(context_strength)
         self.enable_direct_feature_refinement = bool(enable_direct_feature_refinement)
         self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
+        self.gate_topology_gradient_ratio = float(gate_topology_gradient_ratio)
+        self.previous_structure_channels = previous_structure_channels
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
         )
+        if previous_structure_channels is not None:
+            self.previous_structure_fusion = ConvBNReLU(
+                channels + int(previous_structure_channels),
+                channels,
+                kernel_size=1,
+                padding=0,
+            )
+            residual_input_channels = channels * 2
+        else:
+            self.previous_structure_fusion = None
+            residual_input_channels = channels
         self.gate_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
@@ -704,7 +719,7 @@ class DecoderStructureRefinement(nn.Module):
         else:
             self.context_to_gate = None
         self.feature_residual = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(residual_input_channels, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )
@@ -750,9 +765,23 @@ class DecoderStructureRefinement(nn.Module):
         apply_feature_refinement=True,
         disable_skeleton_prediction=False,
         skeleton_prior=None,
+        previous_structure_feat=None,
     ):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
+        if self.previous_structure_fusion is not None:
+            if previous_structure_feat is None:
+                previous_structure_feat = torch.zeros_like(structure_feat)
+            elif previous_structure_feat.shape[-2:] != structure_feat.shape[-2:]:
+                previous_structure_feat = F.interpolate(
+                    previous_structure_feat,
+                    size=structure_feat.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            structure_feat = self.previous_structure_fusion(
+                torch.cat([structure_feat, previous_structure_feat], dim=1)
+            )
         if disable_skeleton_prediction:
             if skeleton_prior is None:
                 skeleton_logits = None
@@ -813,13 +842,21 @@ class DecoderStructureRefinement(nn.Module):
         conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
         if self.runtime_ablate_connectivity_gate:
             conn_strength = torch.zeros_like(conn_strength)
+        gate_skeleton = scale_gradient(
+            runtime_gate_skeleton,
+            self.gate_topology_gradient_ratio,
+        )
+        gate_conn_strength = scale_gradient(
+            conn_strength,
+            self.gate_topology_gradient_ratio,
+        )
         gate_feat = self.gate_branch(x)
         structure_gate_old_logits = self.structure_gate(
             torch.cat(
                 [
                     gate_feat,
-                    runtime_gate_skeleton.detach(),
-                    conn_strength.detach(),
+                    gate_skeleton,
+                    gate_conn_strength,
                 ],
                 dim=1,
             )
@@ -843,7 +880,12 @@ class DecoderStructureRefinement(nn.Module):
         structure_gate = torch.sigmoid(structure_gate_logits)
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
-            residual = structure_gate * self.feature_residual(x)
+            residual_input = (
+                torch.cat([x, structure_feat], dim=1)
+                if self.previous_structure_fusion is not None
+                else x
+            )
+            residual = structure_gate * self.feature_residual(residual_input)
             gate_residual = self.gamma1 * residual
             out = x + gate_residual
         else:
@@ -861,6 +903,7 @@ class DecoderStructureRefinement(nn.Module):
                         conn_strength.mean().detach().cpu()
                     ),
                     "reliability_beta": float(self.reliability_beta.detach().cpu()),
+                    "gate_topology_gradient_ratio": self.gate_topology_gradient_ratio,
                     "reliability_correction_mean": float(
                         reliability_correction.mean().detach().cpu()
                     ),
@@ -883,6 +926,7 @@ class DecoderStructureRefinement(nn.Module):
             "gate_residual": gate_residual,
             "structure_gate_final": structure_gate,
             "reliability_beta": self.reliability_beta.detach(),
+            "structure_feat": structure_feat,
         }
         if self.capture_feature_tensors:
             diagnostics["semantic_feature"] = x.detach()

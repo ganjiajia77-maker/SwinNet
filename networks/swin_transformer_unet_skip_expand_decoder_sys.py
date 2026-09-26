@@ -1069,57 +1069,27 @@ class BasicLayer_up(nn.Module):
     def forward(
         self,
         x,
-        skeleton_prob=None,
-        connectivity_prob=None,
-        topology_alpha=None,
-        roadness_prob=None,
         decoder_skeleton_prob=None,
         decoder_connectivity_prob=None,
         decoder_direction_prob=None,
     ):
         for blk in self.blocks:
             if self.use_checkpoint:
-                if skeleton_prob is None:
-                    x = checkpoint.checkpoint(
-                        lambda feature, dec_skeleton, dec_connectivity, dec_direction: blk(
-                            feature,
-                            decoder_skeleton_prob=dec_skeleton,
-                            decoder_connectivity_prob=dec_connectivity,
-                            decoder_direction_prob=dec_direction,
-                        ),
-                        x,
-                        decoder_skeleton_prob,
-                        decoder_connectivity_prob,
-                        decoder_direction_prob,
-                    )
-                else:
-                    x = checkpoint.checkpoint(
-                        lambda feature, skeleton, connectivity, alpha, roadness, dec_skeleton, dec_connectivity, dec_direction: blk(
-                            feature,
-                            skeleton,
-                            connectivity,
-                            alpha,
-                            roadness,
-                            decoder_skeleton_prob=dec_skeleton,
-                            decoder_connectivity_prob=dec_connectivity,
-                            decoder_direction_prob=dec_direction,
-                        ),
-                        x,
-                        skeleton_prob,
-                        connectivity_prob,
-                        topology_alpha,
-                        roadness_prob,
-                        decoder_skeleton_prob,
-                        decoder_connectivity_prob,
-                        decoder_direction_prob,
-                    )
+                x = checkpoint.checkpoint(
+                    lambda feature, dec_skeleton, dec_connectivity, dec_direction: blk(
+                        feature,
+                        decoder_skeleton_prob=dec_skeleton,
+                        decoder_connectivity_prob=dec_connectivity,
+                        decoder_direction_prob=dec_direction,
+                    ),
+                    x,
+                    decoder_skeleton_prob,
+                    decoder_connectivity_prob,
+                    decoder_direction_prob,
+                )
             else:
                 x = blk(
                     x,
-                    skeleton_prob,
-                    connectivity_prob,
-                    topology_alpha,
-                    roadness_prob,
                     decoder_skeleton_prob=decoder_skeleton_prob,
                     decoder_connectivity_prob=decoder_connectivity_prob,
                     decoder_direction_prob=decoder_direction_prob,
@@ -1263,6 +1233,7 @@ class SwinTransformerSys(nn.Module):
                  structure_profile="full",
                  stage2_skeleton_gradient_ratio=0.5,
                  stage3_skeleton_gradient_ratio=0.5,
+                 stage3_gate_topology_gradient_ratio=0.0,
                  final_skeleton_gradient_ratio=0.0,
                  enable_highres_structure_stream=False,
                  highres_structure_channels=64,
@@ -1313,6 +1284,7 @@ class SwinTransformerSys(nn.Module):
         )
         self.stage2_skeleton_gradient_ratio = float(stage2_skeleton_gradient_ratio)
         self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
+        self.stage3_gate_topology_gradient_ratio = float(stage3_gate_topology_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
         self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
         self.highres_structure_channels = int(highres_structure_channels)
@@ -1536,6 +1508,14 @@ class SwinTransformerSys(nn.Module):
                         else self.stage3_skeleton_gradient_ratio
                         if stage_index == 3
                         else 0.0
+                    ),
+                    gate_topology_gradient_ratio=(
+                        self.stage3_gate_topology_gradient_ratio
+                        if stage_index == 3
+                        else 0.0
+                    ),
+                    previous_structure_channels=(
+                        channels if stage_index == 3 else None
                     ),
                 )
                 for stage_index, channels in decoder_structure_channels.items()
@@ -1872,6 +1852,7 @@ class SwinTransformerSys(nn.Module):
         apply_feature_refinement=True,
         disable_skeleton_prediction=False,
         skeleton_prior=None,
+        previous_structure_feat=None,
     ):
         if not self._decoder_structure_enabled(stage):
             return feature_map, *self._placeholder_structure_outputs(feature_map)
@@ -1894,6 +1875,7 @@ class SwinTransformerSys(nn.Module):
             apply_feature_refinement=apply_feature_refinement,
             disable_skeleton_prediction=disable_skeleton_prediction,
             skeleton_prior=skeleton_prior,
+            previous_structure_feat=previous_structure_feat,
         )
 
     def _decoder_skeleton_disabled(self, stage):
@@ -1974,6 +1956,7 @@ class SwinTransformerSys(nn.Module):
             decoder output [B, L, C]
         """
         structure_outputs = []
+        stage2_structure_feat = None
         if bottleneck_tokens is None:
             bottleneck_tokens = x
         for inx, layer_up in enumerate(self.layers_up):
@@ -2039,7 +2022,10 @@ class SwinTransformerSys(nn.Module):
                         apply_feature_refinement=True,
                         disable_skeleton_prediction=decoder_skeleton_disabled,
                         skeleton_prior=highres_structure_skeleton,
+                        previous_structure_feat=stage2_structure_feat,
                     )
+                    if isinstance(roadness_i, dict):
+                        roadness_i.pop("structure_feat", None)
                     x = map_to_token(x_map)
                     self._append_structure_output(
                         structure_outputs,
@@ -2052,6 +2038,7 @@ class SwinTransformerSys(nn.Module):
                         refinement_step=1,
                         stage_loss_scale=1.0,
                     )
+                    stage2_structure_feat = None
                     continue
                 input_height, input_width = layer_up.input_resolution
                 x_map = token_to_map(x, input_height, input_width)
@@ -2071,6 +2058,8 @@ class SwinTransformerSys(nn.Module):
                     disable_skeleton_prediction=decoder_skeleton_disabled,
                     skeleton_prior=highres_structure_skeleton,
                 )
+                if isinstance(roadness_0, dict):
+                    roadness_0.pop("structure_feat", None)
                 if decoder_skeleton_disabled:
                     skeleton_used = None
                     connectivity_used = self._decoder_connectivity_used(connectivity_0)
@@ -2120,6 +2109,8 @@ class SwinTransformerSys(nn.Module):
                     disable_skeleton_prediction=decoder_skeleton_disabled,
                     skeleton_prior=highres_structure_skeleton,
                 )
+                if inx == 2 and isinstance(roadness_i, dict):
+                    stage2_structure_feat = roadness_i.pop("structure_feat", None)
                 x = map_to_token(x_map)
                 self._append_structure_output(
                     structure_outputs,

@@ -85,7 +85,7 @@ parser.add_argument(
     type=str,
     default='bce_dice',
     choices=['bce_dice'],
-    help='surface segmentation loss; bce_dice is the original BCE + 0.5*Dice objective',
+    help='surface segmentation objective: Focal BCE + 0.5*Dice; set --surface_focal_gamma 0 for BCE',
 )
 parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help='initial final topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
@@ -137,6 +137,12 @@ parser.add_argument(
 )
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
+parser.add_argument(
+    '--stage3_gate_topology_gradient_ratio',
+    type=float,
+    default=0.0,
+    help='gradient ratio for Stage 3 gate skeleton/connectivity inputs; 0 keeps the old detached gate path',
+)
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
 parser.add_argument('--skeleton_pos_weight', type=float, default=None,
                     help='positive-class weight for skeleton BCE losses')
@@ -203,6 +209,12 @@ parser.add_argument(
     help='gamma for focal weighting on connectivity BCE; 0 disables focal weighting',
 )
 parser.add_argument(
+    '--surface_focal_gamma',
+    type=float,
+    default=1.0,
+    help='gamma for focal weighting on surface BCE; 0 disables focal weighting',
+)
+parser.add_argument(
     '--edge_contrastive_margin',
     type=float,
     default=0.0,
@@ -216,6 +228,13 @@ parser.add_argument('--resume', type=str, default='', help='resume from checkpoi
 parser.add_argument('--accumulation_steps', type=int, default=0, help='gradient accumulation steps')
 parser.add_argument('--use_checkpoint', action='store_true', help='use gradient checkpointing')
 parser.add_argument('--amp_opt_level', type=str, default='', help='AMP opt level')
+parser.add_argument(
+    '--amp_dtype',
+    type=str,
+    choices=['bfloat16', 'none'],
+    default='bfloat16',
+    help='automatic mixed precision dtype; defaults to BF16 on CUDA',
+)
 parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
@@ -245,7 +264,7 @@ def apply_structure_profile_defaults(args):
     args.final_gap_rho_init = 0.0
     if args.warmup_epochs == 3:
         args.warmup_epochs = 10
-    if args.max_epochs == 100:
+    if args.max_epochs == 100 and not _cli_has("--max_epochs"):
         args.max_epochs = 60
 
 
@@ -343,6 +362,7 @@ def build_criterion(args, loss_weights, device):
         directional_pos_weight_cardinal=args.directional_pos_weight_cardinal,
         directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
+        surface_focal_gamma=args.surface_focal_gamma,
         edge_contrastive_margin=args.edge_contrastive_margin,
     ).to(device)
 
@@ -350,6 +370,8 @@ def build_criterion(args, loss_weights, device):
 def format_training_config_lines(args, loss_weights):
     lines = [
         f"  结构配置: {args.structure_profile}",
+        f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
+        f"  Training AMP: {args.amp_dtype}",
     ]
     if args.structure_profile in {
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
@@ -371,6 +393,9 @@ def format_training_config_lines(args, loss_weights):
             "  Stage2/Stage3 skeleton gradient ratio: {:.3f}/{:.3f}".format(
                 args.stage2_skeleton_gradient_ratio,
                 args.stage3_skeleton_gradient_ratio,
+            ),
+            "  Stage3 gate topology gradient ratio: {:.3f}".format(
+                args.stage3_gate_topology_gradient_ratio
             ),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
             "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
@@ -416,6 +441,7 @@ def format_training_config_lines(args, loss_weights):
         f"stage3={args.stage3_skeleton_weight}, "
         f"stage2_grad_ratio={args.stage2_skeleton_gradient_ratio}, "
         f"stage3_grad_ratio={args.stage3_skeleton_gradient_ratio}, "
+        f"stage3_gate_topology_grad_ratio={args.stage3_gate_topology_gradient_ratio}, "
         f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
         f"connectivity_factor={args.stage_connectivity_factor}, "
         f"direction_factor={args.stage_direction_factor}, "
@@ -494,6 +520,13 @@ def inherit_resume_architecture_args(args):
         return
 
     saved_args = checkpoint["args"]
+    for name, cast in (
+        ("surface_focal_gamma", float),
+        ("amp_dtype", str),
+        ("stage3_gate_topology_gradient_ratio", float),
+    ):
+        if name in saved_args and not _cli_has(f"--{name}"):
+            setattr(args, name, cast(saved_args[name]))
     if "structure_profile" in saved_args and not _cli_has("--structure_profile"):
         args.structure_profile = saved_args["structure_profile"]
     if "direct_resize_train" in saved_args and not _cli_has("--direct_resize_train"):
@@ -1049,7 +1082,14 @@ def evaluate_trend_topology_subset(
 if __name__ == "__main__":
     # 自动检测可用设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_bf16_amp = (
+        device.type == 'cuda'
+        and args.amp_dtype == 'bfloat16'
+        and torch.cuda.is_bf16_supported()
+    )
     print(f"[INFO] Using device: {device}")
+    if args.amp_dtype == 'bfloat16' and not use_bf16_amp:
+        print("[WARN] BF16 AMP is unsupported on this device; using FP32.", flush=True)
     
     if not args.deterministic:
         cudnn.benchmark = True
@@ -1119,6 +1159,9 @@ if __name__ == "__main__":
                     structure_profile=args.structure_profile,
                     stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
+                    stage3_gate_topology_gradient_ratio=(
+                        args.stage3_gate_topology_gradient_ratio
+                    ),
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
                     highres_structure_channels=args.highres_structure_channels,
@@ -1232,6 +1275,24 @@ if __name__ == "__main__":
                 skipped_missing.append(key)
                 continue
             if model_state[key].shape != value.shape:
+                if (
+                    key.endswith(
+                        "decoder_structure_blocks.3.feature_residual.0.weight"
+                    )
+                    and model_state[key].ndim == value.ndim == 4
+                    and model_state[key].shape[0] == value.shape[0]
+                    and model_state[key].shape[1] == 2 * value.shape[1]
+                    and model_state[key].shape[2:] == value.shape[2:]
+                ):
+                    expanded_weight = torch.zeros_like(model_state[key])
+                    expanded_weight[:, :value.shape[1]].copy_(
+                        value.to(
+                            device=expanded_weight.device,
+                            dtype=expanded_weight.dtype,
+                        )
+                    )
+                    compatible[key] = expanded_weight
+                    continue
                 skipped_shape.append(key)
                 continue
             compatible[key] = value
@@ -1738,9 +1799,12 @@ if __name__ == "__main__":
                 skeletons_padded, _ = pad_to_window_multiple(skeletons, window_size=1)
                 skeletons_dilate_padded, _ = pad_to_window_multiple(skeletons_dilate, window_size=1)
 
-                outputs = model(
-                    images_padded,
-                )
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=use_bf16_amp,
+                ):
+                    outputs = model(images_padded)
 
                 if isinstance(outputs, tuple):
                     (
@@ -1752,6 +1816,21 @@ if __name__ == "__main__":
                     ) = outputs[:5]
                 else:
                     raise RuntimeError("Structure-guided training requires auxiliary model outputs.")
+                surface_logits = surface_logits.float()
+                boundary_logits = boundary_logits.float() if boundary_logits is not None else None
+                skeleton_logits = skeleton_logits.float() if skeleton_logits is not None else None
+                connectivity_logits = connectivity_logits.float() if connectivity_logits is not None else None
+                stage_outputs = [
+                    {
+                        key: value.float()
+                        if torch.is_tensor(value) and value.is_floating_point()
+                        else value
+                        for key, value in item.items()
+                    }
+                    if isinstance(item, dict)
+                    else item
+                    for item in stage_outputs
+                ]
                 surface_logits = crop_to_shape(surface_logits, orig_shape)
                 boundary_logits = crop_to_shape(boundary_logits, orig_shape)
                 skeleton_logits = crop_to_shape(skeleton_logits, orig_shape)

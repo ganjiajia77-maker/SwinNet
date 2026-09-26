@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from losses.road_losses import build_connectivity_target
+from direction_target_utils import build_continuous_direction_target
 from networks.vision_transformer import (
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
     SwinUnet as ViT_seg,
@@ -85,6 +87,7 @@ def parse_args():
     parser.add_argument("--bottleneck_type", type=str, default="global_local")
     parser.add_argument("--stage2_skeleton_gradient_ratio", type=float, default=0.5)
     parser.add_argument("--stage3_skeleton_gradient_ratio", type=float, default=0.5)
+    parser.add_argument("--stage3_gate_topology_gradient_ratio", type=float, default=0.0)
     parser.add_argument("--final_skeleton_gradient_ratio", type=float, default=0.0)
     parser.add_argument("--enable_highres_structure_stream", action="store_true")
     parser.add_argument("--highres_structure_channels", type=int, default=64)
@@ -225,12 +228,17 @@ def load_model(args, device):
             "stage_topology_topo_clip",
             "stage2_skeleton_gradient_ratio",
             "stage3_skeleton_gradient_ratio",
+            "stage3_gate_topology_gradient_ratio",
             "final_skeleton_gradient_ratio",
             "bottleneck_type",
             "enable_highres_structure_stream",
             "highres_structure_channels",
             "highres_structure_fuse_stages",
             "highres_structure_fusion_mode",
+            "enable_global_topology",
+            "global_topology_max_nodes",
+            "global_topology_heads",
+            "global_topology_alpha_max",
         ):
             if name in saved_args:
                 setattr(args, name, saved_args[name])
@@ -243,6 +251,10 @@ def load_model(args, device):
         probe = state_dict.get(
             "swin_unet.decoder_structure_blocks.2.connectivity_head.edge_mlp.0.weight"
         )
+        if probe is None:
+            probe = state_dict.get(
+                "swin_unet.decoder_structure_blocks.2.connectivity_head.edge_linear.weight"
+            )
         if probe is not None and probe.dim() == 4:
             # Standard pairwise head uses [feature, neighbor, prior_embed] -> 2C+P.
             # In these blocks hidden_channels is C/2, so input is 4*out+P.
@@ -250,7 +262,15 @@ def load_model(args, device):
             # which is 8*out+P for the same hidden width. Older checkpoints used P=3.
             out_channels = int(probe.shape[0])
             in_channels = int(probe.shape[1])
-            if in_channels in (4 * out_channels + 3, 4 * out_channels + 16):
+            edge_linear_inputs = [
+                int(value.shape[1])
+                for key, value in state_dict.items()
+                if key.endswith("connectivity_head.edge_linear.weight")
+                and value.dim() == 4
+            ]
+            if edge_linear_inputs:
+                # The current pair-feature head is implemented by the standard
+                # SwinUnet class; ``selective`` is a separate legacy network.
                 model_impl = "standard"
             elif in_channels in (8 * out_channels + 3, 8 * out_channels + 16):
                 model_impl = "selective"
@@ -279,16 +299,36 @@ def load_model(args, device):
         bottleneck_type=args.bottleneck_type,
         final_topology_eta_init=args.final_topology_eta_init,
         final_gap_rho_init=args.final_gap_rho_init,
-        stage_topology_stages=args.stage_topology_stages,
-        stage_topology_alpha_max=args.stage_topology_alpha_max,
-        stage_topology_alpha_init=args.stage_topology_alpha_init,
-        stage_topology_bias_mode=args.stage_topology_bias_mode,
-        stage_topology_ratio=args.stage_topology_ratio,
-        stage_topology_topo_clip=args.stage_topology_topo_clip,
         structure_profile=args.structure_profile,
-        use_msfe_skip=not args.disable_msfe_skip,
         stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
         stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
+        **(
+            {
+                "stage_topology_stages": args.stage_topology_stages,
+                "stage_topology_alpha_max": args.stage_topology_alpha_max,
+                "stage_topology_alpha_init": args.stage_topology_alpha_init,
+                "stage_topology_bias_mode": args.stage_topology_bias_mode,
+                "stage_topology_ratio": args.stage_topology_ratio,
+                "stage_topology_topo_clip": args.stage_topology_topo_clip,
+                "use_msfe_skip": not args.disable_msfe_skip,
+            }
+            if model_impl == "selective"
+            else {
+                "stage3_gate_topology_gradient_ratio": (
+                    args.stage3_gate_topology_gradient_ratio
+                ),
+                "enable_global_topology": getattr(
+                    args, "enable_global_topology", False
+                ),
+                "global_topology_max_nodes": getattr(
+                    args, "global_topology_max_nodes", 32
+                ),
+                "global_topology_heads": getattr(args, "global_topology_heads", 4),
+                "global_topology_alpha_max": getattr(
+                    args, "global_topology_alpha_max", 0.05
+                ),
+            }
+        ),
         final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
         enable_highres_structure_stream=args.enable_highres_structure_stream,
         highres_structure_channels=args.highres_structure_channels,
@@ -587,10 +627,13 @@ def main():
             masks = (batch["mask"].to(device) > 0.5)
             skeleton_raw = batch["skeleton"].to(device).float()
             skeleton_dilate_raw = batch["skeleton_dilate"].to(device).float()
-            connectivity_gt = batch["connectivity_gt"].to(device).float()
-            direction_gt = batch["direction_gt"].to(device).float()
+            connectivity_gt = build_connectivity_target(skeleton_raw).to(device).float()
+            direction_gt = build_continuous_direction_target(skeleton_raw).to(device).float()
 
-            outputs = model(images, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
+            # The current standard model's forward API only accepts images.
+            # topology_alpha_scale and teacher_forcing_ratio were removed with
+            # the inactive decoder topology branches.
+            outputs = model(images)
             surface_logits = outputs[0]
             skeleton = resize_like(skeleton_raw, surface_logits, mode="nearest") > 0.5
             skeleton_dilate = resize_like(

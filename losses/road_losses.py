@@ -27,8 +27,11 @@ class DiceLoss(nn.Module):
 
 
 class BCEDiceLoss(nn.Module):
-    def __init__(self, dice_weight=1.0, bce_weight=1.0, pos_weight=None):
+    def __init__(self, dice_weight=1.0, bce_weight=1.0, pos_weight=None, focal_gamma=0.0):
         super().__init__()
+
+        if focal_gamma < 0:
+            raise ValueError("focal_gamma must be nonnegative")
 
         if pos_weight is not None:
             pos_weight = torch.tensor([pos_weight], dtype=torch.float32)
@@ -37,11 +40,11 @@ class BCEDiceLoss(nn.Module):
         self.dice = DiceLoss()
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
+        self.focal_gamma = float(focal_gamma)
 
     def forward(self, logits, targets):
         pos_weight = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
 
-        # 原始 BCE
         bce_unreduced = F.binary_cross_entropy_with_logits(
             logits,
             targets,
@@ -49,7 +52,10 @@ class BCEDiceLoss(nn.Module):
             reduction='none'
         )
 
-        # 直接取平均 BCE
+        if self.focal_gamma > 0.0:
+            probs = torch.sigmoid(logits)
+            pt = probs * targets + (1.0 - probs) * (1.0 - targets)
+            bce_unreduced = bce_unreduced * (1.0 - pt).pow(self.focal_gamma)
         bce = bce_unreduced.mean()
 
         dice = self.dice(logits, targets)
@@ -344,6 +350,7 @@ class SurfaceStructureLoss(nn.Module):
         directional_pos_weight_cardinal=1.0,
         directional_pos_weight_diagonal=2.5,
         connectivity_focal_gamma=0.0,
+        surface_focal_gamma=0.0,
         edge_contrastive_margin=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
@@ -354,6 +361,7 @@ class SurfaceStructureLoss(nn.Module):
             dice_weight=surface_dice_weight,
             bce_weight=1.0,
             pos_weight=surface_pos_weight,
+            focal_gamma=surface_focal_gamma,
         )
         self.skeleton_loss = BCEDiceLoss(
             dice_weight=skeleton_dice_weight,

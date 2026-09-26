@@ -97,6 +97,10 @@ def main():
     )
     parser.add_argument('--stage_topology_alpha_max', type=float, default=1.0)
     parser.add_argument('--stage_topology_alpha_init', type=float, default=0.1)
+    parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
+    parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
+    parser.add_argument('--stage3_gate_topology_gradient_ratio', type=float, default=0.0)
+    parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
     parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_window7_224_lite.yaml')
     parser.add_argument('--zip', action='store_true', help='use zipped dataset')
     parser.add_argument('--cache_mode', type=str, default='', help='cache mode for dataset')
@@ -185,6 +189,10 @@ def main():
                     "stage_topology_stages",
                     "stage_topology_alpha_max",
                     "stage_topology_alpha_init",
+                    "stage2_skeleton_gradient_ratio",
+                    "stage3_skeleton_gradient_ratio",
+                    "stage3_gate_topology_gradient_ratio",
+                    "final_skeleton_gradient_ratio",
                     "enable_highres_structure_stream",
                     "highres_structure_channels",
                     "highres_structure_fuse_stages",
@@ -221,11 +229,10 @@ def main():
         bottleneck_type=args.bottleneck_type,
         final_topology_eta_init=args.final_topology_eta_init,
         final_gap_rho_init=args.final_gap_rho_init,
-        stage_topology_stages=args.stage_topology_stages,
-        stage_topology_alpha_max=args.stage_topology_alpha_max,
-        stage_topology_alpha_init=args.stage_topology_alpha_init,
         structure_profile=args.structure_profile,
-        use_msfe_skip=not args.disable_msfe_skip,
+        stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
+        stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
+        final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
         enable_highres_structure_stream=args.enable_highres_structure_stream,
         highres_structure_channels=args.highres_structure_channels,
         highres_structure_fuse_stages=args.highres_structure_fuse_stages,
@@ -234,6 +241,7 @@ def main():
     )
     if args.model_impl == 'standard':
         model_kwargs.update(
+            stage3_gate_topology_gradient_ratio=args.stage3_gate_topology_gradient_ratio,
             enable_global_topology=args.enable_global_topology,
             global_topology_max_nodes=args.global_topology_max_nodes,
             global_topology_heads=args.global_topology_heads,
