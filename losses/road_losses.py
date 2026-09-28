@@ -354,6 +354,14 @@ class SurfaceStructureLoss(nn.Module):
         edge_contrastive_margin=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
+        coarse_road_weight=0.0,
+        coarse_road_pos_weight=4.0,
+        bottleneck_coarse_road_weight=0.0,
+        bottleneck_coarse_road_pos_weight=4.0,
+        stage_connectivity_factors=None,
+        stage_direction_factors=None,
+        stage_skeleton_loss_factor=1.0,
+        stage_skeleton_only_loss_factor=1.0,
     ):
         super().__init__()
 
@@ -394,6 +402,16 @@ class SurfaceStructureLoss(nn.Module):
         self.edge_contrastive_margin = float(edge_contrastive_margin)
         self.road_attention_weight = float(road_attention_weight)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
+        self.coarse_road_weight = float(coarse_road_weight)
+        self.coarse_road_pos_weight = float(coarse_road_pos_weight)
+        self.bottleneck_coarse_road_weight = float(bottleneck_coarse_road_weight)
+        self.bottleneck_coarse_road_pos_weight = float(bottleneck_coarse_road_pos_weight)
+        self.stage_connectivity_factors = tuple(stage_connectivity_factors or ())
+        self.stage_direction_factors = tuple(stage_direction_factors or ())
+        self.stage_skeleton_loss_factor = float(stage_skeleton_loss_factor)
+        self.stage_skeleton_only_loss_factor = float(
+            stage_skeleton_only_loss_factor
+        )
 
     @staticmethod
     def _match_spatial_size(target, reference, mode="nearest"):
@@ -659,6 +677,8 @@ class SurfaceStructureLoss(nn.Module):
         for idx, stage_output in enumerate(stage_outputs):
             if idx >= len(self.skeleton_stage_weights):
                 break
+            if "skeleton" not in stage_output or stage_output["skeleton"] is None:
+                continue
             stage_logits = stage_output["skeleton"]
             target_size = stage_logits.shape[-2:]
             stage_skel = build_stage_skeleton_target(skeleton_gt, target_size)
@@ -671,6 +691,50 @@ class SurfaceStructureLoss(nn.Module):
             total = total + self.skeleton_stage_weights[idx] * loss_stage
 
         return total
+
+    def coarse_road_loss(
+        self,
+        stage_outputs,
+        coarse_road_gt,
+        reference_logits,
+        logits_key="coarse_road_logits",
+        weight=None,
+        pos_weight=None,
+    ):
+        if (
+            not stage_outputs
+            or coarse_road_gt is None
+            or (self.coarse_road_weight if weight is None else weight) <= 0
+        ):
+            zero = reference_logits.sum() * 0.0
+            return zero, zero.detach()
+        logits = next(
+            (
+                item.get(logits_key)
+                for item in stage_outputs
+                if isinstance(item, dict) and item.get(logits_key) is not None
+            ),
+            None,
+        )
+        if logits is None:
+            zero = reference_logits.sum() * 0.0
+            return zero, zero.detach()
+        target = coarse_road_gt.to(device=logits.device, dtype=logits.dtype)
+        if target.shape[-2:] != logits.shape[-2:]:
+            target = F.interpolate(target, size=logits.shape[-2:], mode="nearest")
+        pos_weight = logits.new_tensor(
+            self.coarse_road_pos_weight if pos_weight is None else pos_weight
+        )
+        bce = F.binary_cross_entropy_with_logits(
+            logits, target, pos_weight=pos_weight
+        )
+        probability = torch.sigmoid(logits)
+        intersection = (probability * target).sum(dim=(1, 2, 3))
+        denominator = probability.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+        dice = (1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)).mean()
+        raw_loss = bce + dice
+        effective_weight = self.coarse_road_weight if weight is None else weight
+        return effective_weight * raw_loss, raw_loss.detach()
 
     def stage_structure_loss(
         self,
@@ -779,10 +843,20 @@ class SurfaceStructureLoss(nn.Module):
                 ).sum() / direction_valid.sum().clamp_min(1.0)
             else:
                 loss_direction_stage = loss_skeleton_stage * 0.0
-            total = total + stage_weight * (
-                loss_skeleton_stage
-                + self.stage_connectivity_factor * loss_connectivity_stage
-                + self.stage_direction_factor * loss_direction_stage
+            connectivity_factor = (
+                self.stage_connectivity_factors[stage_index]
+                if stage_index < len(self.stage_connectivity_factors)
+                else self.stage_connectivity_factor
+            )
+            direction_factor = (
+                self.stage_direction_factors[stage_index]
+                if stage_index < len(self.stage_direction_factors)
+                else self.stage_direction_factor
+            )
+            total = total + stage_weight * self.stage_skeleton_loss_factor * (
+                self.stage_skeleton_only_loss_factor * loss_skeleton_stage
+                + connectivity_factor * loss_connectivity_stage
+                + direction_factor * loss_direction_stage
             )
 
         return total
@@ -951,6 +1025,8 @@ class SurfaceStructureLoss(nn.Module):
         direction_gt=None,
         boundary_gt=None,
         valid_mask=None,
+        coarse_road_gt=None,
+        bottleneck_coarse_road_gt=None,
     ):
         if surface_gt is None or skeleton_gt is None:
             raise ValueError("surface_gt and skeleton_gt are required.")
@@ -1060,6 +1136,17 @@ class SurfaceStructureLoss(nn.Module):
             skeleton_gt,
             skeleton_dilate_gt,
         )
+        loss_coarse_road, coarse_road_raw = self.coarse_road_loss(
+            stage_outputs, coarse_road_gt, surface_logits
+        )
+        loss_bottleneck_coarse_road, bottleneck_coarse_road_raw = self.coarse_road_loss(
+            stage_outputs,
+            bottleneck_coarse_road_gt,
+            surface_logits,
+            logits_key="bottleneck_coarse_road_logits",
+            weight=self.bottleneck_coarse_road_weight,
+            pos_weight=self.bottleneck_coarse_road_pos_weight,
+        )
         delta_stats = self.structure_surface_delta_stats(
             stage_outputs,
             surface_logits,
@@ -1075,6 +1162,8 @@ class SurfaceStructureLoss(nn.Module):
             + loss_stage_structure
             + loss_road_attention
             + loss_highres_structure_skeleton
+            + loss_coarse_road
+            + loss_bottleneck_coarse_road
         )
 
         loss_dict = {
@@ -1089,6 +1178,10 @@ class SurfaceStructureLoss(nn.Module):
             "road_attention_loss": loss_road_attention.detach(),
             "loss_highres_structure_skeleton": loss_highres_structure_skeleton.detach(),
             "highres_structure_skeleton_raw": highres_stats["highres_structure_skeleton_raw"],
+            "loss_coarse_road": loss_coarse_road.detach(),
+            "coarse_road_raw": coarse_road_raw,
+            "loss_bottleneck_coarse_road": loss_bottleneck_coarse_road.detach(),
+            "bottleneck_coarse_road_raw": bottleneck_coarse_road_raw,
             "structure_delta_mean": delta_stats["structure_delta_mean"],
             "structure_delta_abs_mean": delta_stats["structure_delta_abs_mean"],
             "structure_delta_abs_max": delta_stats["structure_delta_abs_max"],

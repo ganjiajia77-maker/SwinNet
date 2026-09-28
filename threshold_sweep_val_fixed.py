@@ -23,6 +23,17 @@ from networks.vision_transformer_selective_fusion import (
     load_topology_checkpoint_state as load_topology_checkpoint_state_selective,
     print_topology_coefficients as print_topology_coefficients_selective,
 )
+
+
+def _cli_has(flag_name):
+    flag = "--" + flag_name
+    negative_flag = "--no-" + flag_name
+    return any(
+        argument == flag
+        or argument == negative_flag
+        or argument.startswith(flag + "=")
+        for argument in sys.argv[1:]
+    )
 from losses.road_losses import binary_metrics_from_logits
 from config import get_config
 from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
@@ -163,10 +174,24 @@ def main():
         ],
     )
     parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
+    parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--enable_global_topology', action='store_true')
     parser.add_argument('--global_topology_max_nodes', type=int, default=32)
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
+    parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])
+    parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--enable_coarse_road_mask', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--enable_psi_directional_descriptor', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--enable_sparse_window_compute', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--stage2_window_threshold', type=float, default=None)
+    parser.add_argument('--stage3_window_threshold', type=float, default=None)
+    parser.add_argument('--coarse_candidate_window_size', type=int, default=None)
+    parser.add_argument('--coarse_corridor_window_radius', type=int, default=None)
+    parser.add_argument('--coarse_routing_mode', type=str, default=None, choices=['dense', 'p64', 'bottleneck', 'bottleneck_no_psi'])
+    parser.add_argument('--bottleneck_coarse_road_mask', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--bottleneck_window_threshold', type=float, default=None)
     args = parser.parse_args()
     
     checkpoint = None
@@ -174,16 +199,16 @@ def main():
         checkpoint = torch.load(args.model_path, map_location='cpu')
         if isinstance(checkpoint, dict):
             saved_profile = checkpoint.get("structure_profile")
-            if saved_profile:
+            if saved_profile and not _cli_has("structure_profile"):
                 args.structure_profile = saved_profile
-            elif isinstance(checkpoint.get("args"), dict):
+            elif isinstance(checkpoint.get("args"), dict) and not _cli_has("structure_profile"):
                 args.structure_profile = checkpoint["args"].get(
                     "structure_profile",
                     args.structure_profile,
                 )
             if isinstance(checkpoint.get("args"), dict):
                 saved_args = checkpoint["args"]
-                if "disable_msfe_skip" in saved_args:
+                if "disable_msfe_skip" in saved_args and not _cli_has("disable_msfe_skip"):
                     args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
                 for name in (
                     "stage_topology_stages",
@@ -198,14 +223,47 @@ def main():
                     "highres_structure_fuse_stages",
                     "highres_structure_fusion_mode",
                     "enable_post_refine_structure_interaction",
+                    "enable_h3_surface_fusion",
                     "enable_global_topology",
                     "global_topology_max_nodes",
                     "global_topology_heads",
                     "global_topology_alpha_max",
                     "bottleneck_type",
+                    "stage_skeleton_mode",
+                    "enable_e128_stage_fusion",
+                    "enable_coarse_road_mask",
+                    "enable_psi_directional_descriptor",
+                    "enable_sparse_window_compute",
+                    "remove_stage2_pre_topology_source",
+                    "stage2_window_threshold",
+                    "stage3_window_threshold",
+                    "coarse_candidate_window_size",
+                    "coarse_corridor_window_radius",
+                    "coarse_routing_mode",
+                    "bottleneck_coarse_road_mask",
+                    "bottleneck_window_threshold",
                 ):
-                    if name in saved_args:
+                    if name in saved_args and not _cli_has(name):
                         setattr(args, name, saved_args[name])
+
+    for name, default in (
+        ("stage_skeleton_mode", "prior_residual"),
+        ("enable_e128_stage_fusion", False),
+        ("enable_h3_surface_fusion", False),
+        ("enable_coarse_road_mask", False),
+        ("enable_psi_directional_descriptor", False),
+        ("enable_sparse_window_compute", False),
+        ("remove_stage2_pre_topology_source", False),
+        ("stage2_window_threshold", 0.10),
+        ("stage3_window_threshold", 0.10),
+        ("coarse_candidate_window_size", 8),
+        ("coarse_corridor_window_radius", 0),
+        ("coarse_routing_mode", "dense"),
+        ("bottleneck_coarse_road_mask", False),
+        ("bottleneck_window_threshold", 0.25),
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, default)
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print('Using device: {}'.format(device))
@@ -238,6 +296,7 @@ def main():
         highres_structure_fuse_stages=args.highres_structure_fuse_stages,
         highres_structure_fusion_mode=args.highres_structure_fusion_mode,
         enable_post_refine_structure_interaction=args.enable_post_refine_structure_interaction,
+        enable_h3_surface_fusion=args.enable_h3_surface_fusion,
     )
     if args.model_impl == 'standard':
         model_kwargs.update(
@@ -246,6 +305,19 @@ def main():
             global_topology_max_nodes=args.global_topology_max_nodes,
             global_topology_heads=args.global_topology_heads,
             global_topology_alpha_max=args.global_topology_alpha_max,
+            stage_skeleton_mode=args.stage_skeleton_mode,
+            enable_e128_stage_fusion=args.enable_e128_stage_fusion,
+            enable_coarse_road_mask=args.enable_coarse_road_mask,
+            enable_psi_directional_descriptor=args.enable_psi_directional_descriptor,
+            sparse_window_compute=args.enable_sparse_window_compute,
+            stage2_window_threshold=args.stage2_window_threshold,
+            stage3_window_threshold=args.stage3_window_threshold,
+            coarse_candidate_window_size=args.coarse_candidate_window_size,
+            coarse_corridor_window_radius=args.coarse_corridor_window_radius,
+            coarse_routing_mode=args.coarse_routing_mode,
+            bottleneck_coarse_road_mask=args.bottleneck_coarse_road_mask,
+            bottleneck_window_threshold=args.bottleneck_window_threshold,
+            remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
         )
     model = vit_cls(**model_kwargs)
     if checkpoint is None:

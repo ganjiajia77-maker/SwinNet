@@ -164,6 +164,11 @@ def load_topology_checkpoint_state(
         "swin_unet.highres_structure_fusion.",
         "swin_unet.structure_surface_correction_head.",
         "swin_unet.guided_head.post_refine_structure_interaction.",
+        "swin_unet.coarse_road_mask_head.",
+        "swin_unet.decoder_structure_blocks.2.external_structure_fusion.",
+        "swin_unet.decoder_structure_blocks.2.external_structure_scale",
+        "swin_unet.h3_surface_proj.",
+        "swin_unet.surface_h3_fusion.",
     )
 
     def print_expected_highres_missing(missing_keys):
@@ -190,6 +195,7 @@ def load_topology_checkpoint_state(
     obsolete_unexpected_prefixes = (
         "swin_unet.encoder_stage1_road_attention_head.",
         "swin_unet.guided_head.surface_selective_fusion.",
+        "swin_unet.stage2_topology_source.",
     )
     removed_direction_embedding_prefixes = (
         "swin_unet.decoder_structure_blocks.0.directional_embedding.",
@@ -227,6 +233,22 @@ def load_topology_checkpoint_state(
             )
         ):
             skipped_obsolete_keys.append(key)
+            continue
+        if (
+            key in model_state
+            and hasattr(value, "shape")
+            and value.shape != model_state[key].shape
+            and key.endswith("decoder_structure_blocks.2.feature_residual.0.weight")
+            and value.ndim == 4
+            and model_state[key].ndim == 4
+            and model_state[key].shape[0] == value.shape[0]
+            and model_state[key].shape[1] == 2 * value.shape[1]
+            and model_state[key].shape[2:] == value.shape[2:]
+        ):
+            expanded_weight = torch.zeros_like(model_state[key])
+            expanded_weight[:, :value.shape[1]].copy_(value)
+            filtered_state_dict[key] = expanded_weight
+            skipped_shape_keys.append(key + " (expanded for H2 residual input)")
             continue
         if (
             key in model_state
@@ -482,10 +504,29 @@ class SwinUnet(nn.Module):
                  highres_structure_fuse_stages="stage23",
                  highres_structure_fusion_mode="stage23",
                  enable_post_refine_structure_interaction=False,
+                 enable_h3_surface_fusion=False,
                  enable_global_topology=False,
                  global_topology_max_nodes=32,
                  global_topology_heads=4,
-                 global_topology_alpha_max=0.05):
+                 global_topology_alpha_max=0.05,
+                 stage_skeleton_mode="prior_residual",
+                 enable_e128_stage_fusion=False,
+                 enable_coarse_road_mask=False,
+                 enable_psi_directional_descriptor=False,
+                 sparse_window_compute=False,
+                  stage2_window_threshold=0.10,
+                  stage3_window_threshold=0.10,
+                 coarse_candidate_window_size=8,
+                 coarse_corridor_window_radius=1,
+                 coarse_routing_mode="dense",
+                 bottleneck_coarse_road_mask=False,
+                 bottleneck_window_threshold=0.25,
+                  bottleneck_route_warmup_epochs=0,
+                  bottleneck_route_warmup_mode="dense",
+                  coarse_route_warmup_epochs=0,
+                  stage_skeleton_bias_init="zero",
+                 stage_skeleton_positive_prior=0.05,
+                 remove_stage2_pre_topology_source=False):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -525,10 +566,29 @@ class SwinUnet(nn.Module):
                                 enable_post_refine_structure_interaction=(
                                     enable_post_refine_structure_interaction
                                 ),
+                                enable_h3_surface_fusion=enable_h3_surface_fusion,
                                 enable_global_topology=enable_global_topology,
                                 global_topology_max_nodes=global_topology_max_nodes,
-                                global_topology_heads=global_topology_heads,
-                                global_topology_alpha_max=global_topology_alpha_max)
+                                 global_topology_heads=global_topology_heads,
+                                 global_topology_alpha_max=global_topology_alpha_max,
+                                 stage_skeleton_mode=stage_skeleton_mode,
+                                 enable_e128_stage_fusion=enable_e128_stage_fusion,
+                                 enable_coarse_road_mask=enable_coarse_road_mask,
+                                 enable_psi_directional_descriptor=enable_psi_directional_descriptor,
+                                 sparse_window_compute=sparse_window_compute,
+                                 stage2_window_threshold=stage2_window_threshold,
+                                 stage3_window_threshold=stage3_window_threshold,
+                                 coarse_candidate_window_size=coarse_candidate_window_size,
+                                 coarse_corridor_window_radius=coarse_corridor_window_radius,
+                                 coarse_routing_mode=coarse_routing_mode,
+                                 bottleneck_coarse_road_mask=bottleneck_coarse_road_mask,
+                                 bottleneck_window_threshold=bottleneck_window_threshold,
+                                  bottleneck_route_warmup_epochs=bottleneck_route_warmup_epochs,
+                                  bottleneck_route_warmup_mode=bottleneck_route_warmup_mode,
+                                  coarse_route_warmup_epochs=coarse_route_warmup_epochs,
+                                  stage_skeleton_bias_init=stage_skeleton_bias_init,
+                                 stage_skeleton_positive_prior=stage_skeleton_positive_prior,
+                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
     def forward(
         self,
         x,
@@ -547,6 +607,9 @@ class SwinUnet(nn.Module):
         if self.return_skeleton:
             return (logits, *aux_outputs)
         return logits
+
+    def set_route_epoch(self, epoch):
+        self.swin_unet.set_route_epoch(epoch)
 
     def load_from(self, config):
         pretrained_path = config.MODEL.PRETRAIN_CKPT

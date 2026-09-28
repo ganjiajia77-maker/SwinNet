@@ -662,6 +662,8 @@ class DecoderStructureRefinement(nn.Module):
         skeleton_gradient_ratio=0.5,
         gate_topology_gradient_ratio=0.0,
         previous_structure_channels=None,
+        external_structure_channels=None,
+        use_structure_residual=False,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -672,11 +674,25 @@ class DecoderStructureRefinement(nn.Module):
         self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
         self.gate_topology_gradient_ratio = float(gate_topology_gradient_ratio)
         self.previous_structure_channels = previous_structure_channels
+        self.use_structure_residual = bool(
+            use_structure_residual or previous_structure_channels is not None
+        )
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
         )
+        if external_structure_channels is not None:
+            self.external_structure_fusion = ConvBNReLU(
+                channels + int(external_structure_channels),
+                channels,
+                kernel_size=1,
+                padding=0,
+            )
+            self.external_structure_scale = nn.Parameter(torch.tensor(0.05))
+        else:
+            self.external_structure_fusion = None
+            self.register_parameter("external_structure_scale", None)
         if previous_structure_channels is not None:
             self.previous_structure_fusion = ConvBNReLU(
                 channels + int(previous_structure_channels),
@@ -684,10 +700,11 @@ class DecoderStructureRefinement(nn.Module):
                 kernel_size=1,
                 padding=0,
             )
-            residual_input_channels = channels * 2
         else:
             self.previous_structure_fusion = None
-            residual_input_channels = channels
+        residual_input_channels = channels * (
+            2 if self.use_structure_residual else 1
+        )
         self.gate_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
@@ -766,9 +783,29 @@ class DecoderStructureRefinement(nn.Module):
         disable_skeleton_prediction=False,
         skeleton_prior=None,
         previous_structure_feat=None,
+        external_structure_feat=None,
     ):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
+        if self.external_structure_fusion is not None:
+            if external_structure_feat is None:
+                external_structure_feat = structure_feat.new_zeros(
+                    structure_feat.shape[0],
+                    self.external_structure_fusion.block[0].in_channels
+                    - structure_feat.shape[1],
+                    *structure_feat.shape[-2:],
+                )
+            elif external_structure_feat.shape[-2:] != structure_feat.shape[-2:]:
+                external_structure_feat = F.interpolate(
+                    external_structure_feat,
+                    size=structure_feat.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            fused_external = self.external_structure_fusion(
+                torch.cat([structure_feat, external_structure_feat], dim=1)
+            )
+            structure_feat = structure_feat + self.external_structure_scale * fused_external
         if self.previous_structure_fusion is not None:
             if previous_structure_feat is None:
                 previous_structure_feat = torch.zeros_like(structure_feat)
@@ -882,7 +919,7 @@ class DecoderStructureRefinement(nn.Module):
         if self.enable_direct_feature_refinement and apply_feature_refinement:
             residual_input = (
                 torch.cat([x, structure_feat], dim=1)
-                if self.previous_structure_fusion is not None
+                if self.use_structure_residual
                 else x
             )
             residual = structure_gate * self.feature_residual(residual_input)
