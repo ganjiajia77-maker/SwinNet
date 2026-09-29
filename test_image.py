@@ -261,7 +261,7 @@ if __name__ == "__main__":
     args.num_classes = 1
     checkpoint = None
     if os.path.exists(args.model_path):
-        checkpoint = torch.load(args.model_path, map_location='cpu')
+        checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
         if isinstance(checkpoint, dict):
             saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
             saved_profile = checkpoint.get("structure_profile")
