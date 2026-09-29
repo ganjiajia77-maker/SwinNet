@@ -112,6 +112,13 @@ def main():
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--throughput', action='store_true')
+    parser.add_argument(
+        '--amp_dtype',
+        type=str,
+        choices=['bfloat16', 'float16', 'none'],
+        default='none',
+        help='inference autocast dtype; use float16 on Turing GPUs',
+    )
     parser.add_argument('--dataset', type=str, default='ImageData')
     parser.add_argument('--n_class', default=2, type=int)
     parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None)
@@ -119,6 +126,11 @@ def main():
     args = parser.parse_args()
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    inference_dtype = {
+        'bfloat16': torch.bfloat16,
+        'float16': torch.float16,
+    }.get(args.amp_dtype)
+    use_inference_amp = device.type == 'cuda' and inference_dtype is not None
     print('Using device: {}'.format(device))
     
     print('\nLoading model from: {}'.format(args.model_path))
@@ -218,7 +230,12 @@ def main():
             masks = batch['mask'].to(device)
             skeleton_masks = batch['skeleton'].to(device)
             
-            outputs = model(images)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=inference_dtype if inference_dtype is not None else torch.float32,
+                enabled=use_inference_amp,
+            ):
+                outputs = model(images)
             skeleton_logits = None
             
             if isinstance(outputs, tuple):

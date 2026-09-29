@@ -289,9 +289,9 @@ parser.add_argument('--amp_opt_level', type=str, default='', help='AMP opt level
 parser.add_argument(
     '--amp_dtype',
     type=str,
-    choices=['bfloat16', 'none'],
+    choices=['bfloat16', 'float16', 'none'],
     default='bfloat16',
-    help='automatic mixed precision dtype; defaults to BF16 on CUDA',
+    help='automatic mixed precision dtype; FP16 uses GradScaler',
 )
 parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
@@ -1216,14 +1216,30 @@ def evaluate_trend_topology_subset(
 if __name__ == "__main__":
     # 自动检测可用设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    use_bf16_amp = (
-        device.type == 'cuda'
-        and args.amp_dtype == 'bfloat16'
-        and torch.cuda.is_bf16_supported()
-    )
+    amp_dtype_map = {
+        'bfloat16': torch.bfloat16,
+        'float16': torch.float16,
+    }
+    amp_dtype = amp_dtype_map.get(args.amp_dtype)
+    use_amp = device.type == 'cuda' and amp_dtype is not None
+    use_bf16_amp = use_amp and args.amp_dtype == 'bfloat16'
+    use_fp16_amp = use_amp and args.amp_dtype == 'float16'
+    if use_bf16_amp and not torch.cuda.is_bf16_supported():
+        use_bf16_amp = False
+        use_amp = False
+        amp_dtype = None
+    try:
+        scaler = torch.amp.GradScaler(
+            'cuda',
+            enabled=use_fp16_amp,
+        )
+    except AttributeError:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_fp16_amp)
     print(f"[INFO] Using device: {device}")
     if args.amp_dtype == 'bfloat16' and not use_bf16_amp:
         print("[WARN] BF16 AMP is unsupported on this device; using FP32.", flush=True)
+    elif use_fp16_amp:
+        print("[INFO] FP16 AMP enabled with GradScaler.", flush=True)
     
     if not args.deterministic:
         cudnn.benchmark = True
@@ -1758,6 +1774,18 @@ if __name__ == "__main__":
     if optimizer is None:
         optimizer = build_layerwise_optimizer()
 
+    if args.resume and 'checkpoint' in locals():
+        scaler_state = checkpoint.get('amp_scaler_state_dict')
+        if scaler.is_enabled() and scaler_state:
+            try:
+                scaler.load_state_dict(scaler_state)
+                print("[INFO] Restored FP16 GradScaler state.", flush=True)
+            except (RuntimeError, ValueError) as exc:
+                print(
+                    f"[WARN] Could not restore FP16 GradScaler state: {exc}",
+                    flush=True,
+                )
+
     ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
     if ema is not None and args.resume and 'checkpoint' in locals():
         ema_state = checkpoint.get('ema_state_dict')
@@ -1990,8 +2018,8 @@ if __name__ == "__main__":
 
                 with torch.autocast(
                     device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=use_bf16_amp,
+                    dtype=amp_dtype if amp_dtype is not None else torch.float32,
+                    enabled=use_amp,
                 ):
                     outputs = model(images_padded)
 
@@ -2052,7 +2080,11 @@ if __name__ == "__main__":
                     accumulation_count = 0
                     continue
 
-                (loss / accumulation_steps).backward()
+                scaled_loss = loss / accumulation_steps
+                if scaler.is_enabled():
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
                 accumulation_count += 1
                 should_step = (
                     accumulation_count >= accumulation_steps
@@ -2063,6 +2095,8 @@ if __name__ == "__main__":
                     )
                 )
                 if should_step:
+                    if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     if not torch.isfinite(grad_norm):
                         skipped_batches += 1
@@ -2071,10 +2105,16 @@ if __name__ == "__main__":
                             flush=True,
                         )
                         optimizer.zero_grad(set_to_none=True)
+                        if scaler.is_enabled():
+                            scaler.update()
                         accumulation_count = 0
                         continue
 
-                    optimizer.step()
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     accumulation_count = 0
                     if ema is not None:
@@ -2347,6 +2387,9 @@ if __name__ == "__main__":
                 'training_model_state_dict': model.state_dict(),
                 'ema_state_dict': ema.ema.state_dict() if ema is not None else None,
                 'optimizer_state_dict': optimizer.state_dict(),
+                'amp_scaler_state_dict': (
+                    scaler.state_dict() if scaler.is_enabled() else None
+                ),
                 'train_avg_loss': train_avg_loss,
                 'val_loss': val_loss,
                 'val_iou': val_iou,
