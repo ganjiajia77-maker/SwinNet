@@ -16,12 +16,15 @@ from utils import load_config
 
 
 @torch.no_grad()
-def collect(model, loader, device):
+def collect(model, loader, device, use_amp):
     model.eval()
     values = []
     for batch in tqdm(loader, total=len(loader), desc="Evaluation"):
         images = batch["image"].to(device, non_blocking=True)
-        probs = torch.sigmoid(road_logits(model, images)).cpu()
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=use_amp
+        ):
+            probs = torch.sigmoid(road_logits(model, images)).cpu()
         targets = batch["mask"].cpu()
         for index, name in enumerate(batch["name"]):
             values.append((probs[index:index + 1], targets[index:index + 1], name))
@@ -76,6 +79,14 @@ def main():
     parser.add_argument("--data_root", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--sam_ckpt", default="")
+    parser.add_argument(
+        "--batch_size", type=int, default=None,
+        help="Inference micro-batch size for limited GPU memory",
+    )
+    parser.add_argument(
+        "--precision", choices=["16", "32"], default="16",
+        help="CUDA inference precision",
+    )
     parser.add_argument("--split", choices=["val", "test"], default="val")
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument(
@@ -92,6 +103,7 @@ def main():
     config.SAM_CKPT_PATH = args.sam_ckpt or config.SAM_CKPT_PATH
     config.PATCH_SIZE = int(config.RESIZE_INPUT)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda" and args.precision == "16"
     model = SAMRoad(config).to(device)
     load_checkpoint(model, args.checkpoint)
 
@@ -101,11 +113,16 @@ def main():
         resize_size=int(config.RESIZE_INPUT),
         seed=1234,
     )
+    infer_batch_size = (
+        int(args.batch_size)
+        if args.batch_size is not None
+        else min(int(config.INFER_BATCH_SIZE), 4)
+    )
     loader = DataLoader(
-        dataset, batch_size=int(config.INFER_BATCH_SIZE), shuffle=False,
+        dataset, batch_size=infer_batch_size, shuffle=False,
         num_workers=int(config.DATA_WORKER_NUM), pin_memory=True,
     )
-    values = collect(model, loader, device)
+    values = collect(model, loader, device, use_amp)
     if args.threshold is None:
         thresholds = [float(item) for item in args.thresholds.split(",")]
     else:

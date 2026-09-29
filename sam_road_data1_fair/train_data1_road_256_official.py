@@ -54,14 +54,17 @@ def build_optimizer(model, config):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, threshold):
+def evaluate(model, loader, device, threshold, use_amp):
     model.eval()
     tp = fp = fn = 0
     total_loss = 0.0
     for batch in tqdm(loader, total=len(loader), desc="Validation", leave=False):
         images = batch["image"].to(device, non_blocking=True)
         target = batch["mask"].to(device, non_blocking=True)
-        logits = road_logits(model, images)
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=use_amp
+        ):
+            logits = road_logits(model, images)
         total_loss += road_bce(logits, target).item()
         pred = torch.sigmoid(logits) >= threshold
         gt = target > 0.5
@@ -91,6 +94,14 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--grad_accum", type=int, default=1)
+    parser.add_argument(
+        "--eval_batch_size", type=int, default=None,
+        help="Validation micro-batch size; defaults to the smaller configured batch size",
+    )
+    parser.add_argument(
+        "--precision", choices=["16", "32"], default="16",
+        help="CUDA training precision; official SAM-Road uses mixed precision",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--resume", default="")
     args = parser.parse_args()
@@ -109,6 +120,7 @@ def main():
     config.PATCH_SIZE = int(config.RESIZE_INPUT)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda" and args.precision == "16"
     source_size = int(config.SOURCE_SIZE)
     input_size = int(config.RESIZE_INPUT)
     train_ds = Data1RoadDataset(
@@ -128,14 +140,20 @@ def main():
         num_workers=int(config.DATA_WORKER_NUM), pin_memory=True,
         worker_init_fn=seed_worker, generator=loader_generator,
     )
+    eval_batch_size = (
+        int(args.eval_batch_size)
+        if args.eval_batch_size is not None
+        else min(int(config.INFER_BATCH_SIZE), int(config.BATCH_SIZE))
+    )
     val_loader = DataLoader(
-        val_ds, batch_size=int(config.INFER_BATCH_SIZE), shuffle=False,
+        val_ds, batch_size=eval_batch_size, shuffle=False,
         num_workers=int(config.DATA_WORKER_NUM), pin_memory=True,
         worker_init_fn=seed_worker,
     )
     model = SAMRoad(config).to(device)
     optimizer, scheduler = build_optimizer(model, config)
     grad_accum = max(1, int(args.grad_accum))
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     start_epoch = 0
     best_f1 = -1.0
@@ -152,6 +170,8 @@ def main():
         model.load_state_dict(state, strict=False)
         if checkpoint.get("optimizer_state_dict"):
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if use_amp and checkpoint.get("scaler_state_dict"):
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = int(checkpoint.get("epoch", 0))
         best_f1 = float(checkpoint.get("val_f1", -1.0))
 
@@ -160,6 +180,9 @@ def main():
         "args": vars(args),
         "config": config.to_dict(),
         "device": str(device),
+        "precision": "16-mixed" if use_amp else "32",
+        "micro_batch_size": int(config.BATCH_SIZE),
+        "eval_batch_size": eval_batch_size,
         "effective_batch_size": int(config.BATCH_SIZE) * grad_accum,
         "loss": "BCEWithLogitsLoss on road channel",
         "data_note": "1024x1024 source -> one 256x256 input",
@@ -195,11 +218,16 @@ def main():
         for batch_index, batch in enumerate(progress):
             images = batch["image"].to(device, non_blocking=True)
             target = batch["mask"].to(device, non_blocking=True)
-            loss = road_bce(road_logits(model, images), target)
-            (loss / grad_accum).backward()
+            with torch.autocast(
+                device_type=device.type, dtype=torch.float16, enabled=use_amp
+            ):
+                loss = road_bce(road_logits(model, images), target)
+            scaler.scale(loss / grad_accum).backward()
             if (batch_index + 1) % grad_accum == 0 or batch_index + 1 == len(train_loader):
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
             running += loss.item()
             progress.set_postfix(
@@ -209,7 +237,7 @@ def main():
             )
 
         metrics = evaluate(
-            model, val_loader, device, float(config.VAL_THRESHOLD)
+            model, val_loader, device, float(config.VAL_THRESHOLD), use_amp
         )
         lr_encoder = optimizer.param_groups[0]["lr"] if len(optimizer.param_groups) > 1 else 0.0
         lr_decoder = optimizer.param_groups[-1]["lr"]
@@ -227,6 +255,7 @@ def main():
             "training_model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if use_amp else None,
             "val_f1": metrics["f1"],
             "val_iou": metrics["iou"],
             "args": vars(args),
