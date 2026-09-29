@@ -42,7 +42,7 @@ class BCEDiceLoss(nn.Module):
         self.bce_weight = bce_weight
         self.focal_gamma = float(focal_gamma)
 
-    def forward(self, logits, targets):
+    def bce_loss(self, logits, targets):
         pos_weight = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
 
         bce_unreduced = F.binary_cross_entropy_with_logits(
@@ -55,8 +55,12 @@ class BCEDiceLoss(nn.Module):
         if self.focal_gamma > 0.0:
             probs = torch.sigmoid(logits)
             pt = probs * targets + (1.0 - probs) * (1.0 - targets)
-            bce_unreduced = bce_unreduced * (1.0 - pt).pow(self.focal_gamma)
-        bce = bce_unreduced.mean()
+            focal_factor = (1.0 - pt).clamp_min(1e-6).pow(self.focal_gamma)
+            bce_unreduced = bce_unreduced * focal_factor
+        return bce_unreduced.mean()
+
+    def forward(self, logits, targets):
+        bce = self.bce_loss(logits, targets)
 
         dice = self.dice(logits, targets)
         loss = self.bce_weight * bce + self.dice_weight * dice
@@ -351,6 +355,7 @@ class SurfaceStructureLoss(nn.Module):
         directional_pos_weight_diagonal=2.5,
         connectivity_focal_gamma=0.0,
         surface_focal_gamma=0.0,
+        skeleton_focal_gamma=0.0,
         edge_contrastive_margin=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
@@ -375,6 +380,7 @@ class SurfaceStructureLoss(nn.Module):
             dice_weight=skeleton_dice_weight,
             bce_weight=1.0,
             pos_weight=skeleton_pos_weight,
+            focal_gamma=skeleton_focal_gamma,
         )
         self.skeleton_weight = skeleton_weight
         self.connectivity_weight = connectivity_weight
@@ -475,15 +481,8 @@ class SurfaceStructureLoss(nn.Module):
     def skeleton_pixel_loss(self, skeleton_logits, skeleton_gt, skeleton_dilate_gt):
         skeleton_gt = self._match_spatial_size(skeleton_gt, skeleton_logits)
         skeleton_dilate_gt = self._match_spatial_size(skeleton_dilate_gt, skeleton_logits)
-        skeleton_pos_weight = (
-            self.skeleton_loss.pos_weight.to(skeleton_logits.device)
-            if self.skeleton_loss.pos_weight is not None
-            else None
-        )
-        bce_skeleton = F.binary_cross_entropy_with_logits(
-            skeleton_logits,
-            skeleton_dilate_gt,
-            pos_weight=skeleton_pos_weight,
+        bce_skeleton = self.skeleton_loss.bce_loss(
+            skeleton_logits, skeleton_dilate_gt
         )
         dice_skeleton = self.skeleton_loss.dice(skeleton_logits, skeleton_gt)
         loss_skeleton = bce_skeleton + self.skeleton_loss.dice_weight * dice_skeleton
@@ -493,15 +492,8 @@ class SurfaceStructureLoss(nn.Module):
         skeleton_soft_target = self._match_spatial_size(
             skeleton_soft_target, skeleton_logits, mode="bilinear"
         ).to(device=skeleton_logits.device, dtype=skeleton_logits.dtype)
-        skeleton_pos_weight = (
-            self.skeleton_loss.pos_weight.to(skeleton_logits.device)
-            if self.skeleton_loss.pos_weight is not None
-            else None
-        )
-        bce = F.binary_cross_entropy_with_logits(
-            skeleton_logits,
-            skeleton_soft_target,
-            pos_weight=skeleton_pos_weight,
+        bce = self.skeleton_loss.bce_loss(
+            skeleton_logits, skeleton_soft_target
         )
         dice = self.skeleton_loss.dice(skeleton_logits, skeleton_soft_target)
         return bce + self.skeleton_loss.dice_weight * dice

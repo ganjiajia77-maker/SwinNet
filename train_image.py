@@ -189,8 +189,12 @@ parser.add_argument(
     help='gradient ratio for Stage 3 gate skeleton/connectivity inputs; 0 keeps the old detached gate path',
 )
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
-parser.add_argument('--skeleton_pos_weight', type=float, default=None,
+parser.add_argument('--surface_pos_weight', type=float, default=2.0,
+                    help='positive-class weight for surface BCE losses')
+parser.add_argument('--skeleton_pos_weight', type=float, default=2.0,
                     help='positive-class weight for skeleton BCE losses')
+parser.add_argument('--skeleton_focal_gamma', type=float, default=1.0,
+                    help='gamma for focal weighting on skeleton BCE; 0 disables focal weighting')
 parser.add_argument('--stage_direction_factor', type=float, default=0.0)
 parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
 parser.add_argument('--stage2_direction_factor', type=float, default=None)
@@ -421,10 +425,12 @@ def build_criterion(args, loss_weights, device):
         use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
         connectivity_pos_weight=args.connectivity_pos_weight,
         skeleton_pos_weight=args.skeleton_pos_weight,
+        surface_pos_weight=args.surface_pos_weight,
         directional_pos_weight_cardinal=args.directional_pos_weight_cardinal,
         directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
         surface_focal_gamma=args.surface_focal_gamma,
+        skeleton_focal_gamma=args.skeleton_focal_gamma,
         edge_contrastive_margin=args.edge_contrastive_margin,
         stage_connectivity_factors=(
             0.0,
@@ -454,7 +460,8 @@ def build_criterion(args, loss_weights, device):
 def format_training_config_lines(args, loss_weights):
     lines = [
         f"  结构配置: {args.structure_profile}",
-        f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
+        f"  Surface loss: pos_weight={args.surface_pos_weight:.3f}, focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
+        f"  Skeleton loss: pos_weight={args.skeleton_pos_weight:.3f}, focal BCE gamma={args.skeleton_focal_gamma:.3f} + Dice",
         f"  Training AMP: {args.amp_dtype}",
         "  Coarse routing: mode={}, P64={}, PSI={}, sparse={}, thresholds S2/S3={:.3f}/{:.3f}".format(
             args.coarse_routing_mode,

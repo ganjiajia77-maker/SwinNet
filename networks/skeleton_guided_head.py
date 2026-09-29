@@ -685,6 +685,36 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
+        # Multi-channel topology/surface fusion used by Stage 2 and Stage 3.
+        # F, H, S and C are projected independently before concatenation.  The
+        # top-k connectivity mean remains a separate reliability input, while
+        # the full connectivity tensor carries local directional content.
+        self.fusion_f_proj = nn.Conv2d(channels, fusion_channels, kernel_size=1, bias=False)
+        self.fusion_h_proj = nn.Conv2d(channels, fusion_channels, kernel_size=1, bias=False)
+        self.fusion_s_proj = nn.Conv2d(1, fusion_channels, kernel_size=1, bias=False)
+        self.fusion_c_proj = nn.Conv2d(
+            connectivity_channels, fusion_channels, kernel_size=1, bias=False
+        )
+        self.fusion_conn_strength_proj = nn.Conv2d(
+            1, fusion_channels, kernel_size=1, bias=False
+        )
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(fusion_channels * 5, fusion_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(fusion_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(fusion_channels, fusion_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(fusion_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.fusion_gate = nn.Conv2d(fusion_channels, 1, kernel_size=1, bias=True)
+        self.fusion_residual = nn.Conv2d(
+            fusion_channels, channels, kernel_size=3, padding=1, bias=False
+        )
+        # Start as an identity path.  The existing gamma1 parameter is the
+        # controllable residual strength and remains checkpoint-compatible.
+        nn.init.zeros_(self.fusion_residual.weight)
+        nn.init.zeros_(self.fusion_gate.weight)
+        nn.init.zeros_(self.fusion_gate.bias)
         if context_channels is not None:
             self.context_to_gate = nn.Conv2d(context_channels, 1, kernel_size=1)
             nn.init.zeros_(self.context_to_gate.weight)
@@ -839,32 +869,33 @@ class DecoderStructureRefinement(nn.Module):
             conn_strength,
             self.gate_topology_gradient_ratio,
         )
-        gate_feat = self.gate_branch(x)
-        structure_gate_old_logits = self.structure_gate(
-            torch.cat(
-                [
-                    gate_feat,
-                    gate_skeleton,
-                    gate_conn_strength,
-                ],
-                dim=1,
-            )
+        # Keep top-k mean as a separate reliability signal for the gate while
+        # passing the complete C tensor into the residual-content branch.
+        f_embed = self.fusion_f_proj(x)
+        h_embed = self.fusion_h_proj(structure_feat)
+        # Keep the configured gate gradient ratio for both topology gate
+        # inputs.  The forward value is still the predicted S probability;
+        # only its backward contribution is scaled by ``gate_topology_gradient_ratio``.
+        s_embed = self.fusion_s_proj(gate_skeleton)
+        c_embed = self.fusion_c_proj(connectivity_prob)
+        conn_strength_embed = self.fusion_conn_strength_proj(gate_conn_strength)
+        fusion_input = torch.cat(
+            [f_embed, h_embed, s_embed, c_embed, conn_strength_embed], dim=1
         )
+        fusion_feat = self.fusion_conv(fusion_input)
+        structure_gate_old_logits = self.fusion_gate(fusion_feat)
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
                 self.context_to_gate(global_context)
             )
             structure_gate_old_logits = structure_gate_old_logits + context_bias
         structure_gate_old = torch.sigmoid(structure_gate_old_logits)
-        structure_gate = structure_gate_old
+        # The top-k connectivity mean gates the learned correction reliability;
+        # the full C embedding above still determines residual content.
+        structure_gate = structure_gate_old * (0.5 + 0.5 * gate_conn_strength)
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
-            residual_input = (
-                torch.cat([x, structure_feat], dim=1)
-                if self.use_structure_residual
-                else x
-            )
-            residual = structure_gate * self.feature_residual(residual_input)
+            residual = structure_gate * self.fusion_residual(fusion_feat)
             gate_residual = self.gamma1 * residual
             out = x + gate_residual
         else:
@@ -894,12 +925,18 @@ class DecoderStructureRefinement(nn.Module):
                             / (feature_norm + 1e-6)
                         ).detach().cpu()
                     ),
+                    "fusion_feature_norm": float(
+                        torch.linalg.vector_norm(fusion_feat).detach().cpu()
+                    ),
                 }
         diagnostics = {
             "structure_gate_old": structure_gate_old,
             "gate_residual": gate_residual,
             "structure_gate_final": structure_gate,
             "structure_feat": structure_feat,
+            "fusion_feat": fusion_feat,
+            "conn_strength": conn_strength,
+            "connectivity_prob": connectivity_prob,
         }
         if self.capture_feature_tensors:
             diagnostics["semantic_feature"] = x.detach()
