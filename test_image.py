@@ -150,6 +150,13 @@ parser.add_argument('--resume', type=str, default='', help='resume from checkpoi
 parser.add_argument('--accumulation_steps', type=int, default=0, help='gradient accumulation steps')
 parser.add_argument('--use_checkpoint', action='store_true', help='use gradient checkpointing')
 parser.add_argument('--amp_opt_level', type=str, default='', help='AMP opt level')
+parser.add_argument(
+    '--amp_dtype',
+    type=str,
+    choices=['bfloat16', 'float16', 'none'],
+    default='none',
+    help='inference autocast dtype; use float16 on Turing GPUs',
+)
 parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
@@ -364,6 +371,11 @@ if __name__ == "__main__":
                     bottleneck_window_threshold=args.bottleneck_window_threshold,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device
+    inference_dtype = {
+        'bfloat16': torch.bfloat16,
+        'float16': torch.float16,
+    }.get(args.amp_dtype)
+    use_inference_amp = device.type == 'cuda' and inference_dtype is not None
     
     # 加载模型
     if checkpoint is not None:
@@ -487,7 +499,12 @@ if __name__ == "__main__":
                         crop_f = crop_f.transpose(2, 0, 1)
                         inp = torch.from_numpy(crop_f).unsqueeze(0).cuda()
 
-                        outputs = model(inp)
+                        with torch.autocast(
+                            device_type=device.type,
+                            dtype=inference_dtype if inference_dtype is not None else torch.float32,
+                            enabled=use_inference_amp,
+                        ):
+                            outputs = model(inp)
                         surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
                         tile_h = y2 - y1
                         tile_w = x2 - x1
@@ -587,7 +604,12 @@ if __name__ == "__main__":
             skeletons = batch['skeleton'].cuda()
             skeletons_dilate = batch['skeleton_dilate'].cuda()
             
-            outputs = model(images)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=inference_dtype if inference_dtype is not None else torch.float32,
+                enabled=use_inference_amp,
+            ):
+                outputs = model(images)
             if isinstance(outputs, tuple):
                 (
                     surface_logits,
