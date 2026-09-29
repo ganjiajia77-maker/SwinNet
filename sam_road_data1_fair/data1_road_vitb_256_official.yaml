@@ -1,0 +1,31 @@
+DATASET: 'data1'
+NO_SAM: False
+SAM_VERSION: 'vit_b'
+SAM_CKPT_PATH: 'sam_ckpts/sam_vit_b_01ec64.pth'
+
+# Official htcr/sam_road toponet_vitb_256.yaml values.
+PATCH_SIZE: 256
+BATCH_SIZE: 64
+DATA_WORKER_NUM: 1
+TRAIN_EPOCHS: 10
+BASE_LR: 0.001
+FREEZE_ENCODER: False
+ENCODER_LR_FACTOR: 0.1
+ENCODER_LORA: False
+FOCAL_LOSS: False
+USE_SAM_DECODER: False
+
+# Required by the official model constructor. TopoNet is instantiated but is
+# not optimized in this raster-only data1 experiment because data1 has no graph labels.
+TOPO_SAMPLE_NUM: 128
+TOPONET_VERSION: 'normal'
+
+# data1 adapter: every 1024x1024 source image is resized to one 256x256 input.
+SOURCE_SIZE: 1024
+RESIZE_INPUT: 256
+ROTATION_AUGMENT: True
+COLOR_AUGMENT: False
+RANDOM_CROP: False
+
+INFER_BATCH_SIZE: 64
+VAL_THRESHOLD: 0.5

@@ -16,13 +16,16 @@ class Data1RoadDataset(Dataset):
     """
 
     def __init__(self, root, split, crop_size=512, source_size=1024,
-                 random_crop=False, augment=False, seed=1234):
+                 random_crop=False, augment=False, seed=1234,
+                 resize_size=None, rotation_augment=False):
         self.root = root
         self.split = split
         self.crop_size = int(crop_size)
         self.source_size = int(source_size)
         self.random_crop = bool(random_crop and split == "train")
         self.augment = bool(augment and split == "train")
+        self.resize_size = int(resize_size) if resize_size else None
+        self.rotation_augment = bool(rotation_augment and split == "train")
         self.seed = int(seed)
         self.epoch = 0
 
@@ -119,8 +122,22 @@ class Data1RoadDataset(Dataset):
         if self.augment:
             image, mask = self._geometry(image, mask, rng)
             image = self._color_degrade(image, rng)
+        elif self.rotation_augment:
+            rotations = rng.randint(0, 4)
+            if rotations:
+                image = np.rot90(image, rotations, axes=(0, 1)).copy()
+                mask = np.rot90(mask, rotations, axes=(0, 1)).copy()
 
-        if self.random_crop:
+        if self.resize_size is not None:
+            image = cv2.resize(
+                image, (self.resize_size, self.resize_size),
+                interpolation=cv2.INTER_AREA,
+            )
+            mask = cv2.resize(
+                mask, (self.resize_size, self.resize_size),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        elif self.random_crop:
             max_top = self.source_size - self.crop_size
             max_left = self.source_size - self.crop_size
             top = rng.randint(0, max_top + 1) if max_top > 0 else 0
