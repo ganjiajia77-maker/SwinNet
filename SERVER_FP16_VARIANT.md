@@ -1,4 +1,4 @@
-# P64 PSI sparse FP16 server variant
+# P64 PSI sparse random-512 FP16 server variant
 
 Base model/training version: `f06bc5f` (P64 + PSI + real-window sparse routing with server learning rates).
 
@@ -9,4 +9,6 @@ Changes in this branch:
 - Unscales before gradient clipping and saves/restores scaler state in checkpoints.
 - Keeps BF16 and FP32 modes available.
 - Keeps the server learning rates: pretrained `1e-4 -> 1e-5`, new/custom `4e-4 -> 2e-5`, warmup `10` epochs.
-- Does not change the model architecture, P64/PSI routing, losses, or dataset.
+- Keeps the model architecture, P64/PSI routing, and losses unchanged.
+- Training uses one native random `512x512` crop sampled from each `1024x1024` source patch per image per epoch (`--random_crop_train --random_crops_per_image 1`).
+- `threshold_sweep_test.py --fixed_crop_eval` and `test_image.py --overlap_infer` evaluate the matching native `512x512` tiles over each `1024x1024` source patch.
