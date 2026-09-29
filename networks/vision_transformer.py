@@ -211,6 +211,26 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
         "swin_unet.stage2_topology_source.surface_uncertainty_head.",
     )
+    removed_connectivity_direction_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.connectivity_head.axis_basis",
+        "swin_unet.decoder_structure_blocks.1.connectivity_head.axis_basis",
+        "swin_unet.decoder_structure_blocks.2.connectivity_head.axis_basis",
+        "swin_unet.decoder_structure_blocks.3.connectivity_head.axis_basis",
+        "swin_unet.stage2_topology_source.connectivity_head.axis_basis",
+    )
+    removed_direction_gate_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.0.reliability_beta",
+        "swin_unet.decoder_structure_blocks.1.reliability_beta",
+        "swin_unet.decoder_structure_blocks.2.reliability_beta",
+        "swin_unet.decoder_structure_blocks.3.reliability_beta",
+        "swin_unet.stage2_topology_source.reliability_correction.",
+        "swin_unet.stage2_topology_source.reliability_beta",
+        "swin_unet.global_topology.direction_topology_bias_scale",
+    )
     removed_model_prefixes = (
         "swin_unet.decoder_structure_blocks.0.",
         "swin_unet.decoder_structure_blocks.1.",
@@ -228,6 +248,8 @@ def load_topology_checkpoint_state(
                 or key.startswith(obsolete_unexpected_prefixes)
                 or key.startswith(removed_direction_embedding_prefixes)
                 or key.startswith(removed_surface_uncertainty_prefixes)
+                or key.startswith(removed_connectivity_direction_prefixes)
+                or key.startswith(removed_direction_gate_prefixes)
                 or key.startswith(removed_model_prefixes)
                 or key.startswith(highres_structure_missing_prefixes)
             )
@@ -254,11 +276,30 @@ def load_topology_checkpoint_state(
             key in model_state
             and hasattr(value, "shape")
             and value.shape != model_state[key].shape
+            and key.endswith("connectivity_head.prior_embed.0.weight")
+            and value.ndim == model_state[key].ndim == 4
+            and value.shape[0] == model_state[key].shape[0]
+            and value.shape[1] >= 2
+            and model_state[key].shape[1] == 2
+            and value.shape[2:] == model_state[key].shape[2:]
+        ):
+            adapted_weight = model_state[key].detach().clone()
+            adapted_weight.copy_(value[:, :2].to(device=adapted_weight.device, dtype=adapted_weight.dtype))
+            filtered_state_dict[key] = adapted_weight
+            skipped_shape_keys.append(key + " (dropped direction prior channel)")
+            continue
+        if (
+            key in model_state
+            and hasattr(value, "shape")
+            and value.shape != model_state[key].shape
             and (
                 key.endswith("structure_gate.0.weight")
                 or key.startswith(highres_structure_missing_prefixes)
             )
         ):
+            skipped_shape_keys.append(key)
+            continue
+        if key in model_state and hasattr(value, "shape") and value.shape != model_state[key].shape:
             skipped_shape_keys.append(key)
             continue
         filtered_state_dict[key] = value

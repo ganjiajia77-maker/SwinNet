@@ -4,7 +4,6 @@ import torch.nn.functional as F
 
 from topology_direction_constants import (
     CONNECTIVITY_DIRECTIONS,
-    connectivity_double_angle_basis,
 )
 
 def scale_gradient(x, ratio: float):
@@ -132,7 +131,7 @@ class PairwiseConnectivityHead(nn.Module):
         self.feature_channels = channels
         self.prior_channels = 16
         self.prior_embed = nn.Sequential(
-            nn.Conv2d(3, self.prior_channels, kernel_size=1, bias=False),
+            nn.Conv2d(2, self.prior_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(self.prior_channels),
             nn.ReLU(inplace=True),
         )
@@ -142,7 +141,6 @@ class PairwiseConnectivityHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
         )
-        self.register_buffer("axis_basis", connectivity_double_angle_basis().view(1, 8, 2, 1, 1))
 
     @staticmethod
     def _shift_feature(x, dy, dx):
@@ -156,19 +154,7 @@ class PairwiseConnectivityHead(nn.Module):
         x0 = max(dx, 0)
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
-    def direction_alignment(self, direction_logits):
-        direction = F.normalize(direction_logits, dim=1, eps=1e-6)
-        direction = direction.unsqueeze(1)
-        return ((direction * self.axis_basis).sum(dim=2) + 1.0) * 0.5
-
-    def forward(self, feature, direction_alignment=None, skeleton_prob=None):
-        if direction_alignment is None:
-            direction_alignment = feature.new_zeros(
-                feature.shape[0],
-                self.connectivity_channels,
-                feature.shape[-2],
-                feature.shape[-1],
-            )
+    def forward(self, feature, skeleton_prob=None):
         if skeleton_prob is None:
             skeleton_prob = feature.new_zeros(
                 feature.shape[0],
@@ -185,7 +171,6 @@ class PairwiseConnectivityHead(nn.Module):
                     [
                         skeleton_prob,
                         neighbor_skeleton,
-                        direction_alignment[:, idx:idx + 1],
                     ],
                     dim=1,
                 )
@@ -209,15 +194,7 @@ class LegacyConvConnectivityHead(nn.Conv2d):
         super().__init__(channels, connectivity_channels, kernel_size=1)
         self.connectivity_channels = connectivity_channels
 
-    def direction_alignment(self, direction_logits):
-        return direction_logits.new_zeros(
-            direction_logits.shape[0],
-            self.connectivity_channels,
-            direction_logits.shape[-2],
-            direction_logits.shape[-1],
-        )
-
-    def forward(self, feature, direction_alignment=None, skeleton_prob=None):
+    def forward(self, feature, skeleton_prob=None):
         return super().forward(feature)
 
 
@@ -793,13 +770,9 @@ class DecoderStructureRefinement(nn.Module):
             skeleton_logits = self.skeleton_head(structure_feat)
             skeleton_prob = torch.sigmoid(skeleton_logits)
         direction_logits = self.direction_head(structure_feat)
-        direction_alignment = self.connectivity_head.direction_alignment(
-            direction_logits
-        ).detach()
         connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
             connectivity_feat,
-            direction_alignment,
             skeleton_prob=skeleton_prob.detach(),
         )
 

@@ -408,10 +408,6 @@ class RoadSkeletonDataset(Dataset):
         # source-label road pixel falls inside its aligned image region.
         coarse_size = max(1, int(self.image_size or 256) // 4)
         coarse_road_target = _any_road_pool(mask, (coarse_size, coarse_size))
-        bottleneck_size = max(1, int(self.image_size or 256) // 32)
-        bottleneck_coarse_road_target = _any_road_pool(
-            mask, (bottleneck_size, bottleneck_size)
-        )
 
         if self.image_size is not None and image.shape[:2] != (self.image_size, self.image_size):
             size = (self.image_size, self.image_size)
@@ -435,9 +431,6 @@ class RoadSkeletonDataset(Dataset):
             "skeleton_dilate": torch.from_numpy(skeleton_dilate).float(),
             "coarse_road_target": torch.from_numpy(
                 np.expand_dims(coarse_road_target, axis=0)
-            ).float(),
-            "bottleneck_coarse_road_target": torch.from_numpy(
-                np.expand_dims(bottleneck_coarse_road_target, axis=0)
             ).float(),
             "image_name": image_name,
             "case_name": os.path.splitext(image_name)[0].replace("_sat", ""),

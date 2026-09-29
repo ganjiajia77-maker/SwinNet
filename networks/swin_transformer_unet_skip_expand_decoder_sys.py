@@ -1581,8 +1581,8 @@ class SwinTransformerSys(nn.Module):
                   enable_coarse_road_mask=False,
                   enable_psi_directional_descriptor=False,
                   sparse_window_compute=False,
-                  stage2_window_threshold=0.10,
-                  stage3_window_threshold=0.10,
+                  stage2_window_threshold=0.25,
+                  stage3_window_threshold=0.25,
                   coarse_candidate_window_size=8,
                   coarse_corridor_window_radius=0,
                   coarse_routing_mode="dense",
@@ -1590,7 +1590,7 @@ class SwinTransformerSys(nn.Module):
                   bottleneck_window_threshold=0.25,
                   bottleneck_route_warmup_epochs=0,
                   bottleneck_route_warmup_mode="dense",
-                  coarse_route_warmup_epochs=0,
+                  coarse_route_warmup_epochs=5,
                   stage_skeleton_bias_init="zero",
                   stage_skeleton_positive_prior=0.05,
                   remove_stage2_pre_topology_source=False,
@@ -2045,7 +2045,6 @@ class SwinTransformerSys(nn.Module):
                     alpha_max=global_topology_alpha_max,
                     enabled=self.enable_global_topology,
                     connectivity_channels=8,
-                    direction_channels=2,
                 )
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,
@@ -2106,8 +2105,8 @@ class SwinTransformerSys(nn.Module):
                 if self.enable_global_topology:
                     print(
                         "[INFO] Global topology residual: anchors=z_struct*surface, "
-                        "tokens=[z_struct,decoder_feature,connectivity,direction], "
-                        "relation_bias=relative_xy_distance+connectivity+direction"
+                        "tokens=[z_struct,decoder_feature,connectivity], "
+                        "relation_bias=relative_xy_distance+connectivity"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
@@ -2481,22 +2480,20 @@ class SwinTransformerSys(nn.Module):
     @staticmethod
     def _latest_local_topology_features(structure_outputs):
         if not structure_outputs:
-            return None, None
+            return None
         for item in reversed(structure_outputs):
             if not isinstance(item, dict):
                 continue
             connectivity = item.get("connectivity")
-            direction = item.get("direction")
-            if connectivity is None and direction is None:
+            if connectivity is None:
                 continue
             connectivity_feature = (
                 torch.sigmoid(connectivity).detach()
                 if connectivity is not None
                 else None
             )
-            direction_feature = direction.detach() if direction is not None else None
-            return connectivity_feature, direction_feature
-        return None, None
+            return connectivity_feature
+        return None
 
     # Decoder and skip connection with DCA-FPN.
     def forward_up_features(
@@ -2599,7 +2596,7 @@ class SwinTransformerSys(nn.Module):
                         and self.coarse_routing_mode != "dense"
                     ):
                         self.last_stage_features["M64_stage3"] = (
-                            stage3_sparse_probability >= self.bottleneck_window_threshold
+                            stage3_sparse_probability >= self.stage3_window_threshold
                         )
                     x = layer_up(
                         x,
@@ -2681,7 +2678,7 @@ class SwinTransformerSys(nn.Module):
                         and self.coarse_routing_mode != "dense"
                     ):
                         self.last_stage_features["M64_stage2"] = (
-                            stage2_sparse_probability >= self.bottleneck_window_threshold
+                            stage2_sparse_probability >= self.stage2_window_threshold
                         )
                     x = layer_up(
                         x,
@@ -2741,7 +2738,7 @@ class SwinTransformerSys(nn.Module):
                         and self.coarse_routing_mode != "dense"
                     ):
                         self.last_stage_features["M64_stage2"] = (
-                            stage2_sparse_probability >= self.bottleneck_window_threshold
+                            stage2_sparse_probability >= self.stage2_window_threshold
                         )
                     x = layer_up(
                         x,
@@ -2927,6 +2924,9 @@ class SwinTransformerSys(nn.Module):
                         if self.sparse_selection_probability_override is not None
                         else coarse_probability
                     )
+                    if self.current_epoch < self.coarse_route_warmup_epochs:
+                        # Keep Stage 2/3 dense while P64 learns its road map.
+                        selection_probability = None
                     self.last_coarse_road_logits = coarse_road_logits
                     self.last_psi_reliability_gate = psi_gate
                     self.last_stage_features["P64_logits"] = coarse_road_logits
@@ -3002,16 +3002,14 @@ class SwinTransformerSys(nn.Module):
                         x,
                         z_struct,
                     )
-                    (
-                        connectivity_feature,
-                        direction_feature,
-                    ) = self._latest_local_topology_features(structure_outputs)
+                    connectivity_feature = self._latest_local_topology_features(
+                        structure_outputs
+                    )
                     x = self.global_topology.forward_feature_anchors(
                         x,
                         z_struct,
                         surface_prob,
                         connectivity_feature=connectivity_feature,
-                        direction_feature=direction_feature,
                     )
                 if (
                     self.enable_h3_surface_fusion

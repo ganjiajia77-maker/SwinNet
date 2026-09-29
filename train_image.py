@@ -124,8 +124,8 @@ parser.add_argument('--enable_coarse_road_mask', action='store_true')
 parser.add_argument('--enable_psi_directional_descriptor', action='store_true')
 parser.add_argument('--enable_sparse_window_compute', action='store_true')
 parser.add_argument('--remove_stage2_pre_topology_source', action='store_true')
-parser.add_argument('--stage2_window_threshold', type=float, default=0.10)
-parser.add_argument('--stage3_window_threshold', type=float, default=0.10)
+parser.add_argument('--stage2_window_threshold', type=float, default=0.25)
+parser.add_argument('--stage3_window_threshold', type=float, default=0.25)
 parser.add_argument('--coarse_candidate_window_size', type=int, default=8,
                     help='legacy option; ignored by real-window P64 routing')
 parser.add_argument('--coarse_corridor_window_radius', type=int, default=0,
@@ -146,7 +146,7 @@ parser.add_argument('--bottleneck_coarse_road_pos_weight', type=float, default=4
 parser.add_argument(
     '--bottleneck_route_warmup_epochs',
     type=int,
-    default=0,
+    default=5,
     help='keep decoder routing dense for the first N epochs before using predicted P8 routes',
 )
 parser.add_argument(
@@ -191,7 +191,7 @@ parser.add_argument(
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
 parser.add_argument('--skeleton_pos_weight', type=float, default=None,
                     help='positive-class weight for skeleton BCE losses')
-parser.add_argument('--stage_direction_factor', type=float, default=0.1)
+parser.add_argument('--stage_direction_factor', type=float, default=0.0)
 parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
 parser.add_argument('--stage2_direction_factor', type=float, default=None)
 parser.add_argument('--stage3_direction_factor', type=float, default=None)
@@ -456,19 +456,13 @@ def format_training_config_lines(args, loss_weights):
         f"  结构配置: {args.structure_profile}",
         f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
         f"  Training AMP: {args.amp_dtype}",
-        "  Coarse routing: mode={}, P8={}, P64={}, PSI={}, sparse={}, thresholds P8/S2/S3={:.3f}/{:.3f}/{:.3f}".format(
+        "  Coarse routing: mode={}, P64={}, PSI={}, sparse={}, thresholds S2/S3={:.3f}/{:.3f}".format(
             args.coarse_routing_mode,
-            args.bottleneck_coarse_road_mask,
             args.enable_coarse_road_mask,
             args.enable_psi_directional_descriptor,
             args.enable_sparse_window_compute,
-            args.bottleneck_window_threshold,
             args.stage2_window_threshold,
             args.stage3_window_threshold,
-        ),
-        "  Bottleneck route warmup: {} epochs ({})".format(
-            args.bottleneck_route_warmup_epochs,
-            args.bottleneck_route_warmup_mode,
         ),
         "  P64 route warmup: {} epoch(s); dense supervision before sparse routing".format(
             args.coarse_route_warmup_epochs,
@@ -523,12 +517,12 @@ def format_training_config_lines(args, loss_weights):
             "  Global context gate strength: 0.03",
             "  Decoder stage3 step0: removed; only post-upsampling refinement is active",
             "  Decoder gate input: [decoder gate feature, Skeleton, Connectivity]",
-            "  Decoder gate: structure gate plus local+dilated semantic context and direction-confidence reliability correction",
+            "  Decoder gate: structure gate plus local+dilated semantic context; no direction-confidence input",
             "  Connectivity directional positive weight: cardinal={:.3f}, diagonal={:.3f}".format(
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity,direction], relation_bias=relative_xy_distance, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance+connectivity, max_nodes={}, heads={}, alpha_max={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
                 args.global_topology_max_nodes,
                 args.global_topology_heads,
@@ -926,9 +920,6 @@ def evaluate_skeleton(
             skeletons = batch['skeleton'].to(device)
             skeletons_dilate = batch['skeleton_dilate'].to(device)
             coarse_road_targets = batch['coarse_road_target'].to(device)
-            bottleneck_coarse_road_targets = batch[
-                'bottleneck_coarse_road_target'
-            ].to(device)
 
             images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
             masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -966,7 +957,7 @@ def evaluate_skeleton(
                 skeleton_logits=skeleton_logits,
                 connectivity_logits=connectivity_logits,
                 coarse_road_gt=coarse_road_targets,
-                bottleneck_coarse_road_gt=bottleneck_coarse_road_targets,
+                bottleneck_coarse_road_gt=None,
             )
             total_loss += loss.item()
 
@@ -1554,6 +1545,7 @@ if __name__ == "__main__":
             filtered_checkpoint_state = {}
             skipped_gate_keys = []
             skipped_removed_keys = []
+            skipped_shape_keys = []
             removed_direction_embedding_prefixes = (
                 "swin_unet.decoder_structure_blocks.0.directional_embedding.",
                 "swin_unet.decoder_structure_blocks.1.directional_embedding.",
@@ -1569,11 +1561,31 @@ if __name__ == "__main__":
                 "swin_unet.stage2_topology_source.surface_uncertainty_head.",
             )
             for key, value in checkpoint_state.items():
-                if key not in model_state and key.startswith(
-                    removed_direction_embedding_prefixes
-                    + removed_surface_uncertainty_prefixes
-                ):
+                if key not in model_state:
                     skipped_removed_keys.append(key)
+                    continue
+                if value.shape != model_state[key].shape:
+                    if (
+                        key.endswith("connectivity_head.prior_embed.0.weight")
+                        and value.ndim == model_state[key].ndim == 4
+                        and value.shape[0] == model_state[key].shape[0]
+                        and value.shape[1] >= 2
+                        and model_state[key].shape[1] == 2
+                        and value.shape[2:] == model_state[key].shape[2:]
+                    ):
+                        adapted_weight = model_state[key].detach().clone()
+                        adapted_weight.copy_(
+                            value[:, :2].to(
+                                device=adapted_weight.device,
+                                dtype=adapted_weight.dtype,
+                            )
+                        )
+                        filtered_checkpoint_state[key] = adapted_weight
+                        skipped_shape_keys.append(
+                            key + " (dropped direction prior channel)"
+                        )
+                        continue
+                    skipped_shape_keys.append(key)
                     continue
                 if (
                     key in model_state
@@ -1596,7 +1608,14 @@ if __name__ == "__main__":
                     + (" ..." if len(skipped_removed_keys) > 12 else ""),
                     flush=True,
                 )
-            if skipped_gate_keys or skipped_removed_keys:
+            if skipped_shape_keys:
+                print(
+                    "[WARN] Reinitialized shape-incompatible checkpoint keys: "
+                    + ", ".join(skipped_shape_keys[:12])
+                    + (" ..." if len(skipped_shape_keys) > 12 else ""),
+                    flush=True,
+                )
+            if skipped_gate_keys or skipped_removed_keys or skipped_shape_keys:
                 checkpoint_state = filtered_checkpoint_state
             strict_load = args.bottleneck_type == 'global_local'
             try:
@@ -1963,9 +1982,6 @@ if __name__ == "__main__":
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
                 coarse_road_targets = batch['coarse_road_target'].to(device)
-                bottleneck_coarse_road_targets = batch[
-                    'bottleneck_coarse_road_target'
-                ].to(device)
 
                 images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
                 masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -2023,7 +2039,7 @@ if __name__ == "__main__":
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
                     coarse_road_gt=coarse_road_targets,
-                    bottleneck_coarse_road_gt=bottleneck_coarse_road_targets,
+                    bottleneck_coarse_road_gt=None,
                 )
 
                 if not torch.isfinite(loss):
