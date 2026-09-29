@@ -203,7 +203,7 @@ def main():
     
     checkpoint = None
     if os.path.exists(args.model_path):
-        checkpoint = torch.load(args.model_path, map_location='cpu')
+        checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
         if isinstance(checkpoint, dict):
             saved_profile = checkpoint.get("structure_profile")
             if saved_profile and not _cli_has("structure_profile"):
@@ -333,7 +333,7 @@ def main():
         )
     model = vit_cls(**model_kwargs)
     if checkpoint is None:
-        checkpoint = torch.load(args.model_path, map_location=device)
+        checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
     adapt_connectivity_modules_for_checkpoint(
         model,
         checkpoint['model_state_dict'],
