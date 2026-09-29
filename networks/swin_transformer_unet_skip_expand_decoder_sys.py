@@ -2908,7 +2908,14 @@ class SwinTransformerSys(nn.Module):
                             psi_image,
                             max_extension=4,
                             color_threshold=40.0,
-                            output_size=(64, 64),
+                            # P64 is twice the spatial resolution of the
+                            # P32 semantic feature. Keep this dynamic so
+                            # 256 and 512 inputs use matching PSI/semantic
+                            # maps instead of relying on a fixed 64x64 size.
+                            output_size=(
+                                feature32.shape[-2] * 2,
+                                feature32.shape[-1] * 2,
+                            ),
                         )
                     coarse_road_logits, psi_gate = self.coarse_road_mask_head(
                         feature32,
