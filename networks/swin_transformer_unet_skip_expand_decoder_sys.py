@@ -158,38 +158,54 @@ class WindowAttention(nn.Module):
         qkv = F.linear(x, self.qkv.weight, qkv_bias).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
-        qk_logits = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
-        qk_logits = qk_logits * torch.clamp(self.logit_scale, max=torch.log(torch.tensor(100.0, device=x.device))).exp()
-        relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
-        relative_position_bias = relative_position_bias_table[self.relative_position_index.view(-1)].view(N, N, -1)
-        relative_position_bias = 16 * torch.sigmoid(relative_position_bias.permute(2, 0, 1).contiguous())
-        attn = qk_logits + relative_position_bias.unsqueeze(0)
-        if road_attention_bias is not None:
-            if road_attention_bias.dim() == 3:
-                road_attention_bias = road_attention_bias.unsqueeze(1)
-            attn = attn + road_attention_bias
-        if structure_attention_bias is not None:
-            if structure_attention_bias.dim() == 3:
-                structure_attention_bias = structure_attention_bias.unsqueeze(1)
-            attn = attn + structure_attention_bias
+        # Keep the large feature projections under the caller's autocast, but
+        # compute attention logits and softmax in FP32. Turing GPUs have fast
+        # FP16 Tensor Cores but no native BF16 path, while QK/softmax is the
+        # numerically sensitive part of this block.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            q = q.float()
+            k = k.float()
+            v = v.float()
+            qk_logits = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
+            qk_logits = qk_logits * torch.clamp(
+                self.logit_scale.float(),
+                max=torch.log(torch.tensor(100.0, device=x.device)),
+            ).exp()
+            relative_position_bias_table = self.cpb_mlp(
+                self.relative_coords_table.float()
+            ).view(-1, self.num_heads)
+            relative_position_bias = relative_position_bias_table[
+                self.relative_position_index.view(-1)
+            ].view(N, N, -1)
+            relative_position_bias = 16 * torch.sigmoid(
+                relative_position_bias.permute(2, 0, 1).contiguous()
+            )
+            attn = qk_logits + relative_position_bias.unsqueeze(0)
+            if road_attention_bias is not None:
+                if road_attention_bias.dim() == 3:
+                    road_attention_bias = road_attention_bias.unsqueeze(1)
+                attn = attn + road_attention_bias.float()
+            if structure_attention_bias is not None:
+                if structure_attention_bias.dim() == 3:
+                    structure_attention_bias = structure_attention_bias.unsqueeze(1)
+                attn = attn + structure_attention_bias.float()
 
-        if mask is not None:
-            if mask.shape[0] == B_:
-                # Sparse routing may select a different number of windows per
-                # image. In that case each selected window already carries its
-                # own shifted-window mask.
-                attn = attn + mask.unsqueeze(1)
+            if mask is not None:
+                if mask.shape[0] == B_:
+                    # Sparse routing may select a different number of windows per
+                    # image. In that case each selected window already carries its
+                    # own shifted-window mask.
+                    attn = attn + mask.unsqueeze(1).float()
+                else:
+                    nW = mask.shape[0]
+                    attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.float().unsqueeze(1).unsqueeze(0)
+                    attn = attn.view(-1, self.num_heads, N, N)
+                attn = self.softmax(attn)
             else:
-                nW = mask.shape[0]
-                attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-                attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
+                attn = self.softmax(attn)
 
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -2253,6 +2269,9 @@ class SwinTransformerSys(nn.Module):
     def _resize_route_probability(probability, target_hw):
         if probability is None:
             return None
+        # Routing decisions are discrete and should not depend on FP16
+        # rounding near the window threshold.
+        probability = probability.float()
         target_hw = tuple(int(v) for v in target_hw)
         if probability.shape[-2:] == target_hw:
             return probability
@@ -2280,11 +2299,14 @@ class SwinTransformerSys(nn.Module):
                 color_threshold=40.0,
                 output_size=(height, width),
             )
-        logits, psi_gate = self.bottleneck_coarse_road_mask_head(
-            bottleneck_feature,
-            psi_descriptor=psi_descriptor,
-        )
-        probability = torch.sigmoid(logits)
+        with torch.autocast(device_type=bottleneck_feature.device.type, enabled=False):
+            logits, psi_gate = self.bottleneck_coarse_road_mask_head(
+                bottleneck_feature.float(),
+                psi_descriptor=(
+                    psi_descriptor.float() if psi_descriptor is not None else None
+                ),
+            )
+        probability = torch.sigmoid(logits.float())
         self.last_stage_features["F8"] = bottleneck_feature
         self.last_stage_features["PSI8"] = psi_descriptor
         self.last_stage_features["P8_logits"] = logits
@@ -2910,15 +2932,22 @@ class SwinTransformerSys(nn.Module):
                             color_threshold=40.0,
                             output_size=(64, 64),
                         )
-                    coarse_road_logits, psi_gate = self.coarse_road_mask_head(
-                        feature32,
-                        psi_descriptor=psi_descriptor,
-                        output_size=(
-                            feature32.shape[-2] * 2,
-                            feature32.shape[-1] * 2,
-                        ),
-                    )
-                    coarse_probability = torch.sigmoid(coarse_road_logits)
+                    with torch.autocast(device_type=feature32.device.type, enabled=False):
+                        coarse_road_logits, psi_gate = self.coarse_road_mask_head(
+                            feature32.float(),
+                            psi_descriptor=(
+                                psi_descriptor.float()
+                                if psi_descriptor is not None
+                                else None
+                            ),
+                            output_size=(
+                                feature32.shape[-2] * 2,
+                                feature32.shape[-1] * 2,
+                            ),
+                        )
+                    # Keep P64 routing in FP32 so thresholding is stable under
+                    # FP16 autocast, especially for thin road candidates.
+                    coarse_probability = torch.sigmoid(coarse_road_logits.float())
                     selection_probability = (
                         self.sparse_selection_probability_override
                         if self.sparse_selection_probability_override is not None

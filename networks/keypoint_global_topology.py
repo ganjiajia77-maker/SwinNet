@@ -208,7 +208,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
             ],
             dim=-1,
         )
-        bias = self.token_relation_bias(relation).permute(0, 3, 1, 2)
+        with torch.autocast(device_type=relation.device.type, enabled=False):
+            bias = self.token_relation_bias(relation.float()).permute(0, 3, 1, 2)
         valid_pair = valid[:, None, :, None] & valid[:, None, None, :]
         return bias.masked_fill(~valid_pair, 0.0)
 
@@ -231,37 +232,41 @@ class KeypointGuidedGlobalTopology(nn.Module):
         connectivity_feature=None,
     ):
         batch, nodes, channels = node_feature.shape
-        qkv = self.token_relation_qkv(node_feature).reshape(
-            batch,
-            nodes,
-            3,
-            self.heads,
-            channels // self.heads,
-        ).permute(2, 0, 3, 1, 4)
-        query, key, value = qkv[0], qkv[1], qkv[2]
-        logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
-            channels // self.heads
-        )
-        topology_bias = self._relative_topology_bias(coords, valid, anchor_hw)
-        local_topology_bias = node_feature.new_zeros(batch, self.heads, nodes, nodes)
-        if connectivity_feature is not None:
-            local_topology_bias = self._local_topology_bias(
-                connectivity_feature,
-                valid,
+        with torch.autocast(device_type=node_feature.device.type, enabled=False):
+            node_feature = node_feature.float()
+            if connectivity_feature is not None:
+                connectivity_feature = connectivity_feature.float()
+            qkv = self.token_relation_qkv(node_feature).reshape(
+                batch,
+                nodes,
+                3,
+                self.heads,
+                channels // self.heads,
+            ).permute(2, 0, 3, 1, 4)
+            query, key, value = qkv[0], qkv[1], qkv[2]
+            logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
+                channels // self.heads
             )
-        logits = logits + self.token_relation_scale * topology_bias + local_topology_bias
-        logits = logits.masked_fill(
-            ~valid[:, None, None, :],
-            -torch.finfo(logits.dtype).max,
-        )
-        attention = torch.softmax(logits, dim=-1)
-        attended = torch.matmul(attention, value).transpose(1, 2).reshape(
-            batch,
-            nodes,
-            channels,
-        )
-        attended = self.token_relation_projection(attended)
-        refined = node_feature + attended
+            topology_bias = self._relative_topology_bias(coords, valid, anchor_hw)
+            local_topology_bias = node_feature.new_zeros(batch, self.heads, nodes, nodes)
+            if connectivity_feature is not None:
+                local_topology_bias = self._local_topology_bias(
+                    connectivity_feature,
+                    valid,
+                )
+            logits = logits + self.token_relation_scale * topology_bias + local_topology_bias
+            logits = logits.masked_fill(
+                ~valid[:, None, None, :],
+                -torch.finfo(logits.dtype).max,
+            )
+            attention = torch.softmax(logits, dim=-1)
+            attended = torch.matmul(attention, value).transpose(1, 2).reshape(
+                batch,
+                nodes,
+                channels,
+            )
+            attended = self.token_relation_projection(attended)
+            refined = node_feature + attended
         return (
             refined * valid.unsqueeze(-1).to(dtype=refined.dtype),
             topology_bias,
@@ -270,38 +275,41 @@ class KeypointGuidedGlobalTopology(nn.Module):
 
     def _cross_attention_from_structure_tokens(self, feature, node_feature, valid):
         batch, channels, height, width = feature.shape
-        grid_tokens = feature.flatten(2).transpose(1, 2)
-        query = self.grid_q(grid_tokens).reshape(
-            batch,
-            height * width,
-            self.heads,
-            channels // self.heads,
-        ).permute(0, 2, 1, 3)
-        node_kv = self.node_kv(node_feature).reshape(
-            batch,
-            self.max_nodes,
-            2,
-            self.heads,
-            channels // self.heads,
-        ).permute(2, 0, 3, 1, 4)
-        key, value = node_kv[0], node_kv[1]
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            feature = feature.float()
+            node_feature = node_feature.float()
+            grid_tokens = feature.flatten(2).transpose(1, 2)
+            query = self.grid_q(grid_tokens).reshape(
+                batch,
+                height * width,
+                self.heads,
+                channels // self.heads,
+            ).permute(0, 2, 1, 3)
+            node_kv = self.node_kv(node_feature).reshape(
+                batch,
+                self.max_nodes,
+                2,
+                self.heads,
+                channels // self.heads,
+            ).permute(2, 0, 3, 1, 4)
+            key, value = node_kv[0], node_kv[1]
 
-        logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
-            channels // self.heads
-        )
-        logits = logits.masked_fill(
-            ~valid[:, None, None, :],
-            -torch.finfo(logits.dtype).max,
-        )
-        attention = torch.softmax(logits, dim=-1)
-        context = torch.matmul(attention, value).transpose(1, 2).reshape(
-            batch,
-            height * width,
-            channels,
-        )
-        context = self.output_projection(context)
-        context = context.transpose(1, 2).reshape(batch, channels, height, width)
-        has_anchor = valid.any(dim=1).to(dtype=context.dtype).view(batch, 1, 1, 1)
+            logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
+                channels // self.heads
+            )
+            logits = logits.masked_fill(
+                ~valid[:, None, None, :],
+                -torch.finfo(logits.dtype).max,
+            )
+            attention = torch.softmax(logits, dim=-1)
+            context = torch.matmul(attention, value).transpose(1, 2).reshape(
+                batch,
+                height * width,
+                channels,
+            )
+            context = self.output_projection(context)
+            context = context.transpose(1, 2).reshape(batch, channels, height, width)
+            has_anchor = valid.any(dim=1).to(dtype=context.dtype).view(batch, 1, 1, 1)
         return context * has_anchor
 
     def forward_feature_anchors(
@@ -315,13 +323,17 @@ class KeypointGuidedGlobalTopology(nn.Module):
         if not self.enable_global_topology or z_struct is None or surface_prob is None:
             return feature
 
+        feature_dtype = feature.dtype
+        feature_fp32 = feature.float()
+        z_struct_fp32 = z_struct.float()
+
         with torch.no_grad():
             z_score = torch.linalg.vector_norm(
-                z_struct.detach().float(),
+                z_struct_fp32.detach(),
                 dim=1,
                 keepdim=True,
             )
-            z_score = self._minmax_normalize_map(z_score).to(dtype=feature.dtype)
+            z_score = self._minmax_normalize_map(z_score)
             if z_score.shape[-2:] != (height, width):
                 z_score = F.interpolate(
                     z_score,
@@ -329,7 +341,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
-            surface_gate = surface_prob.detach().to(dtype=feature.dtype)
+            surface_gate = surface_prob.detach().float()
             if surface_gate.shape[-2:] != (height, width):
                 surface_gate = F.interpolate(
                     surface_gate,
@@ -341,12 +353,12 @@ class KeypointGuidedGlobalTopology(nn.Module):
             coords, valid, scores, candidate_count = self._extract_fps_anchors(anchor_score)
 
         sampled_struct = self._sample_features_at_anchor_coords(
-            z_struct.to(dtype=feature.dtype),
+            z_struct_fp32,
             coords,
             anchor_hw=(height, width),
         )
         sampled_feature = self._sample_features_at_anchor_coords(
-            feature,
+            feature_fp32,
             coords,
             anchor_hw=(height, width),
         )
@@ -355,7 +367,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
             batch,
             (height, width),
             self.connectivity_channels,
-            feature.dtype,
+            torch.float32,
             feature.device,
         )
         sampled_connectivity = self._sample_features_at_anchor_coords(
@@ -363,26 +375,27 @@ class KeypointGuidedGlobalTopology(nn.Module):
             coords,
             anchor_hw=(height, width),
         )
-        node_types = torch.zeros(
-            batch,
-            self.max_nodes,
-            device=feature.device,
-            dtype=torch.long,
-        )
-        coords_norm = coords.float() / feature.new_tensor(
-            [max(height - 1, 1), max(width - 1, 1)]
-        )
-        node_input = torch.cat(
-            [
-                sampled_struct,
-                sampled_feature,
-                sampled_connectivity,
-                self.node_type_embedding(node_types),
-                coords_norm,
-            ],
-            dim=-1,
-        )
-        node_feature = self.node_projection(node_input)
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            node_types = torch.zeros(
+                batch,
+                self.max_nodes,
+                device=feature.device,
+                dtype=torch.long,
+            )
+            coords_norm = coords.float() / feature_fp32.new_tensor(
+                [max(height - 1, 1), max(width - 1, 1)]
+            )
+            node_input = torch.cat(
+                [
+                    sampled_struct.float(),
+                    sampled_feature.float(),
+                    sampled_connectivity.float(),
+                    self.node_type_embedding(node_types),
+                    coords_norm,
+                ],
+                dim=-1,
+            )
+            node_feature = self.node_projection(node_input)
         (
             node_feature,
             topology_bias,
@@ -399,15 +412,16 @@ class KeypointGuidedGlobalTopology(nn.Module):
             node_feature,
             valid,
         )
-        delta = self.grid_projection(context)
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            delta = self.grid_projection(context.float())
         delta = delta * surface_gate.clamp(0.0, 1.0)
-        output = feature + self.alpha_global * delta
+        output = feature_fp32 + self.alpha_global.float() * delta
 
         if self.capture_diagnostics:
             with torch.no_grad():
                 self.last_diagnostics = {
                     "anchor_count": valid.sum(dim=1).float().detach(),
-                    "candidate_count": feature.new_full(
+                    "candidate_count": feature_fp32.new_full(
                         (batch,),
                         float(candidate_count),
                     ).detach(),
@@ -433,4 +447,4 @@ class KeypointGuidedGlobalTopology(nn.Module):
                         / (torch.linalg.vector_norm(feature) + 1e-6)
                     ).detach(),
                 }
-        return output
+        return output.to(dtype=feature_dtype)
