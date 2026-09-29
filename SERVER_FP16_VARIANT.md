@@ -1,6 +1,6 @@
 # P64 PSI sparse random-512 FP16 server variant
 
-Base model/training version: `f06bc5f` (P64 + PSI + real-window sparse routing with server learning rates).
+Base model/training version: `f12ff39` (P64 + PSI + real-window sparse routing with route warmup and server learning rates).
 
 Changes in this branch:
 
