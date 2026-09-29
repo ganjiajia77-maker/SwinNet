@@ -978,11 +978,22 @@ class SwinTransformerBlock(nn.Module):
         selected_feature_windows = selected_feature_windows + self.drop_path(
             self.norm2(self.mlp(selected_feature_windows))
         )
+        # Under BF16 autocast, LayerNorm/MLP can promote the gathered path to
+        # FP32 while the full feature tensor remains BF16.  The scatter target
+        # must have the same dtype as its source; cast only at the boundary so
+        # the sparse computation keeps the autocast precision internally.
+        selected_feature_windows = selected_feature_windows.to(
+            dtype=feature_windows.dtype
+        )
 
         # Scatter the updated windows into the original shifted window tensor;
         # no full-image norm/MLP or zero-filled intermediate is needed.
         updated_windows = feature_windows.clone()
-        updated_windows.index_copy_(0, selected_indices, selected_feature_windows)
+        updated_windows.index_copy_(
+            0,
+            selected_indices,
+            selected_feature_windows.to(dtype=feature_windows.dtype),
+        )
         shifted_x = window_reverse(
             updated_windows.view(-1, self.window_size, self.window_size, channels),
             self.window_size,
