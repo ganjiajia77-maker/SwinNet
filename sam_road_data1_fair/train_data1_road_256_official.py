@@ -218,11 +218,13 @@ def main():
         for batch_index, batch in enumerate(progress):
             images = batch["image"].to(device, non_blocking=True)
             target = batch["mask"].to(device, non_blocking=True)
+            group_start = (batch_index // grad_accum) * grad_accum
+            group_size = min(grad_accum, len(train_loader) - group_start)
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=use_amp
             ):
                 loss = road_bce(road_logits(model, images), target)
-            scaler.scale(loss / grad_accum).backward()
+            scaler.scale(loss / group_size).backward()
             if (batch_index + 1) % grad_accum == 0 or batch_index + 1 == len(train_loader):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
