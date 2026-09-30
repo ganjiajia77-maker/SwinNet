@@ -22,6 +22,7 @@ python -u train_image.py \
   --run_name "$RUN" \
   --cfg "$REPO/configs/swin_tiny_patch4_window7_224_lite.yaml" \
   --pretrain_ckpt "$MODEL_ROOT/pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth" \
+  --warm_start_ckpt "$MODEL_ROOT/model_out/data1_58d60dd_stage23softske_pw2_pairlinear_con3_dir02_direct256_60e_focal1_bf16_20260925_2/best.pth" \
   --pretrained_lr 5e-5 \
   --pretrained_min_lr 5e-6 \
   --new_lr 2e-4 \
@@ -36,6 +37,8 @@ python -u train_image.py \
   --global_topology_alpha_max 0.05 \
   --highres_structure_fuse_stages stage23 \
   --highres_structure_fusion_mode stage23 \
+  --final_topology_eta_init 0.0 \
+  --final_gap_rho_init 0.0 \
   --img_size 256 \
   --source_patch_size 1024 \
   --direct_resize_train \
@@ -60,8 +63,6 @@ python -u train_image.py \
   --edge_contrastive_margin 0.1 \
   --directional_pos_weight_cardinal 1.0 \
   --directional_pos_weight_diagonal 2.5 \
-  --coarse_road_loss_weight 0.2 \
-  --coarse_road_pos_weight 4.0 \
   --surface_focal_gamma 1.0 \
   --no-use_ema \
   --threshold 0.2 \
