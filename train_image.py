@@ -1474,24 +1474,23 @@ def calibrate_p64_routing(model, loader, args, output_dir):
                     active_map, active_ratio = _window_route_stats(
                         p64_probability, layer, threshold
                     )
-                    road_at_stage = F.adaptive_max_pool2d(
-                        surface_target.float(), layer.input_resolution
-                    ).bool()
-                    skeleton_at_stage = F.adaptive_max_pool2d(
-                        skeleton_target.float(), layer.input_resolution
+                    active_full = F.interpolate(
+                        active_map.float(),
+                        size=surface_target.shape[-2:],
+                        mode="nearest",
                     ).bool()
                     prefix = f"stage{stage}"
                     threshold_stats[f"{prefix}_road_tp"] += int(
-                        (active_map & road_at_stage).sum().item()
+                        (active_full & surface_target).sum().item()
                     )
                     threshold_stats[f"{prefix}_road_fn"] += int(
-                        ((~active_map) & road_at_stage).sum().item()
+                        ((~active_full) & surface_target).sum().item()
                     )
                     threshold_stats[f"{prefix}_skeleton_tp"] += int(
-                        (active_map & skeleton_at_stage).sum().item()
+                        (active_full & skeleton_target).sum().item()
                     )
                     threshold_stats[f"{prefix}_skeleton_fn"] += int(
-                        ((~active_map) & skeleton_at_stage).sum().item()
+                        ((~active_full) & skeleton_target).sum().item()
                     )
                     threshold_stats[f"{prefix}_active_ratio_sum"] += active_ratio
                 threshold_stats["batches"] += 1
