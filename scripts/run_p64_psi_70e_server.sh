@@ -33,6 +33,7 @@ case "${1:-}" in
     }
     mkdir -p "$MODEL_ROOT"
     printf 'RUN=%s\nOUTDIR=%s\n' "$RUN" "$OUTDIR"
+    echo "Training runs for 70 epochs. Epoch 10 calibrates Stage 2/3 routing; sparse training then continues through epoch 70."
     python -u train_image.py \
       --root_path "$DATA" \
       --output_dir "$MODEL_ROOT" \
@@ -53,8 +54,6 @@ case "${1:-}" in
       --enable_psi_directional_descriptor \
       --enable_sparse_window_compute \
       --coarse_routing_mode p64 \
-      --coarse_corridor_window_radius 0 \
-      --coarse_route_warmup_epochs 0 \
       --routing_warmup_epochs 10 \
       --routing_road_recall_min 0.99 \
       --routing_skeleton_recall_min 0.98 \
@@ -98,11 +97,22 @@ case "${1:-}" in
       --no-use_ema \
       2>&1 | tee "$LOG"
     mv "$LOG" "$OUTDIR/train.log"
+    LAST_EPOCH="$(python -c 'import torch,sys; c=torch.load(sys.argv[1], map_location="cpu", weights_only=False); print(int(c.get("epoch", 0)))' "$OUTDIR/last.pth")"
+    if [[ "$LAST_EPOCH" != 70 ]]; then
+      echo "Training did not reach epoch 70 (last checkpoint is epoch $LAST_EPOCH); sweep/test remain locked." >&2
+      exit 1
+    fi
+    printf 'completed_epoch=%s\n' "$LAST_EPOCH" > "$OUTDIR/training.complete"
+    echo "All 70 epochs completed. Final mask-threshold sweep is now available."
     ;;
   sweep|test)
     : "${RUN:?Set RUN to the completed training run name}"
     OUTDIR="$MODEL_ROOT/$RUN"
     CKPT="$OUTDIR/best.pth"
+    [[ -f "$OUTDIR/training.complete" ]] || {
+      echo "Training is not marked complete; final sweep/test require all 70 epochs." >&2
+      exit 1
+    }
     [[ -f "$CKPT" ]] || { echo "Missing checkpoint: $CKPT" >&2; exit 1; }
     if [[ "$1" == sweep ]]; then
       python -u threshold_sweep_test.py \
