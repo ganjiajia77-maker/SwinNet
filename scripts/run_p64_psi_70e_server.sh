@@ -105,6 +105,29 @@ case "${1:-}" in
     printf 'completed_epoch=%s\n' "$LAST_EPOCH" > "$OUTDIR/training.complete"
     echo "All 70 epochs completed. Final mask-threshold sweep is now available."
     ;;
+  resume)
+    : "${RUN:?Set RUN to the interrupted training run name}"
+    OUTDIR="$MODEL_ROOT/$RUN"
+    CKPT="$OUTDIR/last.pth"
+    [[ -f "$CKPT" ]] || { echo "Missing resume checkpoint: $CKPT" >&2; exit 1; }
+    LOG="$OUTDIR/resume_$(date +%Y%m%d_%H%M%S).log"
+    python -u train_image.py \
+      --root_path "$DATA" \
+      --output_dir "$MODEL_ROOT" \
+      --run_name "$RUN" \
+      --cfg "$CFG" \
+      --resume "$CKPT" \
+      --max_epochs 70 \
+      --amp_dtype none \
+      2>&1 | tee "$LOG"
+    LAST_EPOCH="$(python -c 'import torch,sys; c=torch.load(sys.argv[1], map_location="cpu", weights_only=False); print(int(c.get("epoch", 0)))' "$CKPT")"
+    if [[ "$LAST_EPOCH" != 70 ]]; then
+      echo "Resume did not reach epoch 70 (last checkpoint is epoch $LAST_EPOCH); sweep/test remain locked." >&2
+      exit 1
+    fi
+    printf 'completed_epoch=%s\n' "$LAST_EPOCH" > "$OUTDIR/training.complete"
+    echo "All 70 epochs completed. Final mask-threshold sweep is now available."
+    ;;
   sweep|test)
     : "${RUN:?Set RUN to the completed training run name}"
     OUTDIR="$MODEL_ROOT/$RUN"
@@ -144,7 +167,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "Usage: bash scripts/run_p64_psi_70e_server.sh {train|sweep|test}" >&2
+    echo "Usage: bash scripts/run_p64_psi_70e_server.sh {train|resume|sweep|test}" >&2
     exit 2
     ;;
 esac

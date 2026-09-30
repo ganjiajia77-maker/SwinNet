@@ -85,6 +85,12 @@ def test_dense_sparse_forward_retains_h2_h3_and_surface():
         assert model.last_route_stats["stage3"]["active_windows"] == 0
         assert model.last_stage_features["H2"].shape[-2:] == (64, 64)
         assert model.last_stage_features["H3"].shape[-2:] == (64, 64)
+        model.sparse_selection_probability_override.fill_(1)
+        dense_route = model(image)
+        assert dense_route[0].shape == dense[0].shape
+        assert model.last_route_stats["stage2"]["active_ratio"] == 1.0
+        assert model.last_route_stats["stage3"]["active_ratio"] == 1.0
+        model.sparse_selection_probability_override.zero_()
         model.sparse_selection_probability_override[:, :, 8:16, 8:16] = 1
         sparse_partial = model(image)
         assert sparse_partial[0].shape == dense[0].shape

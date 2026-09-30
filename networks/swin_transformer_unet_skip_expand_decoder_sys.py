@@ -2517,6 +2517,7 @@ class SwinTransformerSys(nn.Module):
                 feature_map,
                 stage,
                 bottleneck_tokens,
+                block_stage=block_stage,
                 apply_feature_refinement=apply_feature_refinement,
                 disable_skeleton_prediction=disable_skeleton_prediction,
                 skeleton_prior=skeleton_prior,
@@ -2530,18 +2531,18 @@ class SwinTransformerSys(nn.Module):
         if mask.shape[-2:] != (height, width):
             mask = F.interpolate(mask.float(), size=(height, width), mode="nearest")
         mask = mask.bool()
+        block_key = stage if block_stage is None else block_stage
         if bool(mask.all().item()):
             return self._run_decoder_structure_block(
                 feature_map,
                 stage,
                 bottleneck_tokens,
+                block_stage=block_key,
                 apply_feature_refinement=apply_feature_refinement,
                 disable_skeleton_prediction=disable_skeleton_prediction,
                 skeleton_prior=skeleton_prior,
                 previous_structure_feat=previous_structure_feat,
             )
-
-        block_key = stage if block_stage is None else block_stage
         block = (
             self.stage2_topology_source
             if block_key == "stage2_topology_source"
