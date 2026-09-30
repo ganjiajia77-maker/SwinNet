@@ -96,6 +96,29 @@ def apply_structure_profile_runtime(model):
     guided_head.raw_rho_gap.requires_grad_(False)
 
 
+def restore_routing_checkpoint_state(model, checkpoint):
+    """Restore calibrated P64 routing for resume and all evaluation scripts."""
+    if not isinstance(checkpoint, dict):
+        return None
+    state = checkpoint.get("routing_state")
+    if not isinstance(state, dict):
+        return None
+    core = _core_swin_unet(model)
+    core.routing_warmup_epochs = int(state.get(
+        "routing_warmup_epochs", core.routing_warmup_epochs
+    ))
+    core.set_routing_thresholds(
+        state.get("stage2_window_threshold"),
+        state.get("stage3_window_threshold"),
+    )
+    core.set_routing_calibration_done(state.get("calibration_done", False))
+    core.sparse_window_compute = bool(state.get("sparse_enabled", False))
+    core.set_route_epoch(max(
+        int(checkpoint.get("epoch", 0)), core.routing_warmup_epochs
+    ))
+    return core.routing_state()
+
+
 def format_topology_coefficients(model):
     coefficients = get_topology_coefficients(model)
     fields = [
@@ -565,6 +588,7 @@ class SwinUnet(nn.Module):
                   bottleneck_route_warmup_epochs=0,
                   bottleneck_route_warmup_mode="dense",
                   coarse_route_warmup_epochs=0,
+                  routing_warmup_epochs=10,
                   stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False):
@@ -627,6 +651,7 @@ class SwinUnet(nn.Module):
                                   bottleneck_route_warmup_epochs=bottleneck_route_warmup_epochs,
                                   bottleneck_route_warmup_mode=bottleneck_route_warmup_mode,
                                   coarse_route_warmup_epochs=coarse_route_warmup_epochs,
+                                  routing_warmup_epochs=routing_warmup_epochs,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)

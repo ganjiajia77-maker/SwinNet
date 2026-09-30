@@ -17,6 +17,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         alpha_max=0.05,
         enabled=False,
         connectivity_channels=8,
+        direction_channels=2,
     ):
         super().__init__()
         if channels % heads != 0:
@@ -28,11 +29,13 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.alpha_max = float(alpha_max)
         self.enable_global_topology = bool(enabled)
         self.connectivity_channels = int(connectivity_channels)
+        self.direction_channels = int(direction_channels)
         self.node_type_embedding = nn.Embedding(1, 8)
         token_input_channels = (
             self.struct_channels
             + self.channels
             + self.connectivity_channels
+            + self.direction_channels
             + 8
             + 2
         )
@@ -47,6 +50,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         )
         self.token_relation_scale = nn.Parameter(torch.tensor(0.1))
         self.connectivity_topology_bias_scale = nn.Parameter(torch.tensor(0.1))
+        self.direction_topology_bias_scale = nn.Parameter(torch.tensor(0.1))
         self.grid_q = nn.Linear(channels, channels)
         self.node_kv = nn.Linear(channels, channels * 2)
         self.output_projection = nn.Linear(channels, channels)
@@ -212,7 +216,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         valid_pair = valid[:, None, :, None] & valid[:, None, None, :]
         return bias.masked_fill(~valid_pair, 0.0)
 
-    def _local_topology_bias(self, connectivity_feature, valid):
+    def _local_topology_bias(self, connectivity_feature, direction_feature, valid):
         batch, nodes, _ = connectivity_feature.shape
         bias = connectivity_feature.new_zeros(batch, self.heads, nodes, nodes)
         valid_pair = valid[:, None, :, None] & valid[:, None, None, :]
@@ -220,6 +224,10 @@ class KeypointGuidedGlobalTopology(nn.Module):
             conn = F.normalize(connectivity_feature.float(), dim=-1, eps=1e-6)
             conn_similarity = torch.matmul(conn, conn.transpose(1, 2))
             bias = bias + self.connectivity_topology_bias_scale * conn_similarity[:, None]
+        if direction_feature is not None and direction_feature.numel() > 0:
+            direction = F.normalize(direction_feature.float(), dim=-1, eps=1e-6)
+            direction_similarity = torch.matmul(direction, direction.transpose(1, 2))
+            bias = bias + self.direction_topology_bias_scale * direction_similarity[:, None]
         return bias.to(dtype=connectivity_feature.dtype).masked_fill(~valid_pair, 0.0)
 
     def _refine_tokens_with_relative_topology(
@@ -229,6 +237,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         valid,
         anchor_hw,
         connectivity_feature=None,
+        direction_feature=None,
     ):
         batch, nodes, channels = node_feature.shape
         qkv = self.token_relation_qkv(node_feature).reshape(
@@ -244,9 +253,10 @@ class KeypointGuidedGlobalTopology(nn.Module):
         )
         topology_bias = self._relative_topology_bias(coords, valid, anchor_hw)
         local_topology_bias = node_feature.new_zeros(batch, self.heads, nodes, nodes)
-        if connectivity_feature is not None:
+        if connectivity_feature is not None and direction_feature is not None:
             local_topology_bias = self._local_topology_bias(
                 connectivity_feature,
+                direction_feature,
                 valid,
             )
         logits = logits + self.token_relation_scale * topology_bias + local_topology_bias
@@ -310,6 +320,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         z_struct,
         surface_prob,
         connectivity_feature=None,
+        direction_feature=None,
     ):
         batch, channels, height, width = feature.shape
         if not self.enable_global_topology or z_struct is None or surface_prob is None:
@@ -358,8 +369,21 @@ class KeypointGuidedGlobalTopology(nn.Module):
             feature.dtype,
             feature.device,
         )
+        direction_map = self._prepare_token_map(
+            direction_feature,
+            batch,
+            (height, width),
+            self.direction_channels,
+            feature.dtype,
+            feature.device,
+        )
         sampled_connectivity = self._sample_features_at_anchor_coords(
             connectivity_map,
+            coords,
+            anchor_hw=(height, width),
+        )
+        sampled_direction = self._sample_features_at_anchor_coords(
+            direction_map,
             coords,
             anchor_hw=(height, width),
         )
@@ -377,6 +401,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
                 sampled_struct,
                 sampled_feature,
                 sampled_connectivity,
+                sampled_direction,
                 self.node_type_embedding(node_types),
                 coords_norm,
             ],
@@ -393,6 +418,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
             valid,
             anchor_hw=(height, width),
             connectivity_feature=sampled_connectivity,
+            direction_feature=sampled_direction,
         )
         context = self._cross_attention_from_structure_tokens(
             feature,
@@ -422,12 +448,16 @@ class KeypointGuidedGlobalTopology(nn.Module):
                     "connectivity_topology_bias_scale": (
                         self.connectivity_topology_bias_scale.detach()
                     ),
+                    "direction_topology_bias_scale": (
+                        self.direction_topology_bias_scale.detach()
+                    ),
                     "local_topology_bias_abs_mean": (
                         local_topology_bias.abs().mean().detach()
                     ),
                     "connectivity_token_abs_mean": (
                         sampled_connectivity.abs().mean()
                     ).detach(),
+                    "direction_token_abs_mean": sampled_direction.abs().mean().detach(),
                     "global_residual_relative_norm": (
                         torch.linalg.vector_norm(output - feature)
                         / (torch.linalg.vector_norm(feature) + 1e-6)

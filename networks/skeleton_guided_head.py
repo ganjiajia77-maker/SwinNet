@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from topology_direction_constants import (
     CONNECTIVITY_DIRECTIONS,
+    connectivity_double_angle_basis,
 )
 
 def scale_gradient(x, ratio: float):
@@ -125,13 +126,14 @@ class PairwiseConnectivityHead(nn.Module):
         self.feature_channels = channels
         self.prior_channels = 16
         self.prior_embed = nn.Sequential(
-            nn.Conv2d(2, self.prior_channels, kernel_size=1, bias=False),
+            nn.Conv2d(3, self.prior_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(self.prior_channels),
             nn.ReLU(inplace=True),
         )
         self.edge_linear = nn.Conv2d(4 * channels + self.prior_channels, 1, kernel_size=1)
         self.collect_pair_diagnostics = False
         self.last_pair_diagnostics = None
+        self.register_buffer("axis_basis", connectivity_double_angle_basis().view(1, 8, 2, 1, 1))
 
     @staticmethod
     def _shift_feature(x, dy, dx):
@@ -145,7 +147,19 @@ class PairwiseConnectivityHead(nn.Module):
         x0 = max(dx, 0)
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
-    def forward(self, feature, skeleton_prob=None):
+    def direction_alignment(self, direction_logits):
+        direction = F.normalize(direction_logits, dim=1, eps=1e-6)
+        direction = direction.unsqueeze(1)
+        return ((direction * self.axis_basis).sum(dim=2) + 1.0) * 0.5
+
+    def forward(self, feature, direction_alignment=None, skeleton_prob=None):
+        if direction_alignment is None:
+            direction_alignment = feature.new_zeros(
+                feature.shape[0],
+                self.connectivity_channels,
+                feature.shape[-2],
+                feature.shape[-1],
+            )
         if skeleton_prob is None:
             skeleton_prob = feature.new_zeros(
                 feature.shape[0],
@@ -164,6 +178,7 @@ class PairwiseConnectivityHead(nn.Module):
                     [
                         skeleton_prob,
                         neighbor_skeleton,
+                        direction_alignment[:, idx:idx + 1],
                     ],
                     dim=1,
                 )
@@ -202,11 +217,12 @@ class LegacyPairwisePriorConnectivityHead(nn.Module):
         self.connectivity_channels = connectivity_channels
         self.feature_channels = channels
         self.edge_mlp = nn.Sequential(
-            nn.Conv2d(2 * channels + 2, hidden_channels, kernel_size=1, bias=False),
+            nn.Conv2d(2 * channels + 3, hidden_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
         )
+        self.register_buffer("axis_basis", connectivity_double_angle_basis().view(1, 8, 2, 1, 1))
 
     @staticmethod
     def _shift_feature(x, dy, dx):
@@ -220,7 +236,19 @@ class LegacyPairwisePriorConnectivityHead(nn.Module):
         x0 = max(dx, 0)
         return padded[:, :, y0:y0 + height, x0:x0 + width]
 
-    def forward(self, feature, skeleton_prob=None):
+    def direction_alignment(self, direction_logits):
+        direction = F.normalize(direction_logits, dim=1, eps=1e-6)
+        direction = direction.unsqueeze(1)
+        return ((direction * self.axis_basis).sum(dim=2) + 1.0) * 0.5
+
+    def forward(self, feature, direction_alignment=None, skeleton_prob=None):
+        if direction_alignment is None:
+            direction_alignment = feature.new_zeros(
+                feature.shape[0],
+                self.connectivity_channels,
+                feature.shape[-2],
+                feature.shape[-1],
+            )
         if skeleton_prob is None:
             skeleton_prob = feature.new_zeros(
                 feature.shape[0],
@@ -238,6 +266,7 @@ class LegacyPairwisePriorConnectivityHead(nn.Module):
                     neighbor,
                     skeleton_prob,
                     neighbor_skeleton,
+                    direction_alignment[:, idx:idx + 1],
                 ],
                 dim=1,
             )
@@ -250,7 +279,15 @@ class LegacyConvConnectivityHead(nn.Conv2d):
         super().__init__(channels, connectivity_channels, kernel_size=1)
         self.connectivity_channels = connectivity_channels
 
-    def forward(self, feature, skeleton_prob=None):
+    def direction_alignment(self, direction_logits):
+        return direction_logits.new_zeros(
+            direction_logits.shape[0],
+            self.connectivity_channels,
+            direction_logits.shape[-2],
+            direction_logits.shape[-1],
+        )
+
+    def forward(self, feature, direction_alignment=None, skeleton_prob=None):
         return super().forward(feature)
 
 
@@ -625,8 +662,6 @@ class DecoderStructureRefinement(nn.Module):
         skeleton_gradient_ratio=0.5,
         gate_topology_gradient_ratio=0.0,
         previous_structure_channels=None,
-        external_structure_channels=None,
-        use_structure_residual=False,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -637,25 +672,11 @@ class DecoderStructureRefinement(nn.Module):
         self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
         self.gate_topology_gradient_ratio = float(gate_topology_gradient_ratio)
         self.previous_structure_channels = previous_structure_channels
-        self.use_structure_residual = bool(
-            use_structure_residual or previous_structure_channels is not None
-        )
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
         )
-        if external_structure_channels is not None:
-            self.external_structure_fusion = ConvBNReLU(
-                channels + int(external_structure_channels),
-                channels,
-                kernel_size=1,
-                padding=0,
-            )
-            self.external_structure_scale = nn.Parameter(torch.tensor(0.05))
-        else:
-            self.external_structure_fusion = None
-            self.register_parameter("external_structure_scale", None)
         if previous_structure_channels is not None:
             self.previous_structure_fusion = ConvBNReLU(
                 channels + int(previous_structure_channels),
@@ -663,11 +684,10 @@ class DecoderStructureRefinement(nn.Module):
                 kernel_size=1,
                 padding=0,
             )
+            residual_input_channels = channels * 2
         else:
             self.previous_structure_fusion = None
-        residual_input_channels = channels * (
-            2 if self.use_structure_residual else 1
-        )
+            residual_input_channels = channels
         self.gate_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
@@ -685,36 +705,13 @@ class DecoderStructureRefinement(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
-        # Multi-channel topology/surface fusion used by Stage 2 and Stage 3.
-        # F, H, S and C are projected independently before concatenation.  The
-        # top-k connectivity mean remains a separate reliability input, while
-        # the full connectivity tensor carries local directional content.
-        self.fusion_f_proj = nn.Conv2d(channels, fusion_channels, kernel_size=1, bias=False)
-        self.fusion_h_proj = nn.Conv2d(channels, fusion_channels, kernel_size=1, bias=False)
-        self.fusion_s_proj = nn.Conv2d(1, fusion_channels, kernel_size=1, bias=False)
-        self.fusion_c_proj = nn.Conv2d(
-            connectivity_channels, fusion_channels, kernel_size=1, bias=False
-        )
-        self.fusion_conn_strength_proj = nn.Conv2d(
-            1, fusion_channels, kernel_size=1, bias=False
-        )
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(fusion_channels * 5, fusion_channels, kernel_size=3, padding=1, bias=False),
+        self.reliability_correction = nn.Sequential(
+            nn.Conv2d(channels + 1, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(fusion_channels, fusion_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(fusion_channels),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(fusion_channels, 1, kernel_size=1),
         )
-        self.fusion_gate = nn.Conv2d(fusion_channels, 1, kernel_size=1, bias=True)
-        self.fusion_residual = nn.Conv2d(
-            fusion_channels, channels, kernel_size=3, padding=1, bias=False
-        )
-        # Start as an identity path.  The existing gamma1 parameter is the
-        # controllable residual strength and remains checkpoint-compatible.
-        nn.init.zeros_(self.fusion_residual.weight)
-        nn.init.zeros_(self.fusion_gate.weight)
-        nn.init.zeros_(self.fusion_gate.bias)
+        self.reliability_beta = nn.Parameter(torch.tensor(0.0))
         if context_channels is not None:
             self.context_to_gate = nn.Conv2d(context_channels, 1, kernel_size=1)
             nn.init.zeros_(self.context_to_gate.weight)
@@ -769,29 +766,9 @@ class DecoderStructureRefinement(nn.Module):
         disable_skeleton_prediction=False,
         skeleton_prior=None,
         previous_structure_feat=None,
-        external_structure_feat=None,
     ):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
-        if self.external_structure_fusion is not None:
-            if external_structure_feat is None:
-                external_structure_feat = structure_feat.new_zeros(
-                    structure_feat.shape[0],
-                    self.external_structure_fusion.block[0].in_channels
-                    - structure_feat.shape[1],
-                    *structure_feat.shape[-2:],
-                )
-            elif external_structure_feat.shape[-2:] != structure_feat.shape[-2:]:
-                external_structure_feat = F.interpolate(
-                    external_structure_feat,
-                    size=structure_feat.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            fused_external = self.external_structure_fusion(
-                torch.cat([structure_feat, external_structure_feat], dim=1)
-            )
-            structure_feat = structure_feat + self.external_structure_scale * fused_external
         if self.previous_structure_fusion is not None:
             if previous_structure_feat is None:
                 previous_structure_feat = torch.zeros_like(structure_feat)
@@ -850,9 +827,13 @@ class DecoderStructureRefinement(nn.Module):
             runtime_connectivity_skeleton = connectivity_override
 
         direction_logits = self.direction_head(structure_feat)
+        direction_alignment = self.connectivity_head.direction_alignment(
+            direction_logits
+        ).detach()
         connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
             connectivity_feat,
+            direction_alignment,
             skeleton_prob=runtime_connectivity_skeleton.detach(),
         )
 
@@ -869,33 +850,42 @@ class DecoderStructureRefinement(nn.Module):
             conn_strength,
             self.gate_topology_gradient_ratio,
         )
-        # Keep top-k mean as a separate reliability signal for the gate while
-        # passing the complete C tensor into the residual-content branch.
-        f_embed = self.fusion_f_proj(x)
-        h_embed = self.fusion_h_proj(structure_feat)
-        # Keep the configured gate gradient ratio for both topology gate
-        # inputs.  The forward value is still the predicted S probability;
-        # only its backward contribution is scaled by ``gate_topology_gradient_ratio``.
-        s_embed = self.fusion_s_proj(gate_skeleton)
-        c_embed = self.fusion_c_proj(connectivity_prob)
-        conn_strength_embed = self.fusion_conn_strength_proj(gate_conn_strength)
-        fusion_input = torch.cat(
-            [f_embed, h_embed, s_embed, c_embed, conn_strength_embed], dim=1
+        gate_feat = self.gate_branch(x)
+        structure_gate_old_logits = self.structure_gate(
+            torch.cat(
+                [
+                    gate_feat,
+                    gate_skeleton,
+                    gate_conn_strength,
+                ],
+                dim=1,
+            )
         )
-        fusion_feat = self.fusion_conv(fusion_input)
-        structure_gate_old_logits = self.fusion_gate(fusion_feat)
         if self.context_to_gate is not None and global_context is not None:
             context_bias = self.context_strength * torch.tanh(
                 self.context_to_gate(global_context)
             )
             structure_gate_old_logits = structure_gate_old_logits + context_bias
         structure_gate_old = torch.sigmoid(structure_gate_old_logits)
-        # The top-k connectivity mean gates the learned correction reliability;
-        # the full C embedding above still determines residual content.
-        structure_gate = structure_gate_old * (0.5 + 0.5 * gate_conn_strength)
+        direction_confidence = direction_logits.detach().float().norm(
+            dim=1,
+            keepdim=True,
+        ).to(dtype=x.dtype)
+        reliability_correction = self.reliability_correction(
+            torch.cat([x, direction_confidence], dim=1)
+        )
+        structure_gate_logits = structure_gate_old_logits + (
+            self.reliability_beta * reliability_correction
+        )
+        structure_gate = torch.sigmoid(structure_gate_logits)
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
-            residual = structure_gate * self.fusion_residual(fusion_feat)
+            residual_input = (
+                torch.cat([x, structure_feat], dim=1)
+                if self.previous_structure_fusion is not None
+                else x
+            )
+            residual = structure_gate * self.feature_residual(residual_input)
             gate_residual = self.gamma1 * residual
             out = x + gate_residual
         else:
@@ -912,7 +902,11 @@ class DecoderStructureRefinement(nn.Module):
                     "conn_strength_mean": float(
                         conn_strength.mean().detach().cpu()
                     ),
+                    "reliability_beta": float(self.reliability_beta.detach().cpu()),
                     "gate_topology_gradient_ratio": self.gate_topology_gradient_ratio,
+                    "reliability_correction_mean": float(
+                        reliability_correction.mean().detach().cpu()
+                    ),
                     "gate_residual_relative_norm": float(
                         (
                             torch.linalg.vector_norm(gate_residual)
@@ -925,18 +919,14 @@ class DecoderStructureRefinement(nn.Module):
                             / (feature_norm + 1e-6)
                         ).detach().cpu()
                     ),
-                    "fusion_feature_norm": float(
-                        torch.linalg.vector_norm(fusion_feat).detach().cpu()
-                    ),
                 }
         diagnostics = {
             "structure_gate_old": structure_gate_old,
+            "reliability_correction": reliability_correction,
             "gate_residual": gate_residual,
             "structure_gate_final": structure_gate,
+            "reliability_beta": self.reliability_beta.detach(),
             "structure_feat": structure_feat,
-            "fusion_feat": fusion_feat,
-            "conn_strength": conn_strength,
-            "connectivity_prob": connectivity_prob,
         }
         if self.capture_feature_tensors:
             diagnostics["semantic_feature"] = x.detach()

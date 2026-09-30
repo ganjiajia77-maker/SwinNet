@@ -20,6 +20,7 @@ from networks.vision_transformer import (
     SwinUnet as ViT_seg,
     format_topology_coefficients,
     load_topology_checkpoint_state,
+    restore_routing_checkpoint_state,
     print_topology_coefficients,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
@@ -131,6 +132,7 @@ parser.add_argument('--enable_sparse_window_compute', action=argparse.BooleanOpt
 parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--stage2_window_threshold', type=float, default=None)
 parser.add_argument('--stage3_window_threshold', type=float, default=None)
+parser.add_argument('--routing_warmup_epochs', type=int, default=None)
 parser.add_argument('--coarse_candidate_window_size', type=int, default=None)
 parser.add_argument('--coarse_corridor_window_radius', type=int, default=None)
 parser.add_argument('--coarse_routing_mode', type=str, default=None, choices=['dense', 'p64', 'bottleneck', 'bottleneck_no_psi'])
@@ -303,6 +305,7 @@ if __name__ == "__main__":
                 "remove_stage2_pre_topology_source",
                 "stage2_window_threshold",
                 "stage3_window_threshold",
+                "routing_warmup_epochs",
                 "coarse_candidate_window_size",
                 "coarse_corridor_window_radius",
                 "coarse_routing_mode",
@@ -328,6 +331,7 @@ if __name__ == "__main__":
         ("remove_stage2_pre_topology_source", False),
         ("stage2_window_threshold", 0.25),
         ("stage3_window_threshold", 0.25),
+        ("routing_warmup_epochs", 10),
         ("coarse_candidate_window_size", 8),
         ("coarse_corridor_window_radius", 0),
         ("coarse_routing_mode", "dense"),
@@ -366,6 +370,7 @@ if __name__ == "__main__":
                     sparse_window_compute=args.enable_sparse_window_compute,
                     stage2_window_threshold=args.stage2_window_threshold,
                     stage3_window_threshold=args.stage3_window_threshold,
+                    routing_warmup_epochs=args.routing_warmup_epochs,
                     coarse_candidate_window_size=args.coarse_candidate_window_size,
                     coarse_corridor_window_radius=args.coarse_corridor_window_radius,
                     coarse_routing_mode=args.coarse_routing_mode,
@@ -393,6 +398,9 @@ if __name__ == "__main__":
                 checkpoint.get("topology_attention_version", "legacy-unrecorded"),
                 strict=(args.bottleneck_type == 'global_local'),
             )
+            route_state = restore_routing_checkpoint_state(model, checkpoint)
+            if route_state is not None:
+                print(f'[P64 ROUTING] {route_state}', flush=True)
         else:
             model.load_state_dict(checkpoint, strict=(args.bottleneck_type == 'global_local'))
         print(f"已加载模型: {args.model_path}")

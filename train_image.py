@@ -1,9 +1,11 @@
 import argparse
 import copy
 import csv
+import json
 import math
 import os
 import random
+import shutil
 import sys
 import tempfile
 import time
@@ -25,6 +27,7 @@ from networks.vision_transformer import (
     get_topology_coefficients,
     load_topology_checkpoint_state,
     print_topology_coefficients,
+    restore_routing_checkpoint_state,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
@@ -161,6 +164,19 @@ parser.add_argument(
     type=int,
     default=0,
     help='keep P64 routing dense for the first N epochs while supervising the coarse mask',
+)
+parser.add_argument(
+    '--routing_warmup_epochs',
+    type=int,
+    default=10,
+    help='independent P64 sparse-routing warmup; LR warmup is controlled separately',
+)
+parser.add_argument('--routing_road_recall_min', type=float, default=0.99)
+parser.add_argument('--routing_skeleton_recall_min', type=float, default=0.98)
+parser.add_argument(
+    '--routing_threshold_candidates',
+    type=str,
+    default='0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.50',
 )
 parser.add_argument(
     '--enable_global_topology',
@@ -414,8 +430,6 @@ def build_criterion(args, loss_weights, device):
         ),
         coarse_road_weight=args.coarse_road_loss_weight,
         coarse_road_pos_weight=args.coarse_road_pos_weight,
-        bottleneck_coarse_road_weight=args.bottleneck_coarse_road_loss_weight,
-        bottleneck_coarse_road_pos_weight=args.bottleneck_coarse_road_pos_weight,
         use_legacy_stage_connectivity_loss=(
             args.structure_profile in {
                 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
@@ -430,30 +444,7 @@ def build_criterion(args, loss_weights, device):
         directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
         surface_focal_gamma=args.surface_focal_gamma,
-        skeleton_focal_gamma=args.skeleton_focal_gamma,
         edge_contrastive_margin=args.edge_contrastive_margin,
-        stage_connectivity_factors=(
-            0.0,
-            0.0,
-            args.stage2_connectivity_factor
-            if args.stage2_connectivity_factor is not None
-            else args.stage_connectivity_factor,
-            args.stage3_connectivity_factor
-            if args.stage3_connectivity_factor is not None
-            else args.stage_connectivity_factor,
-        ),
-        stage_direction_factors=(
-            0.0,
-            0.0,
-            args.stage2_direction_factor
-            if args.stage2_direction_factor is not None
-            else args.stage_direction_factor,
-            args.stage3_direction_factor
-            if args.stage3_direction_factor is not None
-            else args.stage_direction_factor,
-        ),
-        stage_skeleton_loss_factor=args.stage_skeleton_loss_factor,
-        stage_skeleton_only_loss_factor=args.stage_skeleton_only_loss_factor,
     ).to(device)
 
 
@@ -472,7 +463,11 @@ def format_training_config_lines(args, loss_weights):
             args.stage3_window_threshold,
         ),
         "  P64 route warmup: {} epoch(s); dense supervision before sparse routing".format(
-            args.coarse_route_warmup_epochs,
+            max(args.coarse_route_warmup_epochs, args.routing_warmup_epochs),
+        ),
+        "  P64 calibration constraints: road_recall>={:.3f}, skeleton_recall>={:.3f}".format(
+            args.routing_road_recall_min,
+            args.routing_skeleton_recall_min,
         ),
         "  P64 window routing: real Swin window max-pool; candidate grouping/radius disabled",
             "  Stage skeleton mode: {}; E128 stage fusion: {}; pre-Stage2 topology source removed: {}".format(
@@ -623,7 +618,7 @@ def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -650,6 +645,9 @@ def inherit_resume_architecture_args(args):
         ("bottleneck_coarse_road_loss_weight", float),
         ("bottleneck_coarse_road_pos_weight", float),
         ("coarse_route_warmup_epochs", int),
+        ("routing_warmup_epochs", int),
+        ("routing_road_recall_min", float),
+        ("routing_skeleton_recall_min", float),
         ("stage_skeleton_bias_init", str),
         ("stage_skeleton_positive_prior", float),
     ):
@@ -716,6 +714,14 @@ def model_state_is_finite(model):
         if torch.is_tensor(param) and not torch.isfinite(param).all():
             return False
     return True
+
+
+def p64_output_gradient_norm(model):
+    core = model.module if hasattr(model, "module") else model
+    head = core.swin_unet.coarse_road_mask_head
+    if head is None or head.out.weight.grad is None:
+        return 0.0
+    return float(head.out.weight.grad.detach().float().norm().item())
 
 
 class ModelEMA:
@@ -1220,6 +1226,436 @@ def evaluate_trend_topology_subset(
     }
 
 
+def _window_route_stats(probability, layer, threshold):
+    """Mirror normal/shifted Swin window selection without running the model."""
+    height, width = layer.input_resolution
+    probability = F.adaptive_max_pool2d(
+        probability.float(), output_size=(height, width)
+    )
+    window_size = int(layer.window_size)
+    pad_h = (window_size - height % window_size) % window_size
+    pad_w = (window_size - width % window_size) % window_size
+    probability = F.pad(probability, (0, pad_w, 0, pad_h))
+    union_mask = torch.zeros_like(probability, dtype=torch.bool)
+    active = total = 0
+    for block in layer.blocks:
+        shift = int(block.shift_size)
+        shifted = (
+            torch.roll(probability, shifts=(-shift, -shift), dims=(-2, -1))
+            if shift else probability
+        )
+        scores = F.max_pool2d(
+            shifted, kernel_size=window_size, stride=window_size
+        )
+        selected = scores >= float(threshold)
+        active += int(selected.sum().item())
+        total += selected.numel()
+        selected_map = selected.repeat_interleave(
+            window_size, dim=-2
+        ).repeat_interleave(window_size, dim=-1)
+        if shift:
+            selected_map = torch.roll(
+                selected_map, shifts=(shift, shift), dims=(-2, -1)
+            )
+        union_mask |= selected_map
+    return union_mask[..., :height, :width], active / max(total, 1)
+
+
+def evaluate_calibrated_routing(model, loader, args):
+    """Measure the selected sparse policy on the same full validation split."""
+    core = model.module if hasattr(model, "module") else model
+    was_training = model.training
+    model.eval()
+    tp = fp = fn = 0
+    cldice_values = []
+    fragmentation = []
+    extra_components = []
+    active2 = active3 = 0.0
+    batches = images_seen = 0
+    forward_gpu_ms = forward_wall_seconds = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device).float()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            gpu_start = gpu_end = None
+            if device.type == "cuda":
+                gpu_start = torch.cuda.Event(enable_timing=True)
+                gpu_end = torch.cuda.Event(enable_timing=True)
+                gpu_start.record()
+            outputs = model(images)
+            if gpu_end is not None:
+                gpu_end.record()
+                torch.cuda.synchronize(device)
+                forward_gpu_ms += gpu_start.elapsed_time(gpu_end)
+            forward_wall_seconds += time.perf_counter() - started
+            images_seen += images.shape[0]
+            probability = torch.sigmoid(outputs[0])
+            pred = probability >= float(args.threshold)
+            gt = masks > 0.5
+            tp += int((pred & gt).sum().item())
+            fp += int((pred & (~gt)).sum().item())
+            fn += int(((~pred) & gt).sum().item())
+            cldice_values.extend(cldice_scores(probability, masks).tolist())
+            for pred_mask, gt_mask in zip(
+                pred.detach().cpu().numpy()[:, 0],
+                gt.detach().cpu().numpy()[:, 0],
+            ):
+                pred_comp = component_stats(
+                    pred_mask, args.trend_val_short_area_threshold
+                )["components"]
+                gt_comp = component_stats(
+                    gt_mask, args.trend_val_short_area_threshold
+                )["components"]
+                fragmentation.append(pred_comp / max(gt_comp, 1.0))
+                extra_components.append(max(pred_comp - gt_comp, 0.0))
+            active2 += core.swin_unet.last_route_stats.get("stage2", {}).get("active_ratio", 1.0)
+            active3 += core.swin_unet.last_route_stats.get("stage3", {}).get("active_ratio", 1.0)
+            batches += 1
+    if was_training:
+        model.train()
+    return {
+        "surface_iou": tp / (tp + fp + fn + 1e-8),
+        "surface_f1": 2.0 * tp / (2.0 * tp + fp + fn + 1e-8),
+        "cldice": float(np.mean(cldice_values)) if cldice_values else None,
+        "frag_idx": float(np.mean(fragmentation)) if fragmentation else None,
+        "extra_comp": float(np.mean(extra_components)) if extra_components else None,
+        "stage2_active_ratio": active2 / max(batches, 1),
+        "stage3_active_ratio": active3 / max(batches, 1),
+        "forward_gpu_ms_per_image": forward_gpu_ms / max(images_seen, 1) if device.type == "cuda" else None,
+        "forward_wall_ms_per_image": 1000.0 * forward_wall_seconds / max(images_seen, 1),
+    }
+
+
+def calibrate_p64_routing(model, loader, args, output_dir):
+    """Calibrate Stage 2/3 thresholds from one dense validation pass.
+
+    The network is still dense during this pass because it is called at the
+    end of routing warmup. Candidate thresholds only reduce cached P64 maps;
+    they do not trigger another full model inference.
+    """
+    core = model.module if hasattr(model, "module") else model
+    swin_unet = core.swin_unet
+    candidates = [
+        float(value.strip())
+        for value in str(args.routing_threshold_candidates).split(",")
+        if value.strip()
+    ]
+    if not candidates:
+        candidates = [0.0]
+
+    stage2_layer = swin_unet.layers_up[2]
+    stage3_layer = swin_unet.layers_up[3]
+    stats = {
+        threshold: {
+            "coarse_tp": 0,
+            "coarse_fn": 0,
+            "skeleton_tp": 0,
+            "skeleton_fn": 0,
+            "stage2_road_tp": 0,
+            "stage2_road_fn": 0,
+            "stage2_skeleton_tp": 0,
+            "stage2_skeleton_fn": 0,
+            "stage3_road_tp": 0,
+            "stage3_road_fn": 0,
+            "stage3_skeleton_tp": 0,
+            "stage3_skeleton_fn": 0,
+            "stage2_active_ratio_sum": 0.0,
+            "stage3_active_ratio_sum": 0.0,
+            "batches": 0,
+        }
+        for threshold in candidates
+    }
+    dense_tp = dense_fp = dense_fn = 0
+    dense_skeleton_tp = dense_skeleton_fp = dense_skeleton_fn = 0
+    dense_cldice = []
+    dense_components = []
+    dense_extra_components = []
+    dense_gpu_ms = 0.0
+    dense_wall_seconds = 0.0
+    dense_images = 0
+    n_batches = 0
+    was_training = model.training
+    model.eval()
+
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device).float()
+            skeletons = batch["skeleton"].to(device).float()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            gpu_start = gpu_end = None
+            if device.type == "cuda":
+                gpu_start = torch.cuda.Event(enable_timing=True)
+                gpu_end = torch.cuda.Event(enable_timing=True)
+                gpu_start.record()
+            outputs = model(images)
+            if gpu_end is not None:
+                gpu_end.record()
+                torch.cuda.synchronize(device)
+                dense_gpu_ms += gpu_start.elapsed_time(gpu_end)
+            dense_wall_seconds += time.perf_counter() - started
+            dense_images += images.shape[0]
+            if not isinstance(outputs, tuple) or len(outputs) < 5:
+                raise RuntimeError("P64 calibration requires structure outputs.")
+            surface_logits = outputs[0]
+            skeleton_logits = outputs[2]
+            stage_outputs = outputs[4]
+            p64_logits = next(
+                (
+                    item.get("coarse_road_logits")
+                    for item in stage_outputs
+                    if isinstance(item, dict)
+                    and item.get("coarse_road_logits") is not None
+                ),
+                None,
+            )
+            if p64_logits is None:
+                raise RuntimeError("P64 calibration did not find coarse_road_logits.")
+            p64_probability = torch.sigmoid(p64_logits)
+            coarse_target = batch["coarse_road_target"].to(device).float()
+            coarse_target = F.interpolate(
+                coarse_target, size=p64_probability.shape[-2:], mode="nearest"
+            ) > 0.5
+            skeleton_target = skeletons > 0.5
+            surface_probability = torch.sigmoid(surface_logits)
+            surface_target = masks > 0.5
+            dense_pred = surface_probability >= float(args.threshold)
+            dense_tp += int((dense_pred & surface_target).sum().item())
+            dense_fp += int((dense_pred & (~surface_target)).sum().item())
+            dense_fn += int(((~dense_pred) & surface_target).sum().item())
+            if skeleton_logits is not None:
+                dense_skeleton_pred = (
+                    torch.sigmoid(skeleton_logits) >= float(args.skeleton_threshold)
+                )
+                dense_skeleton_tp += int(
+                    (dense_skeleton_pred & skeleton_target).sum().item()
+                )
+                dense_skeleton_fp += int(
+                    (dense_skeleton_pred & (~skeleton_target)).sum().item()
+                )
+                dense_skeleton_fn += int(
+                    ((~dense_skeleton_pred) & skeleton_target).sum().item()
+                )
+            dense_cldice.extend(cldice_scores(surface_probability, masks).tolist())
+            for pred_mask, gt_mask in zip(
+                dense_pred.detach().cpu().numpy()[:, 0],
+                surface_target.detach().cpu().numpy()[:, 0],
+            ):
+                pred_comp = component_stats(
+                    pred_mask, args.trend_val_short_area_threshold
+                )["components"]
+                gt_comp = component_stats(
+                    gt_mask, args.trend_val_short_area_threshold
+                )["components"]
+                dense_components.append(pred_comp / max(gt_comp, 1.0))
+                dense_extra_components.append(max(pred_comp - gt_comp, 0.0))
+
+            for threshold, threshold_stats in stats.items():
+                p64_pred = p64_probability >= threshold
+                threshold_stats["coarse_tp"] += int((p64_pred & coarse_target).sum().item())
+                threshold_stats["coarse_fn"] += int(
+                    ((~p64_pred) & coarse_target).sum().item()
+                )
+                p64_at_full = F.interpolate(
+                    p64_probability, size=skeleton_target.shape[-2:], mode="nearest"
+                ) >= threshold
+                threshold_stats["skeleton_tp"] += int(
+                    (p64_at_full & skeleton_target).sum().item()
+                )
+                threshold_stats["skeleton_fn"] += int(
+                    ((~p64_at_full) & skeleton_target).sum().item()
+                )
+                for stage, layer in ((2, stage2_layer), (3, stage3_layer)):
+                    active_map, active_ratio = _window_route_stats(
+                        p64_probability, layer, threshold
+                    )
+                    road_at_stage = F.adaptive_max_pool2d(
+                        surface_target.float(), layer.input_resolution
+                    ).bool()
+                    skeleton_at_stage = F.adaptive_max_pool2d(
+                        skeleton_target.float(), layer.input_resolution
+                    ).bool()
+                    prefix = f"stage{stage}"
+                    threshold_stats[f"{prefix}_road_tp"] += int(
+                        (active_map & road_at_stage).sum().item()
+                    )
+                    threshold_stats[f"{prefix}_road_fn"] += int(
+                        ((~active_map) & road_at_stage).sum().item()
+                    )
+                    threshold_stats[f"{prefix}_skeleton_tp"] += int(
+                        (active_map & skeleton_at_stage).sum().item()
+                    )
+                    threshold_stats[f"{prefix}_skeleton_fn"] += int(
+                        ((~active_map) & skeleton_at_stage).sum().item()
+                    )
+                    threshold_stats[f"{prefix}_active_ratio_sum"] += active_ratio
+                threshold_stats["batches"] += 1
+            n_batches += 1
+
+    if was_training:
+        model.train()
+
+    dense_iou = dense_tp / (dense_tp + dense_fp + dense_fn + 1e-8)
+    dense_f1 = 2.0 * dense_tp / (2.0 * dense_tp + dense_fp + dense_fn + 1e-8)
+    dense_skeleton_recall = dense_skeleton_tp / (
+        dense_skeleton_tp + dense_skeleton_fn + 1e-8
+    )
+    rows = []
+    for threshold in candidates:
+        item = stats[threshold]
+        road_recall = item["coarse_tp"] / (item["coarse_tp"] + item["coarse_fn"] + 1e-8)
+        skeleton_recall = item["skeleton_tp"] / (
+            item["skeleton_tp"] + item["skeleton_fn"] + 1e-8
+        )
+        batches = max(item["batches"], 1)
+        stage_recalls = {}
+        for stage in (2, 3):
+            prefix = f"stage{stage}"
+            for target_name in ("road", "skeleton"):
+                tp = item[f"{prefix}_{target_name}_tp"]
+                fn = item[f"{prefix}_{target_name}_fn"]
+                stage_recalls[f"{prefix}_{target_name}_recall"] = tp / (tp + fn + 1e-8)
+        rows.append(
+            {
+                "threshold": threshold,
+                "road_recall": road_recall,
+                "skeleton_recall": skeleton_recall,
+                **stage_recalls,
+                "stage2_active_ratio": item["stage2_active_ratio_sum"] / batches,
+                "stage3_active_ratio": item["stage3_active_ratio_sum"] / batches,
+                "dense_surface_iou": dense_iou,
+                "dense_surface_f1": dense_f1,
+                "dense_skeleton_recall": dense_skeleton_recall,
+                "dense_cldice": float(np.mean(dense_cldice)) if dense_cldice else float("nan"),
+                "dense_fragmentation": float(np.mean(dense_components)) if dense_components else None,
+                "dense_apls": None,
+            }
+        )
+
+    valid = [
+        row
+        for row in rows
+        if all(
+            row[f"stage{stage}_road_recall"] >= args.routing_road_recall_min
+            and row[f"stage{stage}_skeleton_recall"] >= args.routing_skeleton_recall_min
+            for stage in (2, 3)
+        )
+    ]
+    if valid:
+        stage2_choice = min(valid, key=lambda row: row["stage2_active_ratio"])
+        stage3_choice = min(valid, key=lambda row: row["stage3_active_ratio"])
+        sparse_enabled = True
+    else:
+        stage2_choice = stage3_choice = {
+            "threshold": 0.0,
+            "road_recall": 1.0,
+            "skeleton_recall": 1.0,
+            "stage2_active_ratio": 1.0,
+            "stage3_active_ratio": 1.0,
+        }
+        sparse_enabled = False
+
+    stage2_threshold = float(stage2_choice["threshold"])
+    stage3_threshold = float(stage3_choice["threshold"])
+    swin_unet.set_routing_thresholds(stage2_threshold, stage3_threshold)
+    swin_unet.set_routing_calibration_done(True)
+    if not sparse_enabled:
+        swin_unet.sparse_window_compute = False
+    args.stage2_window_threshold = stage2_threshold
+    args.stage3_window_threshold = stage3_threshold
+
+    dense_results = {
+        "surface_iou": dense_iou,
+        "surface_f1": dense_f1,
+        "cldice": float(np.mean(dense_cldice)) if dense_cldice else None,
+        "frag_idx": float(np.mean(dense_components)) if dense_components else None,
+        "extra_comp": float(np.mean(dense_extra_components)) if dense_extra_components else None,
+        "forward_gpu_ms_per_image": dense_gpu_ms / max(dense_images, 1) if device.type == "cuda" else None,
+        "forward_wall_ms_per_image": 1000.0 * dense_wall_seconds / max(dense_images, 1),
+    }
+    sparse_results = None
+    if sparse_enabled:
+        swin_unet.set_route_epoch(max(args.routing_warmup_epochs, args.coarse_route_warmup_epochs))
+        sparse_results = evaluate_calibrated_routing(model, loader, args)
+
+    os.makedirs(output_dir, exist_ok=True)
+    calibration = {
+        "epoch": int(args.routing_warmup_epochs),
+        "candidates": rows,
+        "selected_stage2_threshold": stage2_threshold,
+        "selected_stage3_threshold": stage3_threshold,
+        "road_recall_min": float(args.routing_road_recall_min),
+        "skeleton_recall_min": float(args.routing_skeleton_recall_min),
+        "sparse_enabled": sparse_enabled,
+        "dense_surface_iou": dense_iou,
+        "dense_surface_f1": dense_f1,
+        "dense_skeleton_recall": dense_skeleton_recall,
+        "dense_cldice": float(np.mean(dense_cldice)) if dense_cldice else float("nan"),
+        "fragmentation": dense_results["frag_idx"],
+        "apls": None,
+        "apls_status": "unavailable: no verified road-graph/APLS evaluator in this repository",
+        "dense_results": dense_results,
+        "sparse_results": sparse_results,
+        "n_batches": n_batches,
+    }
+    with open(
+        os.path.join(output_dir, "p64_routing_calibration.json"),
+        "w",
+        encoding="utf-8",
+    ) as calibration_file:
+        json.dump(calibration, calibration_file, indent=2, allow_nan=True)
+    with open(
+        os.path.join(output_dir, "p64_routing_calibration.csv"),
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as calibration_file:
+        writer = csv.DictWriter(calibration_file, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print(
+        "[P64 CALIBRATION] stage2_threshold={:.3f}, stage3_threshold={:.3f}, "
+        "sparse={}, valid_candidates={}, dense_surface_iou={:.4f}, dense_cldice={:.4f}".format(
+            stage2_threshold,
+            stage3_threshold,
+            sparse_enabled,
+            len(valid),
+            dense_iou,
+            float(np.mean(dense_cldice)) if dense_cldice else float("nan"),
+        ),
+        flush=True,
+    )
+    print(
+        "[P64 COVERAGE] stage2 road/skeleton={:.4f}/{:.4f}, "
+        "stage3 road/skeleton={:.4f}/{:.4f}, "
+        "active_ratio={:.4f}/{:.4f}".format(
+            stage2_choice.get("stage2_road_recall", 1.0),
+            stage2_choice.get("stage2_skeleton_recall", 1.0),
+            stage3_choice.get("stage3_road_recall", 1.0),
+            stage3_choice.get("stage3_skeleton_recall", 1.0),
+            stage2_choice["stage2_active_ratio"],
+            stage3_choice["stage3_active_ratio"],
+        ), flush=True,
+    )
+    if sparse_results is not None:
+        print(
+            "[P64 PAIRED] dense IoU={:.4f}, sparse IoU={:.4f}, "
+            "dense/sparse GPU ms per image={:.2f}/{:.2f}, "
+            "dense/sparse frag={:.3f}/{:.3f}".format(
+                dense_results["surface_iou"], sparse_results["surface_iou"],
+                dense_results["forward_gpu_ms_per_image"] or 0.0,
+                sparse_results["forward_gpu_ms_per_image"] or 0.0,
+                dense_results["frag_idx"], sparse_results["frag_idx"],
+            ), flush=True,
+        )
+    return calibration
+
+
 if __name__ == "__main__":
     # 自动检测可用设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1347,6 +1783,7 @@ if __name__ == "__main__":
                     bottleneck_route_warmup_epochs=args.bottleneck_route_warmup_epochs,
                     bottleneck_route_warmup_mode=args.bottleneck_route_warmup_mode,
                     coarse_route_warmup_epochs=args.coarse_route_warmup_epochs,
+                    routing_warmup_epochs=args.routing_warmup_epochs,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
@@ -1562,7 +1999,7 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             checkpoint_state = checkpoint["model_state_dict"]
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -1758,6 +2195,9 @@ if __name__ == "__main__":
                     flush=True,
                 )
             start_epoch = checkpoint.get('epoch', 0)
+            restored_route = restore_routing_checkpoint_state(model, checkpoint)
+            if restored_route is not None:
+                print(f"[P64 ROUTING] Resumed {restored_route}", flush=True)
             if not args.freeze_post_refine_interaction_only:
                 try:
                     loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
@@ -1852,8 +2292,14 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
+            if (
+                'checkpoint' in locals()
+                and (checkpoint.get('routing_calibration') or {}).get('sparse_enabled')
+                and not (best_checkpoint_for_score.get('routing_state') or {}).get('calibration_done')
+            ):
+                best_val_f1 = -1.0
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
                 flush=True,
@@ -1921,7 +2367,8 @@ if __name__ == "__main__":
                 'epoch', 'lr', 'train_avg_loss', 'val_loss',
                 'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
                 'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall',
-                'bottleneck_coarse_road_loss', 'bottleneck_coarse_road_raw',
+                'p64_mask_loss', 'p64_mask_raw', 'p64_output_grad_norm',
+                'stage2_active_ratio', 'stage3_active_ratio',
                 'highres_skeleton_loss', 'structure_delta_mean',
                 'structure_delta_abs_mean', 'structure_delta_abs_max',
                 'structure_delta_weak_skeleton_fn_mean',
@@ -1930,7 +2377,8 @@ if __name__ == "__main__":
             ])
             batch_loss_writer.writerow([
                 'epoch', 'batch', 'loss',
-                'bottleneck_coarse_road_loss', 'bottleneck_coarse_road_raw',
+                'p64_mask_loss', 'p64_mask_raw', 'p64_output_grad_norm',
+                'stage2_active_ratio', 'stage3_active_ratio',
                 'highres_skeleton_loss',
                 'structure_delta_mean', 'structure_delta_abs_mean',
                 'structure_delta_abs_max', 'structure_delta_weak_skeleton_fn_mean',
@@ -1968,6 +2416,11 @@ if __name__ == "__main__":
                     ])
             print(f"[INFO] Trend validation CSV: {trend_val_csv}", flush=True)
 
+        last_routing_calibration = (
+            checkpoint.get('routing_calibration')
+            if args.resume and 'checkpoint' in locals()
+            else None
+        )
         global_train_step = 0
         for epoch in range(start_epoch, end_epoch):
             if hasattr(train_dataset, "set_epoch"):
@@ -2002,9 +2455,12 @@ if __name__ == "__main__":
                 "structure_delta_background_mean": 0.0,
             }
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
-            bottleneck_coarse_loss_sum = 0.0
-            bottleneck_coarse_raw_sum = 0.0
-            bottleneck_coarse_loss_count = 0
+            p64_loss_sum = 0.0
+            p64_raw_sum = 0.0
+            p64_grad_sum = 0.0
+            stage2_active_ratio_sum = 0.0
+            stage3_active_ratio_sum = 0.0
+            p64_stat_count = 0
             stage_distill_scale = get_stage_distill_scale(epoch)
 
             for i, batch in enumerate(train_loader):
@@ -2104,6 +2560,7 @@ if __name__ == "__main__":
                 if should_step:
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
+                    p64_grad_norm = p64_output_gradient_norm(model)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     if not torch.isfinite(grad_norm):
                         skipped_batches += 1
@@ -2126,6 +2583,8 @@ if __name__ == "__main__":
                     accumulation_count = 0
                     if ema is not None:
                         ema.update(model)
+                else:
+                    p64_grad_norm = p64_output_gradient_norm(model)
 
                 total_loss += loss.item()
                 train_batches += 1
@@ -2137,24 +2596,27 @@ if __name__ == "__main__":
                     if np.isfinite(value):
                         highres_stat_sums[key] += value
                         highres_stat_counts[key] += 1
-                bottleneck_coarse_loss_value = float(
-                    loss_dict['loss_bottleneck_coarse_road'].item()
-                )
-                bottleneck_coarse_raw_value = float(
-                    loss_dict['bottleneck_coarse_road_raw'].item()
-                )
-                if np.isfinite(bottleneck_coarse_loss_value) and np.isfinite(
-                    bottleneck_coarse_raw_value
-                ):
-                    bottleneck_coarse_loss_sum += bottleneck_coarse_loss_value
-                    bottleneck_coarse_raw_sum += bottleneck_coarse_raw_value
-                    bottleneck_coarse_loss_count += 1
+                p64_loss_value = float(loss_dict['loss_coarse_road'].item())
+                p64_raw_value = float(loss_dict['coarse_road_raw'].item())
+                route_stats = model.swin_unet.last_route_stats
+                stage2_active_ratio = float(route_stats.get('stage2', {}).get('active_ratio', 1.0))
+                stage3_active_ratio = float(route_stats.get('stage3', {}).get('active_ratio', 1.0))
+                if np.isfinite(p64_loss_value) and np.isfinite(p64_raw_value):
+                    p64_loss_sum += p64_loss_value
+                    p64_raw_sum += p64_raw_value
+                    p64_grad_sum += p64_grad_norm
+                    stage2_active_ratio_sum += stage2_active_ratio
+                    stage3_active_ratio_sum += stage3_active_ratio
+                    p64_stat_count += 1
                 batch_loss_writer.writerow([
                     epoch + 1,
                     i + 1,
                     f'{loss.item():.6f}',
-                    f"{bottleneck_coarse_loss_value:.6f}",
-                    f"{bottleneck_coarse_raw_value:.6f}",
+                    f"{p64_loss_value:.6f}",
+                    f"{p64_raw_value:.6f}",
+                    f"{p64_grad_norm:.6f}",
+                    f"{stage2_active_ratio:.6f}",
+                    f"{stage3_active_ratio:.6f}",
                     f"{loss_dict['highres_structure_skeleton_raw'].item():.6f}",
                     f"{loss_dict['structure_delta_mean'].item():.6f}",
                     f"{loss_dict['structure_delta_abs_mean'].item():.6f}",
@@ -2216,8 +2678,8 @@ if __name__ == "__main__":
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                         f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                         f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
-                        f"P8: {bottleneck_coarse_loss_value:.4f} "
-                        f"(raw={bottleneck_coarse_raw_value:.4f}), "
+                        f"P64: {p64_loss_value:.4f} (grad={p64_grad_norm:.3g}), "
+                        f"Active S2/S3: {stage2_active_ratio:.3f}/{stage3_active_ratio:.3f}, "
                         f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
                         f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
@@ -2234,16 +2696,11 @@ if __name__ == "__main__":
                 )
                 for key in highres_stat_sums
             }
-            bottleneck_coarse_epoch_loss = (
-                bottleneck_coarse_loss_sum / bottleneck_coarse_loss_count
-                if bottleneck_coarse_loss_count > 0
-                else 0.0
-            )
-            bottleneck_coarse_epoch_raw = (
-                bottleneck_coarse_raw_sum / bottleneck_coarse_loss_count
-                if bottleneck_coarse_loss_count > 0
-                else 0.0
-            )
+            p64_epoch_loss = p64_loss_sum / max(p64_stat_count, 1)
+            p64_epoch_raw = p64_raw_sum / max(p64_stat_count, 1)
+            p64_epoch_grad = p64_grad_sum / max(p64_stat_count, 1)
+            stage2_epoch_active = stage2_active_ratio_sum / max(p64_stat_count, 1)
+            stage3_epoch_active = stage3_active_ratio_sum / max(p64_stat_count, 1)
             should_validate = (
                 args.val_interval <= 1
                 or (epoch + 1) % args.val_interval == 0
@@ -2288,7 +2745,30 @@ if __name__ == "__main__":
                 skeleton_f1 = val_metrics['skeleton_f1']
                 skeleton_precision = val_metrics['skeleton_precision']
                 skeleton_recall = val_metrics['skeleton_recall']
-            
+
+            routing_calibration = None
+            if (
+                args.enable_coarse_road_mask
+                and args.enable_sparse_window_compute
+                and args.coarse_routing_mode == "p64"
+                and args.routing_warmup_epochs > 0
+                and epoch + 1 == args.routing_warmup_epochs
+            ):
+                routing_calibration = calibrate_p64_routing(
+                    eval_model if should_validate else (ema.ema if ema is not None else model),
+                    val_loader,
+                    args,
+                    args.output_dir,
+                )
+                last_routing_calibration = routing_calibration
+                if routing_calibration["sparse_enabled"]:
+                    if os.path.isfile(best_path):
+                        shutil.copy2(
+                            best_path,
+                            os.path.join(args.output_dir, "best_dense.pth"),
+                        )
+                    best_val_f1 = -1.0
+
             # 打印到控制台
             if should_validate:
                 epoch_msg = (
@@ -2305,9 +2785,11 @@ if __name__ == "__main__":
                 )
             print(epoch_msg, flush=True)
             print(
-                "[Bottleneck P8] "
-                f"weighted_loss={bottleneck_coarse_epoch_loss:.6f}, "
-                f"raw_loss={bottleneck_coarse_epoch_raw:.6f}",
+                "[P64 ROUTING] "
+                f"mask_loss={p64_epoch_loss:.6f}, raw={p64_epoch_raw:.6f}, "
+                f"output_grad_norm={p64_epoch_grad:.6f}, "
+                f"stage2_active_ratio={stage2_epoch_active:.4f}, "
+                f"stage3_active_ratio={stage3_epoch_active:.4f}",
                 flush=True,
             )
             highres_skeleton_msg = (
@@ -2337,8 +2819,11 @@ if __name__ == "__main__":
                 epoch + 1, f'{current_lr:.8f}', f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
                 f'{val_iou:.6f}', f'{val_f1:.6f}', f'{val_precision:.6f}', f'{val_recall:.6f}',
                 f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}',
-                f'{bottleneck_coarse_epoch_loss:.6f}',
-                f'{bottleneck_coarse_epoch_raw:.6f}',
+                f'{p64_epoch_loss:.6f}',
+                f'{p64_epoch_raw:.6f}',
+                f'{p64_epoch_grad:.6f}',
+                f'{stage2_epoch_active:.6f}',
+                f'{stage3_epoch_active:.6f}',
                 f"{highres_epoch_stats['highres_structure_skeleton_raw']:.6f}",
                 f"{highres_epoch_stats['structure_delta_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_abs_mean']:.6f}",
@@ -2363,12 +2848,10 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
                 log_f.write(
-                    "  Bottleneck P8 weighted loss: "
-                    f"{bottleneck_coarse_epoch_loss:.6f}\n"
-                )
-                log_f.write(
-                    "  Bottleneck P8 raw loss: "
-                    f"{bottleneck_coarse_epoch_raw:.6f}\n"
+                    f"  P64 mask loss: {p64_epoch_loss:.6f}, "
+                    f"output grad norm: {p64_epoch_grad:.6f}, "
+                    f"Stage2/3 active ratio: "
+                    f"{stage2_epoch_active:.4f}/{stage3_epoch_active:.4f}\n"
                 )
                 log_f.write(highres_skeleton_msg + "\n")
                 log_f.write(structure_delta_msg + "\n")
@@ -2410,13 +2893,23 @@ if __name__ == "__main__":
                 'topology_attention_version': TOPOLOGY_ATTENTION_VERSION,
                 'structure_profile': args.structure_profile,
                 'topology_coefficients': get_topology_coefficients(model),
+                'routing_state': (
+                    (model.module if hasattr(model, 'module') else model)
+                    .swin_unet.routing_state()
+                    if hasattr((model.module if hasattr(model, 'module') else model), 'swin_unet')
+                    else None
+                ),
+                'routing_calibration': last_routing_calibration,
                 'loaded_pretrained_names': sorted(loaded_pretrained_names),
                 'args': vars(args),
             }
             # 保存 last.pth（总是覆盖）
             save_checkpoint_safely(checkpoint, os.path.join(args.output_dir, 'last.pth'))
 
-            if should_validate and val_f1 > best_val_f1:
+            if (should_validate and val_f1 > best_val_f1 and not (
+                routing_calibration is not None
+                and routing_calibration["sparse_enabled"]
+            )):
                 best_val_f1 = val_f1
                 save_checkpoint_safely(checkpoint, best_path)
                 print(f"[BEST] 当前最优模型已保存: best.pth (F1={val_f1:.4f})", flush=True)
@@ -2434,8 +2927,9 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
+        restore_routing_checkpoint_state(model, best_checkpoint)
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(
                 model,

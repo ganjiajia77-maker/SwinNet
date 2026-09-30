@@ -397,6 +397,43 @@ class CoarseRoadMaskHead(nn.Module):
         return self.out(fused), psi_gate
 
 
+class SparseStructureFallbackHead(nn.Module):
+    """Small spatial fallback used where P64 does not select a window.
+
+    The fallback deliberately contains no attention, MLP, or topology
+    propagation. Its feature path starts as an identity so inactive locations
+    remain useful to the following decoder stage.
+    """
+
+    def __init__(self, channels, connectivity_channels=8):
+        super().__init__()
+        self.feature_projection = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.skeleton_head = nn.Conv2d(channels, 1, kernel_size=1)
+        self.connectivity_head = nn.Conv2d(channels, connectivity_channels, kernel_size=1)
+        self.direction_head = nn.Conv2d(channels, 2, kernel_size=1)
+        self.structure_gate = nn.Conv2d(channels, 1, kernel_size=1)
+        nn.init.zeros_(self.feature_projection.weight)
+
+    def forward(self, feature_map):
+        fallback_feature = feature_map + self.feature_projection(feature_map)
+        connectivity_logits = self.connectivity_head(fallback_feature)
+        connectivity_prob = torch.sigmoid(connectivity_logits)
+        return {
+            "feature": fallback_feature,
+            "skeleton": self.skeleton_head(fallback_feature),
+            "connectivity": connectivity_logits,
+            "direction": self.direction_head(fallback_feature),
+            "structure_gate": torch.sigmoid(self.structure_gate(fallback_feature)),
+            "roadness": {
+                "structure_feat": fallback_feature,
+                "conn_strength": connectivity_prob.topk(
+                    k=min(2, connectivity_prob.shape[1]), dim=1
+                ).values.mean(dim=1, keepdim=True),
+                "connectivity_prob": connectivity_prob,
+            },
+        }
+
+
 class BottleneckCoarseRoadMaskHead(nn.Module):
     """8x8 semantic+PSI coarse road head used for decoder routing."""
 
@@ -881,22 +918,9 @@ class SwinTransformerBlock(nn.Module):
         window_size = int(self.window_size)
         pad_h = (window_size - height % window_size) % window_size
         pad_w = (window_size - width % window_size) % window_size
-        candidate_padded = F.pad(candidate, (0, pad_w, 0, pad_h))
-        candidate_windows = F.max_pool2d(
-            candidate_padded,
-            kernel_size=window_size,
-            stride=window_size,
-        ) >= float(threshold)
-        candidate_map = candidate_windows.repeat_interleave(
-            window_size, dim=2
-        ).repeat_interleave(window_size, dim=3)
-
         feature = x.view(batch, height, width, channels)
         feature, padded_h, padded_w = pad_nhwc_to_window(feature, self.window_size)
-        candidate_map = F.pad(
-            candidate_map.float(),
-            (0, padded_w - width, 0, padded_h - height),
-        ).permute(0, 2, 3, 1).bool()
+        candidate_map = F.pad(candidate, (0, pad_w, 0, pad_h)).permute(0, 2, 3, 1)
         if self.shift_size > 0:
             shifted_feature = torch.roll(
                 feature,
@@ -919,8 +943,8 @@ class SwinTransformerBlock(nn.Module):
             shifted_feature, self.window_size
         ).view(-1, self.window_size * self.window_size, channels)
         active_windows = window_partition(
-            shifted_candidate.float(), self.window_size
-        ).view(-1, self.window_size * self.window_size).amax(dim=1) > 0
+            shifted_candidate, self.window_size
+        ).view(-1, self.window_size * self.window_size).amax(dim=1) >= float(threshold)
         active_count = int(active_windows.sum().item())
         total_count = int(active_windows.numel())
         if active_count == 0:
@@ -1366,6 +1390,7 @@ class BasicLayer_up(nn.Module):
         else:
             self.upsample = None
         self.last_sparse_stats = {"active_windows": 0, "total_windows": 0}
+        self.last_active_token_mask = None
 
     def forward(
         self,
@@ -1379,6 +1404,7 @@ class BasicLayer_up(nn.Module):
     ):
         active_windows = 0
         total_windows = 0
+        active_token_mask = None
         for blk in self.blocks:
             if sparse_window_compute and sparse_probability_map is not None:
                 x, block_stats = blk.forward_sparse_windows(
@@ -1391,6 +1417,12 @@ class BasicLayer_up(nn.Module):
                 )
                 active_windows += block_stats["active_windows"]
                 total_windows += block_stats["total_windows"]
+                block_mask = block_stats.get("active_token_mask")
+                if block_mask is not None:
+                    active_token_mask = (
+                        block_mask if active_token_mask is None
+                        else active_token_mask | block_mask
+                    )
             elif self.use_checkpoint:
                 x = checkpoint.checkpoint(
                     lambda feature, dec_skeleton, dec_connectivity, dec_direction: blk(
@@ -1417,6 +1449,9 @@ class BasicLayer_up(nn.Module):
                 padded_w = width + (self.window_size - width % self.window_size) % self.window_size
                 total_windows += (padded_h // self.window_size) * (padded_w // self.window_size) * x.shape[0]
                 active_windows += (padded_h // self.window_size) * (padded_w // self.window_size) * x.shape[0]
+                active_token_mask = x.new_ones(
+                    x.shape[0], x.shape[1], 1, dtype=torch.bool
+                )
         self.last_sparse_stats = {
             "active_windows": int(active_windows),
             "total_windows": int(total_windows),
@@ -1426,7 +1461,16 @@ class BasicLayer_up(nn.Module):
             ),
         }
         if self.upsample is not None:
+            if active_token_mask is not None:
+                mask_map = active_token_mask.view(
+                    x.shape[0], self.input_resolution[0], self.input_resolution[1], 1
+                ).permute(0, 3, 1, 2).float()
+                mask_map = F.interpolate(mask_map, scale_factor=2, mode="nearest")
+                active_token_mask = mask_map.permute(0, 2, 3, 1).reshape(
+                    x.shape[0], -1, 1
+                ).bool()
             x = self.upsample(x)
+        self.last_active_token_mask = active_token_mask
         return x
 
 
@@ -1591,6 +1635,7 @@ class SwinTransformerSys(nn.Module):
                   bottleneck_route_warmup_epochs=0,
                   bottleneck_route_warmup_mode="dense",
                   coarse_route_warmup_epochs=5,
+                  routing_warmup_epochs=10,
                   stage_skeleton_bias_init="zero",
                   stage_skeleton_positive_prior=0.05,
                   remove_stage2_pre_topology_source=False,
@@ -1682,6 +1727,8 @@ class SwinTransformerSys(nn.Module):
         if self.bottleneck_route_warmup_mode != "dense":
             raise ValueError("bottleneck_route_warmup_mode must be dense")
         self.coarse_route_warmup_epochs = max(0, int(coarse_route_warmup_epochs))
+        self.routing_warmup_epochs = max(0, int(routing_warmup_epochs))
+        self.routing_calibration_done = False
         self.current_epoch = 0
         self.stage_skeleton_bias_init = str(stage_skeleton_bias_init).lower()
         self.stage_skeleton_positive_prior = float(stage_skeleton_positive_prior)
@@ -1933,14 +1980,15 @@ class SwinTransformerSys(nn.Module):
                     previous_structure_channels=(
                         channels if stage_index == 3 else None
                     ),
-                    external_structure_channels=(
-                        self.highres_structure_channels
-                        if stage_index == 2 and self.enable_e128_stage_fusion
-                        else None
-                    ),
-                    use_structure_residual=(stage_index in (2, 3)),
                 )
                 for stage_index, channels in decoder_structure_channels.items()
+            }
+        )
+        self.sparse_structure_fallback_heads = nn.ModuleDict(
+            {
+                "2": SparseStructureFallbackHead(embed_dim),
+                "3": SparseStructureFallbackHead(embed_dim),
+                "stage2_topology_source": SparseStructureFallbackHead(embed_dim * 2),
             }
         )
         self.prepatch_structure_encoder = PrePatchStructureEncoder(
@@ -2262,6 +2310,36 @@ class SwinTransformerSys(nn.Module):
             return F.interpolate(probability, size=target_hw, mode="nearest")
         return F.adaptive_max_pool2d(probability, target_hw)
 
+    @staticmethod
+    def _route_active_token_mask(probability, layer, threshold):
+        if probability is None:
+            return None
+        height, width = layer.input_resolution
+        window_size = int(layer.window_size)
+        pad_h = (window_size - height % window_size) % window_size
+        pad_w = (window_size - width % window_size) % window_size
+        candidate = F.pad(probability.float(), (0, pad_w, 0, pad_h))
+        selected_tokens = torch.zeros_like(candidate, dtype=torch.bool)
+        for block in layer.blocks:
+            shift = int(block.shift_size)
+            shifted = (
+                torch.roll(candidate, shifts=(-shift, -shift), dims=(-2, -1))
+                if shift else candidate
+            )
+            scores = F.max_pool2d(
+                shifted, kernel_size=window_size, stride=window_size
+            )
+            selected = scores >= float(threshold)
+            selected_map = selected.repeat_interleave(
+                window_size, dim=-2
+            ).repeat_interleave(window_size, dim=-1)
+            if shift:
+                selected_map = torch.roll(
+                    selected_map, shifts=(shift, shift), dims=(-2, -1)
+                )
+            selected_tokens |= selected_map
+        return selected_tokens[..., :height, :width]
+
     def _build_bottleneck_route(self, bottleneck_tokens, psi_image):
         if not self.bottleneck_coarse_road_mask or self.bottleneck_coarse_road_mask_head is None:
             return None, None
@@ -2396,6 +2474,166 @@ class SwinTransformerSys(nn.Module):
         )
         return context
 
+    @staticmethod
+    def _partition_nchw_windows(feature_map, window_size):
+        batch, channels, height, width = feature_map.shape
+        pad_h = (window_size - height % window_size) % window_size
+        pad_w = (window_size - width % window_size) % window_size
+        padded = F.pad(feature_map, (0, pad_w, 0, pad_h))
+        windows = window_partition(
+            padded.permute(0, 2, 3, 1).contiguous(), window_size
+        ).permute(0, 3, 1, 2).contiguous()
+        return windows, padded, height + pad_h, width + pad_w
+
+    @staticmethod
+    def _reverse_nchw_windows(windows, batch, height, width, window_size):
+        return window_reverse(
+            windows.permute(0, 2, 3, 1).contiguous(),
+            window_size,
+            height,
+            width,
+        ).permute(0, 3, 1, 2).contiguous()[:batch]
+
+    def _run_sparse_decoder_structure_block(
+        self,
+        feature_map,
+        stage,
+        bottleneck_tokens,
+        active_token_mask,
+        apply_feature_refinement=True,
+        disable_skeleton_prediction=False,
+        skeleton_prior=None,
+        previous_structure_feat=None,
+        block_stage=None,
+    ):
+        """Run the existing H2/H3 structure module on selected 8x8 windows.
+
+        Inactive locations use a zero-initialized 1x1 fallback head. Active
+        windows are gathered in their original spatial order, processed by
+        the existing structure block, and scattered back to the full map.
+        """
+        if active_token_mask is None:
+            return self._run_decoder_structure_block(
+                feature_map,
+                stage,
+                bottleneck_tokens,
+                apply_feature_refinement=apply_feature_refinement,
+                disable_skeleton_prediction=disable_skeleton_prediction,
+                skeleton_prior=skeleton_prior,
+                previous_structure_feat=previous_structure_feat,
+            )
+
+        height, width = feature_map.shape[-2:]
+        mask = active_token_mask
+        if mask.dim() == 3:
+            mask = mask.view(mask.shape[0], height, width, 1).permute(0, 3, 1, 2)
+        if mask.shape[-2:] != (height, width):
+            mask = F.interpolate(mask.float(), size=(height, width), mode="nearest")
+        mask = mask.bool()
+        if bool(mask.all().item()):
+            return self._run_decoder_structure_block(
+                feature_map,
+                stage,
+                bottleneck_tokens,
+                apply_feature_refinement=apply_feature_refinement,
+                disable_skeleton_prediction=disable_skeleton_prediction,
+                skeleton_prior=skeleton_prior,
+                previous_structure_feat=previous_structure_feat,
+            )
+
+        block_key = stage if block_stage is None else block_stage
+        block = (
+            self.stage2_topology_source
+            if block_key == "stage2_topology_source"
+            else self.decoder_structure_blocks[str(block_key)]
+        )
+        fallback = self.sparse_structure_fallback_heads[str(block_key)](feature_map)
+        fallback_skeleton = fallback["skeleton"]
+        if disable_skeleton_prediction:
+            if skeleton_prior is None:
+                fallback_skeleton = None
+            else:
+                prior = F.interpolate(
+                    skeleton_prior,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                fallback_skeleton = prior + fallback_skeleton
+
+        window_size = int(self.layers_up[stage].window_size)
+        mask_windows, _, padded_h, padded_w = self._partition_nchw_windows(
+            mask.float(), window_size
+        )
+        active_window_mask = mask_windows.amax(dim=(1, 2, 3)) > 0
+        selected_indices = active_window_mask.nonzero(as_tuple=False).flatten()
+        if selected_indices.numel() == 0:
+            return (
+                fallback["feature"], fallback_skeleton,
+                fallback["connectivity"], fallback["direction"],
+                fallback["structure_gate"], fallback["roadness"],
+            )
+        batch = feature_map.shape[0]
+
+        feature_windows, _, _, _ = self._partition_nchw_windows(feature_map, window_size)
+
+        def gather_windows(value):
+            if value is None:
+                return None
+            if value.shape[-2:] != (height, width):
+                value = F.interpolate(
+                    value, size=(height, width), mode="bilinear", align_corners=False
+                )
+            windows, _, _, _ = self._partition_nchw_windows(value, window_size)
+            return windows.index_select(0, selected_indices)
+
+        selected_feature = feature_windows.index_select(0, selected_indices)
+        selected_previous = gather_windows(previous_structure_feat)
+        selected_prior = gather_windows(skeleton_prior)
+        selected_context = None
+        if self.use_stage3_global_context and stage == 3:
+            context = self._build_stage3_global_context(
+                bottleneck_tokens, (height, width)
+            )
+            selected_context = gather_windows(context)
+
+        heavy = block(
+            selected_feature,
+            global_context=selected_context,
+            apply_feature_refinement=apply_feature_refinement,
+            disable_skeleton_prediction=disable_skeleton_prediction,
+            skeleton_prior=selected_prior,
+            previous_structure_feat=selected_previous,
+        )
+
+        def scatter_windows(selected_value, fallback_value):
+            if selected_value is None:
+                return fallback_value
+            if fallback_value is None:
+                return None
+            fallback_windows, _, _, _ = self._partition_nchw_windows(
+                fallback_value, window_size
+            )
+            padded_windows = fallback_windows.clone()
+            padded_windows.index_copy_(0, selected_indices, selected_value)
+            return self._reverse_nchw_windows(
+                padded_windows, batch, padded_h, padded_w, window_size
+            )[:, :, :height, :width]
+
+        out = scatter_windows(heavy[0], fallback["feature"])
+        skeleton = scatter_windows(heavy[1], fallback_skeleton)
+        connectivity = scatter_windows(heavy[2], fallback["connectivity"])
+        direction = scatter_windows(heavy[3], fallback["direction"])
+        structure_gate = scatter_windows(heavy[4], fallback["structure_gate"])
+        heavy_roadness = heavy[5] if isinstance(heavy[5], dict) else {}
+        fallback_roadness = fallback["roadness"]
+        roadness = {}
+        for key, fallback_value in fallback_roadness.items():
+            roadness[key] = scatter_windows(
+                heavy_roadness.get(key), fallback_value
+            )
+        return out, skeleton, connectivity, direction, structure_gate, roadness
+
     def _run_decoder_structure_block(
         self,
         feature_map,
@@ -2406,7 +2644,7 @@ class SwinTransformerSys(nn.Module):
         disable_skeleton_prediction=False,
         skeleton_prior=None,
         previous_structure_feat=None,
-        external_structure_feat=None,
+        active_token_mask=None,
     ):
         if not self._decoder_structure_enabled(stage):
             return feature_map, *self._placeholder_structure_outputs(feature_map)
@@ -2419,6 +2657,18 @@ class SwinTransformerSys(nn.Module):
             block = self.stage2_topology_source
         else:
             block = self.decoder_structure_blocks[str(block_stage)]
+        if active_token_mask is not None:
+            return self._run_sparse_decoder_structure_block(
+                feature_map,
+                stage,
+                bottleneck_tokens,
+                active_token_mask=active_token_mask,
+                apply_feature_refinement=apply_feature_refinement,
+                disable_skeleton_prediction=disable_skeleton_prediction,
+                skeleton_prior=skeleton_prior,
+                previous_structure_feat=previous_structure_feat,
+                block_stage=block_stage,
+            )
         global_context = None
         if self.use_stage3_global_context and stage == 3:
             global_context = self._build_stage3_global_context(
@@ -2432,7 +2682,6 @@ class SwinTransformerSys(nn.Module):
             disable_skeleton_prediction=disable_skeleton_prediction,
             skeleton_prior=skeleton_prior,
             previous_structure_feat=previous_structure_feat,
-            external_structure_feat=external_structure_feat,
         )
 
     def _decoder_skeleton_disabled(self, stage):
@@ -2644,6 +2893,11 @@ class SwinTransformerSys(nn.Module):
                             else None
                         ),
                         previous_structure_feat=stage2_structure_feat,
+                        active_token_mask=(
+                            layer_up.last_active_token_mask
+                            if self.sparse_window_compute
+                            else None
+                        ),
                     )
                     if isinstance(roadness_i, dict):
                         self.last_stage_features["H3"] = roadness_i.get(
@@ -2701,6 +2955,24 @@ class SwinTransformerSys(nn.Module):
                 else:
                     input_height, input_width = layer_up.input_resolution
                     x_map = token_to_map(x, input_height, input_width)
+                    prehead_probability = (
+                        self._resize_route_probability(
+                            selection_probability, layer_up.input_resolution
+                        )
+                        if inx == 2 and selection_probability is not None
+                        else None
+                    )
+                    prehead_active_mask = (
+                        self._route_active_token_mask(
+                            prehead_probability,
+                            layer_up,
+                            self.stage2_window_threshold,
+                        )
+                        if self.sparse_window_compute
+                        and self.coarse_routing_mode != "dense"
+                        and prehead_probability is not None
+                        else None
+                    )
                     (
                         _,
                         skeleton_0,
@@ -2716,6 +2988,7 @@ class SwinTransformerSys(nn.Module):
                         apply_feature_refinement=False,
                         disable_skeleton_prediction=decoder_skeleton_disabled,
                         skeleton_prior=highres_structure_skeleton,
+                        active_token_mask=prehead_active_mask,
                     )
                     if isinstance(roadness_0, dict):
                         roadness_0.pop("structure_feat", None)
@@ -2803,11 +3076,9 @@ class SwinTransformerSys(nn.Module):
                         if self.stage_skeleton_mode == "prior_residual"
                         else None
                     ),
-                    external_structure_feat=(
-                        F.pixel_unshuffle(e128, 2)
-                        if inx == 2
-                        and self.enable_e128_stage_fusion
-                        and e128 is not None
+                    active_token_mask=(
+                        layer_up.last_active_token_mask
+                        if self.sparse_window_compute
                         else None
                     ),
                 )
@@ -2931,7 +3202,14 @@ class SwinTransformerSys(nn.Module):
                         if self.sparse_selection_probability_override is not None
                         else coarse_probability
                     )
-                    if self.current_epoch < self.coarse_route_warmup_epochs:
+                    route_warmup = max(
+                        self.coarse_route_warmup_epochs,
+                        self.routing_warmup_epochs,
+                    )
+                    if (
+                        self.current_epoch < route_warmup
+                        or not self.routing_calibration_done
+                    ):
                         # Keep Stage 2/3 dense while P64 learns its road map.
                         selection_probability = None
                     self.last_coarse_road_logits = coarse_road_logits
@@ -3042,8 +3320,27 @@ class SwinTransformerSys(nn.Module):
         return x
 
     def set_route_epoch(self, epoch):
-        """Set the zero-based training epoch used by bottleneck route warmup."""
+        """Set the zero-based training epoch used by route warmup."""
         self.current_epoch = max(0, int(epoch))
+
+    def set_routing_thresholds(self, stage2=None, stage3=None):
+        if stage2 is not None:
+            self.stage2_window_threshold = float(stage2)
+        if stage3 is not None:
+            self.stage3_window_threshold = float(stage3)
+
+    def set_routing_calibration_done(self, value=True):
+        self.routing_calibration_done = bool(value)
+
+    def routing_state(self):
+        return {
+            "routing_warmup_epochs": int(self.routing_warmup_epochs),
+            "current_epoch": int(self.current_epoch),
+            "stage2_window_threshold": float(self.stage2_window_threshold),
+            "stage3_window_threshold": float(self.stage3_window_threshold),
+            "sparse_enabled": bool(self.sparse_window_compute),
+            "calibration_done": bool(self.routing_calibration_done),
+        }
 
     def forward(
         self,

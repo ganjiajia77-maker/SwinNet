@@ -12,32 +12,20 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from networks.vision_transformer import (
     SwinUnet as ViT_seg,
     load_topology_checkpoint_state,
+    restore_routing_checkpoint_state,
 )
-from losses.road_losses import binary_metrics_from_logits
 from config import get_config
 
 
 def compute_metrics_all_samples(logits_list, targets_list, threshold):
-    all_metrics = {
-        'iou': [],
-        'f1': [],
-        'precision': [],
-        'recall': [],
-    }
-    
+    tp = fp = fn = 0
     for logits, targets in zip(logits_list, targets_list):
-        metrics = binary_metrics_from_logits(logits, targets, threshold=threshold)
-        all_metrics['iou'].append(metrics['iou'])
-        all_metrics['f1'].append(metrics['f1'])
-        all_metrics['precision'].append(metrics['precision'])
-        all_metrics['recall'].append(metrics['recall'])
-    
-    return {
-        'iou': np.mean(all_metrics['iou']),
-        'f1': np.mean(all_metrics['f1']),
-        'precision': np.mean(all_metrics['precision']),
-        'recall': np.mean(all_metrics['recall']),
-    }
+        pred = torch.sigmoid(logits) >= threshold
+        gt = targets > 0.5
+        tp += int((pred & gt).sum().item())
+        fp += int((pred & (~gt)).sum().item())
+        fn += int(((~pred) & gt).sum().item())
+    return metrics_from_counts(tp, fp, fn)
 
 
 def metrics_from_counts(tp, fp, fn):
@@ -181,6 +169,7 @@ def main():
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--stage2_window_threshold', type=float, default=0.25)
     parser.add_argument('--stage3_window_threshold', type=float, default=0.25)
+    parser.add_argument('--routing_warmup_epochs', type=int, default=10)
     parser.add_argument('--coarse_candidate_window_size', type=int, default=8)
     parser.add_argument('--coarse_corridor_window_radius', type=int, default=0)
     parser.add_argument('--coarse_routing_mode', type=str, default='dense', choices=['dense', 'p64', 'bottleneck', 'bottleneck_no_psi'])
@@ -236,6 +225,7 @@ def main():
             'enable_coarse_road_mask', 'enable_psi_directional_descriptor',
             'enable_sparse_window_compute', 'remove_stage2_pre_topology_source',
             'stage2_window_threshold', 'stage3_window_threshold',
+            'routing_warmup_epochs',
             'coarse_candidate_window_size', 'coarse_corridor_window_radius',
             'coarse_routing_mode', 'bottleneck_coarse_road_mask',
             'bottleneck_window_threshold', 'stage2_skeleton_gradient_ratio',
@@ -275,6 +265,7 @@ def main():
         sparse_window_compute=args.enable_sparse_window_compute,
         stage2_window_threshold=args.stage2_window_threshold,
         stage3_window_threshold=args.stage3_window_threshold,
+        routing_warmup_epochs=args.routing_warmup_epochs,
         coarse_candidate_window_size=args.coarse_candidate_window_size,
         coarse_corridor_window_radius=args.coarse_corridor_window_radius,
         coarse_routing_mode=args.coarse_routing_mode,
@@ -288,6 +279,9 @@ def main():
         checkpoint.get('topology_attention_version', 'legacy-unrecorded'),
         strict=(args.bottleneck_type == 'global_local'),
     )
+    route_state = restore_routing_checkpoint_state(model, checkpoint)
+    if route_state is not None:
+        print(f'[P64 ROUTING] {route_state}', flush=True)
     model = model.to(device)
     model.eval()
     print('Model loaded')
