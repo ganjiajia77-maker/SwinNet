@@ -146,7 +146,7 @@ parser.add_argument(
 parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
 parser.add_argument('--skeleton_pos_weight', type=float, default=None,
                     help='positive-class weight for skeleton BCE losses')
-parser.add_argument('--stage_direction_factor', type=float, default=0.1)
+parser.add_argument('--stage_direction_factor', type=float, default=0.0)
 parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
 parser.add_argument('--final_skeleton_weight', type=float, default=None, help='override final skeleton auxiliary loss weight')
 parser.add_argument('--final_connectivity_weight', type=float, default=None, help='override final connectivity auxiliary loss weight')
@@ -232,8 +232,8 @@ parser.add_argument(
     '--amp_dtype',
     type=str,
     choices=['bfloat16', 'none'],
-    default='bfloat16',
-    help='automatic mixed precision dtype; defaults to BF16 on CUDA',
+    default='none',
+    help='automatic mixed precision dtype; none runs in FP32',
 )
 parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
@@ -398,9 +398,8 @@ def format_training_config_lines(args, loss_weights):
                 args.stage3_gate_topology_gradient_ratio
             ),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
-            "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
+            "skeleton BCE(dilated) + 0.3 Dice(hard); direction head/loss disabled; "
             "{:.3f}*connectivity loss".format(
-                args.stage_direction_factor,
                 args.stage_connectivity_factor
             ),
             "  Stage skeleton-connectivity consistency: disabled",
@@ -410,12 +409,12 @@ def format_training_config_lines(args, loss_weights):
             "  Global context gate strength: 0.03",
             "  Decoder stage3 step0: removed; only post-upsampling refinement is active",
             "  Decoder gate input: [decoder gate feature, Skeleton, Connectivity]",
-            "  Decoder gate: structure gate plus local+dilated semantic context and direction-confidence reliability correction",
+            "  Decoder gate: structure gate plus local+dilated semantic context; direction-confidence input disabled",
             "  Connectivity directional positive weight: cardinal={:.3f}, diagonal={:.3f}".format(
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity,direction], relation_bias=relative_xy_distance, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance, max_nodes={}, heads={}, alpha_max={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
                 args.global_topology_max_nodes,
                 args.global_topology_heads,

@@ -341,7 +341,7 @@ class SurfaceStructureLoss(nn.Module):
         skeleton_stage_weights=(0.1, 0.2, 0.3, 0.3),
         stage_structure_weights=None,
         stage_connectivity_factor=0.5,
-        stage_direction_factor=0.2,
+        stage_direction_factor=0.0,
         road_attention_weight=0.0,
         highres_structure_skeleton_weight=0.0,
         use_legacy_stage_connectivity_loss=False,

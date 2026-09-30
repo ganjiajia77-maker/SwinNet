@@ -695,10 +695,8 @@ class DecoderStructureRefinement(nn.Module):
         self.skeleton_head = SkeletonSpatialHead(channels)
         self.connectivity_context = ConnectivityContextBlock(channels)
         self.connectivity_head = PairwiseConnectivityHead(channels, connectivity_channels)
-        self.direction_head = nn.Sequential(
-            ConvBNReLU(channels, channels),
-            nn.Conv2d(channels, 2, kernel_size=1),
-        )
+        # Direction prediction is disabled in this experiment variant.
+        self.direction_head = None
         self.structure_gate = nn.Sequential(
             nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
@@ -826,14 +824,10 @@ class DecoderStructureRefinement(nn.Module):
         if connectivity_override is not None:
             runtime_connectivity_skeleton = connectivity_override
 
-        direction_logits = self.direction_head(structure_feat)
-        direction_alignment = self.connectivity_head.direction_alignment(
-            direction_logits
-        ).detach()
         connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
             connectivity_feat,
-            direction_alignment,
+            direction_alignment=None,
             skeleton_prob=runtime_connectivity_skeleton.detach(),
         )
 
@@ -867,17 +861,8 @@ class DecoderStructureRefinement(nn.Module):
             )
             structure_gate_old_logits = structure_gate_old_logits + context_bias
         structure_gate_old = torch.sigmoid(structure_gate_old_logits)
-        direction_confidence = direction_logits.detach().float().norm(
-            dim=1,
-            keepdim=True,
-        ).to(dtype=x.dtype)
-        reliability_correction = self.reliability_correction(
-            torch.cat([x, direction_confidence], dim=1)
-        )
-        structure_gate_logits = structure_gate_old_logits + (
-            self.reliability_beta * reliability_correction
-        )
-        structure_gate = torch.sigmoid(structure_gate_logits)
+        reliability_correction = torch.zeros_like(structure_gate_old_logits)
+        structure_gate = structure_gate_old
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
             residual_input = (
@@ -935,7 +920,7 @@ class DecoderStructureRefinement(nn.Module):
             out,
             skeleton_logits,
             connectivity_logits,
-            direction_logits,
+            None,
             structure_gate,
             diagnostics,
         )
