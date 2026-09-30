@@ -232,8 +232,8 @@ parser.add_argument(
     '--amp_dtype',
     type=str,
     choices=['bfloat16', 'none'],
-    default='bfloat16',
-    help='automatic mixed precision dtype; defaults to BF16 on CUDA',
+    default='none',
+    help='automatic mixed precision dtype; defaults to full FP32',
 )
 parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
