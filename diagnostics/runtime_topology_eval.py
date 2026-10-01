@@ -161,6 +161,7 @@ def load_model_for_checkpoint(repo_root, args, device):
         model.load_state_dict(state, strict=True)
 
     route_state = None
+    route_state_source = "checkpoint.routing_state"
     restore_routing = getattr(vision, "restore_routing_checkpoint_state", None)
     if restore_routing is not None:
         route_state = restore_routing(model, checkpoint)
@@ -168,13 +169,45 @@ def load_model_for_checkpoint(repo_root, args, device):
         saved.get("enable_sparse_window_compute", saved.get("sparse_window_compute", False))
         and saved.get("coarse_routing_mode", "dense") == "p64"
     )
-    if uses_sparse and not (
+    route_is_active = (
         isinstance(route_state, dict)
         and route_state.get("sparse_enabled")
         and route_state.get("calibration_done")
-    ):
+    )
+    if uses_sparse and not route_is_active:
+        calibration = checkpoint.get("routing_calibration")
+        if isinstance(calibration, dict) and calibration.get("sparse_enabled"):
+            stage2_threshold = calibration.get("selected_stage2_threshold")
+            stage3_threshold = calibration.get("selected_stage3_threshold")
+            thresholds_valid = all(
+                isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and 0.0 <= float(value) <= 1.0
+                for value in (stage2_threshold, stage3_threshold)
+            )
+            core_model = model.module if hasattr(model, "module") else model
+            swin_unet = getattr(core_model, "swin_unet", None)
+            if thresholds_valid and swin_unet is not None:
+                swin_unet.set_routing_thresholds(
+                    float(stage2_threshold), float(stage3_threshold)
+                )
+                swin_unet.set_routing_calibration_done(True)
+                swin_unet.sparse_window_compute = True
+                swin_unet.set_route_epoch(max(
+                    int(checkpoint.get("epoch", 0)),
+                    int(calibration.get("epoch", 0)),
+                    int(saved.get("routing_warmup_epochs", 0)),
+                ))
+                route_state = swin_unet.routing_state()
+                route_state_source = "checkpoint.routing_calibration"
+                route_is_active = bool(
+                    route_state.get("sparse_enabled")
+                    and route_state.get("calibration_done")
+                )
+    if uses_sparse and not route_is_active:
         raise RuntimeError(
-            "Checkpoint does not contain an active calibrated P64 route; "
+            "Checkpoint has no recoverable active calibrated P64 route: neither "
+            "routing_state nor routing_calibration contains valid active thresholds; "
             "timing would not include sparse window selection/writeback."
         )
 
@@ -189,6 +222,7 @@ def load_model_for_checkpoint(repo_root, args, device):
         "source_patch_size": args.source_patch_size,
         "precision": "fp32",
         "route_state": route_state,
+        "route_state_source": route_state_source,
     }
     print(f"Model: {metadata}", flush=True)
     return model, metadata
