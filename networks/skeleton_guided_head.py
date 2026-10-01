@@ -29,6 +29,40 @@ class ConvBNReLU(nn.Module):
         return self.block(x)
 
 
+class BidirectionalSkeletonFeatureFusion(nn.Module):
+    def __init__(self, highres_channels, stage_channels):
+        super().__init__()
+        self.highres_refine = ConvBNReLU(highres_channels, highres_channels)
+        self.stage_refine = ConvBNReLU(stage_channels, stage_channels)
+        self.stage_to_highres = nn.Sequential(
+            nn.Conv2d(stage_channels, highres_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(highres_channels),
+        )
+        self.highres_to_stage = nn.Sequential(
+            nn.Conv2d(highres_channels, stage_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(stage_channels),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, highres_feature, stage_feature):
+        if highres_feature.shape[-2:] != stage_feature.shape[-2:]:
+            highres_feature = F.interpolate(
+                highres_feature,
+                size=stage_feature.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        highres_refined = self.highres_refine(highres_feature)
+        stage_refined = self.stage_refine(stage_feature)
+        updated_highres = self.activation(
+            highres_refined + self.stage_to_highres(stage_refined)
+        )
+        updated_stage = self.activation(
+            stage_refined + self.highres_to_stage(highres_refined)
+        )
+        return updated_stage, updated_highres
+
+
 class SkeletonSpatialHead(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -625,7 +659,7 @@ class DecoderStructureRefinement(nn.Module):
         skeleton_gradient_ratio=0.5,
         gate_topology_gradient_ratio=0.0,
         previous_structure_channels=None,
-        external_structure_channels=None,
+        highres_structure_channels=None,
         use_structure_residual=False,
     ):
         super().__init__()
@@ -645,17 +679,12 @@ class DecoderStructureRefinement(nn.Module):
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
         )
-        if external_structure_channels is not None:
-            self.external_structure_fusion = ConvBNReLU(
-                channels + int(external_structure_channels),
-                channels,
-                kernel_size=1,
-                padding=0,
+        if highres_structure_channels is not None:
+            self.highres_skeleton_fusion = BidirectionalSkeletonFeatureFusion(
+                int(highres_structure_channels), channels
             )
-            self.external_structure_scale = nn.Parameter(torch.tensor(0.05))
         else:
-            self.external_structure_fusion = None
-            self.register_parameter("external_structure_scale", None)
+            self.highres_skeleton_fusion = None
         if previous_structure_channels is not None:
             self.previous_structure_fusion = ConvBNReLU(
                 channels + int(previous_structure_channels),
@@ -739,29 +768,10 @@ class DecoderStructureRefinement(nn.Module):
         disable_skeleton_prediction=False,
         skeleton_prior=None,
         previous_structure_feat=None,
-        external_structure_feat=None,
+        highres_skeleton_feat=None,
     ):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
-        if self.external_structure_fusion is not None:
-            if external_structure_feat is None:
-                external_structure_feat = structure_feat.new_zeros(
-                    structure_feat.shape[0],
-                    self.external_structure_fusion.block[0].in_channels
-                    - structure_feat.shape[1],
-                    *structure_feat.shape[-2:],
-                )
-            elif external_structure_feat.shape[-2:] != structure_feat.shape[-2:]:
-                external_structure_feat = F.interpolate(
-                    external_structure_feat,
-                    size=structure_feat.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            fused_external = self.external_structure_fusion(
-                torch.cat([structure_feat, external_structure_feat], dim=1)
-            )
-            structure_feat = structure_feat + self.external_structure_scale * fused_external
         if self.previous_structure_fusion is not None:
             if previous_structure_feat is None:
                 previous_structure_feat = torch.zeros_like(structure_feat)
@@ -774,6 +784,14 @@ class DecoderStructureRefinement(nn.Module):
                 )
             structure_feat = self.previous_structure_fusion(
                 torch.cat([structure_feat, previous_structure_feat], dim=1)
+            )
+        if (
+            self.highres_skeleton_fusion is not None
+            and highres_skeleton_feat is not None
+        ):
+            structure_feat, highres_skeleton_feat = self.highres_skeleton_fusion(
+                highres_skeleton_feat,
+                structure_feat,
             )
         if disable_skeleton_prediction:
             if skeleton_prior is None:
@@ -901,6 +919,8 @@ class DecoderStructureRefinement(nn.Module):
             "structure_gate_final": structure_gate,
             "structure_feat": structure_feat,
         }
+        if highres_skeleton_feat is not None:
+            diagnostics["highres_skeleton_feat"] = highres_skeleton_feat
         if self.capture_feature_tensors:
             diagnostics["semantic_feature"] = x.detach()
 

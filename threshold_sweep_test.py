@@ -84,7 +84,6 @@ def main():
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
     parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
-    parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
@@ -121,7 +120,7 @@ def main():
             'highres_structure_fusion_mode', 'enable_global_topology',
             'global_topology_max_nodes', 'global_topology_heads',
             'global_topology_alpha_max', 'stage_skeleton_mode',
-            'enable_e128_stage_fusion', 'enable_h3_surface_fusion',
+            'enable_h3_surface_fusion',
             'remove_stage2_pre_topology_source',
             'stage2_skeleton_gradient_ratio',
             'stage3_skeleton_gradient_ratio', 'stage3_gate_topology_gradient_ratio',
@@ -153,7 +152,6 @@ def main():
         global_topology_heads=args.global_topology_heads,
         global_topology_alpha_max=args.global_topology_alpha_max,
         stage_skeleton_mode=args.stage_skeleton_mode,
-        enable_e128_stage_fusion=args.enable_e128_stage_fusion,
         enable_h3_surface_fusion=args.enable_h3_surface_fusion,
         remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
     )

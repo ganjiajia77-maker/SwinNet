@@ -160,8 +160,11 @@ def load_topology_checkpoint_state(
     highres_structure_missing_prefixes = (
         "swin_unet.highres_structure_encoder.",
         "swin_unet.prepatch_structure_encoder.",
+        "swin_unet.highres_skeleton_adapter.",
         "swin_unet.highres_structure_skeleton_head.",
         "swin_unet.highres_structure_fusion.",
+        "swin_unet.decoder_structure_blocks.2.highres_skeleton_fusion.",
+        "swin_unet.decoder_structure_blocks.3.highres_skeleton_fusion.",
         "swin_unet.structure_surface_correction_head.",
         "swin_unet.guided_head.post_refine_structure_interaction.",
         "swin_unet.coarse_road_mask_head.",
@@ -552,8 +555,7 @@ class SwinUnet(nn.Module):
                  global_topology_heads=4,
                  global_topology_alpha_max=0.05,
                  stage_skeleton_mode="prior_residual",
-                 enable_e128_stage_fusion=False,
-                  stage_skeleton_bias_init="zero",
+                 stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False):
         super(SwinUnet, self).__init__()
@@ -601,7 +603,6 @@ class SwinUnet(nn.Module):
                                  global_topology_heads=global_topology_heads,
                                  global_topology_alpha_max=global_topology_alpha_max,
                                  stage_skeleton_mode=stage_skeleton_mode,
-                                 enable_e128_stage_fusion=enable_e128_stage_fusion,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)

@@ -118,7 +118,6 @@ parser.add_argument(
 )
 parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
-parser.add_argument('--enable_e128_stage_fusion', action='store_true')
 parser.add_argument('--enable_h3_surface_fusion', action='store_true')
 parser.add_argument('--remove_stage2_pre_topology_source', action='store_true')
 parser.add_argument(
@@ -412,15 +411,18 @@ def format_training_config_lines(args, loss_weights):
         f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
         f"  Training AMP: {args.amp_dtype}",
         "  Decoder computation: dense Stage 2/3",
-            "  Stage skeleton mode: {}; E128 stage fusion: {}; pre-Stage2 topology source removed: {}".format(
+            "  Stage skeleton mode: {}; pre-Stage2 topology source removed: {}".format(
                 args.stage_skeleton_mode,
-                args.enable_e128_stage_fusion,
                 args.remove_stage2_pre_topology_source,
             ),
             "  H3 -> final surface fusion: {}".format(
                 args.enable_h3_surface_fusion
             ),
     ]
+    if args.enable_highres_structure_stream:
+        lines.append(
+            "  Skeleton feature flow: z_struct -> H0 <-> G2 -> H1 <-> G3 -> H2"
+        )
     if args.structure_profile in {
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
@@ -593,10 +595,7 @@ def inherit_resume_architecture_args(args):
         args.overlap_stride = int(saved_args["overlap_stride"])
     if "enable_highres_structure_stream" in saved_args and not _cli_has("--enable_highres_structure_stream"):
         args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
-    for name in (
-        "enable_e128_stage_fusion",
-        "remove_stage2_pre_topology_source",
-    ):
+    for name in ("remove_stage2_pre_topology_source",):
         if name in saved_args and not _cli_has("--" + name):
             setattr(args, name, bool(saved_args[name]))
     if "highres_structure_channels" in saved_args and not _cli_has("--highres_structure_channels"):
@@ -1235,7 +1234,6 @@ if __name__ == "__main__":
                     global_topology_heads=args.global_topology_heads,
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
-                    enable_e128_stage_fusion=args.enable_e128_stage_fusion,
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
@@ -1541,8 +1539,11 @@ if __name__ == "__main__":
                         "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
                         "swin_unet.highres_structure_encoder.",
                         "swin_unet.prepatch_structure_encoder.",
+                        "swin_unet.highres_skeleton_adapter.",
                         "swin_unet.highres_structure_skeleton_head.",
                         "swin_unet.highres_structure_fusion.",
+                        "swin_unet.decoder_structure_blocks.2.highres_skeleton_fusion.",
+                        "swin_unet.decoder_structure_blocks.3.highres_skeleton_fusion.",
                         "swin_unet.decoder_structure_blocks.0.direction_head.",
                         "swin_unet.decoder_structure_blocks.1.direction_head.",
                         "swin_unet.decoder_structure_blocks.2.direction_head.",

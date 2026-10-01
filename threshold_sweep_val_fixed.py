@@ -180,7 +180,6 @@ def main():
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
     parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])
-    parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
     
@@ -220,7 +219,6 @@ def main():
                     "global_topology_alpha_max",
                     "bottleneck_type",
                     "stage_skeleton_mode",
-                    "enable_e128_stage_fusion",
                     "remove_stage2_pre_topology_source",
                 ):
                     if name in saved_args and not _cli_has(name):
@@ -228,7 +226,6 @@ def main():
 
     for name, default in (
         ("stage_skeleton_mode", "prior_residual"),
-        ("enable_e128_stage_fusion", False),
         ("enable_h3_surface_fusion", False),
         ("remove_stage2_pre_topology_source", False),
     ):
@@ -276,7 +273,6 @@ def main():
             global_topology_heads=args.global_topology_heads,
             global_topology_alpha_max=args.global_topology_alpha_max,
             stage_skeleton_mode=args.stage_skeleton_mode,
-            enable_e128_stage_fusion=args.enable_e128_stage_fusion,
             remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
         )
     model = vit_cls(**model_kwargs)
