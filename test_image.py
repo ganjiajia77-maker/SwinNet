@@ -123,17 +123,7 @@ parser.add_argument('--global_topology_heads', type=int, default=4)
 parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
 parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])
 parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=None)
-parser.add_argument('--enable_coarse_road_mask', action=argparse.BooleanOptionalAction, default=None)
-parser.add_argument('--enable_psi_directional_descriptor', action=argparse.BooleanOptionalAction, default=None)
-parser.add_argument('--enable_sparse_window_compute', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
-parser.add_argument('--stage2_window_threshold', type=float, default=None)
-parser.add_argument('--stage3_window_threshold', type=float, default=None)
-parser.add_argument('--coarse_candidate_window_size', type=int, default=None)
-parser.add_argument('--coarse_corridor_window_radius', type=int, default=None)
-parser.add_argument('--coarse_routing_mode', type=str, default=None, choices=['dense', 'p64', 'bottleneck', 'bottleneck_no_psi'])
-parser.add_argument('--bottleneck_coarse_road_mask', action=argparse.BooleanOptionalAction, default=None)
-parser.add_argument('--bottleneck_window_threshold', type=float, default=None)
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -288,17 +278,7 @@ if __name__ == "__main__":
                 "global_topology_alpha_max",
                 "stage_skeleton_mode",
                 "enable_e128_stage_fusion",
-                "enable_coarse_road_mask",
-                "enable_psi_directional_descriptor",
-                "enable_sparse_window_compute",
                 "remove_stage2_pre_topology_source",
-                "stage2_window_threshold",
-                "stage3_window_threshold",
-                "coarse_candidate_window_size",
-                "coarse_corridor_window_radius",
-                "coarse_routing_mode",
-                "bottleneck_coarse_road_mask",
-                "bottleneck_window_threshold",
             ):
                 if name in saved_args and not _cli_has(name):
                     setattr(args, name, saved_args[name])
@@ -313,17 +293,7 @@ if __name__ == "__main__":
         ("stage_skeleton_mode", "prior_residual"),
         ("enable_e128_stage_fusion", False),
         ("enable_h3_surface_fusion", False),
-        ("enable_coarse_road_mask", False),
-        ("enable_psi_directional_descriptor", False),
-        ("enable_sparse_window_compute", False),
         ("remove_stage2_pre_topology_source", False),
-        ("stage2_window_threshold", 0.25),
-        ("stage3_window_threshold", 0.25),
-        ("coarse_candidate_window_size", 8),
-        ("coarse_corridor_window_radius", 0),
-        ("coarse_routing_mode", "dense"),
-        ("bottleneck_coarse_road_mask", False),
-        ("bottleneck_window_threshold", 0.25),
     ):
         if getattr(args, name) is None:
             setattr(args, name, default)
@@ -352,16 +322,6 @@ if __name__ == "__main__":
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     enable_e128_stage_fusion=args.enable_e128_stage_fusion,
-                    enable_coarse_road_mask=args.enable_coarse_road_mask,
-                    enable_psi_directional_descriptor=args.enable_psi_directional_descriptor,
-                    sparse_window_compute=args.enable_sparse_window_compute,
-                    stage2_window_threshold=args.stage2_window_threshold,
-                    stage3_window_threshold=args.stage3_window_threshold,
-                    coarse_candidate_window_size=args.coarse_candidate_window_size,
-                    coarse_corridor_window_radius=args.coarse_corridor_window_radius,
-                    coarse_routing_mode=args.coarse_routing_mode,
-                    bottleneck_coarse_road_mask=args.bottleneck_coarse_road_mask,
-                    bottleneck_window_threshold=args.bottleneck_window_threshold,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device
     

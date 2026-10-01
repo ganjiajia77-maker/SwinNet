@@ -6,20 +6,6 @@ import torch
 from torch.utils.data import Dataset
 
 
-def _any_road_pool(mask, output_size):
-    """Aligned any-road pooling that keeps a one-pixel road candidate alive."""
-    target_h, target_w = int(output_size[0]), int(output_size[1])
-    height, width = mask.shape
-    if height % target_h == 0 and width % target_w == 0:
-        return mask.reshape(
-            target_h, height // target_h, target_w, width // target_w
-        ).max(axis=(1, 3))
-    resized = cv2.resize(
-        mask.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_AREA
-    )
-    return (resized > 0.0).astype(np.float32)
-
-
 class RoadSkeletonDataset(Dataset):
     def __init__(
         self,
@@ -403,12 +389,6 @@ class RoadSkeletonDataset(Dataset):
             skeleton_hard = skeleton_hard[top:bottom, left:right]
             skeleton_dilate = skeleton_dilate[top:bottom, left:right]
 
-        # Preserve thin road-label coverage before the model-resolution
-        # nearest-neighbour resize. P64 cell (i,j) supervises whether any
-        # source-label road pixel falls inside its aligned image region.
-        coarse_size = max(1, int(self.image_size or 256) // 4)
-        coarse_road_target = _any_road_pool(mask, (coarse_size, coarse_size))
-
         if self.image_size is not None and image.shape[:2] != (self.image_size, self.image_size):
             size = (self.image_size, self.image_size)
             image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
@@ -429,9 +409,6 @@ class RoadSkeletonDataset(Dataset):
             "mask": torch.from_numpy(mask).float(),
             "skeleton": torch.from_numpy(skeleton_hard).float(),
             "skeleton_dilate": torch.from_numpy(skeleton_dilate).float(),
-            "coarse_road_target": torch.from_numpy(
-                np.expand_dims(coarse_road_target, axis=0)
-            ).float(),
             "image_name": image_name,
             "case_name": os.path.splitext(image_name)[0].replace("_sat", ""),
         }

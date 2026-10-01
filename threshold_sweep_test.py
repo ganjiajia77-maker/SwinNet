@@ -86,17 +86,7 @@ def main():
     parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
     parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument('--enable_coarse_road_mask', action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument('--enable_psi_directional_descriptor', action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument('--enable_sparse_window_compute', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument('--stage2_window_threshold', type=float, default=0.25)
-    parser.add_argument('--stage3_window_threshold', type=float, default=0.25)
-    parser.add_argument('--coarse_candidate_window_size', type=int, default=8)
-    parser.add_argument('--coarse_corridor_window_radius', type=int, default=0)
-    parser.add_argument('--coarse_routing_mode', type=str, default='dense', choices=['dense', 'p64', 'bottleneck', 'bottleneck_no_psi'])
-    parser.add_argument('--bottleneck_coarse_road_mask', action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument('--bottleneck_window_threshold', type=float, default=0.25)
     parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
     parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
     parser.add_argument('--stage3_gate_topology_gradient_ratio', type=float, default=0.0)
@@ -132,12 +122,8 @@ def main():
             'global_topology_max_nodes', 'global_topology_heads',
             'global_topology_alpha_max', 'stage_skeleton_mode',
             'enable_e128_stage_fusion', 'enable_h3_surface_fusion',
-            'enable_coarse_road_mask', 'enable_psi_directional_descriptor',
-            'enable_sparse_window_compute', 'remove_stage2_pre_topology_source',
-            'stage2_window_threshold', 'stage3_window_threshold',
-            'coarse_candidate_window_size', 'coarse_corridor_window_radius',
-            'coarse_routing_mode', 'bottleneck_coarse_road_mask',
-            'bottleneck_window_threshold', 'stage2_skeleton_gradient_ratio',
+            'remove_stage2_pre_topology_source',
+            'stage2_skeleton_gradient_ratio',
             'stage3_skeleton_gradient_ratio', 'stage3_gate_topology_gradient_ratio',
             'final_skeleton_gradient_ratio', 'final_topology_eta_init',
             'final_gap_rho_init',
@@ -169,16 +155,6 @@ def main():
         stage_skeleton_mode=args.stage_skeleton_mode,
         enable_e128_stage_fusion=args.enable_e128_stage_fusion,
         enable_h3_surface_fusion=args.enable_h3_surface_fusion,
-        enable_coarse_road_mask=args.enable_coarse_road_mask,
-        enable_psi_directional_descriptor=args.enable_psi_directional_descriptor,
-        sparse_window_compute=args.enable_sparse_window_compute,
-        stage2_window_threshold=args.stage2_window_threshold,
-        stage3_window_threshold=args.stage3_window_threshold,
-        coarse_candidate_window_size=args.coarse_candidate_window_size,
-        coarse_corridor_window_radius=args.coarse_corridor_window_radius,
-        coarse_routing_mode=args.coarse_routing_mode,
-        bottleneck_coarse_road_mask=args.bottleneck_coarse_road_mask,
-        bottleneck_window_threshold=args.bottleneck_window_threshold,
         remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
     )
     load_topology_checkpoint_state(
