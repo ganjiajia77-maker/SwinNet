@@ -95,34 +95,13 @@ parser.add_argument(
     action='store_true',
     help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
 )
-parser.add_argument('--enable_highres_structure_stream', action='store_true')
-parser.add_argument('--highres_structure_channels', type=int, default=64)
-parser.add_argument(
-    '--highres_structure_fuse_stages',
-    type=str,
-    default='stage23',
-    choices=['stage2', 'stage3', 'stage23'],
-)
-parser.add_argument(
-    '--highres_structure_fusion_mode',
-    type=str,
-    default='stage23',
-    choices=[
-        'stage23',
-        'final_correction',
-        'stage23_final_correction',
-        'post_refine_interaction',
-        'none',
-    ],
-)
-parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
+parser.add_argument('--enable_r64_stream', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--enable_global_topology', action='store_true')
 parser.add_argument('--global_topology_max_nodes', type=int, default=32)
 parser.add_argument('--global_topology_heads', type=int, default=4)
 parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
-parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])
-parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=None)
+parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct'])
 parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
@@ -266,18 +245,13 @@ if __name__ == "__main__":
                 "stage3_skeleton_gradient_ratio",
                 "stage3_gate_topology_gradient_ratio",
                 "final_skeleton_gradient_ratio",
-                "enable_highres_structure_stream",
-                "highres_structure_channels",
-                "highres_structure_fuse_stages",
-                "highres_structure_fusion_mode",
-                "enable_post_refine_structure_interaction",
+                "enable_r64_stream",
                 "enable_h3_surface_fusion",
                 "enable_global_topology",
                 "global_topology_max_nodes",
                 "global_topology_heads",
                 "global_topology_alpha_max",
                 "stage_skeleton_mode",
-                "enable_e128_stage_fusion",
                 "remove_stage2_pre_topology_source",
             ):
                 if name in saved_args and not _cli_has(name):
@@ -290,8 +264,7 @@ if __name__ == "__main__":
                 args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
 
     for name, default in (
-        ("stage_skeleton_mode", "prior_residual"),
-        ("enable_e128_stage_fusion", False),
+        ("stage_skeleton_mode", "direct"),
         ("enable_h3_surface_fusion", False),
         ("remove_stage2_pre_topology_source", False),
     ):
@@ -308,20 +281,13 @@ if __name__ == "__main__":
                     stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
                     stage3_gate_topology_gradient_ratio=args.stage3_gate_topology_gradient_ratio,
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
-                    enable_highres_structure_stream=args.enable_highres_structure_stream,
-                    highres_structure_channels=args.highres_structure_channels,
-                    highres_structure_fuse_stages=args.highres_structure_fuse_stages,
-                    highres_structure_fusion_mode=args.highres_structure_fusion_mode,
-                    enable_post_refine_structure_interaction=(
-                        args.enable_post_refine_structure_interaction
-                    ),
+                    enable_r64_stream=bool(args.enable_r64_stream),
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     enable_global_topology=args.enable_global_topology,
                     global_topology_max_nodes=args.global_topology_max_nodes,
                     global_topology_heads=args.global_topology_heads,
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
-                    enable_e128_stage_fusion=args.enable_e128_stage_fusion,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device
     

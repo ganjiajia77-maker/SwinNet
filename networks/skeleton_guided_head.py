@@ -30,6 +30,29 @@ class ConvBNReLU(nn.Module):
         return self.block(x)
 
 
+class BidirectionalRoadStructureFusion(nn.Module):
+    def __init__(self, road_channels, stage_channels):
+        super().__init__()
+        self.road_refine = ConvBNReLU(road_channels, road_channels)
+        self.stage_refine = ConvBNReLU(stage_channels, stage_channels)
+        self.stage_to_road = nn.Conv2d(stage_channels, road_channels, kernel_size=1)
+        self.road_to_stage = nn.Conv2d(road_channels, stage_channels, kernel_size=1)
+
+    def forward(self, road_feature, stage_feature):
+        road_at_stage = F.interpolate(
+            road_feature, size=stage_feature.shape[-2:], mode="bilinear", align_corners=False
+        )
+        road_refined = self.road_refine(road_at_stage)
+        stage_refined = self.stage_refine(stage_feature)
+        updated_stage = F.gelu(stage_refined + self.road_to_stage(road_refined))
+        updated_road_local = F.gelu(road_refined + self.stage_to_road(stage_refined))
+        road_delta = updated_road_local - road_at_stage
+        updated_road = road_feature + F.interpolate(
+            road_delta, size=road_feature.shape[-2:], mode="bilinear", align_corners=False
+        )
+        return updated_stage, updated_road
+
+
 class SkeletonSpatialHead(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -606,47 +629,6 @@ class GlobalContextHead(nn.Module):
 STAGE3_GLOBAL_CONTEXT_CHANNELS = 32
 
 
-class PostRefineStructureInteraction(nn.Module):
-    def __init__(self, surface_channels, structure_channels, structure_hidden=16):
-        super().__init__()
-        self.structure_proj = nn.Conv2d(
-            structure_channels,
-            structure_hidden,
-            kernel_size=1,
-            bias=False,
-        )
-        self.delta = nn.Sequential(
-            nn.Conv2d(
-                surface_channels + structure_hidden,
-                surface_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(surface_channels),
-            nn.GELU(),
-            nn.Conv2d(surface_channels, surface_channels, kernel_size=1, bias=True),
-        )
-        nn.init.zeros_(self.delta[-1].weight)
-        nn.init.zeros_(self.delta[-1].bias)
-
-    def reset_output(self):
-        nn.init.zeros_(self.delta[-1].weight)
-        nn.init.zeros_(self.delta[-1].bias)
-
-    def forward(self, surface_feat, z_struct):
-        if z_struct is None:
-            return surface_feat
-        z_struct = z_struct.detach()
-        struct_feat = self.structure_proj(z_struct)
-        struct_feat = F.interpolate(
-            struct_feat,
-            size=surface_feat.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        delta = self.delta(torch.cat([surface_feat, struct_feat], dim=1))
-        return surface_feat + delta
 
 
 class DecoderStructureRefinement(nn.Module):
@@ -662,7 +644,7 @@ class DecoderStructureRefinement(nn.Module):
         skeleton_gradient_ratio=0.5,
         gate_topology_gradient_ratio=0.0,
         previous_structure_channels=None,
-        external_structure_channels=None,
+        road_feature_channels=None,
         use_structure_residual=False,
     ):
         super().__init__()
@@ -682,17 +664,10 @@ class DecoderStructureRefinement(nn.Module):
             ConvBNReLU(channels, channels),
             ConvBNReLU(channels, channels),
         )
-        if external_structure_channels is not None:
-            self.external_structure_fusion = ConvBNReLU(
-                channels + int(external_structure_channels),
-                channels,
-                kernel_size=1,
-                padding=0,
-            )
-            self.external_structure_scale = nn.Parameter(torch.tensor(0.05))
-        else:
-            self.external_structure_fusion = None
-            self.register_parameter("external_structure_scale", None)
+        self.road_structure_fusion = (
+            BidirectionalRoadStructureFusion(int(road_feature_channels), channels)
+            if road_feature_channels is not None else None
+        )
         if previous_structure_channels is not None:
             self.previous_structure_fusion = ConvBNReLU(
                 channels + int(previous_structure_channels),
@@ -783,29 +758,10 @@ class DecoderStructureRefinement(nn.Module):
         disable_skeleton_prediction=False,
         skeleton_prior=None,
         previous_structure_feat=None,
-        external_structure_feat=None,
+        road_feature=None,
     ):
         structure_input = scale_gradient(x, self.skeleton_gradient_ratio)
         structure_feat = self.structure_branch(structure_input)
-        if self.external_structure_fusion is not None:
-            if external_structure_feat is None:
-                external_structure_feat = structure_feat.new_zeros(
-                    structure_feat.shape[0],
-                    self.external_structure_fusion.block[0].in_channels
-                    - structure_feat.shape[1],
-                    *structure_feat.shape[-2:],
-                )
-            elif external_structure_feat.shape[-2:] != structure_feat.shape[-2:]:
-                external_structure_feat = F.interpolate(
-                    external_structure_feat,
-                    size=structure_feat.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            fused_external = self.external_structure_fusion(
-                torch.cat([structure_feat, external_structure_feat], dim=1)
-            )
-            structure_feat = structure_feat + self.external_structure_scale * fused_external
         if self.previous_structure_fusion is not None:
             if previous_structure_feat is None:
                 previous_structure_feat = torch.zeros_like(structure_feat)
@@ -818,6 +774,10 @@ class DecoderStructureRefinement(nn.Module):
                 )
             structure_feat = self.previous_structure_fusion(
                 torch.cat([structure_feat, previous_structure_feat], dim=1)
+            )
+        if self.road_structure_fusion is not None and road_feature is not None:
+            structure_feat, road_feature = self.road_structure_fusion(
+                road_feature, structure_feat
             )
         if disable_skeleton_prediction:
             if skeleton_prior is None:
@@ -965,6 +925,8 @@ class DecoderStructureRefinement(nn.Module):
             "reliability_beta": self.reliability_beta.detach(),
             "structure_feat": structure_feat,
         }
+        if road_feature is not None:
+            diagnostics["road_feature"] = road_feature
         if self.capture_feature_tensors:
             diagnostics["semantic_feature"] = x.detach()
 
@@ -990,8 +952,6 @@ class SkeletonGuidedHead(nn.Module):
         enable_final_structure=True,
         enable_final_skeleton_aux=False,
         final_skeleton_gradient_ratio=0.0,
-        enable_post_refine_structure_interaction=False,
-        highres_structure_channels=64,
     ):
         super().__init__()
 
@@ -1003,9 +963,6 @@ class SkeletonGuidedHead(nn.Module):
         self.enable_final_structure = bool(enable_final_structure)
         self.enable_final_skeleton_aux = bool(enable_final_skeleton_aux)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
-        self.enable_post_refine_structure_interaction = bool(
-            enable_post_refine_structure_interaction
-        )
 
         self.surface_proj = ConvBNReLU(
             in_channels,
@@ -1093,11 +1050,6 @@ class SkeletonGuidedHead(nn.Module):
             ConvBNReLU(hidden_channels, hidden_channels),
             ConvBNReLU(hidden_channels, hidden_channels),
         )
-        self.post_refine_structure_interaction = PostRefineStructureInteraction(
-            hidden_channels,
-            highres_structure_channels,
-        )
-
         self.boundary_branch = nn.Sequential(
             ConvBNReLU(hidden_channels, hidden_channels),
             ConvBNReLU(hidden_channels, hidden_channels),
@@ -1136,7 +1088,6 @@ class SkeletonGuidedHead(nn.Module):
         self.last_delta_logit = None
 
         self._init_weights()
-        self.post_refine_structure_interaction.reset_output()
         self.alpha.requires_grad_(False)
 
     def effective_rho_gap(self):
@@ -1171,12 +1122,7 @@ class SkeletonGuidedHead(nn.Module):
             * weak_surface
         ).detach()
 
-    def _apply_post_refine_structure_interaction(self, guided_surface_feat, z_struct):
-        if not self.enable_post_refine_structure_interaction:
-            return guided_surface_feat
-        return self.post_refine_structure_interaction(guided_surface_feat, z_struct)
-
-    def forward(self, x, z_struct=None):
+    def forward(self, x):
         surface_feat = self.surface_branch(self.surface_proj(x))
 
         if not self.enable_final_structure:
@@ -1185,11 +1131,6 @@ class SkeletonGuidedHead(nn.Module):
                 skeleton_logits = self.final_skeleton_aux_head(x)
 
             guided_surface_feat = self.surface_refine(surface_feat)
-            guided_surface_feat = self._apply_post_refine_structure_interaction(
-                guided_surface_feat,
-                z_struct,
-            )
-
             boundary_feat = self.boundary_branch(guided_surface_feat)
             boundary_logits = self.boundary_head(boundary_feat)
             boundary_attn = torch.sigmoid(boundary_logits)
@@ -1256,11 +1197,6 @@ class SkeletonGuidedHead(nn.Module):
         connectivity_prob = torch.sigmoid(connectivity_logits)
 
         guided_surface_feat = self.surface_refine(surface_feat)
-        guided_surface_feat = self._apply_post_refine_structure_interaction(
-            guided_surface_feat,
-            z_struct,
-        )
-
         boundary_feat = self.boundary_branch(guided_surface_feat)
         boundary_logits = self.boundary_head(boundary_feat)
         boundary_attn = torch.sigmoid(boundary_logits)

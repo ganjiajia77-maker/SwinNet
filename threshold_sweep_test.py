@@ -59,32 +59,12 @@ def main():
     )
     parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'legacy_global_local', 'g2l2'])
     parser.add_argument('--disable_msfe_skip', action='store_true')
-    parser.add_argument('--enable_highres_structure_stream', action='store_true')
-    parser.add_argument('--highres_structure_channels', type=int, default=64)
-    parser.add_argument(
-        '--highres_structure_fuse_stages',
-        type=str,
-        default='stage23',
-        choices=['stage2', 'stage3', 'stage23'],
-    )
-    parser.add_argument(
-        '--highres_structure_fusion_mode',
-        type=str,
-        default='stage23',
-        choices=[
-            'stage23',
-            'final_correction',
-            'stage23_final_correction',
-            'post_refine_interaction',
-            'none',
-        ],
-    )
+    parser.add_argument('--enable_r64_stream', action='store_true')
     parser.add_argument('--enable_global_topology', action='store_true')
     parser.add_argument('--global_topology_max_nodes', type=int, default=32)
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
-    parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
-    parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--stage_skeleton_mode', type=str, default='direct', choices=['direct'])
     parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
@@ -116,12 +96,10 @@ def main():
     saved_args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
     if isinstance(saved_args, dict):
         for name in (
-            'structure_profile', 'bottleneck_type', 'enable_highres_structure_stream',
-            'highres_structure_channels', 'highres_structure_fuse_stages',
-            'highres_structure_fusion_mode', 'enable_global_topology',
+            'structure_profile', 'bottleneck_type', 'enable_r64_stream', 'enable_global_topology',
             'global_topology_max_nodes', 'global_topology_heads',
             'global_topology_alpha_max', 'stage_skeleton_mode',
-            'enable_e128_stage_fusion', 'enable_h3_surface_fusion',
+            'enable_h3_surface_fusion',
             'remove_stage2_pre_topology_source',
             'stage2_skeleton_gradient_ratio',
             'stage3_skeleton_gradient_ratio', 'stage3_gate_topology_gradient_ratio',
@@ -144,16 +122,12 @@ def main():
         stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
         stage3_gate_topology_gradient_ratio=args.stage3_gate_topology_gradient_ratio,
         final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
-        enable_highres_structure_stream=args.enable_highres_structure_stream,
-        highres_structure_channels=args.highres_structure_channels,
-        highres_structure_fuse_stages=args.highres_structure_fuse_stages,
-        highres_structure_fusion_mode=args.highres_structure_fusion_mode,
+        enable_r64_stream=args.enable_r64_stream,
         enable_global_topology=args.enable_global_topology,
         global_topology_max_nodes=args.global_topology_max_nodes,
         global_topology_heads=args.global_topology_heads,
         global_topology_alpha_max=args.global_topology_alpha_max,
         stage_skeleton_mode=args.stage_skeleton_mode,
-        enable_e128_stage_fusion=args.enable_e128_stage_fusion,
         enable_h3_surface_fusion=args.enable_h3_surface_fusion,
         remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
     )

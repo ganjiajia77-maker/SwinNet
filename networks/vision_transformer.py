@@ -38,13 +38,7 @@ def get_topology_coefficients(model):
     coefficients = {
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
-        "highres_structure_stream": {
-            "enabled": bool(getattr(swin_unet, "enable_highres_structure_stream", False)),
-            "source": "prepatch",
-            "channels": int(getattr(swin_unet, "highres_structure_channels", 0)),
-            "fuse_stages": getattr(swin_unet, "highres_structure_fuse_stages", "stage23"),
-            "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),
-        },
+        "r64_stream_enabled": bool(getattr(swin_unet, "enable_r64_stream", False)),
         "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
     }
 
@@ -103,14 +97,9 @@ def format_topology_coefficients(model):
         f"profile={coefficients['structure_profile']}",
         f"final_structure={'on' if coefficients['final_structure_enabled'] else 'off'}",
     ]
-    highres_values = coefficients["highres_structure_stream"]
     fields.append(
-        "highres_structure={} source={} channels={} fuse_stages={} fusion_mode={}".format(
-            "on" if highres_values["enabled"] else "off",
-            highres_values["source"],
-            highres_values["channels"],
-            highres_values["fuse_stages"],
-            highres_values["fusion_mode"],
+        "R64={}".format(
+            "on" if coefficients["r64_stream_enabled"] else "off",
         )
     )
     fields.append(
@@ -570,18 +559,13 @@ class SwinUnet(nn.Module):
                  stage3_skeleton_gradient_ratio=0.5,
                  stage3_gate_topology_gradient_ratio=0.0,
                  final_skeleton_gradient_ratio=0.0,
-                 enable_highres_structure_stream=False,
-                 highres_structure_channels=64,
-                 highres_structure_fuse_stages="stage23",
-                 highres_structure_fusion_mode="stage23",
-                 enable_post_refine_structure_interaction=False,
+                 enable_r64_stream=False,
                  enable_h3_surface_fusion=False,
                  enable_global_topology=False,
                  global_topology_max_nodes=32,
                  global_topology_heads=4,
                  global_topology_alpha_max=0.05,
                  stage_skeleton_mode="prior_residual",
-                 enable_e128_stage_fusion=False,
                   stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False):
@@ -622,20 +606,13 @@ class SwinUnet(nn.Module):
                                 stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
                                 stage3_gate_topology_gradient_ratio=stage3_gate_topology_gradient_ratio,
                                 final_skeleton_gradient_ratio=final_skeleton_gradient_ratio,
-                                enable_highres_structure_stream=enable_highres_structure_stream,
-                                highres_structure_channels=highres_structure_channels,
-                                highres_structure_fuse_stages=highres_structure_fuse_stages,
-                                highres_structure_fusion_mode=highres_structure_fusion_mode,
-                                enable_post_refine_structure_interaction=(
-                                    enable_post_refine_structure_interaction
-                                ),
+                                enable_r64_stream=enable_r64_stream,
                                 enable_h3_surface_fusion=enable_h3_surface_fusion,
                                 enable_global_topology=enable_global_topology,
                                 global_topology_max_nodes=global_topology_max_nodes,
                                  global_topology_heads=global_topology_heads,
                                  global_topology_alpha_max=global_topology_alpha_max,
                                  stage_skeleton_mode=stage_skeleton_mode,
-                                 enable_e128_stage_fusion=enable_e128_stage_fusion,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)

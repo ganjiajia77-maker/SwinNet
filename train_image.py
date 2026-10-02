@@ -91,54 +91,18 @@ parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
-parser.add_argument('--enable_highres_structure_stream', action='store_true')
-parser.add_argument('--highres_structure_channels', type=int, default=64)
-parser.add_argument(
-    '--highres_structure_fuse_stages',
-    type=str,
-    default='stage23',
-    choices=['stage2', 'stage3', 'stage23'],
-)
-parser.add_argument(
-    '--highres_structure_fusion_mode',
-    type=str,
-    default='stage23',
-    choices=[
-        'stage23',
-        'final_correction',
-        'stage23_final_correction',
-        'post_refine_interaction',
-        'none',
-    ],
-    help=(
-        'stage23: decoder fusion; final_correction: final residual logit correction; '
-        'stage23_final_correction: both; post_refine_interaction: inject detached '
-        'structure after surface_refine; none: skeleton-only high-res stream'
-    ),
-)
-parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
-parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
-parser.add_argument('--enable_e128_stage_fusion', action='store_true')
+parser.add_argument('--enable_r64_stream', action='store_true')
+parser.add_argument('--stage_skeleton_mode', type=str, default='direct', choices=['direct'])
 parser.add_argument('--enable_h3_surface_fusion', action='store_true')
 parser.add_argument('--remove_stage2_pre_topology_source', action='store_true')
 parser.add_argument(
     '--enable_global_topology',
     action='store_true',
-    help='enable sparse global topology residual with anchors=z_struct*surface and fused topology tokens',
+    help='enable sparse global topology residual anchored by the R64 road feature',
 )
 parser.add_argument('--global_topology_max_nodes', type=int, default=32)
 parser.add_argument('--global_topology_heads', type=int, default=4)
 parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
-parser.add_argument(
-    '--enable_post_refine_structure_interaction',
-    action='store_true',
-    help='enable detached z_struct -> post surface_refine interaction module',
-)
-parser.add_argument(
-    '--freeze_post_refine_interaction_only',
-    action='store_true',
-    help='freeze the loaded model and train only guided_head.post_refine_structure_interaction',
-)
 parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
 parser.add_argument(
@@ -287,12 +251,8 @@ def apply_structure_profile_defaults(args):
 
 apply_structure_profile_defaults(args)
 
-if args.freeze_post_refine_interaction_only:
-    if not args.enable_highres_structure_stream:
-        parser.error("--freeze_post_refine_interaction_only requires --enable_highres_structure_stream")
-    args.enable_post_refine_structure_interaction = True
-if args.enable_global_topology and not args.enable_highres_structure_stream:
-    parser.error("--enable_global_topology requires --enable_highres_structure_stream")
+if args.enable_global_topology and not args.enable_r64_stream:
+    parser.error("--enable_global_topology requires --enable_r64_stream")
 
 
 def get_final_loss_weights(args):
@@ -364,9 +324,7 @@ def build_criterion(args, loss_weights, device):
         road_attention_weight=args.road_attention_weight,
         stage_connectivity_factor=args.stage_connectivity_factor,
         stage_direction_factor=args.stage_direction_factor,
-        highres_structure_skeleton_weight=(
-            args.highres_structure_skeleton_weight
-        ),
+        highres_structure_skeleton_weight=0.0,
         use_legacy_stage_connectivity_loss=(
             args.structure_profile in {
                 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
@@ -412,9 +370,8 @@ def format_training_config_lines(args, loss_weights):
         f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
         f"  Training AMP: {args.amp_dtype}",
         "  Decoder computation: dense Stage 2/3",
-            "  Stage skeleton mode: {}; E128 stage fusion: {}; pre-Stage2 topology source removed: {}".format(
-                args.stage_skeleton_mode,
-                args.enable_e128_stage_fusion,
+            "  Stage skeleton heads: H2/H3 direct; R64 stream: {}; pre-Stage2 topology source removed: {}".format(
+                args.enable_r64_stream,
                 args.remove_stage2_pre_topology_source,
             ),
             "  H3 -> final surface fusion: {}".format(
@@ -466,7 +423,7 @@ def format_training_config_lines(args, loss_weights):
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance+connectivity, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Global topology residual: {}, anchors=R64*surface, max_nodes={}, heads={}, alpha_max={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
                 args.global_topology_max_nodes,
                 args.global_topology_heads,
@@ -497,12 +454,7 @@ def format_training_config_lines(args, loss_weights):
         f"connectivity_factor={args.stage_connectivity_factor}, "
         f"direction_factor={args.stage_direction_factor}, "
         f"road_attention={args.road_attention_weight}",
-        "  High-res structure stream: "
-        f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
-        f"channels={args.highres_structure_channels}, "
-        f"fuse_stages={args.highres_structure_fuse_stages}, "
-        f"fusion_mode={args.highres_structure_fusion_mode}, "
-        f"skeleton_weight={args.highres_structure_skeleton_weight}",
+        f"  R64 encoder exchange: {'enabled' if args.enable_r64_stream else 'disabled'}",
         "  Surface loss: BCE + 0.5*Dice",
         (
             f"  Direct resize: {args.source_patch_size} -> {args.img_size}"
@@ -591,29 +543,13 @@ def inherit_resume_architecture_args(args):
         args.source_patch_size = int(saved_args["source_patch_size"])
     if "overlap_stride" in saved_args and not _cli_has("--overlap_stride"):
         args.overlap_stride = int(saved_args["overlap_stride"])
-    if "enable_highres_structure_stream" in saved_args and not _cli_has("--enable_highres_structure_stream"):
-        args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
+    if "enable_r64_stream" in saved_args and not _cli_has("--enable_r64_stream"):
+        args.enable_r64_stream = bool(saved_args["enable_r64_stream"])
     for name in (
-        "enable_e128_stage_fusion",
         "remove_stage2_pre_topology_source",
     ):
         if name in saved_args and not _cli_has("--" + name):
             setattr(args, name, bool(saved_args[name]))
-    if "highres_structure_channels" in saved_args and not _cli_has("--highres_structure_channels"):
-        args.highres_structure_channels = int(saved_args["highres_structure_channels"])
-    if "highres_structure_fuse_stages" in saved_args and not _cli_has("--highres_structure_fuse_stages"):
-        args.highres_structure_fuse_stages = str(saved_args["highres_structure_fuse_stages"])
-    if "highres_structure_fusion_mode" in saved_args and not _cli_has("--highres_structure_fusion_mode"):
-        args.highres_structure_fusion_mode = str(saved_args["highres_structure_fusion_mode"])
-    if (
-        "enable_post_refine_structure_interaction" in saved_args
-        and not _cli_has("--enable_post_refine_structure_interaction")
-    ):
-        args.enable_post_refine_structure_interaction = bool(
-            saved_args["enable_post_refine_structure_interaction"]
-        )
-    if "highres_structure_skeleton_weight" in saved_args and not _cli_has("--highres_structure_skeleton_weight"):
-        args.highres_structure_skeleton_weight = float(saved_args["highres_structure_skeleton_weight"])
     if "enable_global_topology" in saved_args and not _cli_has("--enable_global_topology"):
         args.enable_global_topology = bool(saved_args["enable_global_topology"])
     if "global_topology_max_nodes" in saved_args and not _cli_has("--global_topology_max_nodes"):
@@ -627,7 +563,7 @@ def inherit_resume_architecture_args(args):
         f"profile={args.structure_profile}, "
         f"direct_resize_train={args.direct_resize_train}, "
         f"img_size={args.img_size}, source_patch_size={args.source_patch_size}, "
-        f"highres_structure={args.enable_highres_structure_stream}, "
+        f"r64_stream={args.enable_r64_stream}, "
         f"global_topology={args.enable_global_topology}",
         flush=True,
     )
@@ -1223,19 +1159,12 @@ if __name__ == "__main__":
                         args.stage3_gate_topology_gradient_ratio
                     ),
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
-                    enable_highres_structure_stream=args.enable_highres_structure_stream,
-                    highres_structure_channels=args.highres_structure_channels,
-                    highres_structure_fuse_stages=args.highres_structure_fuse_stages,
-                    highres_structure_fusion_mode=args.highres_structure_fusion_mode,
-                    enable_post_refine_structure_interaction=(
-                        args.enable_post_refine_structure_interaction
-                    ),
+                    enable_r64_stream=args.enable_r64_stream,
                     enable_global_topology=args.enable_global_topology,
                     global_topology_max_nodes=args.global_topology_max_nodes,
                     global_topology_heads=args.global_topology_heads,
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
-                    enable_e128_stage_fusion=args.enable_e128_stage_fusion,
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
@@ -1303,25 +1232,6 @@ if __name__ == "__main__":
         )
         return restored
 
-    def freeze_post_refine_interaction_only():
-        trainable_names = []
-        target = "guided_head.post_refine_structure_interaction."
-        for name, parameter in model.named_parameters():
-            keep_trainable = target in name
-            parameter.requires_grad_(keep_trainable)
-            if keep_trainable:
-                trainable_names.append(name)
-        if not trainable_names:
-            raise RuntimeError(
-                "No post-refine interaction parameters found. "
-                "Use --enable_post_refine_structure_interaction."
-            )
-        print(
-            "[INFO] Frozen full model; training only "
-            f"{len(trainable_names)} post-refine interaction tensors.",
-            flush=True,
-        )
-        return trainable_names
 
     # 加载数据
     def load_warm_start_checkpoint(path):
@@ -1676,25 +1586,20 @@ if __name__ == "__main__":
                     flush=True,
                 )
             start_epoch = checkpoint.get('epoch', 0)
-            if not args.freeze_post_refine_interaction_only:
-                try:
-                    loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
-                    optimizer = build_layerwise_optimizer()
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                except (ValueError, RuntimeError) as exc:
-                    print(
-                        "[WARN] Optimizer state not restored; "
-                        "continuing with a fresh optimizer for current parameters.",
-                        flush=True,
-                    )
-                    print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
+            try:
+                loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
+                optimizer = build_layerwise_optimizer()
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (ValueError, RuntimeError) as exc:
+                print(
+                    "[WARN] Optimizer state not restored; "
+                    "continuing with a fresh optimizer for current parameters.",
+                    flush=True,
+                )
+                print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
             print(f"从epoch {start_epoch} 继续训练...")
         else:
             print(f"Warning: checkpoint未找到 {args.resume}")
-
-    if args.freeze_post_refine_interaction_only:
-        freeze_post_refine_interaction_only()
-        optimizer = None
 
     if optimizer is None:
         optimizer = build_layerwise_optimizer()
@@ -1827,19 +1732,9 @@ if __name__ == "__main__":
                 'epoch', 'lr', 'train_avg_loss', 'val_loss',
                 'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
                 'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall',
-                'highres_skeleton_loss', 'structure_delta_mean',
-                'structure_delta_abs_mean', 'structure_delta_abs_max',
-                'structure_delta_weak_skeleton_fn_mean',
-                'structure_delta_skeleton_tp_mean',
-                'structure_delta_background_mean',
             ])
             batch_loss_writer.writerow([
                 'epoch', 'batch', 'loss',
-                'highres_skeleton_loss',
-                'structure_delta_mean', 'structure_delta_abs_mean',
-                'structure_delta_abs_max', 'structure_delta_weak_skeleton_fn_mean',
-                'structure_delta_skeleton_tp_mean',
-                'structure_delta_background_mean',
                 'ms_per_batch',
             ])
             loss_log_file.flush()
@@ -1894,16 +1789,6 @@ if __name__ == "__main__":
             skipped_batches = 0
             optimizer.zero_grad(set_to_none=True)
             accumulation_count = 0
-            highres_stat_sums = {
-                "highres_structure_skeleton_raw": 0.0,
-                "structure_delta_mean": 0.0,
-                "structure_delta_abs_mean": 0.0,
-                "structure_delta_abs_max": 0.0,
-                "structure_delta_weak_skeleton_fn_mean": 0.0,
-                "structure_delta_skeleton_tp_mean": 0.0,
-                "structure_delta_background_mean": 0.0,
-            }
-            highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
 
             for i, batch in enumerate(train_loader):
@@ -2016,22 +1901,10 @@ if __name__ == "__main__":
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 ms_per_batch = (time.perf_counter() - batch_start_time) * 1000.0
-                for key in highres_stat_sums:
-                    value = float(loss_dict[key].item())
-                    if np.isfinite(value):
-                        highres_stat_sums[key] += value
-                        highres_stat_counts[key] += 1
                 batch_loss_writer.writerow([
                     epoch + 1,
                     i + 1,
                     f'{loss.item():.6f}',
-                    f"{loss_dict['highres_structure_skeleton_raw'].item():.6f}",
-                    f"{loss_dict['structure_delta_mean'].item():.6f}",
-                    f"{loss_dict['structure_delta_abs_mean'].item():.6f}",
-                    f"{loss_dict['structure_delta_abs_max'].item():.6f}",
-                    f"{loss_dict['structure_delta_weak_skeleton_fn_mean'].item():.6f}",
-                    f"{loss_dict['structure_delta_skeleton_tp_mean'].item():.6f}",
-                    f"{loss_dict['structure_delta_background_mean'].item():.6f}",
                     f"{ms_per_batch:.3f}",
                 ])
                 batch_loss_log_file.flush()
@@ -2084,24 +1957,14 @@ if __name__ == "__main__":
                         f"Epoch [{epoch+1}/{args.max_epochs}], Batch [{i+1}/{len(train_loader)}], "
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
-                    f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
-                    f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
-                    f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
-                        f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
+                        f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
+                        f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"ms/batch: {ms_per_batch:.1f}",
                         flush=True
                     )
 
             train_avg_loss = total_loss / max(train_batches, 1)
-            highres_epoch_stats = {
-                key: (
-                    highres_stat_sums[key] / highres_stat_counts[key]
-                    if highres_stat_counts[key] > 0
-                    else float("nan")
-                )
-                for key in highres_stat_sums
-            }
             should_validate = (
                 args.val_interval <= 1
                 or (epoch + 1) % args.val_interval == 0
@@ -2162,21 +2025,6 @@ if __name__ == "__main__":
                     f"(interval={args.val_interval})"
                 )
             print(epoch_msg, flush=True)
-            highres_skeleton_msg = (
-                "[HighRes Skeleton] "
-                f"highres_skeleton_loss={highres_epoch_stats['highres_structure_skeleton_raw']:.4f}"
-            )
-            print(highres_skeleton_msg, flush=True)
-            structure_delta_msg = (
-                "[Structure Surface Delta] "
-                f"mean={highres_epoch_stats['structure_delta_mean']:.4f}, "
-                f"abs_mean={highres_epoch_stats['structure_delta_abs_mean']:.4f}, "
-                f"abs_max={highres_epoch_stats['structure_delta_abs_max']:.4f}, "
-                f"weak_skel_fn={highres_epoch_stats['structure_delta_weak_skeleton_fn_mean']:.4f}, "
-                f"skel_tp={highres_epoch_stats['structure_delta_skeleton_tp_mean']:.4f}, "
-                f"background={highres_epoch_stats['structure_delta_background_mean']:.4f}"
-            )
-            print(structure_delta_msg, flush=True)
             topology_msg = print_topology_coefficients(
                 model,
                 prefix=f"[TOPOLOGY][Epoch {epoch + 1}]",
@@ -2189,13 +2037,6 @@ if __name__ == "__main__":
                 epoch + 1, f'{current_lr:.8f}', f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
                 f'{val_iou:.6f}', f'{val_f1:.6f}', f'{val_precision:.6f}', f'{val_recall:.6f}',
                 f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}',
-                f"{highres_epoch_stats['highres_structure_skeleton_raw']:.6f}",
-                f"{highres_epoch_stats['structure_delta_mean']:.6f}",
-                f"{highres_epoch_stats['structure_delta_abs_mean']:.6f}",
-                f"{highres_epoch_stats['structure_delta_abs_max']:.6f}",
-                f"{highres_epoch_stats['structure_delta_weak_skeleton_fn_mean']:.6f}",
-                f"{highres_epoch_stats['structure_delta_skeleton_tp_mean']:.6f}",
-                f"{highres_epoch_stats['structure_delta_background_mean']:.6f}",
             ])
             loss_log_file.flush()
             
@@ -2212,8 +2053,6 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton F1: {skeleton_f1:.6f}\n")
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
-                log_f.write(highres_skeleton_msg + "\n")
-                log_f.write(structure_delta_msg + "\n")
                 log_f.write(f"  Skipped non-finite batches: {skipped_batches}\n")
                 log_f.write(topology_msg + "\n")
                 log_f.write("-"*100 + "\n")
