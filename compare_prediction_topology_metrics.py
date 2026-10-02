@@ -14,8 +14,10 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, required=True)
-    parser.add_argument("--baseline_pred_dir", type=str, required=True)
-    parser.add_argument("--current_pred_dir", type=str, required=True)
+    parser.add_argument("--prediction_dir", type=str, default="", help="evaluate one prediction directory")
+    parser.add_argument("--baseline_pred_dir", type=str, default="")
+    parser.add_argument("--current_pred_dir", type=str, default="")
+    parser.add_argument("--name", type=str, default="model")
     parser.add_argument("--baseline_name", type=str, default="baseline")
     parser.add_argument("--current_name", type=str, default="current")
     parser.add_argument("--split", type=str, default="val", choices=["val", "test"])
@@ -347,27 +349,44 @@ def print_rows(rows):
 
 def main():
     args = parse_args()
+    if args.prediction_dir:
+        if args.baseline_pred_dir or args.current_pred_dir:
+            raise SystemExit("Use --prediction_dir alone, or provide both comparison directories.")
+    elif not args.baseline_pred_dir or not args.current_pred_dir:
+        raise SystemExit("Provide --prediction_dir or both --baseline_pred_dir and --current_pred_dir.")
+
     label_dir = resolve_label_dir(args.root_path, args.split)
-    rows = [
-        evaluate_prediction_dir(
-            args.baseline_name,
-            args.baseline_pred_dir,
+    if args.prediction_dir:
+        rows = [evaluate_prediction_dir(
+            args.name,
+            args.prediction_dir,
             label_dir,
             args.short_area_threshold,
             args.apls_max_nodes,
             args.apls_snap_radius,
             args.max_images,
-        ),
-        evaluate_prediction_dir(
-            args.current_name,
-            args.current_pred_dir,
-            label_dir,
-            args.short_area_threshold,
-            args.apls_max_nodes,
-            args.apls_snap_radius,
-            args.max_images,
-        ),
-    ]
+        )]
+    else:
+        rows = [
+            evaluate_prediction_dir(
+                args.baseline_name,
+                args.baseline_pred_dir,
+                label_dir,
+                args.short_area_threshold,
+                args.apls_max_nodes,
+                args.apls_snap_radius,
+                args.max_images,
+            ),
+            evaluate_prediction_dir(
+                args.current_name,
+                args.current_pred_dir,
+                label_dir,
+                args.short_area_threshold,
+                args.apls_max_nodes,
+                args.apls_snap_radius,
+                args.max_images,
+            ),
+        ]
     print_rows(rows)
     if args.output_csv:
         with open(args.output_csv, "w", newline="", encoding="utf-8") as handle:
