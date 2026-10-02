@@ -9,7 +9,10 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from networks.vision_transformer import SwinUnet as ViT_seg
+from networks.vision_transformer import (
+    SwinUnet as ViT_seg,
+    load_topology_checkpoint_state,
+)
 from losses.road_losses import binary_metrics_from_logits
 from config import get_config
 
@@ -54,6 +57,7 @@ def main():
         default='full',
         choices=['full', 'stage23_boundary_0626', 'stage23_boundary_0626_final_ske'],
     )
+    parser.add_argument('--bottleneck_type', type=str, default='global_local', choices=['global_local', 'legacy_global_local', 'g2l2'])
     parser.add_argument('--disable_msfe_skip', action='store_true')
     parser.add_argument('--enable_highres_structure_stream', action='store_true')
     parser.add_argument('--highres_structure_channels', type=int, default=64)
@@ -79,6 +83,16 @@ def main():
     parser.add_argument('--global_topology_max_nodes', type=int, default=32)
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
+    parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
+    parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
+    parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
+    parser.add_argument('--stage3_gate_topology_gradient_ratio', type=float, default=0.0)
+    parser.add_argument('--final_skeleton_gradient_ratio', type=float, default=0.0)
+    parser.add_argument('--final_topology_eta_init', type=float, default=0.005)
+    parser.add_argument('--final_gap_rho_init', type=float, default=0.005)
     parser.add_argument('--zip', action='store_true', help='use zipped dataset')
     parser.add_argument('--cache_mode', type=str, default='', help='cache mode for dataset')
     parser.add_argument('--resume', type=str, default='', help='resume from checkpoint')
@@ -98,14 +112,38 @@ def main():
     print('Using device: {}'.format(device))
     
     print('\nLoading model from: {}'.format(args.model_path))
+    checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
+    saved_args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
+    if isinstance(saved_args, dict):
+        for name in (
+            'structure_profile', 'bottleneck_type', 'enable_highres_structure_stream',
+            'highres_structure_channels', 'highres_structure_fuse_stages',
+            'highres_structure_fusion_mode', 'enable_global_topology',
+            'global_topology_max_nodes', 'global_topology_heads',
+            'global_topology_alpha_max', 'stage_skeleton_mode',
+            'enable_e128_stage_fusion', 'enable_h3_surface_fusion',
+            'remove_stage2_pre_topology_source',
+            'stage2_skeleton_gradient_ratio',
+            'stage3_skeleton_gradient_ratio', 'stage3_gate_topology_gradient_ratio',
+            'final_skeleton_gradient_ratio', 'final_topology_eta_init',
+            'final_gap_rho_init',
+        ):
+            if name in saved_args:
+                setattr(args, name, saved_args[name])
     config = get_config(args)
     model = ViT_seg(
         config=config,
         img_size=args.img_size,
         num_classes=1,
         return_skeleton=True,
+        bottleneck_type=args.bottleneck_type,
+        final_topology_eta_init=args.final_topology_eta_init,
+        final_gap_rho_init=args.final_gap_rho_init,
         structure_profile=args.structure_profile,
-        use_msfe_skip=not args.disable_msfe_skip,
+        stage2_skeleton_gradient_ratio=args.stage2_skeleton_gradient_ratio,
+        stage3_skeleton_gradient_ratio=args.stage3_skeleton_gradient_ratio,
+        stage3_gate_topology_gradient_ratio=args.stage3_gate_topology_gradient_ratio,
+        final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
         enable_highres_structure_stream=args.enable_highres_structure_stream,
         highres_structure_channels=args.highres_structure_channels,
         highres_structure_fuse_stages=args.highres_structure_fuse_stages,
@@ -114,9 +152,17 @@ def main():
         global_topology_max_nodes=args.global_topology_max_nodes,
         global_topology_heads=args.global_topology_heads,
         global_topology_alpha_max=args.global_topology_alpha_max,
+        stage_skeleton_mode=args.stage_skeleton_mode,
+        enable_e128_stage_fusion=args.enable_e128_stage_fusion,
+        enable_h3_surface_fusion=args.enable_h3_surface_fusion,
+        remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
     )
-    checkpoint = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    load_topology_checkpoint_state(
+        model,
+        checkpoint['model_state_dict'],
+        checkpoint.get('topology_attention_version', 'legacy-unrecorded'),
+        strict=(args.bottleneck_type == 'global_local'),
+    )
     model = model.to(device)
     model.eval()
     print('Model loaded')

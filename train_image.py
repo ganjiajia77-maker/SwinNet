@@ -120,48 +120,7 @@ parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0
 parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
 parser.add_argument('--enable_e128_stage_fusion', action='store_true')
 parser.add_argument('--enable_h3_surface_fusion', action='store_true')
-parser.add_argument('--enable_coarse_road_mask', action='store_true')
-parser.add_argument('--enable_psi_directional_descriptor', action='store_true')
-parser.add_argument('--enable_sparse_window_compute', action='store_true')
 parser.add_argument('--remove_stage2_pre_topology_source', action='store_true')
-parser.add_argument('--stage2_window_threshold', type=float, default=0.10)
-parser.add_argument('--stage3_window_threshold', type=float, default=0.10)
-parser.add_argument('--coarse_candidate_window_size', type=int, default=8,
-                    help='legacy option; ignored by real-window P64 routing')
-parser.add_argument('--coarse_corridor_window_radius', type=int, default=0,
-                    help='legacy option; P64 routing always uses radius 0')
-parser.add_argument(
-    '--coarse_routing_mode',
-    type=str,
-    default='dense',
-    choices=['dense', 'p64', 'bottleneck', 'bottleneck_no_psi'],
-    help='decoder routing source: dense, legacy P64, or bottleneck P8 with/without PSI',
-)
-parser.add_argument('--bottleneck_coarse_road_mask', action='store_true')
-parser.add_argument('--bottleneck_window_threshold', type=float, default=0.25)
-parser.add_argument('--coarse_road_loss_weight', type=float, default=0.2)
-parser.add_argument('--coarse_road_pos_weight', type=float, default=4.0)
-parser.add_argument('--bottleneck_coarse_road_loss_weight', type=float, default=0.2)
-parser.add_argument('--bottleneck_coarse_road_pos_weight', type=float, default=4.0)
-parser.add_argument(
-    '--bottleneck_route_warmup_epochs',
-    type=int,
-    default=0,
-    help='keep decoder routing dense for the first N epochs before using predicted P8 routes',
-)
-parser.add_argument(
-    '--bottleneck_route_warmup_mode',
-    type=str,
-    default='dense',
-    choices=['dense'],
-    help='warmup routing policy; dense keeps all decoder windows active',
-)
-parser.add_argument(
-    '--coarse_route_warmup_epochs',
-    type=int,
-    default=0,
-    help='keep P64 routing dense for the first N epochs while supervising the coarse mask',
-)
 parser.add_argument(
     '--enable_global_topology',
     action='store_true',
@@ -408,10 +367,6 @@ def build_criterion(args, loss_weights, device):
         highres_structure_skeleton_weight=(
             args.highres_structure_skeleton_weight
         ),
-        coarse_road_weight=args.coarse_road_loss_weight,
-        coarse_road_pos_weight=args.coarse_road_pos_weight,
-        bottleneck_coarse_road_weight=args.bottleneck_coarse_road_loss_weight,
-        bottleneck_coarse_road_pos_weight=args.bottleneck_coarse_road_pos_weight,
         use_legacy_stage_connectivity_loss=(
             args.structure_profile in {
                 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
@@ -456,24 +411,7 @@ def format_training_config_lines(args, loss_weights):
         f"  结构配置: {args.structure_profile}",
         f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
         f"  Training AMP: {args.amp_dtype}",
-        "  Coarse routing: mode={}, P8={}, P64={}, PSI={}, sparse={}, thresholds P8/S2/S3={:.3f}/{:.3f}/{:.3f}".format(
-            args.coarse_routing_mode,
-            args.bottleneck_coarse_road_mask,
-            args.enable_coarse_road_mask,
-            args.enable_psi_directional_descriptor,
-            args.enable_sparse_window_compute,
-            args.bottleneck_window_threshold,
-            args.stage2_window_threshold,
-            args.stage3_window_threshold,
-        ),
-        "  Bottleneck route warmup: {} epochs ({})".format(
-            args.bottleneck_route_warmup_epochs,
-            args.bottleneck_route_warmup_mode,
-        ),
-        "  P64 route warmup: {} epoch(s); dense supervision before sparse routing".format(
-            args.coarse_route_warmup_epochs,
-        ),
-        "  P64 window routing: real Swin window max-pool; candidate grouping/radius disabled",
+        "  Decoder computation: dense Stage 2/3",
             "  Stage skeleton mode: {}; E128 stage fusion: {}; pre-Stage2 topology source removed: {}".format(
                 args.stage_skeleton_mode,
                 args.enable_e128_stage_fusion,
@@ -523,12 +461,12 @@ def format_training_config_lines(args, loss_weights):
             "  Global context gate strength: 0.03",
             "  Decoder stage3 step0: removed; only post-upsampling refinement is active",
             "  Decoder gate input: [decoder gate feature, Skeleton, Connectivity]",
-            "  Decoder gate: structure gate plus local+dilated semantic context and direction-confidence reliability correction",
+            "  Decoder gate: structure gate plus local+dilated semantic context; no direction-confidence input",
             "  Connectivity directional positive weight: cardinal={:.3f}, diagonal={:.3f}".format(
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity,direction], relation_bias=relative_xy_distance, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance+connectivity, max_nodes={}, heads={}, alpha_max={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
                 args.global_topology_max_nodes,
                 args.global_topology_heads,
@@ -638,17 +576,6 @@ def inherit_resume_architecture_args(args):
         ("amp_dtype", str),
         ("stage3_gate_topology_gradient_ratio", float),
         ("stage_skeleton_mode", str),
-        ("stage2_window_threshold", float),
-        ("stage3_window_threshold", float),
-        ("coarse_candidate_window_size", int),
-        ("coarse_corridor_window_radius", int),
-        ("coarse_road_loss_weight", float),
-        ("coarse_road_pos_weight", float),
-        ("coarse_routing_mode", str),
-        ("bottleneck_window_threshold", float),
-        ("bottleneck_coarse_road_loss_weight", float),
-        ("bottleneck_coarse_road_pos_weight", float),
-        ("coarse_route_warmup_epochs", int),
         ("stage_skeleton_bias_init", str),
         ("stage_skeleton_positive_prior", float),
     ):
@@ -668,11 +595,7 @@ def inherit_resume_architecture_args(args):
         args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
     for name in (
         "enable_e128_stage_fusion",
-        "enable_coarse_road_mask",
-        "enable_psi_directional_descriptor",
-        "enable_sparse_window_compute",
         "remove_stage2_pre_topology_source",
-        "bottleneck_coarse_road_mask",
     ):
         if name in saved_args and not _cli_has("--" + name):
             setattr(args, name, bool(saved_args[name]))
@@ -925,10 +848,6 @@ def evaluate_skeleton(
             masks = batch['mask'].to(device)
             skeletons = batch['skeleton'].to(device)
             skeletons_dilate = batch['skeleton_dilate'].to(device)
-            coarse_road_targets = batch['coarse_road_target'].to(device)
-            bottleneck_coarse_road_targets = batch[
-                'bottleneck_coarse_road_target'
-            ].to(device)
 
             images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
             masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -965,8 +884,6 @@ def evaluate_skeleton(
                 boundary_logits=boundary_logits,
                 skeleton_logits=skeleton_logits,
                 connectivity_logits=connectivity_logits,
-                coarse_road_gt=coarse_road_targets,
-                bottleneck_coarse_road_gt=bottleneck_coarse_road_targets,
             )
             total_loss += loss.item()
 
@@ -1320,19 +1237,6 @@ if __name__ == "__main__":
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     enable_e128_stage_fusion=args.enable_e128_stage_fusion,
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
-                    enable_coarse_road_mask=args.enable_coarse_road_mask,
-                    enable_psi_directional_descriptor=args.enable_psi_directional_descriptor,
-                    sparse_window_compute=args.enable_sparse_window_compute,
-                    stage2_window_threshold=args.stage2_window_threshold,
-                    stage3_window_threshold=args.stage3_window_threshold,
-                    coarse_candidate_window_size=args.coarse_candidate_window_size,
-                    coarse_corridor_window_radius=args.coarse_corridor_window_radius,
-                    coarse_routing_mode=args.coarse_routing_mode,
-                    bottleneck_coarse_road_mask=args.bottleneck_coarse_road_mask,
-                    bottleneck_window_threshold=args.bottleneck_window_threshold,
-                    bottleneck_route_warmup_epochs=args.bottleneck_route_warmup_epochs,
-                    bottleneck_route_warmup_mode=args.bottleneck_route_warmup_mode,
-                    coarse_route_warmup_epochs=args.coarse_route_warmup_epochs,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
@@ -1554,6 +1458,7 @@ if __name__ == "__main__":
             filtered_checkpoint_state = {}
             skipped_gate_keys = []
             skipped_removed_keys = []
+            skipped_shape_keys = []
             removed_direction_embedding_prefixes = (
                 "swin_unet.decoder_structure_blocks.0.directional_embedding.",
                 "swin_unet.decoder_structure_blocks.1.directional_embedding.",
@@ -1569,11 +1474,31 @@ if __name__ == "__main__":
                 "swin_unet.stage2_topology_source.surface_uncertainty_head.",
             )
             for key, value in checkpoint_state.items():
-                if key not in model_state and key.startswith(
-                    removed_direction_embedding_prefixes
-                    + removed_surface_uncertainty_prefixes
-                ):
+                if key not in model_state:
                     skipped_removed_keys.append(key)
+                    continue
+                if value.shape != model_state[key].shape:
+                    if (
+                        key.endswith("connectivity_head.prior_embed.0.weight")
+                        and value.ndim == model_state[key].ndim == 4
+                        and value.shape[0] == model_state[key].shape[0]
+                        and value.shape[1] >= 2
+                        and model_state[key].shape[1] == 2
+                        and value.shape[2:] == model_state[key].shape[2:]
+                    ):
+                        adapted_weight = model_state[key].detach().clone()
+                        adapted_weight.copy_(
+                            value[:, :2].to(
+                                device=adapted_weight.device,
+                                dtype=adapted_weight.dtype,
+                            )
+                        )
+                        filtered_checkpoint_state[key] = adapted_weight
+                        skipped_shape_keys.append(
+                            key + " (dropped direction prior channel)"
+                        )
+                        continue
+                    skipped_shape_keys.append(key)
                     continue
                 if (
                     key in model_state
@@ -1596,7 +1521,14 @@ if __name__ == "__main__":
                     + (" ..." if len(skipped_removed_keys) > 12 else ""),
                     flush=True,
                 )
-            if skipped_gate_keys or skipped_removed_keys:
+            if skipped_shape_keys:
+                print(
+                    "[WARN] Reinitialized shape-incompatible checkpoint keys: "
+                    + ", ".join(skipped_shape_keys[:12])
+                    + (" ..." if len(skipped_shape_keys) > 12 else ""),
+                    flush=True,
+                )
+            if skipped_gate_keys or skipped_removed_keys or skipped_shape_keys:
                 checkpoint_state = filtered_checkpoint_state
             strict_load = args.bottleneck_type == 'global_local'
             try:
@@ -1662,6 +1594,7 @@ if __name__ == "__main__":
                         "swin_unet.guided_head.post_refine_structure_interaction.",
                 )
                 allowed_unexpected_prefixes = (
+                        "swin_unet.coarse_road_mask_head.",
                         "swin_unet.bottleneck_coarse_road_mask_head.",
                         "swin_unet.decoder_structure_blocks.0.reliability_correction.",
                         "swin_unet.decoder_structure_blocks.1.reliability_correction.",
@@ -1867,7 +1800,6 @@ if __name__ == "__main__":
                 'epoch', 'lr', 'train_avg_loss', 'val_loss',
                 'surface_iou', 'surface_f1', 'surface_precision', 'surface_recall',
                 'skeleton_iou', 'skeleton_f1', 'skeleton_precision', 'skeleton_recall',
-                'bottleneck_coarse_road_loss', 'bottleneck_coarse_road_raw',
                 'highres_skeleton_loss', 'structure_delta_mean',
                 'structure_delta_abs_mean', 'structure_delta_abs_max',
                 'structure_delta_weak_skeleton_fn_mean',
@@ -1876,7 +1808,6 @@ if __name__ == "__main__":
             ])
             batch_loss_writer.writerow([
                 'epoch', 'batch', 'loss',
-                'bottleneck_coarse_road_loss', 'bottleneck_coarse_road_raw',
                 'highres_skeleton_loss',
                 'structure_delta_mean', 'structure_delta_abs_mean',
                 'structure_delta_abs_max', 'structure_delta_weak_skeleton_fn_mean',
@@ -1918,8 +1849,6 @@ if __name__ == "__main__":
         for epoch in range(start_epoch, end_epoch):
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
-            if hasattr(model, "set_route_epoch"):
-                model.set_route_epoch(epoch)
             current_lr = get_cosine_warmup_lr(
                 epoch, args.max_epochs, args.new_lr, args.new_min_lr, args.warmup_epochs
             )
@@ -1948,9 +1877,6 @@ if __name__ == "__main__":
                 "structure_delta_background_mean": 0.0,
             }
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
-            bottleneck_coarse_loss_sum = 0.0
-            bottleneck_coarse_raw_sum = 0.0
-            bottleneck_coarse_loss_count = 0
             stage_distill_scale = get_stage_distill_scale(epoch)
 
             for i, batch in enumerate(train_loader):
@@ -1962,10 +1888,6 @@ if __name__ == "__main__":
                 masks = batch['mask'].to(device)
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
-                coarse_road_targets = batch['coarse_road_target'].to(device)
-                bottleneck_coarse_road_targets = batch[
-                    'bottleneck_coarse_road_target'
-                ].to(device)
 
                 images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
                 masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -2022,8 +1944,6 @@ if __name__ == "__main__":
                     boundary_logits=boundary_logits,
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
-                    coarse_road_gt=coarse_road_targets,
-                    bottleneck_coarse_road_gt=bottleneck_coarse_road_targets,
                 )
 
                 if not torch.isfinite(loss):
@@ -2074,24 +1994,10 @@ if __name__ == "__main__":
                     if np.isfinite(value):
                         highres_stat_sums[key] += value
                         highres_stat_counts[key] += 1
-                bottleneck_coarse_loss_value = float(
-                    loss_dict['loss_bottleneck_coarse_road'].item()
-                )
-                bottleneck_coarse_raw_value = float(
-                    loss_dict['bottleneck_coarse_road_raw'].item()
-                )
-                if np.isfinite(bottleneck_coarse_loss_value) and np.isfinite(
-                    bottleneck_coarse_raw_value
-                ):
-                    bottleneck_coarse_loss_sum += bottleneck_coarse_loss_value
-                    bottleneck_coarse_raw_sum += bottleneck_coarse_raw_value
-                    bottleneck_coarse_loss_count += 1
                 batch_loss_writer.writerow([
                     epoch + 1,
                     i + 1,
                     f'{loss.item():.6f}',
-                    f"{bottleneck_coarse_loss_value:.6f}",
-                    f"{bottleneck_coarse_raw_value:.6f}",
                     f"{loss_dict['highres_structure_skeleton_raw'].item():.6f}",
                     f"{loss_dict['structure_delta_mean'].item():.6f}",
                     f"{loss_dict['structure_delta_abs_mean'].item():.6f}",
@@ -2151,11 +2057,9 @@ if __name__ == "__main__":
                         f"Epoch [{epoch+1}/{args.max_epochs}], Batch [{i+1}/{len(train_loader)}], "
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
-                        f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
-                        f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
-                        f"P8: {bottleneck_coarse_loss_value:.4f} "
-                        f"(raw={bottleneck_coarse_raw_value:.4f}), "
-                        f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
+                    f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
+                    f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
+                    f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
                         f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"ms/batch: {ms_per_batch:.1f}",
@@ -2171,16 +2075,6 @@ if __name__ == "__main__":
                 )
                 for key in highres_stat_sums
             }
-            bottleneck_coarse_epoch_loss = (
-                bottleneck_coarse_loss_sum / bottleneck_coarse_loss_count
-                if bottleneck_coarse_loss_count > 0
-                else 0.0
-            )
-            bottleneck_coarse_epoch_raw = (
-                bottleneck_coarse_raw_sum / bottleneck_coarse_loss_count
-                if bottleneck_coarse_loss_count > 0
-                else 0.0
-            )
             should_validate = (
                 args.val_interval <= 1
                 or (epoch + 1) % args.val_interval == 0
@@ -2241,12 +2135,6 @@ if __name__ == "__main__":
                     f"(interval={args.val_interval})"
                 )
             print(epoch_msg, flush=True)
-            print(
-                "[Bottleneck P8] "
-                f"weighted_loss={bottleneck_coarse_epoch_loss:.6f}, "
-                f"raw_loss={bottleneck_coarse_epoch_raw:.6f}",
-                flush=True,
-            )
             highres_skeleton_msg = (
                 "[HighRes Skeleton] "
                 f"highres_skeleton_loss={highres_epoch_stats['highres_structure_skeleton_raw']:.4f}"
@@ -2274,8 +2162,6 @@ if __name__ == "__main__":
                 epoch + 1, f'{current_lr:.8f}', f'{train_avg_loss:.6f}', f'{val_loss:.6f}',
                 f'{val_iou:.6f}', f'{val_f1:.6f}', f'{val_precision:.6f}', f'{val_recall:.6f}',
                 f'{skeleton_iou:.6f}', f'{skeleton_f1:.6f}', f'{skeleton_precision:.6f}', f'{skeleton_recall:.6f}',
-                f'{bottleneck_coarse_epoch_loss:.6f}',
-                f'{bottleneck_coarse_epoch_raw:.6f}',
                 f"{highres_epoch_stats['highres_structure_skeleton_raw']:.6f}",
                 f"{highres_epoch_stats['structure_delta_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_abs_mean']:.6f}",
@@ -2299,14 +2185,6 @@ if __name__ == "__main__":
                 log_f.write(f"  Skeleton F1: {skeleton_f1:.6f}\n")
                 log_f.write(f"  Skeleton Precision: {skeleton_precision:.6f}\n")
                 log_f.write(f"  Skeleton Recall: {skeleton_recall:.6f}\n")
-                log_f.write(
-                    "  Bottleneck P8 weighted loss: "
-                    f"{bottleneck_coarse_epoch_loss:.6f}\n"
-                )
-                log_f.write(
-                    "  Bottleneck P8 raw loss: "
-                    f"{bottleneck_coarse_epoch_raw:.6f}\n"
-                )
                 log_f.write(highres_skeleton_msg + "\n")
                 log_f.write(structure_delta_msg + "\n")
                 log_f.write(f"  Skipped non-finite batches: {skipped_batches}\n")

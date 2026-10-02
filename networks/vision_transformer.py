@@ -165,6 +165,7 @@ def load_topology_checkpoint_state(
         "swin_unet.structure_surface_correction_head.",
         "swin_unet.guided_head.post_refine_structure_interaction.",
         "swin_unet.coarse_road_mask_head.",
+        "swin_unet.bottleneck_coarse_road_mask_head.",
         "swin_unet.decoder_structure_blocks.2.external_structure_fusion.",
         "swin_unet.decoder_structure_blocks.2.external_structure_scale",
         "swin_unet.h3_surface_proj.",
@@ -211,6 +212,26 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
         "swin_unet.stage2_topology_source.surface_uncertainty_head.",
     )
+    removed_connectivity_direction_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.connectivity_head.axis_basis",
+        "swin_unet.decoder_structure_blocks.1.connectivity_head.axis_basis",
+        "swin_unet.decoder_structure_blocks.2.connectivity_head.axis_basis",
+        "swin_unet.decoder_structure_blocks.3.connectivity_head.axis_basis",
+        "swin_unet.stage2_topology_source.connectivity_head.axis_basis",
+    )
+    removed_direction_gate_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
+        "swin_unet.decoder_structure_blocks.0.reliability_beta",
+        "swin_unet.decoder_structure_blocks.1.reliability_beta",
+        "swin_unet.decoder_structure_blocks.2.reliability_beta",
+        "swin_unet.decoder_structure_blocks.3.reliability_beta",
+        "swin_unet.stage2_topology_source.reliability_correction.",
+        "swin_unet.stage2_topology_source.reliability_beta",
+        "swin_unet.global_topology.direction_topology_bias_scale",
+    )
     removed_model_prefixes = (
         "swin_unet.decoder_structure_blocks.0.",
         "swin_unet.decoder_structure_blocks.1.",
@@ -228,6 +249,8 @@ def load_topology_checkpoint_state(
                 or key.startswith(obsolete_unexpected_prefixes)
                 or key.startswith(removed_direction_embedding_prefixes)
                 or key.startswith(removed_surface_uncertainty_prefixes)
+                or key.startswith(removed_connectivity_direction_prefixes)
+                or key.startswith(removed_direction_gate_prefixes)
                 or key.startswith(removed_model_prefixes)
                 or key.startswith(highres_structure_missing_prefixes)
             )
@@ -254,11 +277,30 @@ def load_topology_checkpoint_state(
             key in model_state
             and hasattr(value, "shape")
             and value.shape != model_state[key].shape
+            and key.endswith("connectivity_head.prior_embed.0.weight")
+            and value.ndim == model_state[key].ndim == 4
+            and value.shape[0] == model_state[key].shape[0]
+            and value.shape[1] >= 2
+            and model_state[key].shape[1] == 2
+            and value.shape[2:] == model_state[key].shape[2:]
+        ):
+            adapted_weight = model_state[key].detach().clone()
+            adapted_weight.copy_(value[:, :2].to(device=adapted_weight.device, dtype=adapted_weight.dtype))
+            filtered_state_dict[key] = adapted_weight
+            skipped_shape_keys.append(key + " (dropped direction prior channel)")
+            continue
+        if (
+            key in model_state
+            and hasattr(value, "shape")
+            and value.shape != model_state[key].shape
             and (
                 key.endswith("structure_gate.0.weight")
                 or key.startswith(highres_structure_missing_prefixes)
             )
         ):
+            skipped_shape_keys.append(key)
+            continue
+        if key in model_state and hasattr(value, "shape") and value.shape != model_state[key].shape:
             skipped_shape_keys.append(key)
             continue
         filtered_state_dict[key] = value
@@ -511,19 +553,6 @@ class SwinUnet(nn.Module):
                  global_topology_alpha_max=0.05,
                  stage_skeleton_mode="prior_residual",
                  enable_e128_stage_fusion=False,
-                 enable_coarse_road_mask=False,
-                 enable_psi_directional_descriptor=False,
-                 sparse_window_compute=False,
-                  stage2_window_threshold=0.10,
-                  stage3_window_threshold=0.10,
-                 coarse_candidate_window_size=8,
-                 coarse_corridor_window_radius=1,
-                 coarse_routing_mode="dense",
-                 bottleneck_coarse_road_mask=False,
-                 bottleneck_window_threshold=0.25,
-                  bottleneck_route_warmup_epochs=0,
-                  bottleneck_route_warmup_mode="dense",
-                  coarse_route_warmup_epochs=0,
                   stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False):
@@ -573,19 +602,6 @@ class SwinUnet(nn.Module):
                                  global_topology_alpha_max=global_topology_alpha_max,
                                  stage_skeleton_mode=stage_skeleton_mode,
                                  enable_e128_stage_fusion=enable_e128_stage_fusion,
-                                 enable_coarse_road_mask=enable_coarse_road_mask,
-                                 enable_psi_directional_descriptor=enable_psi_directional_descriptor,
-                                 sparse_window_compute=sparse_window_compute,
-                                 stage2_window_threshold=stage2_window_threshold,
-                                 stage3_window_threshold=stage3_window_threshold,
-                                 coarse_candidate_window_size=coarse_candidate_window_size,
-                                 coarse_corridor_window_radius=coarse_corridor_window_radius,
-                                 coarse_routing_mode=coarse_routing_mode,
-                                 bottleneck_coarse_road_mask=bottleneck_coarse_road_mask,
-                                 bottleneck_window_threshold=bottleneck_window_threshold,
-                                  bottleneck_route_warmup_epochs=bottleneck_route_warmup_epochs,
-                                  bottleneck_route_warmup_mode=bottleneck_route_warmup_mode,
-                                  coarse_route_warmup_epochs=coarse_route_warmup_epochs,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
@@ -607,9 +623,6 @@ class SwinUnet(nn.Module):
         if self.return_skeleton:
             return (logits, *aux_outputs)
         return logits
-
-    def set_route_epoch(self, epoch):
-        self.swin_unet.set_route_epoch(epoch)
 
     def load_from(self, config):
         pretrained_path = config.MODEL.PRETRAIN_CKPT
