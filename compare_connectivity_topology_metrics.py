@@ -18,11 +18,13 @@ from config import get_config
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Compare segmentation and connectivity/topology metrics for two checkpoints."
+        description="Evaluate one checkpoint or compare two checkpoints at model resolution."
     )
     p.add_argument("--root_path", required=True)
-    p.add_argument("--baseline_model_path", required=True)
-    p.add_argument("--current_model_path", required=True)
+    p.add_argument("--model_path", default="")
+    p.add_argument("--name", default="model")
+    p.add_argument("--baseline_model_path", default="")
+    p.add_argument("--current_model_path", default="")
     p.add_argument("--baseline_name", default="baseline")
     p.add_argument("--current_name", default="current")
     p.add_argument("--split", choices=("val", "test"), default="test")
@@ -49,6 +51,11 @@ def parse_args():
     p.add_argument("--highres_structure_channels", type=int, default=64)
     p.add_argument("--highres_structure_fuse_stages", default="stage23")
     p.add_argument("--highres_structure_fusion_mode", default="stage23")
+    p.add_argument("--stage_skeleton_mode", choices=("direct", "prior_residual"), default="prior_residual")
+    p.add_argument("--stage_skeleton_bias_init", choices=("zero", "prior"), default="zero")
+    p.add_argument("--stage_skeleton_positive_prior", type=float, default=0.05)
+    p.add_argument("--enable_h3_surface_fusion", action="store_true")
+    p.add_argument("--remove_stage2_pre_topology_source", action="store_true")
     p.add_argument("--enable_global_topology", action="store_true")
     p.add_argument("--global_topology_max_nodes", type=int, default=32)
     p.add_argument("--global_topology_heads", type=int, default=4)
@@ -76,7 +83,13 @@ def parse_args():
     p.add_argument("--tag", default="")
     p.add_argument("--eval", action="store_true")
     p.add_argument("--throughput", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.model_path:
+        if args.baseline_model_path or args.current_model_path:
+            p.error("Use --model_path alone or provide both comparison checkpoints.")
+    elif not (args.baseline_model_path and args.current_model_path):
+        p.error("Provide --model_path or both comparison checkpoints.")
+    return args
 
 
 def zhang_suen_skeletonize(mask):
@@ -265,6 +278,11 @@ def load_metric_model(model_path, args, device):
             "highres_structure_channels",
             "highres_structure_fuse_stages",
             "highres_structure_fusion_mode",
+            "stage_skeleton_mode",
+            "stage_skeleton_bias_init",
+            "stage_skeleton_positive_prior",
+            "enable_h3_surface_fusion",
+            "remove_stage2_pre_topology_source",
             "enable_post_refine_structure_interaction",
             "enable_global_topology",
             "global_topology_max_nodes",
@@ -294,6 +312,11 @@ def load_metric_model(model_path, args, device):
         highres_structure_channels=model_args.highres_structure_channels,
         highres_structure_fuse_stages=model_args.highres_structure_fuse_stages,
         highres_structure_fusion_mode=model_args.highres_structure_fusion_mode,
+        stage_skeleton_mode=model_args.stage_skeleton_mode,
+        stage_skeleton_bias_init=model_args.stage_skeleton_bias_init,
+        stage_skeleton_positive_prior=model_args.stage_skeleton_positive_prior,
+        enable_h3_surface_fusion=model_args.enable_h3_surface_fusion,
+        remove_stage2_pre_topology_source=model_args.remove_stage2_pre_topology_source,
         enable_post_refine_structure_interaction=model_args.enable_post_refine_structure_interaction,
         enable_global_topology=model_args.enable_global_topology,
         global_topology_max_nodes=model_args.global_topology_max_nodes,
@@ -301,6 +324,22 @@ def load_metric_model(model_path, args, device):
         global_topology_alpha_max=model_args.global_topology_alpha_max,
     ).to(device)
     adapt_connectivity_modules_for_checkpoint(model, state_dict, "standard")
+    model_state = model.state_dict()
+    missing = sorted(set(model_state) - set(state_dict))
+    unexpected = sorted(set(state_dict) - set(model_state))
+    shape_mismatches = [
+        (key, tuple(value.shape), tuple(model_state[key].shape))
+        for key, value in state_dict.items()
+        if key in model_state and value.shape != model_state[key].shape
+    ]
+    if missing or unexpected or shape_mismatches:
+        raise RuntimeError(
+            "Checkpoint does not match the evaluation model; metrics would be invalid. "
+            f"Missing keys: {missing[:8]} (total {len(missing)}); "
+            f"unexpected keys: {unexpected[:8]} (total {len(unexpected)}); "
+            f"shape mismatches: {shape_mismatches[:8]} (total {len(shape_mismatches)})."
+        )
+    print(f"[EVAL] Matched all {len(model_state)} checkpoint tensors.", flush=True)
     load_topology_checkpoint_state(
         model,
         state_dict,
@@ -359,7 +398,15 @@ def evaluate(name, model_path, threshold, args, loader, device):
     eps = 1e-8
     precision = acc["tp"] / (acc["tp"] + acc["fp"] + eps)
     recall = acc["tp"] / (acc["tp"] + acc["fn"] + eps)
-    summary = {"name": name, "checkpoint": model_path, "threshold": threshold, "images": acc["images"]}
+    summary = {
+        "name": name,
+        "checkpoint": model_path,
+        "threshold": threshold,
+        "images": acc["images"],
+        "img_size": args.img_size,
+        "source_patch_size": args.source_patch_size,
+        "apls_max_nodes": args.apls_max_nodes,
+    }
     summary.update(
         {
             "iou": acc["tp"] / (acc["tp"] + acc["fp"] + acc["fn"] + eps),
@@ -395,23 +442,27 @@ def main():
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    baseline_threshold = args.baseline_threshold if args.baseline_threshold is not None else args.threshold
-    current_threshold = args.current_threshold if args.current_threshold is not None else args.threshold
-    rows = [
-        evaluate(args.baseline_name, args.baseline_model_path, baseline_threshold, args, loader, device),
-        evaluate(args.current_name, args.current_model_path, current_threshold, args, loader, device),
-    ]
+    if args.model_path:
+        rows = [evaluate(args.name, args.model_path, args.threshold, args, loader, device)]
+    else:
+        baseline_threshold = args.baseline_threshold if args.baseline_threshold is not None else args.threshold
+        current_threshold = args.current_threshold if args.current_threshold is not None else args.threshold
+        rows = [
+            evaluate(args.baseline_name, args.baseline_model_path, baseline_threshold, args, loader, device),
+            evaluate(args.current_name, args.current_model_path, current_threshold, args, loader, device),
+        ]
     fields = list(rows[0].keys())
-    print("\nConnectivity/topology comparison")
+    print("\nConnectivity/topology metrics" if len(rows) == 1 else "\nConnectivity/topology comparison")
     for row in rows:
         print("\n" + row["name"])
         for key in fields:
             if key not in {"name", "checkpoint"}:
                 print(f"{key:38s} {row[key]}")
-    print("\nDelta current - baseline")
-    for key in fields:
-        if key not in {"name", "checkpoint", "threshold", "images"}:
-            print(f"{key:38s} {rows[1][key] - rows[0][key]:+.6f}")
+    if len(rows) == 2:
+        print("\nDelta current - baseline")
+        for key in fields:
+            if key not in {"name", "checkpoint", "threshold", "images", "img_size", "source_patch_size", "apls_max_nodes"}:
+                print(f"{key:38s} {rows[1][key] - rows[0][key]:+.6f}")
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
     with open(args.output_csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
