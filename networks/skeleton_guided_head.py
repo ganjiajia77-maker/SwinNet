@@ -677,6 +677,7 @@ class DecoderStructureRefinement(nn.Module):
         self.use_structure_residual = bool(
             use_structure_residual or previous_structure_channels is not None
         )
+        self.use_multichannel_fusion = bool(enable_direct_feature_refinement)
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
@@ -702,43 +703,106 @@ class DecoderStructureRefinement(nn.Module):
             )
         else:
             self.previous_structure_fusion = None
-        residual_input_channels = channels * (
-            2 if self.use_structure_residual else 1
-        )
-        self.gate_branch = nn.Sequential(
-            ConvBNReLU(channels, channels),
-            ConvBNReLU(channels, channels),
-        )
+        if self.use_multichannel_fusion:
+            self.multichannel_feature_proj = nn.Conv2d(
+                channels, fusion_channels, kernel_size=1, bias=False
+            )
+            self.multichannel_structure_proj = nn.Conv2d(
+                channels, fusion_channels, kernel_size=1, bias=False
+            )
+            self.multichannel_skeleton_proj = nn.Conv2d(
+                1, fusion_channels, kernel_size=1, bias=False
+            )
+            self.multichannel_connectivity_proj = nn.Conv2d(
+                connectivity_channels, fusion_channels, kernel_size=1, bias=False
+            )
+            self.multichannel_fuse = nn.Sequential(
+                nn.Conv2d(
+                    fusion_channels * 4 + 1,
+                    fusion_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(fusion_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(fusion_channels, fusion_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(fusion_channels),
+                nn.ReLU(inplace=True),
+            )
+            self.multichannel_gate = nn.Sequential(
+                nn.Conv2d(
+                    fusion_channels,
+                    fusion_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(fusion_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(fusion_channels, 1, kernel_size=1),
+            )
+            self.multichannel_residual = nn.Sequential(
+                nn.Conv2d(
+                    fusion_channels,
+                    channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(channels),
+            )
+            self.gate_branch = None
+            self.structure_gate = None
+            self.feature_residual = None
+            self.reliability_correction = None
+            self.register_parameter("reliability_beta", None)
+            self.context_to_gate = None
+        else:
+            self.multichannel_feature_proj = None
+            self.multichannel_structure_proj = None
+            self.multichannel_skeleton_proj = None
+            self.multichannel_connectivity_proj = None
+            self.multichannel_fuse = None
+            self.multichannel_gate = None
+            self.multichannel_residual = None
+            residual_input_channels = channels * (
+                2 if self.use_structure_residual else 1
+            )
+            self.gate_branch = nn.Sequential(
+                ConvBNReLU(channels, channels),
+                ConvBNReLU(channels, channels),
+            )
+            self.structure_gate = nn.Sequential(
+                nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fusion_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(fusion_channels, 1, kernel_size=1),
+            )
+            self.feature_residual = nn.Sequential(
+                nn.Conv2d(residual_input_channels, channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True),
+            )
+            self.reliability_correction = nn.Sequential(
+                nn.Conv2d(channels + 1, fusion_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(fusion_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(fusion_channels, 1, kernel_size=1),
+            )
+            self.reliability_beta = nn.Parameter(torch.tensor(0.0))
+            if context_channels is not None:
+                self.context_to_gate = nn.Conv2d(context_channels, 1, kernel_size=1)
+                nn.init.zeros_(self.context_to_gate.weight)
+                nn.init.zeros_(self.context_to_gate.bias)
+            else:
+                self.context_to_gate = None
         self.skeleton_head = SkeletonSpatialHead(channels)
         self.connectivity_context = ConnectivityContextBlock(channels)
         self.connectivity_head = PairwiseConnectivityHead(channels, connectivity_channels)
         self.direction_head = nn.Sequential(
             ConvBNReLU(channels, channels),
             nn.Conv2d(channels, 2, kernel_size=1),
-        )
-        self.structure_gate = nn.Sequential(
-            nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(fusion_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(fusion_channels, 1, kernel_size=1),
-        )
-        self.reliability_correction = nn.Sequential(
-            nn.Conv2d(channels + 1, fusion_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(fusion_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(fusion_channels, 1, kernel_size=1),
-        )
-        self.reliability_beta = nn.Parameter(torch.tensor(0.0))
-        if context_channels is not None:
-            self.context_to_gate = nn.Conv2d(context_channels, 1, kernel_size=1)
-            nn.init.zeros_(self.context_to_gate.weight)
-            nn.init.zeros_(self.context_to_gate.bias)
-        else:
-            self.context_to_gate = None
-        self.feature_residual = nn.Sequential(
-            nn.Conv2d(residual_input_channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
         )
         self.raw_gamma1 = nn.Parameter(torch.tensor(float(init_gamma1)))
         self.capture_diagnostics = False
@@ -887,42 +951,69 @@ class DecoderStructureRefinement(nn.Module):
             conn_strength,
             self.gate_topology_gradient_ratio,
         )
-        gate_feat = self.gate_branch(x)
-        structure_gate_old_logits = self.structure_gate(
-            torch.cat(
-                [
-                    gate_feat,
-                    gate_skeleton,
-                    gate_conn_strength,
-                ],
+        fused_multichannel = None
+        if self.use_multichannel_fusion:
+            gate_connectivity = scale_gradient(
+                connectivity_prob,
+                self.gate_topology_gradient_ratio,
+            )
+            fused_multichannel = self.multichannel_fuse(
+                torch.cat(
+                    [
+                        self.multichannel_feature_proj(x),
+                        self.multichannel_structure_proj(structure_feat),
+                        self.multichannel_skeleton_proj(gate_skeleton),
+                        self.multichannel_connectivity_proj(gate_connectivity),
+                        gate_conn_strength,
+                    ],
+                    dim=1,
+                )
+            )
+            structure_gate_logits = self.multichannel_gate(fused_multichannel)
+            structure_gate_old = torch.sigmoid(structure_gate_logits)
+            structure_gate = structure_gate_old
+            reliability_correction = torch.zeros_like(structure_gate_logits)
+        else:
+            gate_feat = self.gate_branch(x)
+            structure_gate_old_logits = self.structure_gate(
+                torch.cat(
+                    [
+                        gate_feat,
+                        gate_skeleton,
+                        gate_conn_strength,
+                    ],
+                    dim=1,
+                )
+            )
+            if self.context_to_gate is not None and global_context is not None:
+                context_bias = self.context_strength * torch.tanh(
+                    self.context_to_gate(global_context)
+                )
+                structure_gate_old_logits = structure_gate_old_logits + context_bias
+            structure_gate_old = torch.sigmoid(structure_gate_old_logits)
+            direction_confidence = direction_logits.detach().float().norm(
                 dim=1,
+                keepdim=True,
+            ).to(dtype=x.dtype)
+            reliability_correction = self.reliability_correction(
+                torch.cat([x, direction_confidence], dim=1)
             )
-        )
-        if self.context_to_gate is not None and global_context is not None:
-            context_bias = self.context_strength * torch.tanh(
-                self.context_to_gate(global_context)
+            structure_gate_logits = structure_gate_old_logits + (
+                self.reliability_beta * reliability_correction
             )
-            structure_gate_old_logits = structure_gate_old_logits + context_bias
-        structure_gate_old = torch.sigmoid(structure_gate_old_logits)
-        direction_confidence = direction_logits.detach().float().norm(
-            dim=1,
-            keepdim=True,
-        ).to(dtype=x.dtype)
-        reliability_correction = self.reliability_correction(
-            torch.cat([x, direction_confidence], dim=1)
-        )
-        structure_gate_logits = structure_gate_old_logits + (
-            self.reliability_beta * reliability_correction
-        )
-        structure_gate = torch.sigmoid(structure_gate_logits)
+            structure_gate = torch.sigmoid(structure_gate_logits)
 
         if self.enable_direct_feature_refinement and apply_feature_refinement:
-            residual_input = (
-                torch.cat([x, structure_feat], dim=1)
-                if self.use_structure_residual
-                else x
-            )
-            residual = structure_gate * self.feature_residual(residual_input)
+            if self.use_multichannel_fusion:
+                residual_content = self.multichannel_residual(fused_multichannel)
+            else:
+                residual_input = (
+                    torch.cat([x, structure_feat], dim=1)
+                    if self.use_structure_residual
+                    else x
+                )
+                residual_content = self.feature_residual(residual_input)
+            residual = structure_gate * residual_content
             gate_residual = self.gamma1 * residual
             out = x + gate_residual
         else:
@@ -939,7 +1030,11 @@ class DecoderStructureRefinement(nn.Module):
                     "conn_strength_mean": float(
                         conn_strength.mean().detach().cpu()
                     ),
-                    "reliability_beta": float(self.reliability_beta.detach().cpu()),
+                    "reliability_beta": (
+                        float(self.reliability_beta.detach().cpu())
+                        if self.reliability_beta is not None
+                        else 0.0
+                    ),
                     "gate_topology_gradient_ratio": self.gate_topology_gradient_ratio,
                     "reliability_correction_mean": float(
                         reliability_correction.mean().detach().cpu()
@@ -957,12 +1052,17 @@ class DecoderStructureRefinement(nn.Module):
                         ).detach().cpu()
                     ),
                 }
+        reliability_beta = (
+            self.reliability_beta.detach()
+            if self.reliability_beta is not None
+            else x.new_zeros(())
+        )
         diagnostics = {
             "structure_gate_old": structure_gate_old,
             "reliability_correction": reliability_correction,
             "gate_residual": gate_residual,
             "structure_gate_final": structure_gate,
-            "reliability_beta": self.reliability_beta.detach(),
+            "reliability_beta": reliability_beta,
             "structure_feat": structure_feat,
         }
         if self.capture_feature_tensors:
