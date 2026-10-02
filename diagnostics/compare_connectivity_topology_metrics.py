@@ -22,11 +22,13 @@ from config import get_config
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Compare segmentation and connectivity/topology metrics for two checkpoints."
+        description="Evaluate segmentation and topology metrics for one checkpoint or compare two checkpoints."
     )
     p.add_argument("--root_path", required=True)
-    p.add_argument("--baseline_model_path", required=True)
-    p.add_argument("--current_model_path", required=True)
+    p.add_argument("--model_path", default="", help="evaluate one checkpoint")
+    p.add_argument("--name", default="model", help="name used for single-checkpoint output")
+    p.add_argument("--baseline_model_path", default="")
+    p.add_argument("--current_model_path", default="")
     p.add_argument("--baseline_name", default="baseline")
     p.add_argument("--current_name", default="current")
     p.add_argument("--split", choices=("val", "test"), default="test")
@@ -80,7 +82,13 @@ def parse_args():
     p.add_argument("--tag", default="")
     p.add_argument("--eval", action="store_true")
     p.add_argument("--throughput", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.model_path:
+        if args.baseline_model_path or args.current_model_path:
+            p.error("Use --model_path alone, or provide both comparison checkpoint paths.")
+    elif not (args.baseline_model_path and args.current_model_path):
+        p.error("Provide --model_path, or provide both --baseline_model_path and --current_model_path.")
+    return args
 
 
 def zhang_suen_skeletonize(mask):
@@ -399,23 +407,27 @@ def main():
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    baseline_threshold = args.baseline_threshold if args.baseline_threshold is not None else args.threshold
-    current_threshold = args.current_threshold if args.current_threshold is not None else args.threshold
-    rows = [
-        evaluate(args.baseline_name, args.baseline_model_path, baseline_threshold, args, loader, device),
-        evaluate(args.current_name, args.current_model_path, current_threshold, args, loader, device),
-    ]
+    if args.model_path:
+        rows = [evaluate(args.name, args.model_path, args.threshold, args, loader, device)]
+    else:
+        baseline_threshold = args.baseline_threshold if args.baseline_threshold is not None else args.threshold
+        current_threshold = args.current_threshold if args.current_threshold is not None else args.threshold
+        rows = [
+            evaluate(args.baseline_name, args.baseline_model_path, baseline_threshold, args, loader, device),
+            evaluate(args.current_name, args.current_model_path, current_threshold, args, loader, device),
+        ]
     fields = list(rows[0].keys())
-    print("\nConnectivity/topology comparison")
+    print("\nConnectivity/topology metrics" if len(rows) == 1 else "\nConnectivity/topology comparison")
     for row in rows:
         print("\n" + row["name"])
         for key in fields:
             if key not in {"name", "checkpoint"}:
                 print(f"{key:38s} {row[key]}")
-    print("\nDelta current - baseline")
-    for key in fields:
-        if key not in {"name", "checkpoint", "threshold", "images"}:
-            print(f"{key:38s} {rows[1][key] - rows[0][key]:+.6f}")
+    if len(rows) == 2:
+        print("\nDelta current - baseline")
+        for key in fields:
+            if key not in {"name", "checkpoint", "threshold", "images"}:
+                print(f"{key:38s} {rows[1][key] - rows[0][key]:+.6f}")
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
     with open(args.output_csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
