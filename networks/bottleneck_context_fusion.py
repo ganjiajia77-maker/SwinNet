@@ -6,12 +6,33 @@ import torch.nn.functional as F
 class CenterDilatedConvBlock(nn.Module):
     """D-LinkNet style center block with cascaded dilated convolutions."""
 
-    def __init__(self, channels, dilations=(1, 2, 4, 8)):
+    def __init__(self, channels, dilations=(1, 2, 4, 8), input_resolution=None):
         super().__init__()
-        self.convs = nn.ModuleList([
-            nn.Conv2d(channels, channels, kernel_size=3, padding=d, dilation=d, bias=True)
-            for d in dilations
-        ])
+        height, width = input_resolution or (None, None)
+        self.convs = nn.ModuleList()
+        for dilation in dilations:
+            # If both dimensions are no larger than the dilation, every
+            # off-center sample is padding-only. A 1x1 convolution is exactly
+            # equivalent to the center coefficient of the 3x3 dilated kernel.
+            center_only = (
+                height is not None
+                and width is not None
+                and height <= dilation
+                and width <= dilation
+            )
+            kernel_size = 1 if center_only else 3
+            padding = 0 if center_only else dilation
+            actual_dilation = 1 if center_only else dilation
+            self.convs.append(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=kernel_size,
+                    padding=padding,
+                    dilation=actual_dilation,
+                    bias=True,
+                )
+            )
 
     def forward(self, x):
         out = x
@@ -58,7 +79,10 @@ class GlobalLocalContextFusion(nn.Module):
         super().__init__()
         self.channels = channels
         self.input_resolution = input_resolution
-        self.local_context = CenterDilatedConvBlock(channels)
+        self.local_context = CenterDilatedConvBlock(
+            channels,
+            input_resolution=input_resolution,
+        )
         self.fusion = AttentionalFeatureFusion(channels, reduction=reduction)
         self.out_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
 

@@ -1231,7 +1231,8 @@ class SwinTransformerSys(nn.Module):
     """
 
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
-                 embed_dim=96, depths=[2, 2, 2, 2], num_heads=[3, 6, 12, 24],
+                 embed_dim=96, depths=[2, 2, 2, 2], decoder_depths=None,
+                 num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
@@ -1271,6 +1272,16 @@ class SwinTransformerSys(nn.Module):
 
         self.num_classes = num_classes
         self.num_layers = len(depths)
+        if decoder_depths is None:
+            decoder_depths = [2] * (self.num_layers - 1)
+        if len(decoder_depths) != self.num_layers - 1:
+            raise ValueError(
+                "decoder_depths must define one depth for each upsampling stage "
+                f"(expected {self.num_layers - 1}, got {len(decoder_depths)})"
+            )
+        self.decoder_depths = tuple(int(depth) for depth in decoder_depths)
+        if any(depth < 0 for depth in self.decoder_depths):
+            raise ValueError("decoder_depths must be non-negative")
         self.embed_dim = embed_dim
         self.ape = ape
         self.patch_norm = patch_norm
@@ -1407,6 +1418,13 @@ class SwinTransformerSys(nn.Module):
         # build decoder layers
         self.layers_up = nn.ModuleList()
         self.concat_back_dim = nn.ModuleList()
+        print(
+            "[INFO] Decoder Swin depths by resolution (16/32/64): {} ({} blocks)".format(
+                self.decoder_depths,
+                sum(self.decoder_depths),
+            ),
+            flush=True,
+        )
         for i_layer in range(self.num_layers):
             concat_linear = nn.Linear(2 * int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
                                       int(embed_dim * 2 ** (
@@ -1417,18 +1435,27 @@ class SwinTransformerSys(nn.Module):
                                       patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
                     dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2, norm_layer=norm_layer)
             else:
+                decoder_stage_index = i_layer - 1
+                encoder_stage_index = self.num_layers - 1 - i_layer
+                decoder_depth = self.decoder_depths[decoder_stage_index]
+                if decoder_depth > depths[encoder_stage_index]:
+                    raise ValueError(
+                        "decoder depth cannot exceed its corresponding encoder "
+                        f"depth: decoder stage {decoder_stage_index} requests "
+                        f"{decoder_depth}, encoder stage has {depths[encoder_stage_index]}"
+                    )
+                drop_path_start = sum(depths[:encoder_stage_index])
                 layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
                                          input_resolution=(
                                          patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
                                          patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
-                                         depth=depths[(self.num_layers - 1 - i_layer)],
+                                         depth=decoder_depth,
                                          num_heads=num_heads[(self.num_layers - 1 - i_layer)],
                                          window_size=window_size,
                                          mlp_ratio=self.mlp_ratio,
                                          qkv_bias=qkv_bias, qk_scale=qk_scale,
                                          drop=drop_rate, attn_drop=attn_drop_rate,
-                                         drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
-                                             depths[:(self.num_layers - 1 - i_layer) + 1])],
+                                         drop_path=dpr[drop_path_start:drop_path_start + decoder_depth],
                                          norm_layer=norm_layer,
                                          upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
                                          use_checkpoint=use_checkpoint,

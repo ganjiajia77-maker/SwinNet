@@ -1342,6 +1342,18 @@ if __name__ == "__main__":
                 continue
             if model_state[key].shape != value.shape:
                 if (
+                    key.endswith("bottleneck_context_fusion.local_context.convs.3.weight")
+                    and value.ndim == model_state[key].ndim == 4
+                    and value.shape[:2] == model_state[key].shape[:2]
+                    and value.shape[-2:] == (3, 3)
+                    and model_state[key].shape[-2:] == (1, 1)
+                ):
+                    compatible[key] = value[:, :, 1:2, 1:2].to(
+                        device=model_state[key].device,
+                        dtype=model_state[key].dtype,
+                    )
+                    continue
+                if (
                     key.endswith("feature_residual.0.weight")
                     and model_state[key].ndim == value.ndim == 4
                     and model_state[key].shape[0] == value.shape[0]
@@ -1478,6 +1490,21 @@ if __name__ == "__main__":
                     skipped_removed_keys.append(key)
                     continue
                 if value.shape != model_state[key].shape:
+                    if (
+                        key.endswith("bottleneck_context_fusion.local_context.convs.3.weight")
+                        and value.ndim == model_state[key].ndim == 4
+                        and value.shape[:2] == model_state[key].shape[:2]
+                        and value.shape[-2:] == (3, 3)
+                        and model_state[key].shape[-2:] == (1, 1)
+                    ):
+                        filtered_checkpoint_state[key] = value[:, :, 1:2, 1:2].to(
+                            device=model_state[key].device,
+                            dtype=model_state[key].dtype,
+                        )
+                        skipped_shape_keys.append(
+                            key + " (copied dilation-8 center kernel)"
+                        )
+                        continue
                     if (
                         key.endswith("connectivity_head.prior_embed.0.weight")
                         and value.ndim == model_state[key].ndim == 4

@@ -241,6 +241,17 @@ def load_topology_checkpoint_state(
     filtered_state_dict = {}
     skipped_obsolete_keys = []
     skipped_shape_keys = []
+    decoder_model = getattr(model, "swin_unet", model)
+
+    def is_removed_decoder_block_key(key):
+        prefix = "swin_unet.layers_up.1.blocks."
+        if not key.startswith(prefix):
+            return False
+        block_segment = key[len(prefix):].split(".", 1)[0]
+        if not block_segment.isdigit():
+            return False
+        return int(block_segment) >= len(decoder_model.layers_up[1].blocks)
+
     for key, value in state_dict.items():
         if (
             key not in model_state
@@ -253,9 +264,27 @@ def load_topology_checkpoint_state(
                 or key.startswith(removed_direction_gate_prefixes)
                 or key.startswith(removed_model_prefixes)
                 or key.startswith(highres_structure_missing_prefixes)
+                or is_removed_decoder_block_key(key)
             )
         ):
             skipped_obsolete_keys.append(key)
+            continue
+        if (
+            key in model_state
+            and hasattr(value, "shape")
+            and value.shape != model_state[key].shape
+            and key.endswith("bottleneck_context_fusion.local_context.convs.3.weight")
+            and value.ndim == model_state[key].ndim == 4
+            and value.shape[:2] == model_state[key].shape[:2]
+            and value.shape[-2:] == (3, 3)
+            and model_state[key].shape[-2:] == (1, 1)
+        ):
+            center_weight = value[:, :, 1:2, 1:2].to(
+                device=model_state[key].device,
+                dtype=model_state[key].dtype,
+            )
+            filtered_state_dict[key] = center_weight
+            skipped_shape_keys.append(key + " (copied dilation-8 center kernel)")
             continue
         if (
             key in model_state
@@ -569,6 +598,11 @@ class SwinUnet(nn.Module):
                                 num_classes=self.num_classes,
                                 embed_dim=config.MODEL.SWIN.EMBED_DIM,
                                 depths=config.MODEL.SWIN.DEPTHS,
+                                decoder_depths=getattr(
+                                    config.MODEL.SWIN,
+                                    "DECODER_DEPTHS",
+                                    [2, 2, 2],
+                                ),
                                 num_heads=config.MODEL.SWIN.NUM_HEADS,
                                 window_size=config.MODEL.SWIN.WINDOW_SIZE,
                                 mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
