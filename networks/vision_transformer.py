@@ -198,6 +198,13 @@ def load_topology_checkpoint_state(
         "swin_unet.decoder_structure_blocks.3.directional_embedding.",
         "swin_unet.stage2_topology_source.directional_embedding.",
     )
+    removed_direction_head_prefixes = (
+        "swin_unet.decoder_structure_blocks.0.direction_head.",
+        "swin_unet.decoder_structure_blocks.1.direction_head.",
+        "swin_unet.decoder_structure_blocks.2.direction_head.",
+        "swin_unet.decoder_structure_blocks.3.direction_head.",
+        "swin_unet.stage2_topology_source.direction_head.",
+    )
     removed_surface_uncertainty_prefixes = (
         "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
         "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
@@ -221,6 +228,7 @@ def load_topology_checkpoint_state(
                 key.endswith(obsolete_unexpected_suffixes)
                 or key.startswith(obsolete_unexpected_prefixes)
                 or key.startswith(removed_direction_embedding_prefixes)
+                or key.startswith(removed_direction_head_prefixes)
                 or key.startswith(removed_surface_uncertainty_prefixes)
                 or key.startswith(removed_model_prefixes)
                 or key.startswith(highres_structure_missing_prefixes)
@@ -418,7 +426,7 @@ def load_topology_checkpoint_state(
         "swin_unet.guided_head.final_topology_attention.",
         "swin_unet.guided_head.structure_fusion.",
         "swin_unet.guided_head.structure_residual.",
-    ) + removed_direction_embedding_prefixes + removed_surface_uncertainty_prefixes + removed_model_prefixes
+    ) + removed_direction_embedding_prefixes + removed_direction_head_prefixes + removed_surface_uncertainty_prefixes + removed_model_prefixes
     if strict:
         result = model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
