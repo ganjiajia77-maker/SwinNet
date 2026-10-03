@@ -3,7 +3,15 @@ import os
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
+
+
+def set_dataset_epoch(dataset, epoch):
+    """Update the underlying dataset even when training uses a Subset."""
+    while isinstance(dataset, Subset):
+        dataset = dataset.dataset
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
 
 
 class RoadSkeletonDataset(Dataset):
@@ -37,7 +45,9 @@ class RoadSkeletonDataset(Dataset):
         self.random_crop_train = bool(random_crop_train and split == "train")
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
-        self.epoch = 0
+        # Persistent workers keep their own dataset objects. A shared CPU
+        # tensor makes the current epoch visible to both fork and spawn workers.
+        self._shared_epoch = torch.zeros((), dtype=torch.int64, device="cpu").share_memory_()
 
         self.image_dir = self._resolve_image_dir(root_dir, split)
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -77,8 +87,13 @@ class RoadSkeletonDataset(Dataset):
             positions.append(last)
         return positions
 
+    @property
+    def epoch(self):
+        return int(self._shared_epoch.item())
+
     def set_epoch(self, epoch):
-        self.epoch = int(epoch)
+        # Call before iterating the loader, after the preceding epoch finishes.
+        self._shared_epoch.fill_(int(epoch))
 
     def _load_crop_list(self, crop_list_path):
         if not crop_list_path:
@@ -332,7 +347,7 @@ class RoadSkeletonDataset(Dataset):
                 + image_index * 9176
                 + crop_ordinal * 101
             )
-            rng = np.random.RandomState(rng_seed)
+            rng = np.random.RandomState(rng_seed % (2 ** 32))
             tile_position = None
         elif self.tile_positions is None:
             image_index = idx

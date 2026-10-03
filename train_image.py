@@ -26,7 +26,7 @@ from networks.vision_transformer import (
     load_topology_checkpoint_state,
     print_topology_coefficients,
 )
-from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from datasets.dataset_road_skeleton import RoadSkeletonDataset, set_dataset_epoch
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
@@ -56,7 +56,7 @@ parser.add_argument('--img_size', type=int, default=512, help='model input tile 
 parser.add_argument('--source_patch_size', type=int, default=1024, help='full source image size')
 parser.add_argument('--overlap_stride', type=int, default=256, help='fixed training/validation tile stride')
 parser.add_argument('--direct_resize_train', action='store_true', help='resize the full source patch directly to img_size for training')
-parser.add_argument('--random_crop_train', action='store_true', help='randomly sample native train crops instead of fixed tiles')
+parser.add_argument('--random_crop_train', action=argparse.BooleanOptionalAction, default=True, help='randomly sample native train crops; enabled by default (1024 -> one 512 crop per image per epoch)')
 parser.add_argument('--random_crops_per_image', type=int, default=1, help='random train crops sampled per source image each epoch')
 parser.add_argument('--val_crop_list', type=str, default='', help='fixed validation crop list: one line per crop, image: x=..., y=...')
 parser.add_argument('--min_crop_road_pixels', type=int, default=0, help='retained for run metadata; fixed tiles are never filtered')
@@ -249,8 +249,8 @@ parser.add_argument(
     '--amp_dtype',
     type=str,
     choices=['bfloat16', 'none'],
-    default='bfloat16',
-    help='automatic mixed precision dtype; defaults to BF16 on CUDA',
+    default='none',
+    help='automatic mixed precision dtype; defaults to FP32',
 )
 parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
@@ -578,13 +578,21 @@ def inherit_resume_architecture_args(args):
         ("stage_skeleton_mode", str),
         ("stage_skeleton_bias_init", str),
         ("stage_skeleton_positive_prior", float),
+        ("random_crops_per_image", int),
     ):
         if name in saved_args and not _cli_has(f"--{name}"):
             setattr(args, name, cast(saved_args[name]))
     if "structure_profile" in saved_args and not _cli_has("--structure_profile"):
         args.structure_profile = saved_args["structure_profile"]
-    if "direct_resize_train" in saved_args and not _cli_has("--direct_resize_train"):
+    if "direct_resize_train" in saved_args and not (
+        _cli_has("--direct_resize_train") or _cli_has("--random_crop_train")
+    ):
         args.direct_resize_train = bool(saved_args["direct_resize_train"])
+    if "random_crop_train" in saved_args and not (
+        _cli_has("--random_crop_train") or _cli_has("--no-random_crop_train")
+        or _cli_has("--direct_resize_train")
+    ):
+        args.random_crop_train = bool(saved_args["random_crop_train"])
     if "img_size" in saved_args and not _cli_has("--img_size"):
         args.img_size = int(saved_args["img_size"])
     if "source_patch_size" in saved_args and not _cli_has("--source_patch_size"):
@@ -625,7 +633,7 @@ def inherit_resume_architecture_args(args):
     print(
         "[INFO] Resume architecture args: "
         f"profile={args.structure_profile}, "
-        f"direct_resize_train={args.direct_resize_train}, "
+        f"direct_resize_train={args.direct_resize_train}, random_crop_train={args.random_crop_train}, "
         f"img_size={args.img_size}, source_patch_size={args.source_patch_size}, "
         f"highres_structure={args.enable_highres_structure_stream}, "
         f"global_topology={args.enable_global_topology}",
@@ -1188,6 +1196,15 @@ if __name__ == "__main__":
     training_log_path = os.path.join(args.output_dir, 'training_log.txt')  # 统一日志文件
     
     inherit_resume_architecture_args(args)
+    if args.direct_resize_train:
+        if _cli_has("--random_crop_train"):
+            parser.error("--random_crop_train and --direct_resize_train are mutually exclusive")
+        args.random_crop_train = False
+    if args.random_crop_train:
+        if args.random_crops_per_image < 1:
+            parser.error("--random_crops_per_image must be at least 1")
+        if args.img_size > args.source_patch_size:
+            parser.error("random native crops require --img_size <= --source_patch_size")
     apply_structure_profile_defaults(args)
 
     # 加载配置
@@ -1403,6 +1420,14 @@ if __name__ == "__main__":
         print(
             f"[INFO] Tiny overfit mode: using first {tiny_count} training samples; "
             "train shuffle disabled.",
+            flush=True,
+        )
+    if args.random_crop_train:
+        print(
+            "[INFO] Random crop epochs are shared with DataLoader workers: "
+            f"source={args.source_patch_size}, crop={args.img_size}, "
+            f"crops/image/epoch={args.random_crops_per_image}; "
+            "crop and augmentation RNG refresh each epoch.",
             flush=True,
         )
     loader_kwargs = {}
@@ -1847,8 +1872,7 @@ if __name__ == "__main__":
 
         global_train_step = 0
         for epoch in range(start_epoch, end_epoch):
-            if hasattr(train_dataset, "set_epoch"):
-                train_dataset.set_epoch(epoch)
+            set_dataset_epoch(train_dataset, epoch)
             current_lr = get_cosine_warmup_lr(
                 epoch, args.max_epochs, args.new_lr, args.new_min_lr, args.warmup_epochs
             )
