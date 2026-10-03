@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -34,19 +33,12 @@ def _cli_has(flag_name):
         or argument.startswith(flag + "=")
         for argument in sys.argv[1:]
     )
-from losses.road_losses import binary_metrics_from_logits
 from config import get_config
-from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
+from networks.checkpoint_compat import adapt_connectivity_modules_for_checkpoint
 
 
 def compute_metrics_all_samples(logits_list, targets_list, threshold):
-    all_metrics = {
-        'iou': [],
-        'f1': [],
-        'precision': [],
-        'recall': [],
-    }
-    
+    tp = fp = fn = 0
     for logits, targets in zip(logits_list, targets_list):
         if targets.shape[-2:] != logits.shape[-2:]:
             targets = F.interpolate(
@@ -54,17 +46,18 @@ def compute_metrics_all_samples(logits_list, targets_list, threshold):
                 size=logits.shape[-2:],
                 mode='nearest',
             )
-        metrics = binary_metrics_from_logits(logits, targets, threshold=threshold)
-        all_metrics['iou'].append(metrics['iou'])
-        all_metrics['f1'].append(metrics['f1'])
-        all_metrics['precision'].append(metrics['precision'])
-        all_metrics['recall'].append(metrics['recall'])
-    
+        prediction = torch.sigmoid(logits) >= threshold
+        target = targets > 0.5
+        tp += int((prediction & target).sum().item())
+        fp += int((prediction & ~target).sum().item())
+        fn += int((~prediction & target).sum().item())
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
     return {
-        'iou': np.mean(all_metrics['iou']),
-        'f1': np.mean(all_metrics['f1']),
-        'precision': np.mean(all_metrics['precision']),
-        'recall': np.mean(all_metrics['recall']),
+        'iou': tp / (tp + fp + fn + 1e-8),
+        'f1': 2 * precision * recall / (precision + recall + 1e-8),
+        'precision': precision,
+        'recall': recall,
     }
 
 
@@ -87,6 +80,56 @@ def select_skeleton_logits(outputs):
     return None, "none"
 
 
+def stitch_overlap_logits(model, image, tile_size=512, stride=256):
+    """Fuse native-resolution tiles using the validation/test logit weights."""
+    height, width = image.shape[-2:]
+    surface_canvas = image.new_zeros((1, 1, height, width))
+    surface_weights = image.new_zeros((1, 1, height, width))
+    skeleton_canvas = image.new_zeros((1, 1, height, width))
+    skeleton_weights = image.new_zeros((1, 1, height, width))
+    weights_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=image.device).abs()
+    weights_1d = (1.0 - weights_1d).clamp_min(0.1)
+    tile_weight = (weights_1d[:, None] * weights_1d[None, :]).view(1, 1, tile_size, tile_size)
+    positions = RoadSkeletonDataset.sliding_positions
+    skeleton_source = None
+
+    for top in positions(height, tile_size, stride):
+        for left in positions(width, tile_size, stride):
+            tile = image[:, :, top:top + tile_size, left:left + tile_size]
+            tile_height, tile_width = tile.shape[-2:]
+            if (tile_height, tile_width) != (tile_size, tile_size):
+                tile = F.pad(tile, (0, tile_size - tile_width, 0, tile_size - tile_height))
+            outputs = model(tile)
+            if not isinstance(outputs, tuple):
+                raise RuntimeError("Structure-guided threshold sweep requires auxiliary outputs.")
+            surface_logits = outputs[0][:, :, :tile_height, :tile_width]
+            skeleton_logits, source = select_skeleton_logits(outputs)
+            weight = tile_weight[:, :, :tile_height, :tile_width]
+            surface_canvas[:, :, top:top + tile_height, left:left + tile_width] += surface_logits * weight
+            surface_weights[:, :, top:top + tile_height, left:left + tile_width] += weight
+            if skeleton_logits is not None:
+                if skeleton_logits.shape[-2:] != (tile_size, tile_size):
+                    skeleton_logits = F.interpolate(
+                        skeleton_logits, size=(tile_size, tile_size),
+                        mode="bilinear", align_corners=False,
+                    )
+                skeleton_canvas[:, :, top:top + tile_height, left:left + tile_width] += (
+                    skeleton_logits[:, :, :tile_height, :tile_width] * weight
+                )
+                skeleton_weights[:, :, top:top + tile_height, left:left + tile_width] += weight
+                skeleton_source = source
+
+    if surface_weights.min().item() <= 0:
+        raise RuntimeError("Threshold sweep left uncovered pixels in the image.")
+    surface_logits = surface_canvas / surface_weights
+    skeleton_logits = None
+    if skeleton_source is not None:
+        if skeleton_weights.min().item() <= 0:
+            raise RuntimeError("Threshold sweep left uncovered skeleton pixels.")
+        skeleton_logits = skeleton_canvas / skeleton_weights
+    return surface_logits, skeleton_logits, skeleton_source
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root_path', type=str, default='./data1')
@@ -98,6 +141,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--img_size', type=int, default=256)
     parser.add_argument('--source_patch_size', type=int, default=1024)
+    parser.add_argument('--overlap_infer', action='store_true', help='sweep thresholds on stitched full-image logits')
+    parser.add_argument('--overlap_stride', type=int, default=256)
     parser.add_argument('--final_topology_eta_init', type=float, default=0.005)
     parser.add_argument('--final_gap_rho_init', type=float, default=0.005)
     parser.add_argument(
@@ -183,6 +228,10 @@ def main():
     parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
+    if args.overlap_infer and args.crop_list:
+        parser.error('--overlap_infer and --crop_list cannot be combined')
+    if args.overlap_infer and args.overlap_stride <= 0:
+        parser.error('--overlap_stride must be positive')
     
     checkpoint = None
     if os.path.exists(args.model_path):
@@ -302,8 +351,9 @@ def main():
     val_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split=args.split,
-        image_size=args.img_size,
+        image_size=None if args.overlap_infer else args.img_size,
         source_patch_size=args.source_patch_size,
+        return_full_image=args.overlap_infer,
         crop_list_path=args.crop_list,
     )
     val_loader = DataLoader(
@@ -321,26 +371,31 @@ def main():
     all_skeleton_targets = []
     skeleton_source = None
     
+    if args.overlap_infer:
+        print(f'Sweep mode: full-image {args.img_size} tiles, stride={args.overlap_stride}, weighted logit stitching')
     with torch.no_grad():
         for batch in tqdm(val_loader, desc='Inference'):
             images = batch["image"].to(device)
             masks = batch["mask"].to(device)
-            
-            outputs = model(images)
-            
-            if isinstance(outputs, tuple):
-                surface_logits = outputs[0]
-                skeleton_logits, current_skeleton_source = select_skeleton_logits(outputs)
+            for image_index in range(images.shape[0]):
+                image = images[image_index:image_index + 1]
+                if args.overlap_infer:
+                    surface_logits, skeleton_logits, current_skeleton_source = stitch_overlap_logits(
+                        model, image, tile_size=args.img_size, stride=args.overlap_stride,
+                    )
+                else:
+                    outputs = model(image)
+                    if not isinstance(outputs, tuple):
+                        raise RuntimeError("Structure-guided threshold sweep requires auxiliary outputs.")
+                    surface_logits = outputs[0]
+                    skeleton_logits, current_skeleton_source = select_skeleton_logits(outputs)
                 if skeleton_logits is not None and skeleton_source is None:
                     skeleton_source = current_skeleton_source
-            else:
-                raise RuntimeError("Structure-guided threshold sweep requires auxiliary outputs.")
-            
-            all_surface_logits.append(surface_logits.cpu())
-            all_surface_targets.append(masks.cpu())
-            if skeleton_logits is not None:
-                all_skeleton_logits.append(skeleton_logits.cpu())
-                all_skeleton_targets.append(batch["skeleton"].cpu())
+                all_surface_logits.append(surface_logits.cpu())
+                all_surface_targets.append(masks[image_index:image_index + 1].cpu())
+                if skeleton_logits is not None:
+                    all_skeleton_logits.append(skeleton_logits.cpu())
+                    all_skeleton_targets.append(batch["skeleton"][image_index:image_index + 1].cpu())
     
     print('Inference complete')
     if skeleton_source is not None:
@@ -397,7 +452,7 @@ def main():
     if all_skeleton_logits:
         print('SKELETON ({}) - THRESHOLD SWEEP'.format(skeleton_source))
     else:
-        print('FINAL SKELETON (256x256) - SKIPPED (final skeleton head disabled)')
+        print('SKELETON - SKIPPED (no skeleton logits)')
     print('='*80)
     if all_skeleton_logits:
         print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format(

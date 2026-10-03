@@ -1196,6 +1196,8 @@ if __name__ == "__main__":
     training_log_path = os.path.join(args.output_dir, 'training_log.txt')  # 统一日志文件
     
     inherit_resume_architecture_args(args)
+    if not args.resume:
+        print("[INFO] Fresh run: no previous training arguments inherited.", flush=True)
     if args.direct_resize_train:
         if _cli_has("--random_crop_train"):
             parser.error("--random_crop_train and --direct_resize_train are mutually exclusive")
@@ -1745,6 +1747,8 @@ if __name__ == "__main__":
             f"short_area<{args.trend_val_short_area_threshold}",
             flush=True,
         )
+    else:
+        print("  Trend validation: disabled", flush=True)
     if args.resume:
         print(f"  从checkpoint恢复: {args.resume}")
         print(f"  起始epoch: {start_epoch}")
