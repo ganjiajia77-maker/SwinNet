@@ -32,6 +32,7 @@ def parse_args():
     run.add_argument("--img_size", type=int, default=256)
     run.add_argument("--source_patch_size", type=int, default=1024)
     run.add_argument("--warmup_iters", type=int, default=10)
+    run.add_argument("--short_area_threshold", type=int, default=20)
     run.add_argument("--apls_max_nodes", type=int, default=64)
     run.add_argument("--apls_snap_radius", type=float, default=5.0)
     run.add_argument("--output_dir", required=True)
@@ -298,21 +299,77 @@ def load_sample(image_path, label_path, source_side, image_side):
     return image, mask
 
 
+def zhang_suen_skeletonize(mask):
+    image = mask.astype(np.uint8).copy()
+    height, width = image.shape
+    while True:
+        changed = False
+        for phase in (0, 1):
+            remove = []
+            for y in range(1, height - 1):
+                for x in range(1, width - 1):
+                    if image[y, x] == 0:
+                        continue
+                    p2, p3, p4 = image[y - 1, x], image[y - 1, x + 1], image[y, x + 1]
+                    p5, p6, p7 = image[y + 1, x + 1], image[y + 1, x], image[y + 1, x - 1]
+                    p8, p9 = image[y, x - 1], image[y - 1, x - 1]
+                    neighbors = [p2, p3, p4, p5, p6, p7, p8, p9]
+                    count = sum(neighbors)
+                    transitions = sum(
+                        first == 0 and second == 1
+                        for first, second in zip(neighbors, neighbors[1:] + neighbors[:1])
+                    )
+                    if not (2 <= count <= 6 and transitions == 1):
+                        continue
+                    if phase == 0:
+                        keep_clear = p2 * p4 * p6 == 0 and p4 * p6 * p8 == 0
+                    else:
+                        keep_clear = p2 * p4 * p8 == 0 and p2 * p6 * p8 == 0
+                    if keep_clear:
+                        remove.append((y, x))
+            if remove:
+                changed = True
+                for y, x in remove:
+                    image[y, x] = 0
+        if not changed:
+            return image.astype(bool)
+
+
 def skeletonize(mask):
-    image = mask.astype(np.uint8) * 255
-    skeleton = np.zeros_like(image)
-    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    while cv2.countNonZero(image):
-        eroded = cv2.erode(image, element)
-        opened = cv2.dilate(eroded, element)
-        skeleton = cv2.bitwise_or(skeleton, cv2.subtract(image, opened))
-        image = eroded
-    return skeleton > 0
+    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
+        return cv2.ximgproc.thinning(
+            mask.astype(np.uint8) * 255,
+            thinningType=cv2.ximgproc.THINNING_ZHANGSUEN,
+        ) > 127
+    return zhang_suen_skeletonize(mask)
 
 
 def component_count(mask):
     count, _ = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
     return max(int(count) - 1, 0)
+
+
+def component_stats(mask, short_area_threshold):
+    count, _, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    areas = stats[1:, cv2.CC_STAT_AREA] if count > 1 else np.empty(0, dtype=np.int64)
+    total = float(areas.sum())
+    largest = float(areas.max()) if areas.size else 0.0
+    return {
+        "components": float(max(count - 1, 0)),
+        "short_components": float((areas < short_area_threshold).sum()) if areas.size else 0.0,
+        "largest_ratio": largest / (total + 1e-8),
+    }
+
+
+def max_component_area(mask):
+    count, _, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return 0.0
+    return float(stats[1:, cv2.CC_STAT_AREA].max())
 
 
 def graph_from_skeleton(skeleton):
@@ -380,26 +437,41 @@ def approximate_apls(gt_skeleton, pred_skeleton, maximum, snap_radius):
     return float(np.mean(scores)) if scores else 0.0
 
 
-def topology_metrics(pred, gt, apls_max_nodes, apls_snap_radius):
+def topology_metrics(pred, gt, apls_max_nodes, apls_snap_radius, short_area_threshold):
     pred_skel = skeletonize(pred)
     gt_skel = skeletonize(gt)
-    pred_skel_n = int(pred_skel.sum())
-    gt_skel_n = int(gt_skel.sum())
+    pred_skel_n = float(pred_skel.sum())
+    gt_skel_n = float(gt_skel.sum())
     topo_precision = float((pred_skel & gt).sum()) / (pred_skel_n + 1e-8)
     topo_recall = float((gt_skel & pred).sum()) / (gt_skel_n + 1e-8)
-    cldice = 2.0 * topo_precision * topo_recall / (topo_precision + topo_recall + 1e-8)
+    topo_f1 = 2.0 * topo_precision * topo_recall / (topo_precision + topo_recall + 1e-8)
     missing = gt_skel & ~pred
-    pred_components = component_count(pred)
-    gt_components = component_count(gt)
+    pred_stats = component_stats(pred, short_area_threshold)
+    gt_stats = component_stats(gt, short_area_threshold)
+    pred_components = pred_stats["components"]
+    gt_components = gt_stats["components"]
+    apls = approximate_apls(gt_skel, pred_skel, apls_max_nodes, apls_snap_radius)
     return {
-        "cldice": cldice,
+        "cldice": topo_f1,
+        "topo_precision": topo_precision,
+        "topo_recall": topo_recall,
+        "topo_f1": topo_f1,
+        "pred_skeleton_pixels": pred_skel_n,
+        "gt_skeleton_pixels": gt_skel_n,
+        "pred_components": pred_components,
+        "fragment_density_per_1000_px": 1000.0 * pred_components / (float(pred.sum()) + 1e-8),
+        "largest_component_ratio": pred_stats["largest_ratio"],
+        "short_pred_components": pred_stats["short_components"],
+        "gt_components": gt_components,
+        "extra_components": max(pred_components - gt_components, 0.0),
+        "false_positive_components": float(component_count(pred & ~gt)),
         "break_pixels": int(missing.sum()),
         "break_rate": float(missing.sum()) / (gt_skel_n + 1e-8),
         "gap_components": component_count(missing),
-        "pred_components": pred_components,
-        "gt_components": gt_components,
         "frag_idx": pred_components / max(gt_components, 1),
-        "apls_approx": approximate_apls(gt_skel, pred_skel, apls_max_nodes, apls_snap_radius),
+        "max_gap_pixels": max_component_area(missing),
+        "apls": apls,
+        "apls_approx": apls,
     }
 
 
@@ -455,7 +527,13 @@ def run_eval(args):
             totals["tp"] += tp
             totals["fp"] += fp
             totals["fn"] += fn
-            metrics = topology_metrics(pred, gt, args.apls_max_nodes, args.apls_snap_radius)
+            metrics = topology_metrics(
+                pred,
+                gt,
+                args.apls_max_nodes,
+                args.apls_snap_radius,
+                args.short_area_threshold,
+            )
             case_name = Path(image_path.name).stem.replace("_sat", "")
             records.append({
                 "case_name": case_name,
@@ -479,16 +557,32 @@ def run_eval(args):
         "global_f1": 2.0 * precision * recall / (precision + recall + 1e-8),
         "global_precision": precision,
         "global_recall": recall,
+        "iou": totals["tp"] / (totals["tp"] + totals["fp"] + totals["fn"] + 1e-8),
+        "f1": 2.0 * precision * recall / (precision + recall + 1e-8),
+        "precision": precision,
+        "recall": recall,
         "mean_cldice": float(np.mean([row["cldice"] for row in records])),
         "mean_break_rate": float(np.mean([row["break_rate"] for row in records])),
         "mean_gap_components": float(np.mean([row["gap_components"] for row in records])),
         "mean_frag_idx": float(np.mean([row["frag_idx"] for row in records])),
         "mean_apls_approx": float(np.mean([row["apls_approx"] for row in records])),
+        "short_area_threshold": args.short_area_threshold,
+        "apls": float(np.mean([row["apls"] for row in records])),
+        **{
+            key: float(np.mean([row[key] for row in records]))
+            for key in (
+                "cldice", "topo_precision", "topo_recall", "topo_f1",
+                "pred_components", "fragment_density_per_1000_px",
+                "largest_component_ratio", "short_pred_components",
+                "extra_components", "false_positive_components", "break_pixels",
+                "break_rate", "gap_components", "max_gap_pixels",
+            )
+        },
         "forward_wall_ms_mean": float(np.mean(latencies)),
         "forward_wall_ms_median": float(np.median(latencies)),
         "forward_wall_ms_p90": float(np.percentile(latencies, 90)),
         "timing_scope": "H2D copy plus synchronized model forward; includes P64 selection/gather/sparse compute/scatter when enabled; excludes disk decode and CPU topology metrics.",
-        "skeleton_method": "OpenCV morphological skeleton; identical script/definition for both runs.",
+        "skeleton_method": "Zhang-Suen thinning (OpenCV ximgproc when available; matching fallback otherwise).",
     }
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -522,8 +616,11 @@ def compare_reports(args):
             f"only baseline={missing_from_current[:5]}, only current={missing_from_baseline[:5]}"
         )
     metrics = (
-        "cldice", "break_rate", "gap_components", "frag_idx", "apls_approx",
-        "forward_wall_ms",
+        "cldice", "topo_precision", "topo_recall", "topo_f1",
+        "pred_components", "fragment_density_per_1000_px",
+        "largest_component_ratio", "short_pred_components", "extra_components",
+        "false_positive_components", "break_pixels", "break_rate",
+        "gap_components", "max_gap_pixels", "apls", "forward_wall_ms",
     )
     paired = []
     for case in sorted(baseline):
