@@ -849,12 +849,15 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, road_prior=None):
+    def forward_blocks(self, x, road_prior=None):
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, None, None, None, None, road_prior)
             else:
                 x = blk(x, road_prior=road_prior)
+        return x
+
+    def forward_downsample(self, x):
         self.last_road_attention = None
         self.last_pre_downsample = x
         if self.downsample is not None:
@@ -873,6 +876,9 @@ class BasicLayer(nn.Module):
                 ),
             )
         return x
+
+    def forward(self, x, road_prior=None):
+        return self.forward_downsample(self.forward_blocks(x, road_prior=road_prior))
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
@@ -1541,7 +1547,7 @@ class SwinTransformerSys(nn.Module):
                         "(0626 profile; final connectivity removed)"
                     )
                 if self.enable_global_topology:
-                    print("[INFO] Global topology residual: anchors=R64*surface")
+                    print("[INFO] Global topology residual: anchors=encoder R64^2*surface")
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
@@ -1591,8 +1597,10 @@ class SwinTransformerSys(nn.Module):
         road_feature = None
 
         for i_layer, layer in enumerate(self.layers):
-            x_downsample.append(x)
-            x = layer(
+            # R64 skips carry the post-Swin exchange; the non-R64 path keeps its original skips.
+            if not self.enable_r64_stream and i_layer < self.num_layers - 1:
+                x_downsample.append(x)
+            x = layer.forward_blocks(
                 x,
                 road_prior=(
                     (stage1_road_attention, stage2_road_attention)
@@ -1601,15 +1609,19 @@ class SwinTransformerSys(nn.Module):
                 ),
             )
             if i_layer == 0 and self.enable_r64_stream:
-                e64 = token_to_map(layer.last_pre_downsample, *layer.input_resolution)
+                e64 = token_to_map(x, *layer.input_resolution)
                 road_feature = self.r64_seed(e64)
-                e32 = token_to_map(x, *self.layers[1].input_resolution)
+            elif i_layer == 1 and self.enable_r64_stream:
+                e32 = token_to_map(x, *layer.input_resolution)
                 road_feature, e32 = self.r64_e32_exchange(road_feature, e32)
                 x = map_to_token(e32)
-            elif i_layer == 1 and self.enable_r64_stream:
-                e16 = token_to_map(x, *self.layers[2].input_resolution)
+            elif i_layer == 2 and self.enable_r64_stream:
+                e16 = token_to_map(x, *layer.input_resolution)
                 road_feature, e16 = self.r64_e16_exchange(road_feature, e16)
                 x = map_to_token(e16)
+            if self.enable_r64_stream and i_layer < self.num_layers - 1:
+                x_downsample.append(x)
+            x = layer.forward_downsample(x)
             if i_layer == 0 and layer.last_road_attention is not None:
                 stage1_road_attention = layer.last_road_attention
                 road_attentions.append(
@@ -2041,7 +2053,7 @@ class SwinTransformerSys(nn.Module):
             for module, was_training in zip(prior_modules, prior_training):
                 module.train(was_training)
 
-    def up_x4(self, x, structure_outputs=None, road_feature=None):
+    def up_x4(self, x, structure_outputs=None, encoder_road_feature=None):
         H, W = self.patches_resolution
         B, L, C = x.shape
         assert L == H * W, "input features has wrong size"
@@ -2051,7 +2063,7 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                if self.enable_global_topology and road_feature is not None:
+                if self.enable_global_topology and encoder_road_feature is not None:
                     surface_prob = self._surface_prior_for_global_topology(
                         x,
                     )
@@ -2061,7 +2073,7 @@ class SwinTransformerSys(nn.Module):
                     ) = self._latest_local_topology_features(structure_outputs)
                     x = self.global_topology.forward_feature_anchors(
                         x,
-                        road_feature,
+                        encoder_road_feature,
                         surface_prob,
                         connectivity_feature=connectivity_feature,
                         direction_feature=direction_feature,
@@ -2093,19 +2105,19 @@ class SwinTransformerSys(nn.Module):
         self,
         x,
     ):
-        x, x_downsample, road_attentions, road_feature = self.forward_features(x)
-        x, structure_outputs, road_feature = self.forward_up_features(
+        x, x_downsample, road_attentions, encoder_road_feature = self.forward_features(x)
+        x, structure_outputs, _ = self.forward_up_features(
             x,
             x_downsample,
             bottleneck_tokens=x,
-            road_feature=road_feature,
+            road_feature=encoder_road_feature,
         )
         if self.return_skeleton and road_attentions:
             structure_outputs.extend(road_attentions)
         x = self.up_x4(
             x,
             structure_outputs=structure_outputs if self.return_skeleton else None,
-            road_feature=road_feature,
+            encoder_road_feature=encoder_road_feature,
         )
         if self.return_skeleton and isinstance(x, tuple):
             x = (*x, structure_outputs)

@@ -7,6 +7,6 @@ MODEL:
     FINAL_UPSAMPLE: "expand_first"
     EMBED_DIM: 96
     DEPTHS: [ 2, 2, 6, 2 ]
-    DECODER_DEPTHS: [ 2, 2, 2]
+    DECODER_DEPTHS: [ 6, 2, 2]
     NUM_HEADS: [ 3, 6, 12, 24 ]
     WINDOW_SIZE: 8
