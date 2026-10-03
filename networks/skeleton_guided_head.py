@@ -659,7 +659,7 @@ class DecoderStructureRefinement(nn.Module):
         context_channels=None,
         context_strength=0.03,
         enable_direct_feature_refinement=True,
-        skeleton_gradient_ratio=0.5,
+        skeleton_gradient_ratio=1.0,
         gate_topology_gradient_ratio=0.0,
         previous_structure_channels=None,
         external_structure_channels=None,
@@ -866,12 +866,12 @@ class DecoderStructureRefinement(nn.Module):
         direction_logits = self.direction_head(structure_feat)
         direction_alignment = self.connectivity_head.direction_alignment(
             direction_logits
-        ).detach()
+        )
         connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
             connectivity_feat,
             direction_alignment,
-            skeleton_prob=runtime_connectivity_skeleton.detach(),
+            skeleton_prob=runtime_connectivity_skeleton,
         )
 
         connectivity_prob = torch.sigmoid(connectivity_logits)

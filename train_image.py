@@ -139,8 +139,8 @@ parser.add_argument(
     action='store_true',
     help='freeze the loaded model and train only guided_head.post_refine_structure_interaction',
 )
-parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=0.5)
-parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=0.5)
+parser.add_argument('--stage2_skeleton_gradient_ratio', type=float, default=1.0)
+parser.add_argument('--stage3_skeleton_gradient_ratio', type=float, default=1.0)
 parser.add_argument(
     '--stage3_gate_topology_gradient_ratio',
     type=float,
