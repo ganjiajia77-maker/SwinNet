@@ -18,11 +18,12 @@ from config import get_config
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Compare segmentation and connectivity/topology metrics for two checkpoints."
+        description="Diagnose one checkpoint or compare two checkpoints on segmentation and topology metrics."
     )
     p.add_argument("--root_path", required=True)
-    p.add_argument("--baseline_model_path", required=True)
-    p.add_argument("--current_model_path", required=True)
+    p.add_argument("--model_path", help="single checkpoint to diagnose")
+    p.add_argument("--baseline_model_path", help="baseline checkpoint for comparison")
+    p.add_argument("--current_model_path", help="current checkpoint for comparison")
     p.add_argument("--baseline_name", default="baseline")
     p.add_argument("--current_name", default="current")
     p.add_argument("--split", choices=("val", "test"), default="test")
@@ -76,38 +77,44 @@ def parse_args():
     p.add_argument("--tag", default="")
     p.add_argument("--eval", action="store_true")
     p.add_argument("--throughput", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.model_path and (args.baseline_model_path or args.current_model_path):
+        p.error("--model_path cannot be combined with comparison checkpoint paths")
+    if not args.model_path and not (args.baseline_model_path and args.current_model_path):
+        p.error("provide --model_path, or both --baseline_model_path and --current_model_path")
+    return args
 
 
 def zhang_suen_skeletonize(mask):
     image = mask.astype(np.uint8).copy()
-    h, w = image.shape
     while True:
         changed = False
         for phase in (0, 1):
-            remove = []
-            for y in range(1, h - 1):
-                for x in range(1, w - 1):
-                    if image[y, x] == 0:
-                        continue
-                    p2, p3, p4 = image[y - 1, x], image[y - 1, x + 1], image[y, x + 1]
-                    p5, p6, p7 = image[y + 1, x + 1], image[y + 1, x], image[y + 1, x - 1]
-                    p8, p9 = image[y, x - 1], image[y - 1, x - 1]
-                    n = [p2, p3, p4, p5, p6, p7, p8, p9]
-                    count = sum(n)
-                    transitions = sum(a == 0 and b == 1 for a, b in zip(n, n[1:] + n[:1]))
-                    if not (2 <= count <= 6 and transitions == 1):
-                        continue
-                    if phase == 0:
-                        keep_clear = p2 * p4 * p6 == 0 and p4 * p6 * p8 == 0
-                    else:
-                        keep_clear = p2 * p4 * p8 == 0 and p2 * p6 * p8 == 0
-                    if keep_clear:
-                        remove.append((y, x))
-            if remove:
+            padded = np.pad(image, 1)
+            p2 = padded[:-2, 1:-1]
+            p3 = padded[:-2, 2:]
+            p4 = padded[1:-1, 2:]
+            p5 = padded[2:, 2:]
+            p6 = padded[2:, 1:-1]
+            p7 = padded[2:, :-2]
+            p8 = padded[1:-1, :-2]
+            p9 = padded[:-2, :-2]
+            neighbors = (p2, p3, p4, p5, p6, p7, p8, p9)
+            count = sum(neighbors)
+            transitions = sum(
+                ((a == 0) & (b == 1)).astype(np.uint8)
+                for a, b in zip(neighbors, neighbors[1:] + neighbors[:1])
+            )
+            remove = (image == 1) & (count >= 2) & (count <= 6) & (transitions == 1)
+            if phase == 0:
+                remove &= (p2 * p4 * p6 == 0) & (p4 * p6 * p8 == 0)
+            else:
+                remove &= (p2 * p4 * p8 == 0) & (p2 * p6 * p8 == 0)
+            remove[[0, -1], :] = False
+            remove[:, [0, -1]] = False
+            if remove.any():
                 changed = True
-                for y, x in remove:
-                    image[y, x] = 0
+                image[remove] = 0
         if not changed:
             return image.astype(bool)
 
@@ -266,10 +273,16 @@ def load_metric_model(model_path, args, device):
             "highres_structure_fuse_stages",
             "highres_structure_fusion_mode",
             "enable_post_refine_structure_interaction",
+            "enable_h3_surface_fusion",
             "enable_global_topology",
             "global_topology_max_nodes",
             "global_topology_heads",
             "global_topology_alpha_max",
+            "stage_skeleton_mode",
+            "enable_e128_stage_fusion",
+            "stage_skeleton_bias_init",
+            "stage_skeleton_positive_prior",
+            "remove_stage2_pre_topology_source",
         ):
             if name in saved_args:
                 setattr(model_args, name, saved_args[name])
@@ -294,11 +307,17 @@ def load_metric_model(model_path, args, device):
         highres_structure_channels=model_args.highres_structure_channels,
         highres_structure_fuse_stages=model_args.highres_structure_fuse_stages,
         highres_structure_fusion_mode=model_args.highres_structure_fusion_mode,
-        enable_post_refine_structure_interaction=model_args.enable_post_refine_structure_interaction,
+        enable_post_refine_structure_interaction=getattr(model_args, "enable_post_refine_structure_interaction", False),
+        enable_h3_surface_fusion=getattr(model_args, "enable_h3_surface_fusion", False),
         enable_global_topology=model_args.enable_global_topology,
         global_topology_max_nodes=model_args.global_topology_max_nodes,
         global_topology_heads=model_args.global_topology_heads,
         global_topology_alpha_max=model_args.global_topology_alpha_max,
+        stage_skeleton_mode=getattr(model_args, "stage_skeleton_mode", "prior_residual"),
+        enable_e128_stage_fusion=getattr(model_args, "enable_e128_stage_fusion", False),
+        stage_skeleton_bias_init=getattr(model_args, "stage_skeleton_bias_init", "zero"),
+        stage_skeleton_positive_prior=getattr(model_args, "stage_skeleton_positive_prior", 0.05),
+        remove_stage2_pre_topology_source=getattr(model_args, "remove_stage2_pre_topology_source", False),
     ).to(device)
     adapt_connectivity_modules_for_checkpoint(model, state_dict, "standard")
     load_topology_checkpoint_state(
@@ -395,23 +414,27 @@ def main():
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    baseline_threshold = args.baseline_threshold if args.baseline_threshold is not None else args.threshold
-    current_threshold = args.current_threshold if args.current_threshold is not None else args.threshold
-    rows = [
-        evaluate(args.baseline_name, args.baseline_model_path, baseline_threshold, args, loader, device),
-        evaluate(args.current_name, args.current_model_path, current_threshold, args, loader, device),
-    ]
+    if args.model_path:
+        rows = [evaluate(args.current_name, args.model_path, args.threshold, args, loader, device)]
+    else:
+        baseline_threshold = args.baseline_threshold if args.baseline_threshold is not None else args.threshold
+        current_threshold = args.current_threshold if args.current_threshold is not None else args.threshold
+        rows = [
+            evaluate(args.baseline_name, args.baseline_model_path, baseline_threshold, args, loader, device),
+            evaluate(args.current_name, args.current_model_path, current_threshold, args, loader, device),
+        ]
     fields = list(rows[0].keys())
-    print("\nConnectivity/topology comparison")
+    print("\nSegmentation and topology metrics")
     for row in rows:
         print("\n" + row["name"])
         for key in fields:
             if key not in {"name", "checkpoint"}:
                 print(f"{key:38s} {row[key]}")
-    print("\nDelta current - baseline")
-    for key in fields:
-        if key not in {"name", "checkpoint", "threshold", "images"}:
-            print(f"{key:38s} {rows[1][key] - rows[0][key]:+.6f}")
+    if len(rows) == 2:
+        print("\nDelta current - baseline")
+        for key in fields:
+            if key not in {"name", "checkpoint", "threshold", "images"}:
+                print(f"{key:38s} {rows[1][key] - rows[0][key]:+.6f}")
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
     with open(args.output_csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)

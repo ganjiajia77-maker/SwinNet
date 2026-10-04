@@ -235,10 +235,17 @@ def load_model(args, device):
             "highres_structure_channels",
             "highres_structure_fuse_stages",
             "highres_structure_fusion_mode",
+            "enable_post_refine_structure_interaction",
+            "enable_h3_surface_fusion",
             "enable_global_topology",
             "global_topology_max_nodes",
             "global_topology_heads",
             "global_topology_alpha_max",
+            "stage_skeleton_mode",
+            "enable_e128_stage_fusion",
+            "stage_skeleton_bias_init",
+            "stage_skeleton_positive_prior",
+            "remove_stage2_pre_topology_source",
         ):
             if name in saved_args:
                 setattr(args, name, saved_args[name])
@@ -326,6 +333,17 @@ def load_model(args, device):
                 "global_topology_heads": getattr(args, "global_topology_heads", 4),
                 "global_topology_alpha_max": getattr(
                     args, "global_topology_alpha_max", 0.05
+                ),
+                "enable_post_refine_structure_interaction": getattr(
+                    args, "enable_post_refine_structure_interaction", False
+                ),
+                "enable_h3_surface_fusion": getattr(args, "enable_h3_surface_fusion", False),
+                "stage_skeleton_mode": getattr(args, "stage_skeleton_mode", "prior_residual"),
+                "enable_e128_stage_fusion": getattr(args, "enable_e128_stage_fusion", False),
+                "stage_skeleton_bias_init": getattr(args, "stage_skeleton_bias_init", "zero"),
+                "stage_skeleton_positive_prior": getattr(args, "stage_skeleton_positive_prior", 0.05),
+                "remove_stage2_pre_topology_source": getattr(
+                    args, "remove_stage2_pre_topology_source", False
                 ),
             }
         ),
