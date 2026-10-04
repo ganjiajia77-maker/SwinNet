@@ -13,6 +13,8 @@ from utils.lr_scheduler import LR_Scheduler
 from utils.saver import Saver
 from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
+from eval_data1_common import (binary_prediction, image_names, load_eval_case,
+                               predict_components_full)
 
 
 class Trainer(object):
@@ -109,7 +111,12 @@ class Trainer(object):
         self.evaluator.reset()
         tbar = tqdm(self.train_loader)
         num_img_tr = len(self.train_loader)
+        self.optimizer.zero_grad()
         for i, sample in enumerate(tbar):
+            if i == 0 and self.args.dataset == 'data1':
+                print('CROP-AUDIT epoch={} worker_epoch={} indices={} top={} left={}'.format(
+                    epoch + 1, sample['crop_epoch'].tolist(), sample['crop_index'].tolist(),
+                    sample['crop_top'].tolist(), sample['crop_left'].tolist()), flush=True)
             image, target, con0, con1, con2, con_d1_0, con_d1_1, con_d1_2 = \
                 sample['image'], sample['label'], sample['connect0'], sample['connect1'], sample['connect2'],\
                 sample['connect_d1_0'], sample['connect_d1_1'], sample['connect_d1_2']
@@ -118,7 +125,6 @@ class Trainer(object):
             if self.args.cuda:
                 image, target, connect_label, connect_d1_label = image.cuda(), target.cuda(), connect_label.cuda(), connect_d1_label.cuda()
             self.scheduler(self.optimizer, i, epoch, self.best_pred)
-            self.optimizer.zero_grad()
             output, out_connect, out_connect_d1 = self.model(image)
             target = torch.unsqueeze(target, 1)
             loss1 = self.criterion(output, target)
@@ -126,8 +132,12 @@ class Trainer(object):
             loss3 = self.criterion_con(out_connect_d1, connect_d1_label)
             lad = 0.2
             loss = loss1 + lad*(0.6*loss2 + 0.4*loss3)
-            loss.backward()
-            self.optimizer.step()
+            group_start = (i // self.args.accumulation_steps) * self.args.accumulation_steps
+            group_size = min(self.args.accumulation_steps, num_img_tr - group_start)
+            (loss / group_size).backward()
+            if (i + 1) % self.args.accumulation_steps == 0 or i + 1 == num_img_tr:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
             train_loss1 += loss1.item()
             train_loss2 += lad * 0.6 * loss2.item()
             train_loss3 += lad * 0.4 * loss3.item()
@@ -170,13 +180,47 @@ class Trainer(object):
         self.saver.append_epoch_losses({'epoch': epoch + 1, 'split': 'train', 'total_loss': train_loss, 'loss1': train_loss1, 'loss2': train_loss2, 'loss3': train_loss3, 'iou': IoU, 'precision': Precision, 'recall': Recall, 'f1': F1})
         self.saver.save_checkpoint({
             'epoch': epoch + 1,
-            'state_dict': self.model.module.state_dict(),
+            'state_dict': (self.model.module if self.args.cuda else self.model).state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'best_pred': self.best_pred,
         }, False)
 
 
+    def validation_data1_full(self, epoch):
+        self.model.eval()
+        self.evaluator.reset()
+        names = image_names(self.args.data_root, 'val')
+        device = torch.device('cuda:0' if self.args.cuda else 'cpu')
+        for index, name in enumerate(names, 1):
+            image, target = load_eval_case(self.args.data_root, 'val', name,
+                                           self.args.base_size)
+            components = predict_components_full(self.model, image, self.args.crop_size,
+                                                 self.args.val_overlap_stride, device,
+                                                 tta=not self.args.no_val_tta)
+            pred = binary_prediction(components, self.args.val_threshold, 'paper_fusion')
+            self.evaluator.add_batch(target.astype(np.uint8), pred.astype(np.uint8))
+            if index % 100 == 0 or index == len(names):
+                print('Full val: {}/{}'.format(index, len(names)), flush=True)
+        iou = self.evaluator.Intersection_over_Union()
+        precision = self.evaluator.Pixel_Precision()
+        recall = self.evaluator.Pixel_Recall()
+        f1 = self.evaluator.Pixel_F1()
+        print('Full val epoch {}: IoU={:.6f} F1={:.6f}'.format(epoch + 1, iou, f1), flush=True)
+        self.saver.append_epoch_losses({'epoch': epoch + 1, 'split': 'val_full',
+                                        'iou': iou, 'precision': precision,
+                                        'recall': recall, 'f1': f1})
+        if iou > self.best_pred:
+            self.best_pred = iou
+            self.saver.save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': (self.model.module if self.args.cuda else self.model).state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'best_pred': self.best_pred,
+            }, True)
+
     def validation(self, epoch):
+        if self.args.dataset == 'data1':
+            return self.validation_data1_full(epoch)
         self.model.eval()
         self.evaluator.reset()
         tbar = tqdm(self.val_loader, desc='\r')
@@ -267,6 +311,9 @@ def main():
                         help='dataset name (default: spacenet)')
     parser.add_argument('--data-root', type=str, default='/home/gjj/Swin-Unet-main/data1')
     parser.add_argument('--random-crop-train', action='store_true', default=False)
+    parser.add_argument('--val-overlap-stride', type=int, default=256)
+    parser.add_argument('--val-threshold', type=float, default=0.1)
+    parser.add_argument('--no-val-tta', action='store_true')
     parser.add_argument('--workers', type=int, default=16,
                         metavar='N', help='dataloader threads')
     parser.add_argument('--base-size', type=int, default=1024,
@@ -288,6 +335,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=1,
                         metavar='N', help='input batch size for \
                                 training (default: 16)')
+    parser.add_argument('--accumulation-steps', type=int, default=1,
+                        help='optimizer update every N batches; batch-size times N is effective batch')
     parser.add_argument('--use-balanced-weights', action='store_true', default=False,
                         help='whether to use balanced weights (default: False)')
     # optimizer params
@@ -326,6 +375,15 @@ def main():
                         help='skip validation during training')
 
     args = parser.parse_args()
+    if args.dataset == 'data1':
+        if not args.random_crop_train:
+            parser.error('data1 comparison requires --random-crop-train; fixed center crops are disallowed')
+        if args.base_size != 1024 or args.crop_size != 512:
+            parser.error('data1 comparison requires --base-size 1024 --crop-size 512')
+    if args.workers < 0:
+        parser.error('--workers must be nonnegative')
+    if args.batch_size < 1 or args.accumulation_steps < 1:
+        parser.error('--batch-size and --accumulation-steps must be positive')
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     if args.cuda:
         try:

@@ -26,6 +26,7 @@ class Saver(object):
         if not is_best:
             return
         best_pred = state['best_pred']
+        shutil.copyfile(filename, os.path.join(self.experiment_dir, 'best.pth'))
         with open(os.path.join(self.experiment_dir, 'best_pred.txt'), 'w') as handle:
             handle.write(str(best_pred))
         previous_best = []
@@ -61,6 +62,21 @@ class Saver(object):
         values['epochs'] = self.args.epochs
         values['base_size'] = self.args.base_size
         values['crop_size'] = self.args.crop_size
+        values['data_root'] = getattr(self.args, 'data_root', '')
+        values['random_crop_train'] = getattr(self.args, 'random_crop_train', False)
+        values['workers'] = self.args.workers
+        values['persistent_workers'] = False
+        values['batch_size'] = self.args.batch_size
+        values['accumulation_steps'] = self.args.accumulation_steps
+        values['effective_batch_size'] = self.args.batch_size * self.args.accumulation_steps
+        values['seed'] = self.args.seed
+        values['momentum'] = self.args.momentum
+        values['weight_decay'] = self.args.weight_decay
+        values['poly_power'] = 3
+        values['head_lr_multiplier'] = 10
+        values['val_overlap_stride'] = getattr(self.args, 'val_overlap_stride', '')
+        values['val_threshold'] = getattr(self.args, 'val_threshold', '')
+        values['val_tta'] = not getattr(self.args, 'no_val_tta', False)
         with open(logfile, 'w') as handle:
             for key, value in values.items():
                 handle.write(key + ':' + str(value) + '\n')

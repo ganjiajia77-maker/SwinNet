@@ -102,10 +102,25 @@ class Data1Random512(Dataset):
                 channels.append(padded[y0:y0 + mask.shape[0], x0:x0 + mask.shape[1]] * binary)
         return np.stack(channels, axis=0).astype(np.float32)
 
+    @staticmethod
+    def _center_crop_or_pad(array, size):
+        height, width = array.shape[:2]
+        top = max((height - size) // 2, 0)
+        left = max((width - size) // 2, 0)
+        array = array[top:top + min(height, size), left:left + min(width, size)]
+        height, width = array.shape[:2]
+        pad = (((size - height) // 2, size - height - (size - height) // 2),
+               ((size - width) // 2, size - width - (size - width) // 2))
+        if array.ndim == 3:
+            pad += ((0, 0),)
+        return np.pad(array, pad, mode='constant')
+
     def _make_sample(self, index):
         image_name = self.images[index]
         image = np.asarray(Image.open(os.path.join(self.image_dir, image_name)).convert('RGB'))
         mask = np.asarray(Image.open(self._resolve_mask(image_name)).convert('L'))
+        image = self._center_crop_or_pad(image, self.source_size)
+        mask = self._center_crop_or_pad(mask, self.source_size)
         rng = np.random.RandomState(self.seed + self.epoch * 1000003 + index * 9176)
 
         if self.split == 'train':
@@ -136,17 +151,21 @@ class Data1Random512(Dataset):
             for channel_index, channel in enumerate(np.array_split(array, 3, axis=0)):
                 key = group + ('_' if group == 'connect_d1' else '') + str(channel_index)
                 sample[key] = Image.fromarray((channel.transpose(1, 2, 0) * 255).astype(np.uint8))
-        return sample, image_name
+        return sample, image_name, (top, left)
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
     def __getitem__(self, index):
-        sample, image_name = self._make_sample(index)
+        sample, image_name, (top, left) = self._make_sample(index)
         sample = transforms.Compose([
             tr.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             tr.ToTensor(),
         ])(sample)
         if self.split == 'train':
+            sample['crop_index'] = index
+            sample['crop_top'] = top
+            sample['crop_left'] = left
+            sample['crop_epoch'] = self.epoch
             return sample
         return sample, image_name

@@ -4,9 +4,8 @@ import os
 
 import numpy as np
 import torch
-from PIL import Image
-
-from eval_data1_common import image_names, load_model, mask_path, predict_full
+from eval_data1_common import (binary_prediction, image_names, load_eval_case,
+                               load_model, predict_components_full)
 
 
 def main():
@@ -17,7 +16,10 @@ def main():
     parser.add_argument("--split", default="val", choices=["val"])
     parser.add_argument("--thresholds", default="0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50")
     parser.add_argument("--tile_size", type=int, default=512)
-    parser.add_argument("--overlap_stride", type=int, default=512)
+    parser.add_argument("--overlap_stride", type=int, default=256)
+    parser.add_argument("--source_patch_size", type=int, default=1024)
+    parser.add_argument("--prediction_mode", choices=["paper_fusion", "surface"], default="paper_fusion")
+    parser.add_argument("--no_tta", action="store_true")
     parser.add_argument("--backbone", default="resnet")
     parser.add_argument("--out_stride", type=int, default=8)
     args = parser.parse_args()
@@ -26,26 +28,26 @@ def main():
     model = load_model(args, device)
     names = image_names(args.root_path, args.split)
     thresholds = [float(value) for value in args.thresholds.split(",")]
-    probabilities = []
-    targets = []
+    totals = {threshold: [0, 0, 0, 0] for threshold in thresholds}
     for index, name in enumerate(names, 1):
-        image = Image.open(os.path.join(args.root_path, args.split, "image", name)).convert("RGB")
-        target = np.asarray(Image.open(mask_path(args.root_path, args.split, name)).convert("L")) >= 128
-        probabilities.append(predict_full(model, image, args.tile_size, args.overlap_stride, device))
-        targets.append(target)
+        image, target = load_eval_case(args.root_path, args.split, name, args.source_patch_size)
+        components = predict_components_full(model, image, args.tile_size,
+                                             args.overlap_stride, device, tta=not args.no_tta)
+        for threshold in thresholds:
+            prediction = binary_prediction(components, threshold, args.prediction_mode)
+            counts = totals[threshold]
+            counts[0] += int(np.logical_and(prediction, target).sum())
+            counts[1] += int(np.logical_and(prediction, ~target).sum())
+            counts[2] += int(np.logical_and(~prediction, target).sum())
+            counts[3] += int(np.logical_and(~prediction, ~target).sum())
         print("[{}/{}] {}".format(index, len(names), name), flush=True)
     rows = []
     for threshold in thresholds:
-        tp = fp = fn = tn = 0
-        for probability, target in zip(probabilities, targets):
-            prediction = probability >= threshold
-            tp += int(np.logical_and(prediction, target).sum())
-            fp += int(np.logical_and(prediction, ~target).sum())
-            fn += int(np.logical_and(~prediction, target).sum())
-            tn += int(np.logical_and(~prediction, ~target).sum())
+        tp, fp, fn, tn = totals[threshold]
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
-        rows.append({"threshold": threshold, "iou": tp / max(tp + fp + fn, 1),
+        rows.append({"threshold": threshold, "mode": args.prediction_mode,
+                     "tta": not args.no_tta, "iou": tp / max(tp + fp + fn, 1),
                      "f1": 2 * precision * recall / max(precision + recall, 1e-12),
                      "precision": precision, "recall": recall,
                      "tp": tp, "fp": fp, "fn": fn, "tn": tn})

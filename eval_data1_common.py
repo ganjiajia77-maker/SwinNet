@@ -46,6 +46,67 @@ def tensor_from_pil(image):
     return torch.from_numpy(array.transpose(2, 0, 1)).float()
 
 
+def center_crop_or_pad(image, size=1024, fill=0):
+    """Match the source frame used by the Swin data1 dataset."""
+    width, height = image.size
+    left = max((width - size) // 2, 0)
+    top = max((height - size) // 2, 0)
+    image = image.crop((left, top, left + min(width, size), top + min(height, size)))
+    result = Image.new(image.mode, (size, size), color=fill)
+    result.paste(image, ((size - image.width) // 2, (size - image.height) // 2))
+    return result
+
+
+def load_eval_case(root, split, name, source_size=1024):
+    image = Image.open(os.path.join(root, split, 'image', name)).convert('RGB')
+    mask = Image.open(mask_path(root, split, name)).convert('L')
+    image = center_crop_or_pad(image, source_size)
+    target = np.asarray(center_crop_or_pad(mask, source_size)) >= 128
+    return image, target
+
+
+def predict_components_full(model, image, tile_size=512, stride=256, device='cuda', tta=True):
+    """Return full-image segment probabilities and the two CoANet connection scores."""
+    width, height = image.size
+    sums = [np.zeros((height, width), dtype=np.float32) for _ in range(3)]
+    count = np.zeros((height, width), dtype=np.float32)
+    dims = [(), (2,), (3,), (2, 3)] if tta else [()]
+    with torch.no_grad():
+        for top in positions(height, tile_size, stride):
+            for left in positions(width, tile_size, stride):
+                crop = image.crop((left, top, min(left + tile_size, width), min(top + tile_size, height)))
+                if crop.size != (tile_size, tile_size):
+                    padded = Image.new('RGB', (tile_size, tile_size))
+                    padded.paste(crop, (0, 0))
+                    crop = padded
+                tensor = tensor_from_pil(crop).unsqueeze(0).to(device)
+                predictions = [model(torch.flip(tensor, flip_dims) if flip_dims else tensor)
+                               for flip_dims in dims]
+                restored = []
+                for head in range(3):
+                    stacked = torch.stack([torch.flip(pred[head], flip_dims) if flip_dims else pred[head]
+                                           for pred, flip_dims in zip(predictions, dims)])
+                    mean = stacked.mean(dim=0)[0]
+                    restored.append(mean[0] if head == 0 else mean.sum(dim=0))
+                h = min(tile_size, height - top)
+                w = min(tile_size, width - left)
+                for total, value in zip(sums, restored):
+                    total[top:top + h, left:left + w] += value[:h, :w].float().cpu().numpy()
+                count[top:top + h, left:left + w] += 1.0
+    return tuple(total / np.maximum(count, 1.0) for total in sums)
+
+
+def binary_prediction(components, threshold, mode='paper_fusion'):
+    surface, connect_d1, connect_d3 = components
+    prediction = surface >= threshold
+    if mode == 'paper_fusion':
+        # The author's public test.py thresholds the sums of raw connection outputs.
+        prediction = prediction | (connect_d1 >= 0.9) | (connect_d3 >= 2.0)
+    elif mode != 'surface':
+        raise ValueError('Unknown prediction mode: ' + mode)
+    return prediction
+
+
 def predict_full(model, image, tile_size=512, stride=512, device="cuda"):
     width, height = image.size
     output = np.zeros((height, width), dtype=np.float32)
@@ -70,7 +131,7 @@ def predict_full(model, image, tile_size=512, stride=512, device="cuda"):
 def load_model(args, device):
     from modeling.coanet import CoANet
     model = CoANet(num_classes=1, backbone=args.backbone, output_stride=args.out_stride,
-                   sync_bn=False, freeze_bn=False)
+                   sync_bn=False, freeze_bn=False, pretrained_backbone=False)
     checkpoint = torch.load(args.model_path, map_location="cpu")
     state = checkpoint.get("state_dict", checkpoint)
     state = {key.replace("module.", "", 1): value for key, value in state.items()}

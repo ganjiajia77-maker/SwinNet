@@ -1,11 +1,15 @@
 from dataloaders.datasets import spacenet, spacenet_crop, deepglobe, deepglobe_crop
 from dataloaders.datasets.data1_random512 import Data1Random512
 from torch.utils.data import DataLoader
-from prefetch_generator import BackgroundGenerator
+try:
+    from prefetch_generator import BackgroundGenerator
+except ImportError:
+    BackgroundGenerator = None
 
 class DataLoaderX(DataLoader):
     def __iter__(self):
-        return BackgroundGenerator(super().__iter__())
+        iterator = super().__iter__()
+        return BackgroundGenerator(iterator) if BackgroundGenerator is not None else iterator
 
 def make_data_loader(args, **kwargs):
     if args.dataset == 'data1':
@@ -23,7 +27,8 @@ def make_data_loader(args, **kwargs):
     else:
         raise NotImplementedError
     return (
-        DataLoaderX(train_set, batch_size=args.batch_size, shuffle=True, **kwargs),
+        DataLoaderX(train_set, batch_size=args.batch_size, shuffle=True,
+                    persistent_workers=False, **kwargs),
         DataLoaderX(val_set, batch_size=args.batch_size, shuffle=False, **kwargs),
         DataLoaderX(test_set, batch_size=args.batch_size, shuffle=False, **kwargs),
         train_set.NUM_CLASSES,

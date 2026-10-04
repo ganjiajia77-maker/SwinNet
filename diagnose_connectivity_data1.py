@@ -5,11 +5,11 @@ import os
 
 import numpy as np
 import torch
-from PIL import Image
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
-from eval_data1_common import image_names, load_model, mask_path, predict_full
+from eval_data1_common import (binary_prediction, image_names, load_eval_case,
+                               load_model, predict_components_full)
 
 
 EIGHT_CONNECTED = np.ones((3, 3), dtype=np.uint8)
@@ -24,8 +24,7 @@ def component_stats(mask):
     return int(count), int(sizes.max()), float(sizes.max() / max(foreground, 1))
 
 
-def image_metrics(probability, target, threshold):
-    prediction = probability >= threshold
+def image_metrics(prediction, target):
     target = target.astype(bool)
     tp = int(np.logical_and(prediction, target).sum())
     fp = int(np.logical_and(prediction, ~target).sum())
@@ -97,7 +96,10 @@ def main():
     parser.add_argument("--split", choices=["val", "test"], default="test")
     parser.add_argument("--threshold", type=float, required=True)
     parser.add_argument("--tile_size", type=int, default=512)
-    parser.add_argument("--overlap_stride", type=int, default=512)
+    parser.add_argument("--overlap_stride", type=int, default=256)
+    parser.add_argument("--source_patch_size", type=int, default=1024)
+    parser.add_argument("--prediction_mode", choices=["paper_fusion", "surface"], default="paper_fusion")
+    parser.add_argument("--no_tta", action="store_true")
     parser.add_argument("--backbone", default="resnet")
     parser.add_argument("--out_stride", type=int, default=8)
     args = parser.parse_args()
@@ -109,10 +111,11 @@ def main():
     rows = []
 
     for index, name in enumerate(names, 1):
-        image = Image.open(os.path.join(args.root_path, args.split, "image", name)).convert("RGB")
-        target = np.asarray(Image.open(mask_path(args.root_path, args.split, name)).convert("L")) >= 128
-        probability = predict_full(model, image, args.tile_size, args.overlap_stride, device)
-        metrics = image_metrics(probability, target, args.threshold)
+        image, target = load_eval_case(args.root_path, args.split, name, args.source_patch_size)
+        components = predict_components_full(model, image, args.tile_size,
+                                             args.overlap_stride, device, tta=not args.no_tta)
+        prediction = binary_prediction(components, args.threshold, args.prediction_mode)
+        metrics = image_metrics(prediction, target)
         metrics["image_id"] = name
         rows.append(metrics)
         print("[{}/{}] {} IoU={:.4f} clDice={:.4f} pred_components={} frag_excess={:.4f}".format(
@@ -128,7 +131,9 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    summary = {"split": args.split, "threshold": args.threshold, "tile_size": args.tile_size,
+    summary = {"split": args.split, "threshold": args.threshold,
+               "prediction_mode": args.prediction_mode, "tta": not args.no_tta,
+               "source_patch_size": args.source_patch_size, "tile_size": args.tile_size,
                "overlap_stride": args.overlap_stride, **aggregate(rows)}
     summary_path = os.path.join(args.output_dir, "connectivity_metrics_summary.json")
     with open(summary_path, "w", encoding="utf-8") as handle:
