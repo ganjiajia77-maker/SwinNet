@@ -1480,7 +1480,11 @@ if __name__ == "__main__":
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
-            checkpoint_state = checkpoint["model_state_dict"]
+            # EMA is used for validation, but optimizer state belongs to the
+            # training model. Restore that model for an exact continuation.
+            checkpoint_state = checkpoint.get(
+                "training_model_state_dict", checkpoint["model_state_dict"]
+            )
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
             skipped_gate_keys = []
