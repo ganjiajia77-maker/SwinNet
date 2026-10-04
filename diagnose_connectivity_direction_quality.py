@@ -468,7 +468,7 @@ def main():
             masks = (batch["mask"].to(device) > 0.5)
             skeleton_raw = batch["skeleton"].to(device).float()
 
-            outputs = model(images, topology_alpha_scale=1.0, teacher_forcing_ratio=0.0)
+            outputs = model(images)
             surface_logits = outputs[0]
             surface_prob = torch.sigmoid(surface_logits)
             masks_resized = resize_like(masks.float(), surface_logits, mode="nearest")
