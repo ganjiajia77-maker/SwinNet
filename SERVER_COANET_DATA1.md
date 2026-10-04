@@ -23,6 +23,7 @@ on its line.
 cd /home/gjj
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate swinunet
+set -o pipefail
 
 curl -fL --http1.1 --retry 10 --retry-delay 3 \
   'https://codeload.github.com/ganjiajia77-maker/SwinNet/tar.gz/refs/heads/codex/coanet-paper-best-data1-random512' \
@@ -91,7 +92,7 @@ CUDA_VISIBLE_DEVICES=1 python -u test_data1.py \
   --prediction_mode paper_fusion --threshold "$THRESHOLD"
 ```
 
-For comparable clDice and fragmentation measurements on the same test masks:
+For additional clDice and fragmentation measurements on the same test masks:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -u diagnose_connectivity_data1.py \
