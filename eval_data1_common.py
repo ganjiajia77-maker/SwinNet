@@ -132,7 +132,8 @@ def load_model(args, device):
     from modeling.coanet import CoANet
     model = CoANet(num_classes=1, backbone=args.backbone, output_stride=args.out_stride,
                    sync_bn=False, freeze_bn=False, pretrained_backbone=False)
-    checkpoint = torch.load(args.model_path, map_location="cpu")
+    # The user's own training checkpoints can include NumPy scalar metrics.
+    checkpoint = torch.load(args.model_path, map_location="cpu", weights_only=False)
     has_ema = checkpoint.get('ema_state_dict') is not None
     if getattr(args, 'require_ema', False) and not has_ema:
         raise RuntimeError('Checkpoint has no EMA weights: ' + args.model_path)
