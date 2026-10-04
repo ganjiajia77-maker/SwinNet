@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--overlap_stride", type=int, default=256)
     parser.add_argument("--source_patch_size", type=int, default=1024)
     parser.add_argument("--prediction_mode", choices=["paper_fusion", "surface"], default="paper_fusion")
+    parser.add_argument("--require_ema", action="store_true")
     parser.add_argument("--no_tta", action="store_true")
     parser.add_argument("--backbone", default="resnet")
     parser.add_argument("--out_stride", type=int, default=8)

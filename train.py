@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os, time
 import numpy as np
 from tqdm import tqdm
@@ -15,6 +16,29 @@ from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
 from eval_data1_common import (binary_prediction, image_names, load_eval_case,
                                predict_components_full)
+
+
+class ModelEMA:
+    """Match the Swin comparison run: update after each optimizer step."""
+
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = float(decay)
+        self.updates = 0
+        for parameter in self.ema.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        model_state = model.state_dict()
+        for name, ema_value in self.ema.state_dict().items():
+            source_value = model_state[name].detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.mul_(self.decay).add_(source_value.to(ema_value.dtype),
+                                                alpha=1.0 - self.decay)
+            else:
+                ema_value.copy_(source_value)
+        self.updates += 1
 
 
 class Trainer(object):
@@ -82,9 +106,11 @@ class Trainer(object):
             args.start_epoch = checkpoint['epoch']
 
             if args.cuda:
-                self.model.module.load_state_dict(checkpoint['state_dict'])
+                self.model.module.load_state_dict(
+                    checkpoint.get('training_model_state_dict', checkpoint['state_dict']))
             else:
-                self.model.load_state_dict(checkpoint['state_dict'])
+                self.model.load_state_dict(
+                    checkpoint.get('training_model_state_dict', checkpoint['state_dict']))
             if not args.ft:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
             self.best_pred = checkpoint['best_pred']
@@ -94,6 +120,40 @@ class Trainer(object):
         # Clear start epoch if fine-tuning
         if args.ft:
             args.start_epoch = 0
+            self.best_pred = 0.0
+
+        if args.resume is not None and (checkpoint.get('ema_state_dict') is not None) != args.use_ema:
+            self.best_pred = 0.0
+
+        self.ema = ModelEMA(self.training_model, decay=args.ema_decay) if args.use_ema else None
+        if self.ema is not None and args.resume is not None and not args.ft:
+            ema_state = checkpoint.get('ema_state_dict')
+            if ema_state is not None:
+                self.ema.ema.load_state_dict(ema_state)
+                self.ema.updates = int(checkpoint.get('ema_updates', 0))
+        print('EMA: enabled={}, decay={}, updates={}'.format(
+            self.ema is not None, args.ema_decay, self.ema.updates if self.ema else 0),
+            flush=True)
+
+    @property
+    def training_model(self):
+        return self.model.module if self.args.cuda else self.model
+
+    @property
+    def evaluation_model(self):
+        return self.ema.ema if self.ema is not None else self.training_model
+
+    def checkpoint_state(self, epoch):
+        return {
+            'epoch': epoch + 1,
+            'state_dict': self.evaluation_model.state_dict(),
+            'training_model_state_dict': self.training_model.state_dict(),
+            'ema_state_dict': self.ema.ema.state_dict() if self.ema is not None else None,
+            'ema_decay': self.args.ema_decay if self.ema is not None else None,
+            'ema_updates': self.ema.updates if self.ema is not None else 0,
+            'optimizer': self.optimizer.state_dict(),
+            'best_pred': self.best_pred,
+        }
 
     def training(self, epoch):
         if hasattr(self.train_loader.dataset, 'set_epoch'):
@@ -138,6 +198,8 @@ class Trainer(object):
             if (i + 1) % self.args.accumulation_steps == 0 or i + 1 == num_img_tr:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+                if self.ema is not None:
+                    self.ema.update(self.training_model)
             train_loss1 += loss1.item()
             train_loss2 += lad * 0.6 * loss2.item()
             train_loss3 += lad * 0.4 * loss3.item()
@@ -178,23 +240,18 @@ class Trainer(object):
         print('Loss: %.3f, Loss1: %.6f, Loss2: %.3f, Loss3: %.3f' % (train_loss, train_loss1, train_loss2, train_loss2))
 
         self.saver.append_epoch_losses({'epoch': epoch + 1, 'split': 'train', 'total_loss': train_loss, 'loss1': train_loss1, 'loss2': train_loss2, 'loss3': train_loss3, 'iou': IoU, 'precision': Precision, 'recall': Recall, 'f1': F1})
-        self.saver.save_checkpoint({
-            'epoch': epoch + 1,
-            'state_dict': (self.model.module if self.args.cuda else self.model).state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'best_pred': self.best_pred,
-        }, False)
+        self.saver.save_checkpoint(self.checkpoint_state(epoch), False)
 
 
     def validation_data1_full(self, epoch):
-        self.model.eval()
+        self.evaluation_model.eval()
         self.evaluator.reset()
         names = image_names(self.args.data_root, 'val')
         device = torch.device('cuda:0' if self.args.cuda else 'cpu')
         for index, name in enumerate(names, 1):
             image, target = load_eval_case(self.args.data_root, 'val', name,
                                            self.args.base_size)
-            components = predict_components_full(self.model, image, self.args.crop_size,
+            components = predict_components_full(self.evaluation_model, image, self.args.crop_size,
                                                  self.args.val_overlap_stride, device,
                                                  tta=not self.args.no_val_tta)
             pred = binary_prediction(components, self.args.val_threshold, 'paper_fusion')
@@ -211,17 +268,12 @@ class Trainer(object):
                                         'recall': recall, 'f1': f1})
         if iou > self.best_pred:
             self.best_pred = iou
-            self.saver.save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': (self.model.module if self.args.cuda else self.model).state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'best_pred': self.best_pred,
-            }, True)
+            self.saver.save_checkpoint(self.checkpoint_state(epoch), True)
 
     def validation(self, epoch):
         if self.args.dataset == 'data1':
             return self.validation_data1_full(epoch)
-        self.model.eval()
+        self.evaluation_model.eval()
         self.evaluator.reset()
         tbar = tqdm(self.val_loader, desc='\r')
         test_loss1 = 0.0
@@ -239,7 +291,7 @@ class Trainer(object):
             if self.args.cuda:
                 image, target, connect_label, connect_d1_label = image.cuda(), target.cuda(), connect_label.cuda(), connect_d1_label.cuda()
             with torch.no_grad():
-                output, out_connect, out_connect_d1 = self.model(image)
+                output, out_connect, out_connect_d1 = self.evaluation_model(image)
             target = torch.unsqueeze(target, 1)
             loss1 = self.criterion(output, target)
             loss2 = self.criterion_con(out_connect, connect_label)
@@ -293,12 +345,7 @@ class Trainer(object):
         if new_pred > self.best_pred:
             is_best = True
             self.best_pred = new_pred
-            self.saver.save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': self.model.module.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'best_pred': self.best_pred,
-            }, is_best)
+            self.saver.save_checkpoint(self.checkpoint_state(epoch), is_best)
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch CoANet Training")
@@ -311,6 +358,9 @@ def main():
                         help='dataset name (default: spacenet)')
     parser.add_argument('--data-root', type=str, default='/home/gjj/Swin-Unet-main/data1')
     parser.add_argument('--random-crop-train', action='store_true', default=False)
+    parser.add_argument('--use_ema', '--use-ema', action=argparse.BooleanOptionalAction,
+                        default=False, help='validate and save EMA weights')
+    parser.add_argument('--ema_decay', '--ema-decay', type=float, default=0.999)
     parser.add_argument('--val-overlap-stride', type=int, default=256)
     parser.add_argument('--val-threshold', type=float, default=0.1)
     parser.add_argument('--no-val-tta', action='store_true')
@@ -384,6 +434,8 @@ def main():
         parser.error('--workers must be nonnegative')
     if args.batch_size < 1 or args.accumulation_steps < 1:
         parser.error('--batch-size and --accumulation-steps must be positive')
+    if not 0.0 <= args.ema_decay < 1.0:
+        parser.error('--ema_decay must be in [0, 1)')
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     if args.cuda:
         try:

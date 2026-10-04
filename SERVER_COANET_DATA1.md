@@ -4,6 +4,10 @@ The full CoANet (ResNet-101 + SCM + CoA) is the best architecture in Table III o
 [authors' paper](https://mftp.mmcheng.net/Papers/21TIP-CoANetRoad.pdf). The paper uses
 ImageNet initialization, SGD 0.01, momentum 0.9, weight decay 0.0005, poly power 3,
 and batch 16. Here a single GPU uses microbatch 4 and four accumulation steps.
+The comparison run enables EMA with decay 0.999 to match the Swin run. The
+authors' public paper configuration did not specify EMA; omit `--use_ema` for a
+separate paper-style run. Gradient accumulation also does not make batch
+normalization or Dice loss mathematically identical to a direct batch of 16.
 The public paper does not define a best number of epochs for data1; 100 follows
 the Swin comparison run.
 
@@ -43,7 +47,7 @@ The crop check must end in `PASS`. It prints the coordinates for the same images
 at epochs 1, 2 and 3 through real worker processes.
 
 ```bash
-RUN=coanet_full_resnet101_data1_random512_paper_sgd_fp32_100e_$(date +%Y%m%d_%H%M%S)
+RUN=coanet_full_resnet101_data1_random512_ema0999_fp32_100e_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$RESULTS"
 printf '%s\n' "$RUN" > "$RESULTS/latest_coanet_run.txt"
 CUDA_VISIBLE_DEVICES=1 OPENCV_LOG_LEVEL=ERROR \
@@ -55,6 +59,7 @@ python -u train.py \
   --epochs 100 --eval-interval 5 \
   --lr 0.01 --lr-scheduler poly --momentum 0.9 --weight-decay 0.0005 \
   --loss-type con_ce --seed 1234 --gpu-ids 0 \
+  --use_ema --ema_decay 0.999 \
   --val-overlap-stride 256 --val-threshold 0.1 \
   --output-dir "$RESULTS" --checkname "$RUN" \
   2>&1 | tee "$REPO/${RUN}.log"
@@ -84,6 +89,7 @@ CUDA_VISIBLE_DEVICES=1 python -u threshold_sweep_data1.py \
   --root_path "$DATA" --model_path "$CKPT" --output_dir "$SWEEP" \
   --split val --source_patch_size 1024 --tile_size 512 --overlap_stride 256 \
   --prediction_mode paper_fusion \
+  --require_ema \
   --thresholds 0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50
 THRESHOLD=$(cat "$SWEEP/best_threshold.txt")
 echo "Validation threshold: $THRESHOLD"
@@ -96,7 +102,7 @@ TEST_OUT="$RESULTS/data1/$RUN/test_paper_fusion"
 CUDA_VISIBLE_DEVICES=1 python -u test_data1.py \
   --root_path "$DATA" --model_path "$CKPT" --output_dir "$TEST_OUT" \
   --split test --source_patch_size 1024 --tile_size 512 --overlap_stride 256 \
-  --prediction_mode paper_fusion --threshold "$THRESHOLD"
+  --prediction_mode paper_fusion --require_ema --threshold "$THRESHOLD"
 ```
 
 For additional clDice and fragmentation measurements on the same test masks:
@@ -106,5 +112,5 @@ CUDA_VISIBLE_DEVICES=1 python -u diagnose_connectivity_data1.py \
   --root_path "$DATA" --model_path "$CKPT" \
   --output_dir "$RESULTS/data1/$RUN/topology_test" \
   --split test --source_patch_size 1024 --tile_size 512 --overlap_stride 256 \
-  --prediction_mode paper_fusion --threshold "$THRESHOLD"
+  --prediction_mode paper_fusion --require_ema --threshold "$THRESHOLD"
 ```

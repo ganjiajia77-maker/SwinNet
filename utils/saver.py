@@ -74,6 +74,8 @@ class Saver(object):
         values['weight_decay'] = self.args.weight_decay
         values['poly_power'] = 3
         values['head_lr_multiplier'] = 10
+        values['use_ema'] = self.args.use_ema
+        values['ema_decay'] = self.args.ema_decay if self.args.use_ema else None
         values['val_overlap_stride'] = getattr(self.args, 'val_overlap_stride', '')
         values['val_threshold'] = getattr(self.args, 'val_threshold', '')
         values['val_tta'] = not getattr(self.args, 'no_val_tta', False)
