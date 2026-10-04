@@ -44,6 +44,8 @@ at epochs 1, 2 and 3 through real worker processes.
 
 ```bash
 RUN=coanet_full_resnet101_data1_random512_paper_sgd_fp32_100e_$(date +%Y%m%d_%H%M%S)
+mkdir -p "$RESULTS"
+printf '%s\n' "$RUN" > "$RESULTS/latest_coanet_run.txt"
 CUDA_VISIBLE_DEVICES=1 OPENCV_LOG_LEVEL=ERROR \
 python -u train.py \
   --dataset data1 --data-root "$DATA" \
@@ -62,6 +64,11 @@ After training, select the experiment-specific best checkpoint. Do not use a bes
 file from another CoANet run.
 
 ```bash
+REPO=/home/gjj/CoANet-paper-best-data1-random512
+DATA=/home/gjj/Swin-Unet-main/data1
+RESULTS=/home/gjj/CoANet-results
+RUN=$(cat "$RESULTS/latest_coanet_run.txt")
+cd "$REPO"
 EXP=$(find "$RESULTS/data1/$RUN" -maxdepth 1 -type d -name 'experiment_*' | sort | tail -1)
 CKPT="$EXP/best.pth"
 test -s "$CKPT" || { echo "No best checkpoint: $CKPT"; exit 1; }
