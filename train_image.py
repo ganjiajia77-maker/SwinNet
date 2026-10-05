@@ -29,6 +29,9 @@ from networks.vision_transformer import (
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
+from losses.anchor_connectivity import supervised_connection_loss
+from datasets.anchor_reachability import collate_anchor_graphs
+from networks.anchor_topology_options import add_anchor_options, anchor_options, restore_anchor_options
 from config import get_config
 
 
@@ -39,6 +42,12 @@ def seed_worker(worker_id):
 
 
 parser = argparse.ArgumentParser()
+add_anchor_options(parser)
+parser.add_argument('--anchor_connection_loss_weight', type=float, default=0.1)
+parser.add_argument('--anchor_cache_dir', default='')
+parser.add_argument('--anchor_snap_radius', type=float, default=3.0)
+parser.add_argument('--anchor_max_geodesic', type=float, default=96.0)
+parser.add_argument('--anchor_max_detour', type=float, default=2.0)
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--list_dir', type=str, default='./lists/lists_Synapse', help='list dir')
@@ -468,8 +477,9 @@ def format_training_config_lines(args, loss_weights):
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance+connectivity, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Global topology residual: {}, mode={}, anchors=H2*surface, max_nodes={}, heads={}, alpha_max={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
+                args.global_topology_mode,
                 args.global_topology_max_nodes,
                 args.global_topology_heads,
                 args.global_topology_alpha_max,
@@ -562,7 +572,7 @@ def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -573,6 +583,15 @@ def inherit_resume_architecture_args(args):
         return
 
     saved_args = checkpoint["args"]
+    if ('enable_h3_surface_fusion' in saved_args
+            and not _cli_has('--enable_h3_surface_fusion')
+            and not _cli_has('--no-enable_h3_surface_fusion')):
+        args.enable_h3_surface_fusion = bool(saved_args['enable_h3_surface_fusion'])
+    restore_anchor_options(args, saved_args, sys.argv[1:])
+    for name in ('anchor_connection_loss_weight', 'anchor_snap_radius',
+                 'anchor_max_geodesic', 'anchor_max_detour'):
+        if name in saved_args and not _cli_has('--' + name):
+            setattr(args, name, saved_args[name])
     for name, cast in (
         ("surface_focal_gamma", float),
         ("amp_dtype", str),
@@ -1233,6 +1252,8 @@ if __name__ == "__main__":
                     global_topology_max_nodes=args.global_topology_max_nodes,
                     global_topology_heads=args.global_topology_heads,
                     global_topology_alpha_max=args.global_topology_alpha_max,
+                    global_topology_mode=args.global_topology_mode,
+                    global_topology_options=anchor_options(args),
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
@@ -1328,7 +1349,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1377,6 +1398,17 @@ if __name__ == "__main__":
             )
         return set(compatible)
 
+    supervised_anchors = args.enable_global_topology and args.global_topology_mode == 'supervised_anchors'
+    if supervised_anchors and args.anchor_connection_loss_weight <= 0:
+        raise ValueError('Supervised anchor topology requires a positive connection loss weight')
+    if supervised_anchors and (args.anchor_snap_radius <= 0 or args.anchor_max_geodesic <= 0
+                               or args.anchor_max_detour < 1):
+        raise ValueError('Invalid GT snapping/geodesic/detour configuration')
+    if supervised_anchors:
+        print(f'[ANCHOR] max_edges/image={args.global_topology_max_nodes * args.anchor_neighbours}; '
+              f'max_distance={args.anchor_max_distance}px; samples={args.anchor_samples}; '
+              f'connection_loss_weight={args.anchor_connection_loss_weight}; '
+              f'prior_warmup={args.anchor_prior_warmup_epochs}, ramp={args.anchor_prior_ramp_epochs}', flush=True)
     train_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
         split='train',
@@ -1394,6 +1426,9 @@ if __name__ == "__main__":
         random_crop_train=args.random_crop_train,
         random_crops_per_image=args.random_crops_per_image,
         random_crop_seed=args.seed,
+        anchor_cache_dir=(args.anchor_cache_dir or os.path.join(args.root_path, '.anchor_reachability_cache'))
+                         if supervised_anchors else '',
+        anchor_max_geodesic=args.anchor_max_geodesic,
     )
     if args.tiny_overfit_samples > 0:
         tiny_count = min(int(args.tiny_overfit_samples), len(train_dataset))
@@ -1416,6 +1451,7 @@ if __name__ == "__main__":
         pin_memory=True,
         worker_init_fn=seed_worker,
         generator=loader_generator,
+        collate_fn=collate_anchor_graphs if supervised_anchors else None,
         **loader_kwargs,
     )
 
@@ -1450,7 +1486,10 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            saved_topology_mode = checkpoint.get('args', {}).get('global_topology_mode', 'feature_anchors')
+            if saved_topology_mode != args.global_topology_mode:
+                raise ValueError('Cannot resume across different global topology modes; start a fresh experiment')
             checkpoint_state = checkpoint["model_state_dict"]
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -1732,7 +1771,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -1848,6 +1887,10 @@ if __name__ == "__main__":
 
         global_train_step = 0
         for epoch in range(start_epoch, end_epoch):
+            if supervised_anchors:
+                model.swin_unet.global_topology.set_epoch(epoch)
+                if ema is not None:
+                    ema.ema.swin_unet.global_topology.set_epoch(epoch)
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
             current_lr = get_cosine_warmup_lr(
@@ -1947,6 +1990,16 @@ if __name__ == "__main__":
                     connectivity_logits=connectivity_logits,
                 )
 
+                anchor_stats = None
+                if supervised_anchors:
+                    graph_output = next(item for item in stage_outputs
+                                        if item.get('stage') == 'global_anchor_topology')
+                    connection_loss, anchor_stats = supervised_connection_loss(
+                        graph_output, batch['anchor_graph'], snap_radius=args.anchor_snap_radius,
+                        max_geodesic=args.anchor_max_geodesic, max_detour=args.anchor_max_detour)
+                    loss = loss + args.anchor_connection_loss_weight * connection_loss
+                    loss_dict['total_loss'] = loss
+
                 if not torch.isfinite(loss):
                     skipped_batches += 1
                     print(
@@ -2010,6 +2063,24 @@ if __name__ == "__main__":
                 ])
                 batch_loss_log_file.flush()
 
+                if anchor_stats is not None:
+                    anchor_log = os.path.join(args.output_dir, 'anchor_connections.csv')
+                    new_log = not os.path.isfile(anchor_log)
+                    fields = ('epoch', 'batch', 'connection_loss', 'positive', 'negative',
+                              'candidate_edges', 'probability', 'writeback_abs_mean',
+                              'prior_strength', 'ms_per_batch')
+                    with open(anchor_log, 'a', newline='', encoding='utf-8') as handle:
+                        writer = csv.writer(handle)
+                        if new_log:
+                            writer.writerow(fields)
+                        writer.writerow([epoch + 1, i + 1, anchor_stats['connection_loss'].item(),
+                                         anchor_stats['connection_positive'].item(),
+                                         anchor_stats['connection_negative'].item(),
+                                         graph_output['candidate_edges'].item(),
+                                         graph_output['connection_probability'].item(),
+                                         graph_output['writeback_abs_mean'].item(),
+                                         graph_output['prior_strength'].item(), ms_per_batch])
+
                 global_train_step += 1
                 if (
                     args.trend_val_every_steps > 0
@@ -2054,6 +2125,13 @@ if __name__ == "__main__":
                     model.train()
 
                 if (i + 1) % args.print_freq == 0 or i == 0:
+                    if anchor_stats is not None:
+                        print(f"[ANCHOR] BCE={anchor_stats['connection_loss'].item():.4f} "
+                              f"pos={anchor_stats['connection_positive'].item()} "
+                              f"neg={anchor_stats['connection_negative'].item()} "
+                              f"edges={graph_output['candidate_edges'].item()} "
+                              f"prior={graph_output['prior_strength'].item():.3f} "
+                              f"write={graph_output['writeback_abs_mean'].item():.6f}", flush=True)
                     print(
                         f"Epoch [{epoch+1}/{args.max_epochs}], Batch [{i+1}/{len(train_loader)}], "
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
@@ -2247,7 +2325,7 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(

@@ -10,6 +10,7 @@ from .dca_fpn_lite import DCAFPNLite
 from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
 from .keypoint_global_topology import KeypointGuidedGlobalTopology
+from .supervised_anchor_topology import SupervisedAnchorTopology
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
 from .skeleton_guided_head import (
@@ -1271,6 +1272,8 @@ class SwinTransformerSys(nn.Module):
                  global_topology_max_nodes=32,
                  global_topology_heads=4,
                  global_topology_alpha_max=0.05,
+                 global_topology_mode='feature_anchors',
+                 global_topology_options=None,
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
@@ -1320,6 +1323,7 @@ class SwinTransformerSys(nn.Module):
         self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
         self.highres_structure_channels = int(highres_structure_channels)
         self.enable_global_topology = bool(enable_global_topology)
+        self.global_topology_mode = global_topology_mode
         self.stage_skeleton_mode = str(stage_skeleton_mode).lower()
         if self.stage_skeleton_mode not in {"direct", "prior_residual"}:
             raise ValueError("stage_skeleton_mode must be direct or prior_residual")
@@ -1660,7 +1664,10 @@ class SwinTransformerSys(nn.Module):
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
             if self.return_skeleton:
-                self.global_topology = KeypointGuidedGlobalTopology(
+                topology_class = (SupervisedAnchorTopology
+                                  if global_topology_mode == 'supervised_anchors'
+                                  else KeypointGuidedGlobalTopology)
+                self.global_topology = topology_class(
                     channels=embed_dim,
                     struct_channels=self.highres_structure_channels,
                     max_nodes=global_topology_max_nodes,
@@ -1668,6 +1675,8 @@ class SwinTransformerSys(nn.Module):
                     alpha_max=global_topology_alpha_max,
                     enabled=self.enable_global_topology,
                     connectivity_channels=8,
+                    **((global_topology_options or {})
+                       if global_topology_mode == 'supervised_anchors' else {}),
                 )
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,
@@ -1726,11 +1735,16 @@ class SwinTransformerSys(nn.Module):
                         "(0626 profile; final connectivity removed)"
                     )
                 if self.enable_global_topology:
-                    print(
-                        "[INFO] Global topology residual: anchors=H2*surface, "
-                        "tokens=[H2,decoder_feature,connectivity], "
-                        "relation_bias=relative_xy_distance+connectivity"
-                    )
+                    if global_topology_mode == 'supervised_anchors':
+                        print('[INFO] Supervised anchor topology: H2*surface anchors; '
+                              'bounded nearby pairs + ordered corridor evidence; '
+                              'candidate-only attention + local residual writeback')
+                    else:
+                        print(
+                            "[INFO] Global topology residual: anchors=H2*surface, "
+                            "tokens=[H2,decoder_feature,connectivity], "
+                            "relation_bias=relative_xy_distance+connectivity"
+                        )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
@@ -2381,12 +2395,23 @@ class SwinTransformerSys(nn.Module):
                     connectivity_feature = self._latest_local_topology_features(
                         structure_outputs
                     )
+                    topology_kwargs = {}
+                    if isinstance(self.global_topology, SupervisedAnchorTopology):
+                        latest_skeleton = next((item.get('skeleton') for item in reversed(structure_outputs or [])
+                                                if item.get('stage') == 3 and item.get('skeleton') is not None), None)
+                        topology_kwargs['skeleton_prob'] = (torch.sigmoid(latest_skeleton)
+                                                            if latest_skeleton is not None else None)
                     x = self.global_topology.forward_feature_anchors(
                         x,
                         highres_skeleton_feat,
                         surface_prob,
                         connectivity_feature=connectivity_feature,
+                        **topology_kwargs,
                     )
+                    if (isinstance(self.global_topology, SupervisedAnchorTopology)
+                            and self.global_topology.last_output is not None
+                            and structure_outputs is not None):
+                        structure_outputs.append(self.global_topology.last_output)
                 if (
                     self.enable_h3_surface_fusion
                     and self.h3_surface_proj is not None

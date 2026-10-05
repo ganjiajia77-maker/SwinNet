@@ -22,6 +22,8 @@ class RoadSkeletonDataset(Dataset):
         random_crops_per_image=1,
         random_crop_seed=1234,
         crop_list_path="",
+        anchor_cache_dir="",
+        anchor_max_geodesic=96.0,
     ):
         super().__init__()
 
@@ -38,6 +40,10 @@ class RoadSkeletonDataset(Dataset):
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
         self.epoch = 0
+        self.anchor_cache = None
+        if anchor_cache_dir:
+            from .anchor_reachability import ReachabilityCache
+            self.anchor_cache = ReachabilityCache(anchor_cache_dir, anchor_max_geodesic)
 
         self.image_dir = self._resolve_image_dir(root_dir, split)
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -416,6 +422,9 @@ class RoadSkeletonDataset(Dataset):
         if tile_position is not None:
             sample["tile_top"] = tile_position[0]
             sample["tile_left"] = tile_position[1]
+
+        if self.anchor_cache is not None:
+            sample['anchor_graph'] = self.anchor_cache.get(mask[0])
 
         if self.transform:
             sample = self.transform(sample)

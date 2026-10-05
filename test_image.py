@@ -24,6 +24,7 @@ from networks.vision_transformer import (
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
+from networks.anchor_topology_options import add_anchor_options, anchor_options, restore_anchor_options
 from config import get_config
 from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
 
@@ -40,6 +41,7 @@ def _cli_has(flag_name):
 
 
 parser = argparse.ArgumentParser()
+add_anchor_options(parser)
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--num_classes', type=int, default=1, help='output channel of network')
@@ -243,9 +245,10 @@ if __name__ == "__main__":
     args.num_classes = 1
     checkpoint = None
     if os.path.exists(args.model_path):
-        checkpoint = torch.load(args.model_path, map_location='cpu')
+        checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
         if isinstance(checkpoint, dict):
             saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
+            restore_anchor_options(args, saved_args, sys.argv[1:])
             saved_profile = checkpoint.get("structure_profile")
             if saved_profile and not _cli_has("structure_profile"):
                 args.structure_profile = saved_profile
@@ -317,6 +320,8 @@ if __name__ == "__main__":
                     global_topology_max_nodes=args.global_topology_max_nodes,
                     global_topology_heads=args.global_topology_heads,
                     global_topology_alpha_max=args.global_topology_alpha_max,
+                    global_topology_mode=args.global_topology_mode,
+                    global_topology_options=anchor_options(args),
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device

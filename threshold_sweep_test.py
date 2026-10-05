@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import json
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -15,33 +16,25 @@ from networks.vision_transformer import (
 )
 from losses.road_losses import binary_metrics_from_logits
 from config import get_config
+from networks.anchor_topology_options import add_anchor_options, anchor_options, restore_anchor_options
 
 
 def compute_metrics_all_samples(logits_list, targets_list, threshold):
-    all_metrics = {
-        'iou': [],
-        'f1': [],
-        'precision': [],
-        'recall': [],
-    }
-    
+    tp = fp = fn = 0
     for logits, targets in zip(logits_list, targets_list):
-        metrics = binary_metrics_from_logits(logits, targets, threshold=threshold)
-        all_metrics['iou'].append(metrics['iou'])
-        all_metrics['f1'].append(metrics['f1'])
-        all_metrics['precision'].append(metrics['precision'])
-        all_metrics['recall'].append(metrics['recall'])
-    
-    return {
-        'iou': np.mean(all_metrics['iou']),
-        'f1': np.mean(all_metrics['f1']),
-        'precision': np.mean(all_metrics['precision']),
-        'recall': np.mean(all_metrics['recall']),
-    }
+        pred, truth = torch.sigmoid(logits) >= threshold, targets > 0.5
+        tp += (pred & truth).sum().item()
+        fp += (pred & ~truth).sum().item()
+        fn += (~pred & truth).sum().item()
+    return dict(iou=tp / max(tp + fp + fn, 1), f1=2 * tp / max(2 * tp + fp + fn, 1),
+                precision=tp / max(tp + fp, 1), recall=tp / max(tp + fn, 1))
 
 
 def main():
     parser = argparse.ArgumentParser()
+    add_anchor_options(parser)
+    parser.add_argument('--thresholds', default='0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70')
+    parser.add_argument('--output_json', default='')
     parser.add_argument('--root_path', type=str, default='./data1')
     parser.add_argument('--model_path', type=str, 
                        default='./model_out/train_skeleton_20260521_200553/checkpoints/epoch_100.pth')
@@ -114,6 +107,7 @@ def main():
     checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
     saved_args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
     if isinstance(saved_args, dict):
+        restore_anchor_options(args, saved_args, sys.argv[1:])
         for name in (
             'structure_profile', 'bottleneck_type', 'enable_highres_structure_stream',
             'highres_structure_channels', 'highres_structure_fuse_stages',
@@ -151,6 +145,8 @@ def main():
         global_topology_max_nodes=args.global_topology_max_nodes,
         global_topology_heads=args.global_topology_heads,
         global_topology_alpha_max=args.global_topology_alpha_max,
+        global_topology_mode=args.global_topology_mode,
+        global_topology_options=anchor_options(args),
         stage_skeleton_mode=args.stage_skeleton_mode,
         enable_h3_surface_fusion=args.enable_h3_surface_fusion,
         remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
@@ -197,8 +193,8 @@ def main():
             
             if isinstance(outputs, tuple):
                 surface_logits = outputs[0]
-                if len(outputs) > 1 and torch.is_tensor(outputs[1]):
-                    skeleton_logits = outputs[1]
+                if len(outputs) > 2 and torch.is_tensor(outputs[2]):
+                    skeleton_logits = outputs[2]
             else:
                 surface_logits = outputs
             
@@ -206,6 +202,8 @@ def main():
             all_surface_targets.append(masks.cpu())
             
             if skeleton_logits is not None:
+                skeleton_masks = torch.nn.functional.interpolate(
+                    skeleton_masks.float(), size=skeleton_logits.shape[-2:], mode='nearest')
                 all_skeleton_logits.append(skeleton_logits.cpu())
                 all_skeleton_targets.append(skeleton_masks.cpu())
     
@@ -217,7 +215,9 @@ def main():
     print('{:<12} {:<12} {:<12} {:<12} {:<12}'.format('Threshold', 'IoU', 'F1', 'Precision', 'Recall'))
     print('-'*60)
     
-    thresholds = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    thresholds = [float(value) for value in args.thresholds.split(',')]
+    if not thresholds or any(not 0 < value < 1 for value in thresholds):
+        raise ValueError('Thresholds must be in (0, 1)')
     surface_results = {}
     
     for threshold in thresholds:
@@ -240,6 +240,12 @@ def main():
         best_threshold_iou, surface_results[best_threshold_iou]['iou']))
     print('Best threshold (F1):  {:.2f} -> F1: {:.4f}'.format(
         best_threshold_f1, surface_results[best_threshold_f1]['f1']))
+    if args.output_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
+        with open(args.output_json, 'w', encoding='utf-8') as handle:
+            json.dump(dict(split=args.split, checkpoint=args.model_path,
+                           metric_reduction='global_pixels', best_threshold=best_threshold_iou,
+                           surface_results=surface_results), handle, indent=2)
     
     if all_skeleton_logits:
         print('\n' + '='*80)

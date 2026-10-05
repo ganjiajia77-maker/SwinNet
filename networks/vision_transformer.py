@@ -46,6 +46,7 @@ def get_topology_coefficients(model):
             "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),
         },
         "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
+        "global_topology_mode": getattr(swin_unet, "global_topology_mode", 'feature_anchors'),
     }
 
     for stage in (2, 3):
@@ -157,6 +158,13 @@ def load_topology_checkpoint_state(
     strict=True,
 ):
     model_state = model.state_dict()
+    if getattr(model.swin_unet, 'global_topology_mode', '') == 'supervised_anchors':
+        prefix = 'swin_unet.global_topology.'
+        required = {key for key in model_state if key.startswith(prefix)}
+        supplied = {key for key in state_dict if key.startswith(prefix)}
+        if required != supplied:
+            raise RuntimeError('Supervised anchor checkpoint must contain the complete trained '
+                               'connection/attention/writeback module; refusing random initialization')
     highres_structure_missing_prefixes = (
         "swin_unet.highres_structure_encoder.",
         "swin_unet.prepatch_structure_encoder.",
@@ -554,6 +562,8 @@ class SwinUnet(nn.Module):
                  global_topology_max_nodes=32,
                  global_topology_heads=4,
                  global_topology_alpha_max=0.05,
+                 global_topology_mode='feature_anchors',
+                 global_topology_options=None,
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
@@ -602,6 +612,8 @@ class SwinUnet(nn.Module):
                                 global_topology_max_nodes=global_topology_max_nodes,
                                  global_topology_heads=global_topology_heads,
                                  global_topology_alpha_max=global_topology_alpha_max,
+                                 global_topology_mode=global_topology_mode,
+                                 global_topology_options=global_topology_options,
                                  stage_skeleton_mode=stage_skeleton_mode,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
