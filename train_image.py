@@ -231,6 +231,14 @@ parser.add_argument(
     help='gamma for focal weighting on surface BCE; 0 disables focal weighting',
 )
 parser.add_argument(
+    '--surface_cldice_weight', type=float, default=0.1,
+    help='weight of soft-clDice from final surface logits and 256x256 surface GT; 0 disables it',
+)
+parser.add_argument(
+    '--surface_cldice_iterations', type=int, default=10,
+    help='soft skeletonization iterations for surface soft-clDice',
+)
+parser.add_argument(
     '--edge_contrastive_margin',
     type=float,
     default=0.0,
@@ -379,6 +387,8 @@ def build_criterion(args, loss_weights, device):
         directional_pos_weight_diagonal=args.directional_pos_weight_diagonal,
         connectivity_focal_gamma=args.connectivity_focal_gamma,
         surface_focal_gamma=args.surface_focal_gamma,
+        surface_cldice_weight=args.surface_cldice_weight,
+        surface_cldice_iterations=args.surface_cldice_iterations,
         edge_contrastive_margin=args.edge_contrastive_margin,
         stage_connectivity_factors=(
             0.0,
@@ -409,6 +419,8 @@ def format_training_config_lines(args, loss_weights):
     lines = [
         f"  结构配置: {args.structure_profile}",
         f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
+        f"  Surface soft-clDice: weight={args.surface_cldice_weight:.3f}, "
+        f"iterations={args.surface_cldice_iterations} (final surface, 256x256 GT)",
         f"  Training AMP: {args.amp_dtype}",
         "  Decoder computation: dense Stage 2/3",
             "  Stage skeleton mode: {}; pre-Stage2 topology source removed: {}".format(
@@ -575,6 +587,8 @@ def inherit_resume_architecture_args(args):
     saved_args = checkpoint["args"]
     for name, cast in (
         ("surface_focal_gamma", float),
+        ("surface_cldice_weight", float),
+        ("surface_cldice_iterations", int),
         ("amp_dtype", str),
         ("stage3_gate_topology_gradient_ratio", float),
         ("stage_skeleton_mode", str),
@@ -1806,6 +1820,7 @@ if __name__ == "__main__":
                 'structure_delta_weak_skeleton_fn_mean',
                 'structure_delta_skeleton_tp_mean',
                 'structure_delta_background_mean',
+                'surface_cldice_loss',
             ])
             batch_loss_writer.writerow([
                 'epoch', 'batch', 'loss',
@@ -1815,6 +1830,8 @@ if __name__ == "__main__":
                 'structure_delta_skeleton_tp_mean',
                 'structure_delta_background_mean',
                 'ms_per_batch',
+                'surface_cldice_loss',
+                'surface_cldice_weighted',
             ])
             loss_log_file.flush()
             batch_loss_log_file.flush()
@@ -1878,6 +1895,7 @@ if __name__ == "__main__":
                 "structure_delta_background_mean": 0.0,
             }
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
+            surface_cldice_sum = 0.0
             stage_distill_scale = get_stage_distill_scale(epoch)
 
             for i, batch in enumerate(train_loader):
@@ -1987,6 +2005,7 @@ if __name__ == "__main__":
 
                 total_loss += loss.item()
                 train_batches += 1
+                surface_cldice_sum += loss_dict['surface_cldice_loss'].item()
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 ms_per_batch = (time.perf_counter() - batch_start_time) * 1000.0
@@ -2007,6 +2026,8 @@ if __name__ == "__main__":
                     f"{loss_dict['structure_delta_skeleton_tp_mean'].item():.6f}",
                     f"{loss_dict['structure_delta_background_mean'].item():.6f}",
                     f"{ms_per_batch:.3f}",
+                    f"{loss_dict['surface_cldice_loss'].item():.6f}",
+                    f"{loss_dict['surface_cldice_weighted'].item():.6f}",
                 ])
                 batch_loss_log_file.flush()
 
@@ -2057,6 +2078,7 @@ if __name__ == "__main__":
                     print(
                         f"Epoch [{epoch+1}/{args.max_epochs}], Batch [{i+1}/{len(train_loader)}], "
                         f"Loss: {loss.item():.4f}, Surface: {loss_dict['surface_loss'].item():.4f}, "
+                        f"SurfaceCL: {loss_dict['surface_cldice_weighted'].item():.4f}, "
                         f"Skeleton: {loss_dict['skeleton_loss'].item():.4f}, "
                     f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                     f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
@@ -2170,6 +2192,7 @@ if __name__ == "__main__":
                 f"{highres_epoch_stats['structure_delta_weak_skeleton_fn_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_skeleton_tp_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_background_mean']:.6f}",
+                f"{surface_cldice_sum / max(train_batches, 1):.6f}",
             ])
             loss_log_file.flush()
             
