@@ -36,6 +36,12 @@ def main():
     parser.add_argument("--connectivity_metrics", action="store_true")
     parser.add_argument("--min_component_pixels", type=int, default=5)
     parser.add_argument("--metrics_csv", default="")
+    parser.add_argument("--topology_metrics", action="store_true",
+                        help="Data1 full-mask connectivity and sampled raster APLS proxy")
+    parser.add_argument("--topology_csv", default="")
+    parser.add_argument("--short_area_threshold", type=int, default=20)
+    parser.add_argument("--apls_max_nodes", type=int, default=64)
+    parser.add_argument("--apls_snap_radius", type=float, default=5.0)
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
 
@@ -45,6 +51,14 @@ def main():
         parser.error("--connectivity_metrics requires a single --threshold")
     if args.metrics_csv and not args.connectivity_metrics:
         parser.error("--metrics_csv requires --connectivity_metrics")
+    if args.topology_metrics and args.threshold is None:
+        parser.error("--topology_metrics requires a single --threshold")
+    if args.topology_csv and not args.topology_metrics:
+        parser.error("--topology_csv requires --topology_metrics")
+    if args.short_area_threshold < 1 or args.apls_max_nodes < 0 or args.apls_snap_radius < 0:
+        parser.error("Topology thresholds must be nonnegative; short area must be positive")
+    if args.topology_metrics:
+        from data1_prediction_topology_metrics import image_metrics, summarize
     thresholds = (
         [args.threshold] if args.threshold is not None
         else [float(value) for value in args.thresholds.split(",")]
@@ -75,6 +89,7 @@ def main():
     )
     counts = {threshold: [0, 0, 0] for threshold in thresholds}
     topology_rows = []
+    extended_topology_rows = []
     for batch in tqdm(loader, total=len(loader), desc=f"Evaluation {args.split}"):
         probability = sliding_probability(
             model, batch["image"], device,
@@ -91,6 +106,18 @@ def main():
                 args.threshold, args.min_component_pixels,
             )
             topology_rows.extend(rows)
+        if args.topology_metrics:
+            pred_mask = probability[0, 0].numpy() >= args.threshold
+            gt_mask = target[0, 0].numpy() > 0.5
+            extended_topology_rows.append({
+                "image_id": batch["name"][0],
+                **image_metrics(
+                    pred_mask, gt_mask,
+                    short_area_threshold=args.short_area_threshold,
+                    apls_max_nodes=args.apls_max_nodes,
+                    apls_snap_radius=args.apls_snap_radius,
+                ),
+            })
 
     results = {str(t): counts_to_metrics(counts[t]) for t in thresholds}
     for threshold in thresholds:
@@ -134,6 +161,20 @@ def main():
                 writer = csv.DictWriter(file, fieldnames=list(topology_rows[0]))
                 writer.writeheader()
                 writer.writerows(topology_rows)
+
+    if extended_topology_rows:
+        extended_summary = summarize(
+            extended_topology_rows, args.short_area_threshold,
+            args.apls_max_nodes, args.apls_snap_radius,
+        )
+        summary["topology"] = extended_summary
+        print("Data1 topology metrics (macro image mean):", extended_summary, flush=True)
+        if args.topology_csv:
+            os.makedirs(os.path.dirname(os.path.abspath(args.topology_csv)), exist_ok=True)
+            with open(args.topology_csv, "w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=list(extended_topology_rows[0]))
+                writer.writeheader()
+                writer.writerows(extended_topology_rows)
 
     if args.summary_json:
         os.makedirs(os.path.dirname(os.path.abspath(args.summary_json)), exist_ok=True)
