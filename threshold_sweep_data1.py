@@ -59,7 +59,10 @@ def main():
     best = max(rows, key=lambda row: row["iou"])
     with open(os.path.join(args.output_dir, "best_threshold.txt"), "w") as handle:
         handle.write("{:.6f}\n".format(best["threshold"]))
-    print("Best threshold (IoU): {:.2f} -> IoU: {:.6f}".format(best["threshold"], best["iou"]))
+    print("Best threshold (IoU): {:.2f} -> IoU: {:.6f}, F1: {:.6f}, "
+          "Precision: {:.6f}, Recall: {:.6f}".format(
+              best["threshold"], best["iou"], best["f1"],
+              best["precision"], best["recall"]))
 
 
 if __name__ == "__main__":

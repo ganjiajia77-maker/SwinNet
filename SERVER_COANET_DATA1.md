@@ -95,6 +95,10 @@ THRESHOLD=$(cat "$SWEEP/best_threshold.txt")
 echo "Validation threshold: $THRESHOLD"
 ```
 
+The selected row's IoU, F1, precision and recall are all in
+`$SWEEP/threshold_sweep_val.csv`. `best_threshold.txt` contains only the
+threshold so test inference can read it directly.
+
 Test once at the validation-selected threshold, using identical inference settings.
 
 ```bash
@@ -103,14 +107,22 @@ CUDA_VISIBLE_DEVICES=1 python -u test_data1.py \
   --root_path "$DATA" --model_path "$CKPT" --output_dir "$TEST_OUT" \
   --split test --source_patch_size 1024 --tile_size 512 --overlap_stride 256 \
   --prediction_mode paper_fusion --require_ema --threshold "$THRESHOLD"
+cat "$TEST_OUT/test_metrics.csv"
 ```
 
-For additional clDice and fragmentation measurements on the same test masks:
+Evaluate the saved test masks with the same pixel, skeleton and component
+definitions as the Swin topology comparison. `apls` is a sampled approximation;
+use the same `--apls_max_nodes` and `--apls_snap_radius` for both models.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -u diagnose_connectivity_data1.py \
-  --root_path "$DATA" --model_path "$CKPT" \
-  --output_dir "$RESULTS/data1/$RUN/topology_test" \
-  --split test --source_patch_size 1024 --tile_size 512 --overlap_stride 256 \
-  --prediction_mode paper_fusion --require_ema --threshold "$THRESHOLD"
+python -u evaluate_prediction_topology_data1.py \
+  --root_path "$DATA" --pred_dir "$TEST_OUT/masks" \
+  --output_dir "$RESULTS/data1/$RUN/topology_test_from_masks" \
+  --split test --source_patch_size 1024 \
+  --short_area_threshold 20 --apls_max_nodes 64 --apls_snap_radius 5
 ```
+
+The mask metrics do not include CoANet connection head AUROC/AUPRC because
+these scores cannot be recovered from binary test masks. The older
+`diagnose_connectivity_data1.py` also evaluates only the final mask, with a
+different skeletonization method, so use the script above for comparison.
