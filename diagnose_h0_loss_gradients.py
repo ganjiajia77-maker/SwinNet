@@ -70,11 +70,21 @@ def stage_term(criterion, outputs, skeleton, skeleton_dilate, kind):
          criterion.stage_connectivity_factors, criterion.stage_direction_factors) = original
 
 
-def gradient_norm(loss, parameter):
+def gradient_vector(loss, parameter):
     if not loss.requires_grad:
-        return 0.0
+        return None
     grad, = torch.autograd.grad(loss, parameter, retain_graph=True, allow_unused=True)
-    return 0.0 if grad is None else float(torch.linalg.vector_norm(grad.detach().float()))
+    return None if grad is None else grad.detach().float().reshape(-1)
+
+
+def gradient_cosine(left, right):
+    if left is None or right is None:
+        return None
+    left_norm = torch.linalg.vector_norm(left)
+    right_norm = torch.linalg.vector_norm(right)
+    if left_norm <= 1e-12 or right_norm <= 1e-12:
+        return None
+    return float(torch.dot(left, right) / (left_norm * right_norm))
 
 
 def main():
@@ -146,10 +156,22 @@ def main():
         terms["other"] = total_loss - sum(terms.values())
         row = {"batch": batch_number, "total": float(total_loss.detach()),
                "stage_structure": float(loss_dict["stage_structure_loss"])}
+        gradients = {}
         for name, loss in terms.items():
             row[name] = {"weighted_loss": float(loss.detach())}
             for stage, parameter in probes.items():
-                row[name][f"stage{stage}_grad_norm"] = gradient_norm(loss, parameter)
+                grad = gradient_vector(loss, parameter)
+                gradients[name, stage] = grad
+                row[name][f"stage{stage}_grad_norm"] = (
+                    0.0 if grad is None else float(torch.linalg.vector_norm(grad))
+                )
+        row["cosines_vs_surface"] = {
+            f"stage{stage}": {
+                name: gradient_cosine(gradients[name, stage], gradients["surface", stage])
+                for name in ("skeleton", "connectivity", "direction")
+            }
+            for stage in probes
+        }
         rows.append(row)
         print(json.dumps(row), flush=True)
     summary = {name: {
@@ -166,6 +188,21 @@ def main():
             summary[name][f"stage{stage}_grad_vs_surface"] = (
                 summary[name][key] / max(summary["surface"][key], 1e-12)
             )
+    cosine_summary = {}
+    for stage in probes:
+        stage_key = f"stage{stage}"
+        cosine_summary[stage_key] = {}
+        for name in ("skeleton", "connectivity", "direction"):
+            values = [row["cosines_vs_surface"][stage_key][name] for row in rows]
+            valid = [value for value in values if value is not None]
+            negative = sum(value < 0 for value in valid)
+            cosine_summary[stage_key][name] = {
+                "mean": float(np.mean(valid)) if valid else None,
+                "median": float(np.median(valid)) if valid else None,
+                "negative_batches": negative,
+                "valid_batches": len(valid),
+                "negative_fraction": negative / len(valid) if valid else None,
+            }
     result = {"checkpoint": cli.checkpoint,
               "checkpoint_epoch": (int(checkpoint["epoch"]) if "epoch" in checkpoint else None),
               "n_batches": len(rows), "batch_size": cli.batch_size,
@@ -174,10 +211,11 @@ def main():
                           "connectivity_factor": train_args.stage_connectivity_factor,
                           "direction_factor": train_args.stage_direction_factor,
                           "final": weights},
-              "summary": summary, "batches": rows}
+              "summary": summary, "cosine_summary": cosine_summary, "batches": rows}
     with open(cli.output_json, "w", encoding="utf-8") as output:
         json.dump(result, output, indent=2)
     print("SUMMARY " + json.dumps(summary), flush=True)
+    print("COSINE_SUMMARY " + json.dumps(cosine_summary), flush=True)
 
 
 if __name__ == "__main__":
