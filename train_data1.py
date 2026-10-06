@@ -156,6 +156,10 @@ def main():
                 if ema is not None:
                     update_ema(ema, model, args.ema_decay)
                 total_loss += float(loss.detach())
+                if (batch_index + 1) % 100 == 0 or batch_index + 1 == len(loader):
+                    print('Epoch {}/{} batch {}/{} loss={:.6f}'.format(
+                        epoch_index + 1, args.max_epochs, batch_index + 1,
+                        len(loader), float(loss.detach())), flush=True)
             train_loss = total_loss / len(loader)
             values = {}
             if (epoch_index + 1) % args.val_interval == 0 or epoch_index + 1 == args.max_epochs:
