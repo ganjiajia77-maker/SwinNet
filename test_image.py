@@ -25,7 +25,7 @@ from networks.vision_transformer import (
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
-from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
+from networks.checkpoint_compat import adapt_connectivity_modules_for_checkpoint
 
 
 def _cli_has(flag_name):
@@ -117,6 +117,7 @@ parser.add_argument(
 )
 parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
 parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=None)
+parser.add_argument('--enable_c3_neighbor_fusion', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--enable_global_topology', action='store_true')
 parser.add_argument('--global_topology_max_nodes', type=int, default=32)
 parser.add_argument('--global_topology_heads', type=int, default=4)
@@ -271,6 +272,7 @@ if __name__ == "__main__":
                 "highres_structure_fusion_mode",
                 "enable_post_refine_structure_interaction",
                 "enable_h3_surface_fusion",
+                "enable_c3_neighbor_fusion",
                 "enable_global_topology",
                 "global_topology_max_nodes",
                 "global_topology_heads",
@@ -290,6 +292,7 @@ if __name__ == "__main__":
     for name, default in (
         ("stage_skeleton_mode", "prior_residual"),
         ("enable_h3_surface_fusion", False),
+        ("enable_c3_neighbor_fusion", False),
         ("remove_stage2_pre_topology_source", False),
     ):
         if getattr(args, name) is None:
@@ -313,6 +316,7 @@ if __name__ == "__main__":
                         args.enable_post_refine_structure_interaction
                     ),
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
+                    enable_c3_neighbor_fusion=args.enable_c3_neighbor_fusion,
                     enable_global_topology=args.enable_global_topology,
                     global_topology_max_nodes=args.global_topology_max_nodes,
                     global_topology_heads=args.global_topology_heads,

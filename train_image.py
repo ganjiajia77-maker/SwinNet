@@ -119,6 +119,8 @@ parser.add_argument(
 parser.add_argument('--highres_structure_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
 parser.add_argument('--enable_h3_surface_fusion', action='store_true')
+parser.add_argument('--enable_c3_neighbor_fusion', action='store_true',
+                    help='use reciprocal Stage 3 C3 and predicted S3 to aggregate neighboring G3 features')
 parser.add_argument('--remove_stage2_pre_topology_source', action='store_true')
 parser.add_argument(
     '--enable_global_topology',
@@ -418,6 +420,9 @@ def format_training_config_lines(args, loss_weights):
             "  H3 -> final surface fusion: {}".format(
                 args.enable_h3_surface_fusion
             ),
+            "  Stage 3 C3-guided G3 neighbor fusion: {}".format(
+                args.enable_c3_neighbor_fusion
+            ),
     ]
     if args.enable_highres_structure_stream:
         lines.append(
@@ -595,7 +600,7 @@ def inherit_resume_architecture_args(args):
         args.overlap_stride = int(saved_args["overlap_stride"])
     if "enable_highres_structure_stream" in saved_args and not _cli_has("--enable_highres_structure_stream"):
         args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
-    for name in ("remove_stage2_pre_topology_source",):
+    for name in ("remove_stage2_pre_topology_source", "enable_c3_neighbor_fusion"):
         if name in saved_args and not _cli_has("--" + name):
             setattr(args, name, bool(saved_args[name]))
     if "highres_structure_channels" in saved_args and not _cli_has("--highres_structure_channels"):
@@ -1235,6 +1240,7 @@ if __name__ == "__main__":
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
+                    enable_c3_neighbor_fusion=args.enable_c3_neighbor_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)

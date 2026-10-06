@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from topology_direction_constants import (
     CONNECTIVITY_DIRECTIONS,
+    CONNECTIVITY_OPPOSITE,
 )
 
 def scale_gradient(x, ratio: float):
@@ -661,6 +662,7 @@ class DecoderStructureRefinement(nn.Module):
         previous_structure_channels=None,
         highres_structure_channels=None,
         use_structure_residual=False,
+        enable_c3_neighbor_fusion=False,
     ):
         super().__init__()
         fusion_channels = max(channels // 2, 16)
@@ -674,6 +676,15 @@ class DecoderStructureRefinement(nn.Module):
         self.use_structure_residual = bool(
             use_structure_residual or previous_structure_channels is not None
         )
+        self.enable_c3_neighbor_fusion = bool(enable_c3_neighbor_fusion)
+        if self.enable_c3_neighbor_fusion and connectivity_channels != len(CONNECTIVITY_DIRECTIONS):
+            raise ValueError("C3 neighbor fusion requires eight connectivity directions")
+        if self.enable_c3_neighbor_fusion:
+            self.c3_neighbor_projection = nn.Conv2d(channels, channels, kernel_size=1)
+            nn.init.zeros_(self.c3_neighbor_projection.weight)
+            nn.init.zeros_(self.c3_neighbor_projection.bias)
+        else:
+            self.c3_neighbor_projection = None
 
         self.structure_branch = nn.Sequential(
             ConvBNReLU(channels, channels),
@@ -759,6 +770,28 @@ class DecoderStructureRefinement(nn.Module):
             shifted = self._shift_feature(feature, dy, dx)
             propagated = propagated + connectivity_prob[:, idx:idx + 1] * shifted
         return propagated / float(len(CONNECTIVITY_DIRECTIONS))
+
+    def fuse_c3_neighbors(self, surface_feature, structure_feat, skeleton_prob, connectivity_prob):
+        # A zero-padded shift makes out-of-image neighbors contribute zero weight.
+        weighted_sum = structure_feat
+        weight_sum = torch.ones_like(skeleton_prob)
+        for direction, (dy, dx) in enumerate(CONNECTIVITY_DIRECTIONS):
+            neighbor_structure = self._shift_feature(structure_feat, dy, dx)
+            opposite = CONNECTIVITY_OPPOSITE[direction]
+            neighbor_reverse_connection = self._shift_feature(
+                connectivity_prob[:, opposite:opposite + 1], dy, dx
+            )
+            neighbor_skeleton = self._shift_feature(skeleton_prob, dy, dx)
+            edge_weight = (
+                connectivity_prob[:, direction:direction + 1]
+                * neighbor_reverse_connection
+                * skeleton_prob
+                * neighbor_skeleton
+            )
+            weighted_sum = weighted_sum + edge_weight * neighbor_structure
+            weight_sum = weight_sum + edge_weight
+        new_information = weighted_sum / weight_sum - structure_feat
+        return surface_feature + 0.1 * self.c3_neighbor_projection(new_information)
 
     def forward(
         self,
@@ -888,6 +921,8 @@ class DecoderStructureRefinement(nn.Module):
         else:
             gate_residual = torch.zeros_like(x)
             out = x
+        if self.c3_neighbor_projection is not None and apply_feature_refinement:
+            out = self.fuse_c3_neighbors(out, structure_feat, skeleton_prob, connectivity_prob)
         if self.capture_diagnostics:
             with torch.no_grad():
                 feature_norm = torch.linalg.vector_norm(x)

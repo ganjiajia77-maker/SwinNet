@@ -1267,6 +1267,7 @@ class SwinTransformerSys(nn.Module):
                  highres_structure_fusion_mode="stage23",
                  enable_post_refine_structure_interaction=False,
                  enable_h3_surface_fusion=False,
+                 enable_c3_neighbor_fusion=False,
                  enable_global_topology=False,
                  global_topology_max_nodes=32,
                  global_topology_heads=4,
@@ -1358,6 +1359,7 @@ class SwinTransformerSys(nn.Module):
             or self.highres_structure_fusion_mode == "post_refine_interaction"
         )
         self.enable_h3_surface_fusion = bool(enable_h3_surface_fusion)
+        self.enable_c3_neighbor_fusion = bool(enable_c3_neighbor_fusion)
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -1573,6 +1575,9 @@ class SwinTransformerSys(nn.Module):
                         else None
                     ),
                     use_structure_residual=(stage_index in (2, 3)),
+                    enable_c3_neighbor_fusion=(
+                        stage_index == 3 and self.enable_c3_neighbor_fusion
+                    ),
                 )
                 for stage_index, channels in decoder_structure_channels.items()
             }

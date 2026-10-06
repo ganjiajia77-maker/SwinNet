@@ -550,6 +550,7 @@ class SwinUnet(nn.Module):
                  highres_structure_fusion_mode="stage23",
                  enable_post_refine_structure_interaction=False,
                  enable_h3_surface_fusion=False,
+                 enable_c3_neighbor_fusion=False,
                  enable_global_topology=False,
                  global_topology_max_nodes=32,
                  global_topology_heads=4,
@@ -598,6 +599,7 @@ class SwinUnet(nn.Module):
                                     enable_post_refine_structure_interaction
                                 ),
                                 enable_h3_surface_fusion=enable_h3_surface_fusion,
+                                enable_c3_neighbor_fusion=enable_c3_neighbor_fusion,
                                 enable_global_topology=enable_global_topology,
                                 global_topology_max_nodes=global_topology_max_nodes,
                                  global_topology_heads=global_topology_heads,
