@@ -147,61 +147,6 @@ class EdgeAwareLoss(nn.Module):
         return bce + dice.mean()
 
 
-def soft_erode(img):
-    erode_h = -F.max_pool2d(-img, kernel_size=(3, 1), stride=1, padding=(1, 0))
-    erode_w = -F.max_pool2d(-img, kernel_size=(1, 3), stride=1, padding=(0, 1))
-    return torch.min(erode_h, erode_w)
-
-
-def soft_dilate(img):
-    return F.max_pool2d(img, kernel_size=3, stride=1, padding=1)
-
-
-def soft_open(img):
-    return soft_dilate(soft_erode(img))
-
-
-def soft_skeletonize(img, iterations=10):
-    img = img.clamp(0.0, 1.0)
-    skeleton = F.relu(img - soft_open(img))
-
-    for _ in range(iterations):
-        img = soft_erode(img)
-        delta = F.relu(img - soft_open(img))
-        skeleton = skeleton + F.relu(delta - skeleton * delta)
-
-    return skeleton.clamp(0.0, 1.0)
-
-
-class SoftClDiceLoss(nn.Module):
-    def __init__(self, iterations=10, smooth=1e-6):
-        super().__init__()
-        self.iterations = iterations
-        self.smooth = smooth
-
-    def forward(self, probs, targets):
-        if probs.dim() == 3:
-            probs = probs.unsqueeze(1)
-        if targets.dim() == 3:
-            targets = targets.unsqueeze(1)
-
-        probs = probs.float().clamp(0.0, 1.0)
-        targets = (targets > 0.5).float()
-
-        pred_skel = soft_skeletonize(probs, iterations=self.iterations)
-        target_skel = soft_skeletonize(targets, iterations=self.iterations)
-
-        dims = (1, 2, 3)
-        tprec = ((pred_skel * targets).sum(dims) + self.smooth) / (
-            pred_skel.sum(dims) + self.smooth
-        )
-        tsens = ((target_skel * probs).sum(dims) + self.smooth) / (
-            target_skel.sum(dims) + self.smooth
-        )
-        cldice = 2.0 * tprec * tsens / (tprec + tsens + self.smooth)
-        return (1.0 - cldice).mean()
-
-
 class SurfaceSkeletonLoss(nn.Module):
     def __init__(
         self,
