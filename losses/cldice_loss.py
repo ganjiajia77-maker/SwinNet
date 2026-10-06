@@ -72,7 +72,7 @@ class SoftCLDiceLoss(nn.Module):
         Tubular Structure Segmentation", CVPR 2021
     """
 
-    def __init__(self, iter_num: int = 10, smooth: float = 1.0):
+    def __init__(self, iter_num: int = 10, smooth: float = 1e-6):
         """
         Args:
             iter_num: number of soft skeletonization iterations

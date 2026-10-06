@@ -174,7 +174,7 @@ def soft_skeletonize(img, iterations=10):
 
 
 class SoftClDiceLoss(nn.Module):
-    def __init__(self, iterations=10, smooth=1.0):
+    def __init__(self, iterations=10, smooth=1e-6):
         super().__init__()
         self.iterations = iterations
         self.smooth = smooth
@@ -192,9 +192,13 @@ class SoftClDiceLoss(nn.Module):
         target_skel = soft_skeletonize(targets, iterations=self.iterations)
 
         dims = (1, 2, 3)
-        tprec = (pred_skel * targets).sum(dims) / (pred_skel.sum(dims) + self.smooth)
-        tsens = (target_skel * probs).sum(dims) / (target_skel.sum(dims) + self.smooth)
-        cldice = (2.0 * tprec * tsens + self.smooth) / (tprec + tsens + self.smooth)
+        tprec = ((pred_skel * targets).sum(dims) + self.smooth) / (
+            pred_skel.sum(dims) + self.smooth
+        )
+        tsens = ((target_skel * probs).sum(dims) + self.smooth) / (
+            target_skel.sum(dims) + self.smooth
+        )
+        cldice = 2.0 * tprec * tsens / (tprec + tsens + self.smooth)
         return (1.0 - cldice).mean()
 
 
