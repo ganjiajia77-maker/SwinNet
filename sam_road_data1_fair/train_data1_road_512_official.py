@@ -1,6 +1,7 @@
 """SAM-Road ViT-B road-head training on data1, using the official 512 recipe."""
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -15,7 +16,7 @@ from data1_road_512_official_common import (
 )
 from data1_road_dataset import Data1RoadDataset
 from model import SAMRoad
-from train_data1_road import road_logits, seed_everything, seed_worker
+from train_data1_road import road_logits, seed_everything, seed_worker, update_ema
 from train_data1_road_256_official import build_optimizer, road_bce
 from utils import load_config
 
@@ -51,6 +52,8 @@ def main():
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--precision", choices=["16", "32"], default="16")
+    parser.add_argument("--use_ema", action="store_true")
+    parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--resume", default="")
     args = parser.parse_args()
@@ -64,6 +67,8 @@ def main():
         config.DATA_WORKER_NUM = args.workers
     if args.micro_batch_size < 1 or args.grad_accum < 1:
         parser.error("--micro_batch_size and --grad_accum must be positive")
+    if not 0 <= args.ema_decay < 1:
+        parser.error("--ema_decay must be in [0, 1)")
     if args.micro_batch_size * args.grad_accum != int(config.BATCH_SIZE):
         parser.error("micro_batch_size * grad_accum must equal official BATCH_SIZE=16")
     if int(config.PATCH_SIZE) != 512 or int(config.SOURCE_SIZE) != 1024:
@@ -100,11 +105,20 @@ def main():
     model = SAMRoad(config).to(device)
     optimizer, scheduler = build_optimizer(model, config)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    ema_model = copy.deepcopy(model).eval() if args.use_ema else None
+    if ema_model is not None:
+        ema_model.requires_grad_(False)
     start_epoch = 0
     best_f1 = -1.0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if bool(checkpoint.get("use_ema", False)) != args.use_ema:
+            parser.error("EMA setting differs from checkpoint; start a new run")
+        if args.use_ema and float(checkpoint["ema_decay"]) != args.ema_decay:
+            parser.error("EMA decay differs from checkpoint; use the original value")
         model.load_state_dict(checkpoint["training_model_state_dict"])
+        if ema_model is not None:
+            ema_model.load_state_dict(checkpoint["ema_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if use_amp and checkpoint.get("scaler_state_dict"):
@@ -117,6 +131,7 @@ def main():
             "args": vars(args), "config": config.to_dict(),
             "effective_batch_size": args.micro_batch_size * args.grad_accum,
             "precision": "16-mixed" if use_amp else "32",
+            "ema": {"enabled": args.use_ema, "decay": args.ema_decay},
             "train": "one 512 random crop per 1024 image per epoch; random 90-degree rotation",
             "evaluation": "512 window, stride 256, weighted-logit stitching to 1024",
             "supervision": "road BCE only; data1 has no graph labels for TopoNet",
@@ -159,8 +174,11 @@ def main():
                     loss = road_bce(road_logits(model, images), target)
                 scaler.scale(loss * images.shape[0] / group_samples).backward()
                 if (batch_index + 1) % args.grad_accum == 0 or batch_index + 1 == len(train_loader):
+                    scale_before_step = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
+                    if ema_model is not None and scaler.get_scale() >= scale_before_step:
+                        update_ema(ema_model.state_dict(), model, args.ema_decay)
                     optimizer.zero_grad(set_to_none=True)
                 loss_sum += loss.item() * images.shape[0]
                 progress.set_postfix(
@@ -169,13 +187,17 @@ def main():
                     lr=f"{lr_decoder:.2e}",
                 )
 
-            metrics = evaluate(model, val_loader, device, config, use_amp)
+            metrics = evaluate(
+                ema_model if ema_model is not None else model,
+                val_loader, device, config, use_amp,
+            )
             train_loss = loss_sum / len(train_ds)
             print(
                 f"epoch={epoch + 1}/{config.TRAIN_EPOCHS} "
                 f"lr_enc={lr_encoder:.3g} lr_dec={lr_decoder:.3g} "
                 f"train={train_loss:.5f} val_iou={metrics['iou']:.5f} "
-                f"val_f1={metrics['f1']:.5f}", flush=True,
+                f"val_f1={metrics['f1']:.5f} "
+                f"val_weights={'ema' if ema_model is not None else 'raw'}", flush=True,
             )
             improved = metrics["f1"] > best_f1
             if improved:
@@ -183,8 +205,11 @@ def main():
             scheduler.step()
             checkpoint = {
                 "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": ema_model.state_dict() if ema_model is not None else model.state_dict(),
                 "training_model_state_dict": model.state_dict(),
+                "ema_state_dict": ema_model.state_dict() if ema_model is not None else None,
+                "use_ema": args.use_ema,
+                "ema_decay": args.ema_decay if args.use_ema else None,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "scaler_state_dict": scaler.state_dict() if use_amp else None,

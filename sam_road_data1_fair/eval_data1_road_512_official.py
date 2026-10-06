@@ -64,6 +64,8 @@ def main():
     model = SAMRoad(config).to(device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    weights_kind = "ema" if checkpoint.get("use_ema", False) else "raw"
+    print(f"Loaded {weights_kind} weights from {args.checkpoint}", flush=True)
     model.eval()
 
     dataset = Data1RoadDataset(args.data_root, args.split, source_size=1024)
@@ -100,6 +102,8 @@ def main():
         )
     summary = {
         "checkpoint": os.path.abspath(args.checkpoint),
+        "weights": weights_kind,
+        "ema_decay": checkpoint.get("ema_decay") if weights_kind == "ema" else None,
         "split": args.split,
         "source_size": 1024,
         "tile": int(config.EVAL_TILE),
