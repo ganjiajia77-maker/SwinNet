@@ -7,6 +7,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+from scipy.spatial import cKDTree
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 
@@ -84,7 +87,107 @@ def skeletonize(mask):
     return RoadSkeletonDataset._skeletonize_binary(mask.astype(np.uint8) * 255) > 127
 
 
-def case_metrics(case, prediction, ground_truth, short_area_threshold):
+def skeleton_graph(skeleton):
+    """Create an undirected, distance-weighted 8-neighbor pixel graph."""
+    points = np.argwhere(skeleton)
+    node_count = len(points)
+    if node_count == 0:
+        return csr_matrix((0, 0), dtype=np.float64), points
+    height, width = skeleton.shape
+    node_ids = np.full((height, width), -1, dtype=np.int32)
+    node_ids[points[:, 0], points[:, 1]] = np.arange(node_count, dtype=np.int32)
+    row_parts = []
+    col_parts = []
+    weight_parts = []
+    for dy, dx in ((0, 1), (1, -1), (1, 0), (1, 1)):
+        y_start, y_stop = max(0, -dy), height - max(0, dy)
+        x_start, x_stop = max(0, -dx), width - max(0, dx)
+        source = node_ids[y_start:y_stop, x_start:x_stop]
+        target = node_ids[y_start + dy:y_stop + dy, x_start + dx:x_stop + dx]
+        connected = (source >= 0) & (target >= 0)
+        rows, cols = source[connected], target[connected]
+        row_parts.extend((rows, cols))
+        col_parts.extend((cols, rows))
+        weight_parts.extend((np.full(len(rows), np.hypot(dy, dx)),) * 2)
+    if row_parts:
+        graph = csr_matrix(
+            (np.concatenate(weight_parts),
+             (np.concatenate(row_parts), np.concatenate(col_parts))),
+            shape=(node_count, node_count),
+        )
+    else:
+        graph = csr_matrix((node_count, node_count), dtype=np.float64)
+    return graph, points
+
+
+def sample_graph_nodes(graph, max_nodes):
+    """Prefer endpoints and junctions, then sample along ordinary paths."""
+    node_count = graph.shape[0]
+    if node_count <= max_nodes:
+        return np.arange(node_count, dtype=np.int32)
+    special = np.flatnonzero(np.diff(graph.indptr) != 2)
+    if len(special) >= max_nodes:
+        return special[np.linspace(0, len(special) - 1, max_nodes, dtype=int)]
+    ordinary = np.flatnonzero(np.diff(graph.indptr) == 2)
+    remaining = max_nodes - len(special)
+    selected = ordinary[np.linspace(0, len(ordinary) - 1, remaining, dtype=int)]
+    return np.concatenate((special, selected))
+
+
+def directional_path_similarity(source_graph, source_points, target_graph, target_points,
+                                max_nodes, snap_radius):
+    if source_graph.shape[0] < 2 or target_graph.shape[0] < 2:
+        return 0.0
+    control_nodes = sample_graph_nodes(source_graph, max_nodes)
+    distances, nearest = cKDTree(target_points).query(
+        source_points[control_nodes], distance_upper_bound=snap_radius
+    )
+    snapped = np.where(np.isfinite(distances), nearest, -1).astype(np.int32)
+    source_paths = dijkstra(source_graph, directed=False, indices=control_nodes)
+    source_paths = source_paths[:, control_nodes]
+    matched = np.unique(snapped[snapped >= 0])
+    target_paths = None
+    matched_rows = {}
+    if matched.size:
+        target_paths = dijkstra(target_graph, directed=False, indices=matched)
+        matched_rows = {int(node): row for row, node in enumerate(matched)}
+
+    scores = []
+    for left in range(len(control_nodes)):
+        for right in range(left + 1, len(control_nodes)):
+            reference_length = source_paths[left, right]
+            if not np.isfinite(reference_length) or reference_length <= 0:
+                continue
+            route_score = 0.0
+            if snapped[left] >= 0 and snapped[right] >= 0:
+                proposed_length = target_paths[matched_rows[int(snapped[left])], snapped[right]]
+                if np.isfinite(proposed_length):
+                    route_score = max(
+                        0.0,
+                        1.0 - abs(proposed_length - reference_length) / reference_length,
+                    )
+            scores.append(route_score)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def approximate_apls(gt_skeleton, pred_skeleton, max_nodes, snap_radius):
+    gt_graph, gt_points = skeleton_graph(gt_skeleton)
+    pred_graph, pred_points = skeleton_graph(pred_skeleton)
+    gt_to_pred = directional_path_similarity(
+        gt_graph, gt_points, pred_graph, pred_points, max_nodes, snap_radius
+    )
+    pred_to_gt = directional_path_similarity(
+        pred_graph, pred_points, gt_graph, gt_points, max_nodes, snap_radius
+    )
+    symmetric = (
+        2 * gt_to_pred * pred_to_gt / (gt_to_pred + pred_to_gt)
+        if gt_to_pred + pred_to_gt else 0.0
+    )
+    return gt_to_pred, pred_to_gt, symmetric
+
+
+def case_metrics(case, prediction, ground_truth, short_area_threshold,
+                 apls_max_nodes, apls_snap_radius):
     pred = prediction > 127
     gt = ground_truth > 127
     if pred.shape != gt.shape:
@@ -116,6 +219,9 @@ def case_metrics(case, prediction, ground_truth, short_area_threshold):
     gap_stats = component_stats(missing, 1)
     pred_skel_components = component_stats(pred_skel, 1)["components"]
     gt_skel_components = component_stats(gt_skel, 1)["components"]
+    apls_gt_to_pred, apls_pred_to_gt, apls_approx = approximate_apls(
+        gt_skel, pred_skel, apls_max_nodes, apls_snap_radius
+    )
 
     return {
         "case": case,
@@ -146,6 +252,9 @@ def case_metrics(case, prediction, ground_truth, short_area_threshold):
         "missing_gt_skeleton_rate": float(missing.sum() / gt_skel_count) if gt_skel_count else 0.0,
         "gap_components": gap_stats["components"],
         "max_gap_pixels": gap_stats["largest_area"],
+        "apls_gt_to_pred_approx": apls_gt_to_pred,
+        "apls_pred_to_gt_approx": apls_pred_to_gt,
+        "apls_approx": apls_approx,
     }
 
 
@@ -174,10 +283,14 @@ def main():
     parser.add_argument("--pred_dir", type=Path, required=True)
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--short_area_threshold", type=int, default=20)
+    parser.add_argument("--apls_max_nodes", type=int, default=64)
+    parser.add_argument("--apls_snap_radius", type=float, default=5.0)
     parser.add_argument("--output_dir", type=Path, required=True)
     args = parser.parse_args()
     if args.short_area_threshold < 1:
         parser.error("--short_area_threshold must be positive")
+    if args.apls_max_nodes < 2 or args.apls_snap_radius <= 0:
+        parser.error("--apls_max_nodes must be at least 2 and --apls_snap_radius must be positive")
 
     pred_dir = prediction_directory(args.pred_dir)
     source_dir = split_image_directory(args.root_path, args.split)
@@ -201,11 +314,21 @@ def main():
         gt = cv2.imread(str(gt_file), cv2.IMREAD_GRAYSCALE)
         if pred is None or gt is None:
             raise OSError(f"Cannot read prediction or label for {case}")
-        rows.append(case_metrics(case, pred, gt, args.short_area_threshold))
+        rows.append(case_metrics(
+            case, pred, gt, args.short_area_threshold,
+            args.apls_max_nodes, args.apls_snap_radius,
+        ))
         print(f"[{index}/{len(pred_files)}] {case}: IoU={rows[-1]['iou']:.4f} "
-              f"clDice={rows[-1]['cldice']:.4f} pred_comp={rows[-1]['pred_components']}", flush=True)
+              f"clDice={rows[-1]['cldice']:.4f} "
+              f"APLS~={rows[-1]['apls_approx']:.4f} "
+              f"pred_comp={rows[-1]['pred_components']}", flush=True)
 
     summary = summarize(rows)
+    summary.update({
+        "apls_method": "bidirectional sampled 8-neighbor pixel-skeleton paths; harmonic mean",
+        "apls_max_nodes": args.apls_max_nodes,
+        "apls_snap_radius_pixels": args.apls_snap_radius,
+    })
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with (args.output_dir / "per_image.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
