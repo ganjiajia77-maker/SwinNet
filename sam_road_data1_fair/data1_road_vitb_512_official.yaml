@@ -1,0 +1,38 @@
+DATASET: 'data1'
+NO_SAM: False
+SAM_VERSION: 'vit_b'
+SAM_CKPT_PATH: 'sam_ckpts/sam_vit_b_01ec64.pth'
+
+# htcr/sam_road config/toponet_vitb_512_cityscale.yaml road-head settings.
+PATCH_SIZE: 512
+BATCH_SIZE: 16
+DATA_WORKER_NUM: 1
+TRAIN_EPOCHS: 80  # User-requested extension; official Cityscale run uses 10.
+BASE_LR: 0.001
+FREEZE_ENCODER: False
+ENCODER_LR_FACTOR: 0.1
+ENCODER_LORA: False
+FOCAL_LOSS: False
+USE_SAM_DECODER: False
+
+# Required by SAMRoad construction. Graph topology is not supervised on data1.
+TOPO_SAMPLE_NUM: 512
+TOPONET_VERSION: 'normal'
+INFER_BATCH_SIZE: 64
+SAMPLE_MARGIN: 64
+INFER_PATCHES_PER_EDGE: 16
+ITSC_THRESHOLD: 0.248
+ROAD_THRESHOLD: 0.364
+TOPO_THRESHOLD: 0.500
+ITSC_NMS_RADIUS: 8
+ROAD_NMS_RADIUS: 16
+NEIGHBOR_RADIUS: 64
+MAX_NEIGHBOR_QUERIES: 16
+
+# data1 adapter: one 512 crop per 1024 training image per epoch.
+SOURCE_SIZE: 1024
+RANDOM_CROP: True
+ROTATION_AUGMENT: True
+VAL_THRESHOLD: 0.364
+EVAL_TILE: 512
+EVAL_STRIDE: 256
