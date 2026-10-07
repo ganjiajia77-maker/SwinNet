@@ -41,6 +41,7 @@ def _cli_has(flag_name):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
+parser.add_argument('--split', choices=['val', 'test'], default='test', help='dataset split for inference')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--num_classes', type=int, default=1, help='output channel of network')
 parser.add_argument('--output_dir', type=str, default='./predictions', help='output dir')
@@ -49,6 +50,8 @@ parser.add_argument('--img_size', type=int, default=256, help='network input siz
 parser.add_argument('--source_patch_size', type=int, default=1024, help='source patch size before resizing to img_size')
 parser.add_argument('--test_crop_list', type=str, default='', help='fixed test crop list: one line per crop, image: x=..., y=...')
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
+parser.add_argument('--export_thresholds', nargs='+', type=float, default=[],
+                    help='save full-resolution overlap masks for each listed threshold in output_dir/threshold_XX/surface')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
 parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final skeleton')
 parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final topology repair coefficient')
@@ -148,6 +151,14 @@ args = parser.parse_args()
 if args.test_crop_list and args.overlap_infer:
     print("[INFO] --test_crop_list is set; disabling --overlap_infer for fixed-crop evaluation.")
     args.overlap_infer = False
+if args.export_thresholds:
+    if not args.overlap_infer:
+        parser.error('--export_thresholds requires --overlap_infer')
+    if any(not np.isfinite(value) or not 0 <= value <= 1 or
+           abs(value - round(value, 2)) > 1e-8 for value in args.export_thresholds):
+        parser.error('--export_thresholds values must be between 0 and 1 with at most two decimals')
+    if len({f'{value:.2f}' for value in args.export_thresholds}) != len(args.export_thresholds):
+        parser.error('--export_thresholds values must be unique')
 
 def make_unique_dir(base_dir, run_name):
     run_dir = os.path.join(base_dir, run_name)
@@ -357,16 +368,16 @@ if __name__ == "__main__":
     else:
         print(f"错误: 模型文件不存在 {args.model_path}")
         exit(1)
-    test_image_dir = os.path.join(args.root_path, 'test', 'image')
+    test_image_dir = os.path.join(args.root_path, args.split, 'image')
     if not os.path.exists(test_image_dir):
-        test_image_dir = os.path.join(args.root_path, 'test')
-    test_label_dir = os.path.join(args.root_path, 'test', 'mask')
+        test_image_dir = os.path.join(args.root_path, args.split)
+    test_label_dir = os.path.join(args.root_path, args.split, 'mask')
     if not os.path.exists(test_label_dir):
-        test_label_dir = os.path.join(args.root_path, 'test', 'label')
+        test_label_dir = os.path.join(args.root_path, args.split, 'label')
     if not os.path.exists(test_label_dir):
-        test_label_dir = os.path.join(args.root_path, 'test_labels')
+        test_label_dir = os.path.join(args.root_path, f'{args.split}_labels')
     
-    print(f"加载测试数据...")
+    print(f"加载 {args.split} 数据集...")
     print(f"  Image目录: {test_image_dir}")
     print(f"  Label目录: {test_label_dir}")
     print(f"  阈值: {args.threshold}")
@@ -389,6 +400,13 @@ if __name__ == "__main__":
         os.makedirs(pred_dir, exist_ok=True)
         surface_dir = os.path.join(pred_dir, 'surface')
         os.makedirs(surface_dir, exist_ok=True)
+        threshold_dirs = {}
+        for threshold in args.export_thresholds:
+            candidate_dir = os.path.join(
+                args.output_dir, f'threshold_{threshold:.2f}', 'surface'
+            )
+            os.makedirs(candidate_dir, exist_ok=False)
+            threshold_dirs[threshold] = candidate_dir
 
         stride = args.img_size // 2
         tile_size = args.img_size
@@ -475,20 +493,28 @@ if __name__ == "__main__":
                 # save
                 case_name = os.path.splitext(image_name)[0]
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
-                cv2.imwrite(png_save_path, pred)
+                if not cv2.imwrite(png_save_path, pred):
+                    raise OSError(f'Could not write prediction: {png_save_path}')
+                for threshold, candidate_dir in threshold_dirs.items():
+                    candidate_path = os.path.join(candidate_dir, f'{case_name}_pred.png')
+                    candidate = (avg_prob >= threshold).astype(np.uint8) * 255
+                    if not cv2.imwrite(candidate_path, candidate):
+                        raise OSError(f'Could not write prediction: {candidate_path}')
 
                 total_samples += 1
 
         print(f"滑窗推理完成，结果保存在: {pred_dir}")
+        for threshold, candidate_dir in threshold_dirs.items():
+            print(f"[EXPORT] threshold={threshold:.2f}: {candidate_dir}", flush=True)
         iou = tp / (tp + fp + fn + 1e-8)
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
-        print(f"Overlap Test IoU: {iou:.4f}, F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
+        print(f"Overlap {args.split} IoU: {iou:.4f}, F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
         with open(os.path.join(pred_dir, "test_results.txt"), "w", encoding="utf-8") as log_f:
             log_f.write(f"模型路径: {args.model_path}\n")
             log_f.write(f"阈值: {args.threshold}\n")
-            log_f.write(f"测试数据路径: {args.root_path}\n")
+            log_f.write(f"数据集: {args.split}; 路径: {args.root_path}\n")
             log_f.write(f"Overlap tile: {args.img_size}, stride: {stride}\n")
             log_f.write("Stitching: weighted logits -> sigmoid -> threshold\n")
             log_f.write(f"IoU: {iou:.6f}\n")
@@ -501,7 +527,7 @@ if __name__ == "__main__":
     # 非滑窗情况：使用 Dataset + DataLoader（会对图像做 resize 到 args.img_size）
     test_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
-        split='test',
+        split=args.split,
         image_size=args.img_size,
         source_patch_size=args.source_patch_size,
         crop_list_path=args.test_crop_list,
