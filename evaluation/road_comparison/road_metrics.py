@@ -7,7 +7,7 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
 
-METRIC_VERSION = "road-mask-v1"
+METRIC_VERSION = "road-mask-v1.1"
 DEFAULT_PROTOCOL = {
     "metric_version": METRIC_VERSION,
     "image_size": 1024,
@@ -20,6 +20,7 @@ DEFAULT_PROTOCOL = {
     "segmentation_aggregation": "global TP/FP/FN",
     "topology_aggregation": "per-image mean; bidirectional APLS harmonic per image",
     "postprocessing": "none; use supplied binary masks without resizing",
+    "gt_encoding": "single-channel or identical-channel RGB binary mask; predictions single-channel",
 }
 
 

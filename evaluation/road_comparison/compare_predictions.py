@@ -48,10 +48,17 @@ def index_files(directory):
     return result
 
 
-def read_binary(path, size):
+def read_binary(path, size, allow_replicated_rgb=False):
     array = (np.load(path, allow_pickle=False) if path.suffix.lower() == ".npy" else
              cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED))
-    if array is None or array.ndim != 2:
+    if array is None:
+        raise ValueError(f"Could not read mask: {path}")
+    if allow_replicated_rgb and array.ndim == 3 and array.shape[2] == 3:
+        if not (np.array_equal(array[:, :, 0], array[:, :, 1]) and
+                np.array_equal(array[:, :, 0], array[:, :, 2])):
+            raise ValueError(f"GT RGB channels differ; refusing color conversion: {path}")
+        array = array[:, :, 0]
+    if array.ndim != 2:
         raise ValueError(f"Expected a single-channel mask: {path}")
     if array.shape != (size, size):
         raise ValueError(f"No implicit resizing: {path} is {array.shape}, expected {(size, size)}")
@@ -155,7 +162,7 @@ def select_validation(manifest, base, protocol, output, progress):
         indexed = [(candidate, prediction_index(candidate, base, labels)) for candidate in candidates]
         totals = [{k: 0 for k in ("tp", "fp", "fn")} for _ in indexed]
         for i, (case, path) in enumerate(sorted(labels.items()), 1):
-            target = read_binary(path, protocol["image_size"])
+            target = read_binary(path, protocol["image_size"], allow_replicated_rgb=True)
             for total, (_, predictions) in zip(totals, indexed):
                 counts = confusion(read_binary(predictions[case], protocol["image_size"]), target)
                 for key in total:
@@ -225,7 +232,7 @@ def evaluate(manifest, base, protocol, split, selection, output, progress):
         for i, (case, path) in enumerate(sorted(labels.items()), 1):
             if i == 1 or i % progress == 0:
                 print(f"[{split}] starting image {i}/{len(labels)}: {case}", flush=True)
-            target = read_binary(path, protocol["image_size"])
+            target = read_binary(path, protocol["image_size"], allow_replicated_rgb=True)
             content_hashes["gt"].update(case.encode() + b"\0" + np.packbits(target).tobytes())
             prepared = prepare_target(target, protocol)
             for model, predictions, _ in models:

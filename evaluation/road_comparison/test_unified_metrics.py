@@ -117,6 +117,20 @@ class PipelineTests(unittest.TestCase):
             index_files(self.root / "swin/val_low")
         self.assertEqual(case_id(Path("113_sat_surface_pred.png")), "113")
 
+    def test_rgb_gt_requires_identical_binary_channels(self):
+        road = np.zeros((16, 16), dtype=np.uint8)
+        road[7, 2:14] = 255
+        rgb = np.repeat(road[:, :, None], 3, axis=2)
+        self.save("rgb/1_mask.png", rgb)
+        with self.assertRaisesRegex(ValueError, "single-channel"):
+            read_binary(self.root / "rgb/1_mask.png", 16)
+        actual = read_binary(self.root / "rgb/1_mask.png", 16, allow_replicated_rgb=True)
+        self.assertTrue(np.array_equal(actual, road > 0))
+        rgb[7, 2, 1] = 0
+        self.save("rgb/1_mask.png", rgb)
+        with self.assertRaisesRegex(ValueError, "RGB channels differ"):
+            read_binary(self.root / "rgb/1_mask.png", 16, allow_replicated_rgb=True)
+
     def test_missing_case_and_skeleton_directory(self):
         self.save("wrong/2.png", np.zeros((16, 16), dtype=np.uint8))
         with self.assertRaisesRegex(ValueError, "Case set mismatch"):
