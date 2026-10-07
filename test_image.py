@@ -50,6 +50,8 @@ parser.add_argument('--source_patch_size', type=int, default=1024, help='source 
 parser.add_argument('--test_crop_list', type=str, default='', help='fixed test crop list: one line per crop, image: x=..., y=...')
 parser.add_argument('--overlap_infer', action='store_true', help='use overlapping tile inference')
 parser.add_argument('--threshold', type=float, default=0.2, help='binary threshold for predictions')
+parser.add_argument('--save_eval_resolution_masks', action='store_true',
+                    help='save the exact binary surface masks used for IoU/F1 under surface_256')
 parser.add_argument('--skeleton_threshold', type=float, default=0.5, help='binary threshold for final skeleton')
 parser.add_argument('--final_topology_eta_init', type=float, default=0.005, help='initial final topology repair coefficient')
 parser.add_argument('--final_gap_rho_init', type=float, default=0.005, help='initial localized gap-repair coefficient')
@@ -523,6 +525,9 @@ if __name__ == "__main__":
     skeleton_dir = os.path.join(pred_dir, 'skeleton')
     os.makedirs(surface_dir, exist_ok=True)
     os.makedirs(skeleton_dir, exist_ok=True)
+    eval_surface_dir = os.path.join(pred_dir, 'surface_256')
+    if args.save_eval_resolution_masks:
+        os.makedirs(eval_surface_dir, exist_ok=True)
     
     criterion = SurfaceStructureLoss(
         surface_dice_weight=0.5,
@@ -596,6 +601,11 @@ if __name__ == "__main__":
             
             # 自动保存预测结果（NPY 格式用于计算，PNG 格式便于查看）
             case_name = batch['case_name'][0]
+            if args.save_eval_resolution_masks:
+                eval_mask = (pred.squeeze(0).squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                Image.fromarray(eval_mask, mode='L').save(
+                    os.path.join(eval_surface_dir, f'{case_name}_pred.png')
+                )
             
             # 仅保存 PNG：最多保留 30 张代表性预测（按前 30 个 case）
             prob_numpy = torch.sigmoid(surface_logits).squeeze(0).squeeze(0).cpu().numpy()
