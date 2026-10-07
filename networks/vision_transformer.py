@@ -566,6 +566,8 @@ class SwinUnet(nn.Module):
         self.bottleneck_type = bottleneck_type
 
         self.swin_unet = SwinTransformerSys(img_size=config.DATA.IMG_SIZE,
+                                encoder_type=config.MODEL.ENCODER_TYPE,
+                                freeze_pretrained_encoder=config.MODEL.FREEZE_PRETRAINED_ENCODER,
                                 patch_size=config.MODEL.SWIN.PATCH_SIZE,
                                 in_chans=config.MODEL.SWIN.IN_CHANS,
                                 num_classes=self.num_classes,
@@ -627,6 +629,10 @@ class SwinUnet(nn.Module):
 
     def load_from(self, config):
         pretrained_path = config.MODEL.PRETRAIN_CKPT
+        if self.swin_unet.encoder_type == "dinov2_l16":
+            if not pretrained_path:
+                raise ValueError("A converted DINOv2-L/16 checkpoint is required")
+            return self.swin_unet.dino_encoder.load_pretrained(pretrained_path)
         if pretrained_path is None:
             print("[INFO] No ImageNet checkpoint configured.")
             return set()

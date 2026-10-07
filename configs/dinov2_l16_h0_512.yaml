@@ -1,0 +1,7 @@
+BASE: ['swin_tiny_patch4_window7_224_lite.yaml']
+DATA:
+  IMG_SIZE: 512
+MODEL:
+  ENCODER_TYPE: dinov2_l16
+  FREEZE_PRETRAINED_ENCODER: true
+  PRETRAIN_CKPT: /home/gjj/Swin-Unet-main/pretrained_ckpt/dinov2_converted.pth

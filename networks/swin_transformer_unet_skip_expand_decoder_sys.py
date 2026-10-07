@@ -1275,8 +1275,12 @@ class SwinTransformerSys(nn.Module):
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False,
+                 encoder_type="swin", freeze_pretrained_encoder=True,
                   **kwargs):
         super().__init__()
+        self.encoder_type = encoder_type
+        if encoder_type not in {"swin", "dinov2_l16"}:
+            raise ValueError(f"Unknown encoder: {encoder_type}")
 
         print(
             "SwinTransformerSys expand initial----depths:{};drop_path_rate:{};num_classes:{}".format(
@@ -1750,6 +1754,18 @@ class SwinTransformerSys(nn.Module):
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.weight)
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.bias)
 
+        if self.encoder_type == "dinov2_l16":
+            from .dinov2_encoder import DinoRoadEncoder
+            merges = [self.layers[i].downsample for i in (0, 1)]
+            road_stage = self.layers[2]
+            self.layers = nn.ModuleList()
+            self.patch_embed = None
+            if self.ape:
+                raise ValueError("Swin absolute position embedding is not used with DINOv2")
+            self.dino_encoder = DinoRoadEncoder(
+                img_size, embed_dim, merges, road_stage, frozen=freeze_pretrained_encoder,
+            )
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -1769,6 +1785,12 @@ class SwinTransformerSys(nn.Module):
 
     # Encoder and Bottleneck
     def forward_features(self, x):
+        if self.encoder_type == "dinov2_l16":
+            x, skips, road_attentions = self.dino_encoder(
+                x, (self.encoder_stage1_road_attention_head, self.encoder_stage2_road_attention_head),
+            )
+            x = self.norm(self.bottleneck_swin_block(self.bottleneck_context_fusion(x)))
+            return x, skips, road_attentions
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed

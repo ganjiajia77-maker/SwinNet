@@ -30,6 +30,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
+from encoder_options import add_encoder_arguments, inherit_encoder_arguments
 
 
 def seed_worker(worker_id):
@@ -39,6 +40,7 @@ def seed_worker(worker_id):
 
 
 parser = argparse.ArgumentParser()
+add_encoder_arguments(parser)
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--list_dir', type=str, default='./lists/lists_Synapse', help='list dir')
@@ -562,7 +564,7 @@ def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -573,6 +575,7 @@ def inherit_resume_architecture_args(args):
         return
 
     saved_args = checkpoint["args"]
+    inherit_encoder_arguments(args, checkpoint)
     for name, cast in (
         ("surface_focal_gamma", float),
         ("amp_dtype", str),
@@ -641,7 +644,11 @@ def model_state_is_finite(model):
 
 class ModelEMA:
     def __init__(self, model, decay=0.999):
-        self.ema = copy.deepcopy(model).eval()
+        encoder = getattr(model.swin_unet, "dino_encoder", None)
+        frozen = encoder.backbone if encoder is not None and encoder.frozen else None
+        # Frozen weights are identical in raw/EMA models; only adapters need EMA.
+        self.ema = copy.deepcopy(model, {id(frozen): frozen} if frozen is not None else {}).eval()
+        self.shared_prefix = "swin_unet.dino_encoder.backbone." if frozen is not None else None
         self.decay = float(decay)
         for parameter in self.ema.parameters():
             parameter.requires_grad_(False)
@@ -650,6 +657,8 @@ class ModelEMA:
     def update(self, model):
         model_state = model.state_dict()
         for name, ema_value in self.ema.state_dict().items():
+            if self.shared_prefix is not None and name.startswith(self.shared_prefix):
+                continue
             source_value = model_state[name].detach()
             if torch.is_floating_point(ema_value):
                 ema_value.mul_(self.decay).add_(source_value.to(ema_value.dtype), alpha=1.0 - self.decay)
@@ -1191,6 +1200,10 @@ if __name__ == "__main__":
 
     # 加载配置
     config = get_config(args)
+    args.encoder_type = config.MODEL.ENCODER_TYPE
+    args.freeze_pretrained_encoder = config.MODEL.FREEZE_PRETRAINED_ENCODER
+    if args.encoder_type == "dinov2_l16" and not args.resume and (args.no_pretrain or args.warm_start_ckpt):
+        raise ValueError("DINOv2 fresh runs require full converted pretrained weights, not random/partial warm-start weights")
     if args.pretrain_ckpt:
         config.defrost()
         config.MODEL.PRETRAIN_CKPT = args.pretrain_ckpt
@@ -1328,7 +1341,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1450,8 +1463,13 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            checkpoint_state = checkpoint["model_state_dict"]
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+            checkpoint_state = (
+                checkpoint.get("training_model_state_dict", checkpoint["model_state_dict"])
+                if args.encoder_type == "dinov2_l16" else checkpoint["model_state_dict"]
+            )
+            if args.encoder_type == "dinov2_l16":
+                model.load_state_dict(checkpoint_state, strict=True)
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
             skipped_gate_keys = []
@@ -1732,7 +1750,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -2247,7 +2265,7 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(

@@ -44,6 +44,8 @@ _C.DATA.NUM_WORKERS = 8
 _C.MODEL = CN()
 # Model type
 _C.MODEL.TYPE = 'swin'
+_C.MODEL.ENCODER_TYPE = 'swin'
+_C.MODEL.FREEZE_PRETRAINED_ENCODER = True
 # Model name
 _C.MODEL.NAME = 'swin_tiny_patch4_window7_224'
 # Checkpoint to resume, could be overwritten by command line argument
@@ -195,6 +197,10 @@ def update_config(config, args):
         config.merge_from_list(args.opts)
 
     # merge from specific arguments
+    if getattr(args, 'encoder_type', None) is not None:
+        config.MODEL.ENCODER_TYPE = args.encoder_type
+    if getattr(args, 'freeze_pretrained_encoder', None) is not None:
+        config.MODEL.FREEZE_PRETRAINED_ENCODER = args.freeze_pretrained_encoder
     if args.batch_size:
         config.DATA.BATCH_SIZE = args.batch_size
     if args.img_size:

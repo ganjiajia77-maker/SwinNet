@@ -1,0 +1,10 @@
+# Keep the server's existing CUDA-compatible PyTorch installation.
+timm==1.0.26
+einops>=0.7
+yacs>=0.1.8
+PyYAML>=6.0
+numpy
+opencv-python
+Pillow
+tqdm
+scipy
