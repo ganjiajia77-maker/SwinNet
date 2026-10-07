@@ -1,0 +1,89 @@
+{
+  "data_root": "/home/gjj/Swin-Unet-main/data1",
+  "protocol": {
+    "image_size": 1024,
+    "short_area_threshold": 20,
+    "apls_max_nodes": 64,
+    "apls_snap_radius": 5.0
+  },
+  "models": [
+    {
+      "name": "swin_random512",
+      "provenance": {
+        "checkpoint": "REPLACE_WITH_ACTUAL_CHECKPOINT",
+        "code_commit": "e2020d9 (confirm actual run)",
+        "pretrained_source": "ImageNet SwinV2 Tiny: swinv2_tiny_patch4_window8_256.pth",
+        "training_crop": "one random 512 crop from each 1024 image",
+        "inference_tile_size": 512,
+        "overlap_stride": 256,
+        "merge": "taper-weighted logits -> sigmoid; weight divisor clamped at 1e-8",
+        "tta": "none in audited test_image.py overlap entry",
+        "postprocessing": "surface threshold only",
+        "weights": "CONFIRM_EMA_OR_RAW",
+        "actual_run_verified": false
+      },
+      "validation_selection": {
+        "selected_on": "val",
+        "criterion": "global_iou",
+        "threshold": 0.45,
+        "evidence": "REPLACE_WITH_EXISTING_VAL_THRESHOLD_LOG"
+      },
+      "predictions": {
+        "val": [{"threshold": 0.45, "path": "REPLACE_WITH_VAL_SURFACE_MASK_DIR"}],
+        "test": [{"threshold": 0.45, "path": "REPLACE_WITH_TEST_SURFACE_MASK_DIR"}]
+      }
+    },
+    {
+      "name": "sam_road_random512",
+      "provenance": {
+        "checkpoint": "REPLACE_WITH_ACTUAL_CHECKPOINT",
+        "code_commit": "REPLACE_WITH_ACTUAL_COMMIT",
+        "pretrained_source": "SAM ViT-B: sam_vit_b_01ec64.pth",
+        "training_crop": "one random 512 crop from each 1024 image (confirm run)",
+        "inference_tile_size": 512,
+        "overlap_stride": 256,
+        "merge": "taper-weighted logits -> sigmoid; audited collect clamps divisor at 1.0",
+        "tta": "none in audited eval_data1_road.py",
+        "postprocessing": "surface threshold only (confirm mask export)",
+        "weights": "CONFIRM_EMA_OR_RAW",
+        "actual_run_verified": false
+      },
+      "validation_selection": {
+        "selected_on": "val",
+        "criterion": "global_iou",
+        "threshold": 0.5,
+        "evidence": "REPLACE_WITH_EXISTING_VAL_THRESHOLD_LOG"
+      },
+      "predictions": {
+        "val": [{"threshold": 0.5, "path": "REPLACE_WITH_VAL_SURFACE_MASK_DIR"}],
+        "test": [{"threshold": 0.5, "path": "REPLACE_WITH_TEST_SURFACE_MASK_DIR"}]
+      }
+    },
+    {
+      "name": "coanet_random512",
+      "provenance": {
+        "checkpoint": "REPLACE_WITH_ACTUAL_CHECKPOINT",
+        "code_commit": "REPLACE_WITH_ACTUAL_COMMIT",
+        "pretrained_source": "ImageNet ResNet101: resnet101-5d3b4d8f.pth",
+        "training_crop": "one random 512 crop from each 1024 image",
+        "inference_tile_size": 512,
+        "overlap_stride": 256,
+        "merge": "uniform average of surface/connectivity probabilities",
+        "tta": "4 flips unless --no_tta",
+        "postprocessing": "paper_fusion: surface >= threshold OR sum(C_d1) >= 0.9 OR sum(C_d3) >= 2.0; confirm run",
+        "weights": "CONFIRM_EMA_OR_RAW",
+        "actual_run_verified": false
+      },
+      "validation_selection": {
+        "selected_on": "val",
+        "criterion": "global_iou",
+        "threshold": 0.45,
+        "evidence": "REPLACE_WITH_EXISTING_VAL_THRESHOLD_LOG"
+      },
+      "predictions": {
+        "val": [{"threshold": 0.45, "path": "REPLACE_WITH_VAL_MASK_DIR"}],
+        "test": [{"threshold": 0.45, "path": "REPLACE_WITH_TEST_MASK_DIR"}]
+      }
+    }
+  ]
+}
