@@ -80,7 +80,7 @@ def main():
         ],
     )
     parser.add_argument('--enable_global_topology', action='store_true')
-    parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+    parser.add_argument('--global_topology_max_nodes', type=int, default=64)
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
     parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])

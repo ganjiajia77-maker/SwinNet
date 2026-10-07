@@ -358,6 +358,8 @@ class SurfaceStructureLoss(nn.Module):
         stage_direction_factors=None,
         stage_skeleton_loss_factor=1.0,
         stage_skeleton_only_loss_factor=1.0,
+        fragment_validity_loss_weight=0.1,
+        path_validity_loss_weight=0.1,
     ):
         super().__init__()
 
@@ -404,6 +406,58 @@ class SurfaceStructureLoss(nn.Module):
         self.stage_skeleton_only_loss_factor = float(
             stage_skeleton_only_loss_factor
         )
+        self.fragment_validity_loss_weight = float(fragment_validity_loss_weight)
+        self.path_validity_loss_weight = float(path_validity_loss_weight)
+
+    @staticmethod
+    def fragment_path_loss(stage_outputs, surface_gt, reference):
+        """Supervise only proposed branches and geometrically valid/invalid paths."""
+        zero = reference.sum() * 0.0
+        fragment_losses, path_losses = [], []
+        if not stage_outputs:
+            return zero, zero
+        target = next((item for item in stage_outputs
+                       if isinstance(item, dict)
+                       and item.get("stage") == "fragment_path_topology"), None)
+        if target is None:
+            return zero, zero
+        gt = surface_gt.float()
+        if gt.shape[-2:] != reference.shape[-2:]:
+            gt = F.interpolate(gt, size=reference.shape[-2:], mode="nearest")
+        gt = (gt > 0.5).float()
+        # One-pixel registration tolerance only for the endpoint test.
+        endpoint_gt = F.max_pool2d(gt, kernel_size=3, stride=1, padding=1)
+        for image_idx, record in enumerate(target["records"]):
+            flat_gt = gt[image_idx, 0].flatten()
+            flat_endpoint_gt = endpoint_gt[image_idx, 0].flatten()
+            for logit, pixels in zip(record["branch_logits"], record["branch_pixels"]):
+                soft_target = flat_gt[pixels].mean()
+                fragment_losses.append(F.binary_cross_entropy_with_logits(
+                    logit, soft_target))
+            for logit, centerline, endpoints in zip(
+                    record["path_logits"], record["path_centerlines"],
+                    record["path_endpoints"]):
+                coverage = flat_gt[centerline]
+                fraction = float(coverage.mean().detach())
+                both_ends = bool((flat_endpoint_gt[endpoints] > 0.5).all())
+                # The candidate itself must follow GT: shared GT component is
+                # insufficient when the proposed shortcut crosses background.
+                background = (coverage < 0.5).detach().cpu().tolist()
+                longest_run, run = 0, 0
+                for is_background in background:
+                    run = run + 1 if is_background else 0
+                    longest_run = max(longest_run, run)
+                if both_ends and fraction >= 0.9 and longest_run <= 4:
+                    label = 1.0
+                elif not both_ends or fraction <= 0.5 or longest_run >= 8:
+                    label = 0.0
+                else:
+                    continue
+                path_losses.append(F.binary_cross_entropy_with_logits(
+                    logit, logit.new_tensor(label)))
+        fragment_loss = torch.stack(fragment_losses).mean() if fragment_losses else zero
+        path_loss = torch.stack(path_losses).mean() if path_losses else zero
+        return fragment_loss, path_loss
 
     @staticmethod
     def _match_spatial_size(target, reference, mode="nearest"):
@@ -1088,6 +1142,9 @@ class SurfaceStructureLoss(nn.Module):
             surface_gt,
             skeleton_gt,
         )
+        loss_fragment_validity, loss_path_validity = self.fragment_path_loss(
+            stage_outputs, surface_gt, surface_logits
+        )
 
         total_loss = (
             loss_surface
@@ -1097,6 +1154,8 @@ class SurfaceStructureLoss(nn.Module):
             + loss_stage_structure
             + loss_road_attention
             + loss_highres_structure_skeleton
+            + self.fragment_validity_loss_weight * loss_fragment_validity
+            + self.path_validity_loss_weight * loss_path_validity
         )
 
         loss_dict = {
@@ -1110,6 +1169,8 @@ class SurfaceStructureLoss(nn.Module):
             "stage_structure_loss": loss_stage_structure.detach(),
             "road_attention_loss": loss_road_attention.detach(),
             "loss_highres_structure_skeleton": loss_highres_structure_skeleton.detach(),
+            "fragment_validity_loss": loss_fragment_validity.detach(),
+            "path_validity_loss": loss_path_validity.detach(),
             "highres_structure_skeleton_raw": highres_stats["highres_structure_skeleton_raw"],
             "structure_delta_mean": delta_stats["structure_delta_mean"],
             "structure_delta_abs_mean": delta_stats["structure_delta_abs_mean"],

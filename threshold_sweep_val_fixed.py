@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -34,19 +33,12 @@ def _cli_has(flag_name):
         or argument.startswith(flag + "=")
         for argument in sys.argv[1:]
     )
-from losses.road_losses import binary_metrics_from_logits
 from config import get_config
 from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
 
 
 def compute_metrics_all_samples(logits_list, targets_list, threshold):
-    all_metrics = {
-        'iou': [],
-        'f1': [],
-        'precision': [],
-        'recall': [],
-    }
-    
+    tp = fp = fn = 0
     for logits, targets in zip(logits_list, targets_list):
         if targets.shape[-2:] != logits.shape[-2:]:
             targets = F.interpolate(
@@ -54,17 +46,16 @@ def compute_metrics_all_samples(logits_list, targets_list, threshold):
                 size=logits.shape[-2:],
                 mode='nearest',
             )
-        metrics = binary_metrics_from_logits(logits, targets, threshold=threshold)
-        all_metrics['iou'].append(metrics['iou'])
-        all_metrics['f1'].append(metrics['f1'])
-        all_metrics['precision'].append(metrics['precision'])
-        all_metrics['recall'].append(metrics['recall'])
-    
+        prediction = torch.sigmoid(logits) > threshold
+        truth = targets > 0.5
+        tp += int((prediction & truth).sum())
+        fp += int((prediction & ~truth).sum())
+        fn += int((~prediction & truth).sum())
     return {
-        'iou': np.mean(all_metrics['iou']),
-        'f1': np.mean(all_metrics['f1']),
-        'precision': np.mean(all_metrics['precision']),
-        'recall': np.mean(all_metrics['recall']),
+        'iou': tp / max(tp + fp + fn, 1),
+        'f1': 2 * tp / max(2 * tp + fp + fn, 1),
+        'precision': tp / max(tp + fp, 1),
+        'recall': tp / max(tp + fn, 1),
     }
 
 
@@ -176,7 +167,7 @@ def main():
     parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
     parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--enable_global_topology', action='store_true')
-    parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+    parser.add_argument('--global_topology_max_nodes', type=int, default=64)
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
     parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])

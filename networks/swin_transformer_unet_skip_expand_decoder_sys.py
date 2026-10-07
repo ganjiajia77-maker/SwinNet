@@ -9,7 +9,7 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from .dca_fpn_lite import DCAFPNLite
 from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
-from .keypoint_global_topology import KeypointGuidedGlobalTopology
+from .fragment_path_topology import FragmentPathTopology
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
 from .skeleton_guided_head import (
@@ -1268,7 +1268,7 @@ class SwinTransformerSys(nn.Module):
                  enable_post_refine_structure_interaction=False,
                  enable_h3_surface_fusion=False,
                  enable_global_topology=False,
-                 global_topology_max_nodes=32,
+                 global_topology_max_nodes=64,
                  global_topology_heads=4,
                  global_topology_alpha_max=0.05,
                  stage_skeleton_mode="prior_residual",
@@ -1660,14 +1660,11 @@ class SwinTransformerSys(nn.Module):
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
             if self.return_skeleton:
-                self.global_topology = KeypointGuidedGlobalTopology(
+                self.global_topology = FragmentPathTopology(
                     channels=embed_dim,
-                    struct_channels=self.highres_structure_channels,
-                    max_nodes=global_topology_max_nodes,
+                    h3_channels=decoder_structure_channels[3],
+                    max_tokens=global_topology_max_nodes,
                     heads=global_topology_heads,
-                    alpha_max=global_topology_alpha_max,
-                    enabled=self.enable_global_topology,
-                    connectivity_channels=8,
                 )
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,
@@ -1727,9 +1724,8 @@ class SwinTransformerSys(nn.Module):
                     )
                 if self.enable_global_topology:
                     print(
-                        "[INFO] Global topology residual: anchors=H2*surface, "
-                        "tokens=[H2,decoder_feature,connectivity], "
-                        "relation_bias=relative_xy_distance+connectivity"
+                        "[INFO] Fragment/path topology: P0>=0.45, branch/end tokens, "
+                        "token relation attention, signed surface logit correction"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
@@ -2329,40 +2325,6 @@ class SwinTransformerSys(nn.Module):
 
         return x, structure_outputs, highres_skeleton_feat
 
-    def _surface_prior_for_global_topology(self, x, highres_skeleton_feat):
-        prior_modules = (
-            self.guided_head.surface_proj,
-            self.guided_head.surface_branch,
-            self.guided_head.surface_refine,
-            self.guided_head.surface_head,
-        )
-        if getattr(
-            self.guided_head,
-            "enable_post_refine_structure_interaction",
-            False,
-        ):
-            prior_modules = (
-                *prior_modules,
-                self.guided_head.post_refine_structure_interaction,
-            )
-        prior_training = [module.training for module in prior_modules]
-        for module in prior_modules:
-            module.eval()
-        try:
-            with torch.no_grad():
-                surface_feat = self.guided_head.surface_branch(
-                    self.guided_head.surface_proj(x)
-                )
-                surface_feat = self.guided_head.surface_refine(surface_feat)
-                surface_feat = self.guided_head._apply_post_refine_structure_interaction(
-                    surface_feat,
-                    highres_skeleton_feat,
-                )
-                return torch.sigmoid(self.guided_head.surface_head(surface_feat))
-        finally:
-            for module, was_training in zip(prior_modules, prior_training):
-                module.train(was_training)
-
     def up_x4(self, x, structure_outputs=None, highres_skeleton_feat=None):
         H, W = self.patches_resolution
         B, L, C = x.shape
@@ -2373,20 +2335,6 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                if self.enable_global_topology and highres_skeleton_feat is not None:
-                    surface_prob = self._surface_prior_for_global_topology(
-                        x,
-                        highres_skeleton_feat,
-                    )
-                    connectivity_feature = self._latest_local_topology_features(
-                        structure_outputs
-                    )
-                    x = self.global_topology.forward_feature_anchors(
-                        x,
-                        highres_skeleton_feat,
-                        surface_prob,
-                        connectivity_feature=connectivity_feature,
-                    )
                 if (
                     self.enable_h3_surface_fusion
                     and self.h3_surface_proj is not None
@@ -2404,6 +2352,7 @@ class SwinTransformerSys(nn.Module):
                         x = self.surface_h3_fusion(
                             torch.cat([x, h3_surface], dim=1)
                         )
+                self.last_surface_feature = x
                 x = self.guided_head(x, z_struct=highres_skeleton_feat)
             else:
                 x = self.output(x)
@@ -2449,6 +2398,15 @@ class SwinTransformerSys(nn.Module):
                 highres_skeleton_feat,
                 structure_outputs,
             )
+            if self.enable_global_topology:
+                h3 = self.last_stage_features.get("G3")
+                if h3 is None:
+                    raise RuntimeError("Fragment/path topology requires Stage 3 H3 features")
+                final_logits, topology_output = self.global_topology(
+                    self.last_surface_feature, h3, x[0]
+                )
+                structure_outputs.append(topology_output)
+                x = (final_logits, *x[1:])
             x = (*x, structure_outputs)
 
         return x

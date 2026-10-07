@@ -20,7 +20,7 @@ from .swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys
 
 logger = logging.getLogger(__name__)
 
-TOPOLOGY_ATTENTION_VERSION = "stage-topology-roadness-gap-v1"
+TOPOLOGY_ATTENTION_VERSION = "h0-fragment-path-v1"
 STRUCTURE_PROFILE_FULL = "full"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 = "stage23_boundary_0626"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE = "stage23_boundary_0626_final_ske"
@@ -47,6 +47,15 @@ def get_topology_coefficients(model):
         },
         "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
     }
+    if coefficients["global_topology_enabled"]:
+        topology = swin_unet.global_topology
+        coefficients["fragment_path_topology"] = {
+            "candidate_threshold": topology.candidate_threshold,
+            "max_tokens": topology.max_tokens,
+            "max_paths": topology.max_paths,
+            "beta_add": float(topology.beta_add.detach().cpu()),
+            "beta_remove": float(topology.beta_remove.detach().cpu()),
+        }
 
     for stage in (2, 3):
         structure_block = swin_unet.decoder_structure_blocks[str(stage)]
@@ -118,6 +127,14 @@ def format_topology_coefficients(model):
             "on" if coefficients["global_topology_enabled"] else "off"
         )
     )
+    if coefficients["global_topology_enabled"]:
+        topology = coefficients["fragment_path_topology"]
+        fields.append(
+            "fragment_path[threshold={:.2f}, tokens={}, paths={}, beta_add={:.4f}, beta_remove={:.4f}]".format(
+                topology["candidate_threshold"], topology["max_tokens"],
+                topology["max_paths"], topology["beta_add"], topology["beta_remove"]
+            )
+        )
     for stage in ("decoder_stage2", "decoder_stage3"):
         values = coefficients[stage]
         enabled = "active" if values.get("structure_enabled") else "bypass"
@@ -551,7 +568,7 @@ class SwinUnet(nn.Module):
                  enable_post_refine_structure_interaction=False,
                  enable_h3_surface_fusion=False,
                  enable_global_topology=False,
-                 global_topology_max_nodes=32,
+                 global_topology_max_nodes=64,
                  global_topology_heads=4,
                  global_topology_alpha_max=0.05,
                  stage_skeleton_mode="prior_residual",

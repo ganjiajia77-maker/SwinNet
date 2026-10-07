@@ -123,11 +123,14 @@ parser.add_argument('--remove_stage2_pre_topology_source', action='store_true')
 parser.add_argument(
     '--enable_global_topology',
     action='store_true',
-    help='enable sparse global topology residual with anchors=z_struct*surface and fused topology tokens',
+    help='enable fragment/endpoint token attention and signed candidate-path surface correction',
 )
-parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+parser.add_argument('--global_topology_max_nodes', type=int, default=64)
 parser.add_argument('--global_topology_heads', type=int, default=4)
-parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
+parser.add_argument('--global_topology_alpha_max', type=float, default=0.05,
+                    help='legacy checkpoint argument; ignored by fragment/path topology')
+parser.add_argument('--fragment_validity_loss_weight', type=float, default=0.1)
+parser.add_argument('--path_validity_loss_weight', type=float, default=0.1)
 parser.add_argument(
     '--enable_post_refine_structure_interaction',
     action='store_true',
@@ -402,6 +405,8 @@ def build_criterion(args, loss_weights, device):
         ),
         stage_skeleton_loss_factor=args.stage_skeleton_loss_factor,
         stage_skeleton_only_loss_factor=args.stage_skeleton_only_loss_factor,
+        fragment_validity_loss_weight=args.fragment_validity_loss_weight,
+        path_validity_loss_weight=args.path_validity_loss_weight,
     ).to(device)
 
 
@@ -468,11 +473,12 @@ def format_training_config_lines(args, loss_weights):
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance+connectivity, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Fragment/path topology: {}, candidate=P0>=0.45, max_tokens={}, heads={}, max_paths=128, beta_init=0.1, lambda_q={:.3f}, lambda_e={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
                 args.global_topology_max_nodes,
                 args.global_topology_heads,
-                args.global_topology_alpha_max,
+                args.fragment_validity_loss_weight,
+                args.path_validity_loss_weight,
             ),
         ])
         if args.masked_connectivity_center_experiment:
@@ -2061,6 +2067,8 @@ if __name__ == "__main__":
                     f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                     f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
                     f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
+                    f"FragmentQ: {loss_dict['fragment_validity_loss'].item():.4f}, "
+                    f"PathE: {loss_dict['path_validity_loss'].item():.4f}, "
                         f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"ms/batch: {ms_per_batch:.1f}",

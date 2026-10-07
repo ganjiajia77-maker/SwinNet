@@ -118,7 +118,7 @@ parser.add_argument(
 parser.add_argument('--enable_post_refine_structure_interaction', action='store_true')
 parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--enable_global_topology', action='store_true')
-parser.add_argument('--global_topology_max_nodes', type=int, default=32)
+parser.add_argument('--global_topology_max_nodes', type=int, default=64)
 parser.add_argument('--global_topology_heads', type=int, default=4)
 parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
 parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])
