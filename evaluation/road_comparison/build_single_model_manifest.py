@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--training_commit", required=True)
     parser.add_argument("--inference_commit", required=True)
     parser.add_argument("--selection", type=Path, help="val_selection.json after validation")
+    parser.add_argument("--check_only", action="store_true", help="verify checkpoint metadata before inference")
     args = parser.parse_args()
 
     model_name = "swin_random512_fp32_ema80"
@@ -47,6 +48,9 @@ def main():
                      f"EMA state present={checkpoint.get('ema_state_dict') is not None}")
     checkpoint_epoch = checkpoint.get("epoch")
     del checkpoint
+    if args.check_only:
+        print(f"Checkpoint verified: random512 FP32 EMA, max_epochs=80, saved_epoch={checkpoint_epoch}")
+        return
     val_root = args.predictions_root / "val"
     candidates = []
     for directory in sorted(val_root.iterdir()):
