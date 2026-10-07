@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -34,19 +33,13 @@ def _cli_has(flag_name):
         or argument.startswith(flag + "=")
         for argument in sys.argv[1:]
     )
-from losses.road_losses import binary_metrics_from_logits
 from config import get_config
 from networks.checkpoint_compat import adapt_connectivity_modules_for_checkpoint
 
 
 def compute_metrics_all_samples(logits_list, targets_list, threshold):
-    all_metrics = {
-        'iou': [],
-        'f1': [],
-        'precision': [],
-        'recall': [],
-    }
-    
+    # Match train_image.evaluate_skeleton: aggregate pixel counts across the split.
+    tp = fp = fn = 0
     for logits, targets in zip(logits_list, targets_list):
         if targets.shape[-2:] != logits.shape[-2:]:
             targets = F.interpolate(
@@ -54,17 +47,18 @@ def compute_metrics_all_samples(logits_list, targets_list, threshold):
                 size=logits.shape[-2:],
                 mode='nearest',
             )
-        metrics = binary_metrics_from_logits(logits, targets, threshold=threshold)
-        all_metrics['iou'].append(metrics['iou'])
-        all_metrics['f1'].append(metrics['f1'])
-        all_metrics['precision'].append(metrics['precision'])
-        all_metrics['recall'].append(metrics['recall'])
-    
+        prediction = torch.sigmoid(logits) >= threshold
+        target = targets > 0.5
+        tp += int((prediction & target).sum().item())
+        fp += int((prediction & ~target).sum().item())
+        fn += int((~prediction & target).sum().item())
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
     return {
-        'iou': np.mean(all_metrics['iou']),
-        'f1': np.mean(all_metrics['f1']),
-        'precision': np.mean(all_metrics['precision']),
-        'recall': np.mean(all_metrics['recall']),
+        'iou': tp / (tp + fp + fn + 1e-8),
+        'f1': 2 * precision * recall / (precision + recall + 1e-8),
+        'precision': precision,
+        'recall': recall,
     }
 
 
