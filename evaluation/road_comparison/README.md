@@ -86,6 +86,8 @@ python -u compare_predictions.py --manifest comparison.json --split val --output
 python -u compare_predictions.py --manifest comparison.json --split test --selection results_val/val_selection.json --output_dir results_test
 ```
 
+若只需验证集选阈值、仅在测试集计算拓扑，给第一条命令加 `--select_threshold_only`。验证阶段仍输出 `val_threshold_scores.csv` 与 `val_selection.json`，但不会生成 `val_comparison.csv` 或验证集 APLS。
+
 验证只扫描已有二值目录，按 global IoU 最大选择；相同分数选较低阈值。只有一个候选时，只能说评估了该候选，不能说完成了阈值寻优。扫描阶段只算分割计数，然后只为选中候选计算拓扑，避免每个阈值重复 APLS。
 
 ### B. 已经在验证集选过阈值：直接导入记录

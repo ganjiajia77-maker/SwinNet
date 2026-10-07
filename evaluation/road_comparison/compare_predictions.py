@@ -285,6 +285,8 @@ def main():
     parser.add_argument("--split", choices=["val", "test"], required=True)
     parser.add_argument("--selection", type=Path, help="val_selection.json, required for test unless importing evidence")
     parser.add_argument("--import_val_selection", action="store_true", help="import existing val-selected thresholds and logs")
+    parser.add_argument("--select_threshold_only", action="store_true",
+                        help="on val, select threshold and write scores without computing topology")
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--progress_every", type=int, default=1)
     args = parser.parse_args()
@@ -294,6 +296,8 @@ def main():
         parser.error("Choose --selection or --import_val_selection, not both")
     if args.split == "val" and (args.selection or args.import_val_selection):
         parser.error("Val selects from supplied validation candidates; selection import is for test")
+    if args.select_threshold_only and args.split != "val":
+        parser.error("--select_threshold_only is valid only for val")
     if args.split == "test" and not (args.selection or args.import_val_selection):
         parser.error("Test never selects thresholds; provide --selection or --import_val_selection")
     manifest = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
@@ -305,6 +309,9 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.split == "val":
         selection = select_validation(manifest, base, protocol, args.output_dir, args.progress_every)
+        if args.select_threshold_only:
+            print(f"Validation threshold selected; topology skipped. See {args.output_dir / 'val_selection.json'}", flush=True)
+            return
     elif args.import_val_selection:
         selection = import_declared_selection(manifest, base, protocol)
         write_json(args.output_dir / "imported_val_selection.json", selection)
