@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 import torch
+from PIL import Image
 from eval_data1_common import (binary_prediction, image_names, load_eval_case,
                                load_model, predict_components_full)
 
@@ -21,6 +22,8 @@ def main():
     parser.add_argument("--prediction_mode", choices=["paper_fusion", "surface"], default="paper_fusion")
     parser.add_argument("--require_ema", action="store_true")
     parser.add_argument("--no_tta", action="store_true")
+    parser.add_argument("--save_masks", action="store_true",
+                        help="Save native-size binary val masks for the unified evaluator")
     parser.add_argument("--backbone", default="resnet")
     parser.add_argument("--out_stride", type=int, default=8)
     args = parser.parse_args()
@@ -29,6 +32,12 @@ def main():
     model = load_model(args, device)
     names = image_names(args.root_path, args.split)
     thresholds = [float(value) for value in args.thresholds.split(",")]
+    mask_dirs = {}
+    if args.save_masks:
+        for threshold in thresholds:
+            name = "thr_" + "{:.6f}".format(threshold).replace(".", "p")
+            mask_dirs[threshold] = os.path.join(args.output_dir, "val_masks", name)
+            os.makedirs(mask_dirs[threshold], exist_ok=True)
     totals = {threshold: [0, 0, 0, 0] for threshold in thresholds}
     for index, name in enumerate(names, 1):
         image, target = load_eval_case(args.root_path, args.split, name, args.source_patch_size)
@@ -36,6 +45,10 @@ def main():
                                              args.overlap_stride, device, tta=not args.no_tta)
         for threshold in thresholds:
             prediction = binary_prediction(components, threshold, args.prediction_mode)
+            if args.save_masks:
+                mask_path = os.path.join(mask_dirs[threshold],
+                                         os.path.splitext(name)[0] + ".png")
+                Image.fromarray(prediction.astype(np.uint8) * 255).save(mask_path)
             counts = totals[threshold]
             counts[0] += int(np.logical_and(prediction, target).sum())
             counts[1] += int(np.logical_and(prediction, ~target).sum())
