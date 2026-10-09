@@ -4,7 +4,9 @@ import argparse
 import csv
 import os
 
+import numpy as np
 import torch
+from PIL import Image
 
 from data1_common import image_names, load_case, load_model, metrics, pixel_counts, predict_full
 
@@ -20,11 +22,19 @@ def main():
     parser.add_argument('--overlap_stride', type=int, default=256)
     parser.add_argument('--thresholds', default='0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50')
     parser.add_argument('--no_tta', action='store_true')
+    parser.add_argument('--save_masks', action='store_true',
+                        help='Save native-size binary validation masks for unified metrics')
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = load_model(args.model_path, device)
     thresholds = [float(value) for value in args.thresholds.split(',')]
+    mask_dirs = {}
+    if args.save_masks:
+        for threshold in thresholds:
+            label = 'thr_' + '{:.6f}'.format(threshold).replace('.', 'p')
+            mask_dirs[threshold] = os.path.join(args.output_dir, 'val_masks', label)
+            os.makedirs(mask_dirs[threshold], exist_ok=True)
     counts = {value: [0, 0, 0] for value in thresholds}
     names = image_names(args.root_path, 'val')
     for index, name in enumerate(names, 1):
@@ -32,7 +42,11 @@ def main():
         probability = predict_full(model, image, device, args.tile_size,
                                    args.overlap_stride, tta=not args.no_tta)
         for threshold in thresholds:
-            result = pixel_counts(probability >= threshold, target)
+            prediction = probability >= threshold
+            if args.save_masks:
+                path = os.path.join(mask_dirs[threshold], os.path.splitext(name)[0] + '.png')
+                Image.fromarray(prediction.astype(np.uint8) * 255).save(path)
+            result = pixel_counts(prediction, target)
             for position, value in enumerate(result):
                 counts[threshold][position] += value
         print('[{}/{}] {}'.format(index, len(names), name), flush=True)
