@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+model_out/
+predictions/
+reports/
+pretrained_ckpt/
+*.pth

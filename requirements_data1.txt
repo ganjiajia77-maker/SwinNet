@@ -1,0 +1,8 @@
+# Install only missing packages in the existing swinunet environment.
+torch
+numpy
+opencv-python-headless
+yacs
+timm
+einops
+scipy
