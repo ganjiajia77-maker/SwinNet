@@ -9,6 +9,10 @@ lfw/
 logs/*
 logs_chn6/*
 logs_mass/*
+weights/
+model_out/
+analysis_out/
+*.pth.tmp
 !logs/
 !logs_chn6/
 !logs_mass/

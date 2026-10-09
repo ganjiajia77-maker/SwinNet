@@ -1,0 +1,6 @@
+# Use the existing swinunet environment; do not reinstall its CUDA torch wheels.
+numpy
+Pillow
+opencv-python
+scipy
+einops
