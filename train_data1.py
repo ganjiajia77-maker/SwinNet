@@ -50,6 +50,7 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--accumulation_steps", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--tile_size", type=int, default=512)
@@ -58,8 +59,8 @@ def main():
     parser.add_argument("--val_threshold", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
-    if args.epochs < 1 or args.batch_size < 1 or args.tile_size != 512:
-        parser.error("Require positive epochs/batch_size and tile_size=512")
+    if args.epochs < 1 or args.batch_size < 1 or args.accumulation_steps < 1 or args.tile_size != 512:
+        parser.error("Require positive epochs/batch/accumulation and tile_size=512")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -90,16 +91,20 @@ def main():
     for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         total = 0.0
-        for image, target in train:
+        optimizer.zero_grad(set_to_none=True)
+        for batch_index, (image, target) in enumerate(train):
             image, target = image.to(device, non_blocking=True), target.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
             probability = model(image)
             loss = criterion(probability, target)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss at epoch {epoch}; training stopped")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
+            group_start = (batch_index // args.accumulation_steps) * args.accumulation_steps
+            group_size = min(args.accumulation_steps, len(train) - group_start)
+            (loss / group_size).backward()
+            if (batch_index + 1) % args.accumulation_steps == 0 or batch_index + 1 == len(train):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             total += float(loss.detach())
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()

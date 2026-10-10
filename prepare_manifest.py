@@ -35,6 +35,8 @@ def main():
     provenance = {"checkpoint": str(checkpoint), "checkpoint_epoch": report["checkpoint_epoch"],
                   "pretrained_source": report["pretrained_source"],
                   "training_crop": "one native-resolution random 512 crop per Data1 image per epoch",
+                  "train_micro_batch": report["train_micro_batch"],
+                  "train_accumulation_steps": report["train_accumulation_steps"],
                   "encoder": "trainable EfficientNet-V2-S", "checkpoint_weights": "model_state_dict (no EMA)",
                   "inference_tile_size": 512, "overlap_stride": 256,
                   "merge": "taper-weighted probabilities", "tta": False,
