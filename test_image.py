@@ -41,6 +41,9 @@ def _cli_has(flag_name):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
+parser.add_argument('--split', choices=['val', 'test'], default='test')
+parser.add_argument('--require_ema', action='store_true', help='require and explicitly load EMA weights')
+parser.add_argument('--export_thresholds', nargs='+', type=float, default=[])
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--num_classes', type=int, default=1, help='output channel of network')
 parser.add_argument('--output_dir', type=str, default='./predictions', help='output dir')
@@ -144,6 +147,15 @@ parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
 args = parser.parse_args()
+if args.export_thresholds:
+    if args.test_crop_list:
+        parser.error('--export_thresholds requires full images, not a fixed crop list')
+    if not args.overlap_infer:
+        parser.error('--export_thresholds requires --overlap_infer')
+    if any(not np.isfinite(t) or not 0 <= t <= 1 or abs(t - round(t, 2)) > 1e-8 for t in args.export_thresholds):
+        parser.error('thresholds must be in [0,1] with at most two decimals')
+    if len(set(args.export_thresholds)) != len(args.export_thresholds):
+        parser.error('duplicate export thresholds')
 if args.test_crop_list and args.overlap_infer:
     print("[INFO] --test_crop_list is set; disabling --overlap_infer for fixed-crop evaluation.")
     args.overlap_infer = False
@@ -243,7 +255,7 @@ if __name__ == "__main__":
     args.num_classes = 1
     checkpoint = None
     if os.path.exists(args.model_path):
-        checkpoint = torch.load(args.model_path, map_location='cpu')
+        checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
         if isinstance(checkpoint, dict):
             saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
             saved_profile = checkpoint.get("structure_profile")
@@ -321,6 +333,12 @@ if __name__ == "__main__":
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device
     
+    # The unified experiment requires the EMA snapshot, never raw fallback.
+    if args.require_ema:
+        if not isinstance(checkpoint, dict) or checkpoint.get('ema_state_dict') is None:
+            raise ValueError('--require_ema: checkpoint has no EMA state')
+        checkpoint['model_state_dict'] = checkpoint['ema_state_dict']
+        print('[INFERENCE] explicitly loading EMA weights', flush=True)
     # 加载模型
     if checkpoint is not None:
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -353,16 +371,16 @@ if __name__ == "__main__":
     else:
         print(f"错误: 模型文件不存在 {args.model_path}")
         exit(1)
-    test_image_dir = os.path.join(args.root_path, 'test', 'image')
+    test_image_dir = os.path.join(args.root_path, args.split, 'image')
     if not os.path.exists(test_image_dir):
-        test_image_dir = os.path.join(args.root_path, 'test')
-    test_label_dir = os.path.join(args.root_path, 'test', 'mask')
+        test_image_dir = os.path.join(args.root_path, args.split)
+    test_label_dir = os.path.join(args.root_path, args.split, 'mask')
     if not os.path.exists(test_label_dir):
-        test_label_dir = os.path.join(args.root_path, 'test', 'label')
+        test_label_dir = os.path.join(args.root_path, args.split, 'label')
     if not os.path.exists(test_label_dir):
-        test_label_dir = os.path.join(args.root_path, 'test_labels')
+        test_label_dir = os.path.join(args.root_path, f'{args.split}_labels')
     
-    print(f"加载测试数据...")
+    print(f"加载 {args.split} 数据集...")
     print(f"  Image目录: {test_image_dir}")
     print(f"  Label目录: {test_label_dir}")
     print(f"  阈值: {args.threshold}")
@@ -386,6 +404,13 @@ if __name__ == "__main__":
         surface_dir = os.path.join(pred_dir, 'surface')
         os.makedirs(surface_dir, exist_ok=True)
 
+        threshold_dirs = {}
+        for value in args.export_thresholds:
+            directory = os.path.join(args.output_dir, f'threshold_{value:.2f}', 'surface')
+            if os.path.isdir(directory) and os.listdir(directory):
+                raise FileExistsError(f'Use a fresh output directory: {directory}')
+            os.makedirs(directory, exist_ok=True)
+            threshold_dirs[value] = directory
         stride = args.img_size // 2
         tile_size = args.img_size
         positions = RoadSkeletonDataset.sliding_positions
@@ -416,6 +441,8 @@ if __name__ == "__main__":
                 img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
                 img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 h, w, _ = img.shape
+                if (h, w) != (args.source_patch_size, args.source_patch_size):
+                    raise ValueError(f'Expected native {args.source_patch_size} square image: {img_path}, {(h,w)}')
 
                 logit_canvas = torch.zeros((1, 1, h, w), device=device)
                 weight_canvas = torch.zeros_like(logit_canvas)
@@ -471,7 +498,15 @@ if __name__ == "__main__":
                 # save
                 case_name = os.path.splitext(image_name)[0]
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
-                cv2.imwrite(png_save_path, pred)
+                if not np.isfinite(avg_prob).all():
+                    raise ValueError(f'Nonfinite probabilities: {image_name}')
+                if not cv2.imwrite(png_save_path, pred):
+                    raise OSError(png_save_path)
+                for value, directory in threshold_dirs.items():
+                    candidate = (avg_prob >= value).astype(np.uint8) * 255
+                    path = os.path.join(directory, f'{case_name}_pred.png')
+                    if not cv2.imwrite(path, candidate):
+                        raise OSError(path)
 
                 total_samples += 1
 
@@ -480,11 +515,11 @@ if __name__ == "__main__":
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
-        print(f"Overlap Test IoU: {iou:.4f}, F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
+        print(f"Overlap {args.split} IoU: {iou:.4f}, F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
         with open(os.path.join(pred_dir, "test_results.txt"), "w", encoding="utf-8") as log_f:
             log_f.write(f"模型路径: {args.model_path}\n")
             log_f.write(f"阈值: {args.threshold}\n")
-            log_f.write(f"测试数据路径: {args.root_path}\n")
+            log_f.write(f"数据集: {args.split}; 路径: {args.root_path}\n")
             log_f.write(f"Overlap tile: {args.img_size}, stride: {stride}\n")
             log_f.write("Stitching: weighted logits -> sigmoid -> threshold\n")
             log_f.write(f"IoU: {iou:.6f}\n")
@@ -497,7 +532,7 @@ if __name__ == "__main__":
     # 非滑窗情况：使用 Dataset + DataLoader（会对图像做 resize 到 args.img_size）
     test_dataset = RoadSkeletonDataset(
         root_dir=args.root_path,
-        split='test',
+        split=args.split,
         image_size=args.img_size,
         source_patch_size=args.source_patch_size,
         crop_list_path=args.test_crop_list,

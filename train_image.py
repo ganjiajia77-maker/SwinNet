@@ -562,7 +562,7 @@ def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -1328,7 +1328,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1450,7 +1450,7 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             checkpoint_state = checkpoint["model_state_dict"]
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -1732,7 +1732,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -2247,7 +2247,7 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location='cuda', weights_only=False)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(

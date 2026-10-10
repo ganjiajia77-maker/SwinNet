@@ -37,7 +37,8 @@ class RoadSkeletonDataset(Dataset):
         self.random_crop_train = bool(random_crop_train and split == "train")
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
-        self.epoch = 0
+        # Share epoch with persistent DataLoader workers, including spawn workers.
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
         self.image_dir = self._resolve_image_dir(root_dir, split)
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -77,8 +78,12 @@ class RoadSkeletonDataset(Dataset):
             positions.append(last)
         return positions
 
+    @property
+    def epoch(self):
+        return int(self._epoch.item())
+
     def set_epoch(self, epoch):
-        self.epoch = int(epoch)
+        self._epoch.fill_(int(epoch))
 
     def _load_crop_list(self, crop_list_path):
         if not crop_list_path:
