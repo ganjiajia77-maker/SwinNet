@@ -1,64 +1,44 @@
-# Swin-Unet
-[ECCVW2022] The codes for the work "Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation"(https://arxiv.org/abs/2105.05537). Our paper has been accepted by ECCV 2022 MEDICAL COMPUTER VISION WORKSHOP (https://mcv-workshop.github.io/). We updated the Reproducibility. I hope this will help you to reproduce the results.
+# DARENet Data1 random-512 comparison adapter
 
-## 1. Download pre-trained swin transformer model (Swin-T)
-* [Get pre-trained model in this link] (https://drive.google.com/drive/folders/1UC3XOoezeum0uck4KBVGa8osahs6rKUY?usp=sharing): Put pretrained Swin-T into folder "pretrained_ckpt/"
+This package trains the author's `networks.lmz.DARENet` on Data1. It does not replace
+the model with another network. Download the author's repository separately and pass
+its directory as `--original_repo`.
 
-## 2. Prepare data
+The author's repository at commit `8bf0c094903f518442efe44682a59bba862d7d5c`
+does not contain `networks/lmz.py`. It does contain the tracked
+`networks/__pycache__/lmz.cpython-310.pyc`. The adapter loads that bytecode with
+Python 3.10. A later `networks/lmz.py` source file will take priority automatically.
+The model body therefore cannot currently be audited or edited as normal source.
 
-- The datasets we used are provided by TransUnet's authors. [Get processed data in this link] (Synapse/BTCV: https://drive.google.com/drive/folders/1ACJEoTp-uqfFJ73qS3eUObQh52nGuzCd and ACDC: https://drive.google.com/drive/folders/1KQcrci7aKsYZi1hQoZ3T3QUtcy7b--n4).
+## Data and training
 
-## 3. Environment
+- `data1/{train,val,test}/image` plus matching `mask` or `label` directories.
+- Each image and GT is required to be native 1024×1024; no resizing.
+- Each train image contributes exactly one 512×512 crop per epoch. Per-image crop
+  locations cycle through a seeded permutation, so epochs do not repeat the same
+  location until all 263169 positions have been used.
+- Workers are recreated each epoch (`persistent_workers=False`) so they see the
+  current epoch. Optional paired flips and 90-degree rotations follow cropping.
+- Images use the original DARENet loader's BGR `pixel/255*3.2-1.6` transform.
+  Targets are strict binary 0/1. Training loss is BCE-with-logits plus soft Dice.
+- This adapter uses FP32, AdamW (2e-4), 5-epoch warmup, cosine decay, no EMA.
+  It uses the author's model and preprocessing, with a controlled Data1 training
+  schedule; it is not a claim that the original training script is identical.
 
-- Please prepare an environment with python=3.7, and then use the command "pip install -r requirements.txt" for the dependencies.
+## Validation, testing, and topology
 
-## 4. Train/Test
+Each 1024 image is covered by nine 512 windows with stride 256. Window logits are
+merged with positive taper weights, divided by weight sum, then passed through
+sigmoid and thresholded. Exported masks are native 1024×1024 binary PNGs.
 
-- Run the train script on synapse dataset. The batch size we used is 24. If you do not have enough GPU memory, the bacth size can be reduced to 12 or 6 to save memory.
+`evaluation/road_comparison/compare_predictions.py` and `road_metrics.py` are the
+shared unified tool. Its validation stage selects a threshold by global IoU from
+the exported threshold grid. Its test stage checks exact case pairing and reports
+surface metrics and topology including directional/bidirectional APLS with fixed
+Zhang-Suen skeletonization, 8-neighborhood, area `<20`, 64 nodes, and snap radius 5.
 
-- Train
-
-```bash
-sh train.sh 
-# or 
-python train.py --dataset Synapse --cfg configs/swin_tiny_patch4_window7_224_lite.yaml --root_path your DATA_DIR --max_epochs 150 --output_dir your OUT_DIR  --img_size 224 --base_lr 0.05 --batch_size 24
-```
-
-- Test 
-
-```bash
-sh test.sh 
-# or 
-python test.py --dataset Synapse --cfg configs/swin_tiny_patch4_window7_224_lite.yaml --is_saveni --volume_path your DATA_DIR --output_dir your OUT_DIR --max_epoch 150 --base_lr 0.05 --img_size 224 --batch_size 24
-```
-
-## Reproducibility
-
-
-- Codes
-
-Our trained model is stored on the Huawei cloud. The interns do not have the right to send any files out from the internal system, so I can't share our trained model weights. Regarding how to reproduce the segmentation results presented in the paper, we discovered that different GPU types would generate different results. In our code, we carefully set the random seed, so the results should be consistent when trained multiple times on the same type of GPU. If the training does not give the same segmentation results as in the paper, it is recommended to adjust the learning rate. And, the type of GPU we used in this work is Tesla v100. Finaly, pre-training is very important for pure transformer models. In our experiments, both the encoder and decoder are initialized with pretrained weights rather than initializing the encoder with pretrained weights only.
-
-## References
-* [TransUnet](https://github.com/Beckschen/TransUNet)
-* [SwinTransformer](https://github.com/microsoft/Swin-Transformer)
-
-## Citation
-
-```bibtex
-@InProceedings{swinunet,
-author = {Hu Cao and Yueyue Wang and Joy Chen and Dongsheng Jiang and Xiaopeng Zhang and Qi Tian and Manning Wang},
-title = {Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation},
-booktitle = {Proceedings of the European Conference on Computer Vision Workshops(ECCVW)},
-year = {2022}
-}
-
-@misc{cao2021swinunet,
-      title={Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation}, 
-      author={Hu Cao and Yueyue Wang and Joy Chen and Dongsheng Jiang and Xiaopeng Zhang and Qi Tian and Manning Wang},
-      year={2021},
-      eprint={2105.05537},
-      archivePrefix={arXiv},
-      primaryClass={eess.IV}
-}
-```
+The author's DARENet bytecode appears to instantiate an ImageNet pretrained
+torchvision ResNet34. Its official `IMAGENET1K_V1` checkpoint is
+`resnet34-b627a593.pth` in Torch's model cache. Existing PyTorch and torchvision
+versions must match. The binary model may also require `timm`, `torchinfo`,
+`ptflops`, and `mmengine` at import time.
