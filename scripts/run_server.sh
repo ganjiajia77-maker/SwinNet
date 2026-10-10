@@ -18,7 +18,7 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
     extra+=(--resume "$RUN_DIR/last.pth")
   fi
   python -u train_data1.py --data_root "$DATA_ROOT" --output_dir "$RUN_DIR" \
-    --epochs 80 --batch_size 1 --accumulation_steps 4 --workers 4 --lr 2e-4 \
+    --epochs 80 --batch_size 2 --accumulation_steps 2 --workers 4 --lr 2e-4 \
     --tile_size 512 --stride 256 --val_interval 5 --val_threshold 0.2 --seed 1234 \
     "${extra[@]}" 2>&1 | tee -a "$RUN_DIR/$MODE.log"
 elif [[ "$MODE" == sweep ]]; then
