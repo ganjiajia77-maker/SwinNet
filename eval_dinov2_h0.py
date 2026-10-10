@@ -91,7 +91,10 @@ def main():
     parser.add_argument("--threshold_file", help="best_threshold.json selected only on validation")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_probabilities", action="store_true")
+    parser.add_argument("--save_val_masks", action="store_true", help="save one binary validation mask per threshold")
     args = parser.parse_args()
+    if args.save_val_masks and args.split != "val":
+        parser.error("--save_val_masks is for validation only")
     if args.split == "test":
         if not args.threshold_file:
             parser.error("Test requires --threshold_file from validation sweep")
@@ -110,9 +113,17 @@ def main():
                                   source_patch_size=saved["source_patch_size"], return_full_image=True)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers)
     output_dir = Path(args.output_dir)
+    if args.save_val_masks and output_dir.exists() and any(output_dir.iterdir()):
+        parser.error(f"Validation mask output is not empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.split == "test":
         (output_dir / "surface").mkdir(exist_ok=True)
+    val_mask_dirs = []
+    if args.save_val_masks:
+        for threshold in thresholds:
+            directory = output_dir / f"threshold_{threshold:.12g}" / "surface"
+            directory.mkdir(parents=True, exist_ok=True)
+            val_mask_dirs.append(directory)
     if args.save_probabilities:
         (output_dir / "probabilities").mkdir(exist_ok=True)
     counts = np.zeros((len(thresholds), 3), dtype=np.int64)
@@ -123,6 +134,9 @@ def main():
         for i, threshold in enumerate(thresholds):
             pred = probability >= threshold
             counts[i] += (np.count_nonzero(pred & gt), np.count_nonzero(pred & ~gt), np.count_nonzero(~pred & gt))
+            if args.save_val_masks:
+                if not cv2.imwrite(str(val_mask_dirs[i] / f"{case}_pred.png"), pred.astype(np.uint8) * 255):
+                    raise IOError(f"Could not save validation prediction {case} at {threshold}")
         if args.split == "test":
             if not cv2.imwrite(str(output_dir / "surface" / f"{case}_pred.png"), ((probability >= thresholds[0]) * 255).astype(np.uint8)):
                 raise IOError(f"Could not save prediction {case}")
