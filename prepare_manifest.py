@@ -33,7 +33,7 @@ def main():
         if not Path(source["path"]).is_dir():
             parser.error(f"Missing masks: {source['path']}")
     provenance = {"checkpoint": str(checkpoint), "checkpoint_epoch": report["checkpoint_epoch"],
-                  "pretrained_source": "torchvision EfficientNet-V2-S ImageNet-1K",
+                  "pretrained_source": report["pretrained_source"],
                   "training_crop": "one native-resolution random 512 crop per Data1 image per epoch",
                   "encoder": "trainable EfficientNet-V2-S", "checkpoint_weights": "model_state_dict (no EMA)",
                   "inference_tile_size": 512, "overlap_stride": 256,

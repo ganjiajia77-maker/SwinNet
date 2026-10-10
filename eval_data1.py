@@ -60,6 +60,8 @@ def main():
                 print(f"{args.split}: {i}/{len(dataset)}", flush=True)
     report = {"split": args.split, "checkpoint": str(args.checkpoint.resolve()),
               "checkpoint_epoch": checkpoint["epoch"], "images": len(dataset),
+              "pretrained_source": str(checkpoint["args"].get("encoder_ckpt") or
+                                       "torchvision EfficientNet_V2_S_Weights.IMAGENET1K_V1"),
               "tile_size": args.tile_size, "overlap_stride": args.stride,
               "fusion": "taper-weighted probabilities", "tta": False, "postprocessing": "none",
               "threshold_scores": {str(t): metrics(*totals[t]) for t in thresholds}}
