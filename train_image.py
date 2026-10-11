@@ -1451,7 +1451,16 @@ if __name__ == "__main__":
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-            checkpoint_state = checkpoint["model_state_dict"]
+            checkpoint_state = checkpoint.get('training_model_state_dict')
+            if checkpoint_state is None:
+                if checkpoint.get('ema_state_dict') is not None:
+                    raise RuntimeError(
+                        'EMA checkpoint lacks training_model_state_dict; '
+                        'cannot resume its optimizer with the raw training weights.'
+                    )
+                checkpoint_state = checkpoint["model_state_dict"]
+            else:
+                print('[INFO] Resuming raw training weights; EMA state loads separately.', flush=True)
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
             skipped_gate_keys = []

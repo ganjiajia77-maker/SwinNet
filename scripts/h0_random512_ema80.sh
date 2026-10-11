@@ -12,13 +12,23 @@ cd "$REPO"
 MODE=${1:-}
 mkdir -p "$RESULTS"
 
-if [[ "$MODE" == train ]]; then
-  test -f "$PRETRAIN" || { echo "Missing pretrained checkpoint: $PRETRAIN"; exit 1; }
-  RUN=${RUN:-h0_599a410_data1_random512_fp32_ema0999_80e_$(date +%Y%m%d_%H%M%S)}
-  test ! -e "$RESULTS/$RUN" || { echo "Existing run: $RUN; choose a new RUN"; exit 1; }
-  printf '%s\n' "$RUN" > "$RESULTS/latest_h0_run.txt"
+if [[ "$MODE" == train || "$MODE" == resume ]]; then
+  resume_args=()
+  if [[ "$MODE" == train ]]; then
+    test -f "$PRETRAIN" || { echo "Missing pretrained checkpoint: $PRETRAIN"; exit 1; }
+    RUN=${RUN:-h0_599a410_data1_random512_fp32_ema0999_80e_$(date +%Y%m%d_%H%M%S)}
+    test ! -e "$RESULTS/$RUN" || { echo "Existing run: $RUN; choose a new RUN"; exit 1; }
+    printf '%s\n' "$RUN" > "$RESULTS/latest_h0_run.txt"
+  else
+    RUN=${RUN:-$(cat "$RESULTS/latest_h0_run.txt")}
+    last_ckpt="$RESULTS/$RUN/last.pth"
+    test -f "$last_ckpt" || { echo "Missing resume checkpoint: $last_ckpt"; exit 1; }
+    resume_args=(--resume "$last_ckpt")
+    echo "Resuming $RUN from $last_ckpt"
+  fi
   python -u train_image.py \
     --root_path "$DATA" --output_dir "$RESULTS" --run_name "$RUN" \
+    "${resume_args[@]}" \
     --cfg "$REPO/configs/swin_tiny_patch4_window7_224_lite.yaml" \
     --pretrain_ckpt "$PRETRAIN" \
     --pretrained_lr 5e-5 --pretrained_min_lr 5e-6 \
@@ -44,11 +54,11 @@ if [[ "$MODE" == train ]]; then
     --edge_contrastive_margin 0.1 \
     --directional_pos_weight_cardinal 1.0 --directional_pos_weight_diagonal 2.5 \
     --surface_focal_gamma 1.0 \
-    2>&1 | tee "$RESULTS/${RUN}.log"
+    2>&1 | tee -a "$RESULTS/${RUN}.log"
   exit 0
 fi
 
-case "$MODE" in val|test|topology) ;; *) echo "Usage: bash scripts/h0_random512_ema80.sh train|val|test|topology"; exit 2 ;; esac
+case "$MODE" in val|test|topology) ;; *) echo "Usage: bash scripts/h0_random512_ema80.sh train|resume|val|test|topology"; exit 2 ;; esac
 RUN=${RUN:-$(cat "$RESULTS/latest_h0_run.txt")}
 RUN_DIR="$RESULTS/$RUN"
 CKPT="$RUN_DIR/best.pth"

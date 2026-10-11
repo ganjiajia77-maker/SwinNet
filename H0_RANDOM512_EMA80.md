@@ -24,6 +24,7 @@ Activate `swinunet`, then run these stages in order:
 
 ```bash
 bash scripts/h0_random512_ema80.sh train
+bash scripts/h0_random512_ema80.sh resume # only when an interrupted run has last.pth
 bash scripts/h0_random512_ema80.sh val
 bash scripts/h0_random512_ema80.sh test
 ```
