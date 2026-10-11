@@ -1,0 +1,10 @@
+# Reuse the existing CUDA-enabled PyTorch in the swinunet environment.
+numpy
+scipy
+opencv-contrib-python
+Pillow
+tqdm
+PyYAML
+yacs
+einops
+timm

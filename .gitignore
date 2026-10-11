@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+model_out/
+predictions/
+reports/
+tests/
+mass_run_name.txt
