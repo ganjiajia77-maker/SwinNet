@@ -32,8 +32,8 @@ def predict_full(model, image, tile_size=512, stride=256):
 
 
 def counts(probability, target, threshold):
-    pred = probability >= threshold
-    gt = target.bool()
+    pred = torch.as_tensor(probability) >= threshold
+    gt = torch.as_tensor(target, dtype=torch.bool, device=pred.device)
     return int((pred & gt).sum()), int((pred & ~gt).sum()), int((~pred & gt).sum())
 
 
