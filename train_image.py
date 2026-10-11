@@ -92,6 +92,7 @@ parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='ini
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
+parser.add_argument('--ablate_h0_stream', action='store_true', help='remove the H0 bypass and use Stage 3 structure features for global topology')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
 parser.add_argument(
     '--highres_structure_fuse_stages',
@@ -290,7 +291,9 @@ if args.freeze_post_refine_interaction_only:
     if not args.enable_highres_structure_stream:
         parser.error("--freeze_post_refine_interaction_only requires --enable_highres_structure_stream")
     args.enable_post_refine_structure_interaction = True
-if args.enable_global_topology and not args.enable_highres_structure_stream:
+if args.ablate_h0_stream and args.enable_highres_structure_stream:
+    parser.error('--ablate_h0_stream cannot be combined with --enable_highres_structure_stream')
+if args.enable_global_topology and not (args.enable_highres_structure_stream or args.ablate_h0_stream):
     parser.error("--enable_global_topology requires --enable_highres_structure_stream")
 
 
@@ -1223,6 +1226,7 @@ if __name__ == "__main__":
                     ),
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
+                    ablate_h0_stream=args.ablate_h0_stream,
                     highres_structure_channels=args.highres_structure_channels,
                     highres_structure_fuse_stages=args.highres_structure_fuse_stages,
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,

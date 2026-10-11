@@ -1262,6 +1262,7 @@ class SwinTransformerSys(nn.Module):
                  stage3_gate_topology_gradient_ratio=0.0,
                  final_skeleton_gradient_ratio=0.0,
                  enable_highres_structure_stream=False,
+                 ablate_h0_stream=False,
                  highres_structure_channels=64,
                  highres_structure_fuse_stages="stage23",
                  highres_structure_fusion_mode="stage23",
@@ -1318,6 +1319,9 @@ class SwinTransformerSys(nn.Module):
         self.stage3_gate_topology_gradient_ratio = float(stage3_gate_topology_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
         self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
+        self.ablate_h0_stream = bool(ablate_h0_stream)
+        if self.ablate_h0_stream and self.enable_highres_structure_stream:
+            raise ValueError("ablate_h0_stream requires the high-resolution stream to be disabled")
         self.highres_structure_channels = int(highres_structure_channels)
         self.enable_global_topology = bool(enable_global_topology)
         self.stage_skeleton_mode = str(stage_skeleton_mode).lower()
@@ -1577,28 +1581,33 @@ class SwinTransformerSys(nn.Module):
                 for stage_index, channels in decoder_structure_channels.items()
             }
         )
-        self.prepatch_structure_encoder = PrePatchStructureEncoder(
-            struct_channels=self.highres_structure_channels,
+        self.prepatch_structure_encoder = (
+            None if self.ablate_h0_stream else
+            PrePatchStructureEncoder(struct_channels=self.highres_structure_channels)
         )
         self.highres_skeleton_adapter = (
             HighResSkeletonAdapter(self.highres_structure_channels)
             if self.enable_highres_structure_stream
             else None
         )
-        self.highres_structure_skeleton_head = nn.Conv2d(
+        self.highres_structure_skeleton_head = None if self.ablate_h0_stream else nn.Conv2d(
             self.highres_structure_channels,
             1,
             kernel_size=1,
             bias=True,
         )
-        self.highres_structure_fusion = nn.ModuleDict(
+        self.highres_structure_fusion = nn.ModuleDict({}) if self.ablate_h0_stream else nn.ModuleDict(
             {
                 "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
                 "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
             }
         )
-        self.structure_surface_correction_head = StructureSurfaceCorrectionHead(
+        self.structure_surface_correction_head = None if self.ablate_h0_stream else StructureSurfaceCorrectionHead(
             self.highres_structure_channels,
+        )
+        self.stage3_topology_projection = (
+            nn.Conv2d(embed_dim, self.highres_structure_channels, kernel_size=1)
+            if self.ablate_h0_stream and self.enable_global_topology else None
         )
         print(
             "[INFO] High-res structure stream: {}, source=prepatch, channels={}, fuse_stages={}, fusion_mode={}".format(
@@ -1726,9 +1735,10 @@ class SwinTransformerSys(nn.Module):
                         "(0626 profile; final connectivity removed)"
                     )
                 if self.enable_global_topology:
+                    anchor_source = "projected_G3" if self.ablate_h0_stream else "H2"
                     print(
-                        "[INFO] Global topology residual: anchors=H2*surface, "
-                        "tokens=[H2,decoder_feature,connectivity], "
+                        f"[INFO] Global topology residual: anchors={anchor_source}*surface, "
+                        f"tokens=[{anchor_source},decoder_feature,connectivity], "
                         "relation_bias=relative_xy_distance+connectivity"
                     )
             else:
@@ -2373,7 +2383,15 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                if self.enable_global_topology and highres_skeleton_feat is not None:
+                if self.enable_global_topology:
+                    topology_feature = highres_skeleton_feat
+                    if self.ablate_h0_stream:
+                        stage3_feature = self.last_stage_features.get("G3")
+                        if stage3_feature is None:
+                            raise RuntimeError("A ablation requires the Stage 3 structure feature")
+                        topology_feature = self.stage3_topology_projection(stage3_feature)
+                    if topology_feature is None:
+                        raise RuntimeError("Global topology requires a structure feature")
                     surface_prob = self._surface_prior_for_global_topology(
                         x,
                         highres_skeleton_feat,
@@ -2383,7 +2401,7 @@ class SwinTransformerSys(nn.Module):
                     )
                     x = self.global_topology.forward_feature_anchors(
                         x,
-                        highres_skeleton_feat,
+                        topology_feature,
                         surface_prob,
                         connectivity_feature=connectivity_feature,
                     )

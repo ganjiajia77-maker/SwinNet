@@ -8,7 +8,9 @@ from pathlib import Path
 import torch
 
 
-NAME = 'h0_599a410_random512_fp32_ema80'
+NAME_FULL = 'h0_599a410_mass1500_random512_fp32_ema80'
+NAME_A = 'h0_a_no_highres_mass1500_random512_fp32_ema80'
+NAME_DATA1 = 'h0_599a410_random512_fp32_ema80'
 BASE = '599a410de8d341850e1810417307e4b3bbdfc82d'
 
 
@@ -23,13 +25,24 @@ def main():
     args = p.parse_args()
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     saved = checkpoint.get('args', {})
-    expected = dict(img_size=512, source_patch_size=1024, random_crop_train=True,
+    source_size = int(saved.get('source_patch_size', 0))
+    if source_size not in (1024, 1500):
+        p.error(f'Unsupported source_patch_size: {source_size}')
+    ablated = bool(saved.get('ablate_h0_stream', False))
+    if source_size == 1024 and ablated:
+        p.error('The A ablation is only configured for native-1500 Massachusetts data')
+    name = (NAME_A if ablated else NAME_FULL) if source_size == 1500 else NAME_DATA1
+    expected = dict(img_size=512, source_patch_size=source_size, random_crop_train=True,
                     random_crops_per_image=1, direct_resize_train=False,
                     amp_dtype='none', use_ema=True, ema_decay=0.999, max_epochs=80,
                     structure_profile='stage23_boundary_0626',
-                    enable_highres_structure_stream=True, enable_global_topology=True,
+                    enable_highres_structure_stream=not ablated, enable_global_topology=True,
                     stage_skeleton_mode='direct', enable_h3_surface_fusion=True,
                     remove_stage2_pre_topology_source=True)
+    if source_size == 1500:
+        expected.update(ablate_h0_stream=ablated, batch_size=2, overlap_stride=256)
+        if not isinstance(saved.get('seed'), int):
+            p.error('Massachusetts checkpoint must record its random seed')
     mismatches = {key: [saved.get(key), value] for key, value in expected.items()
                   if saved.get(key) != value}
     if mismatches or checkpoint.get('ema_state_dict') is None:
@@ -37,7 +50,7 @@ def main():
                 f'EMA present={checkpoint.get("ema_state_dict") is not None}')
     epoch = checkpoint.get('epoch')
     del checkpoint
-    print(f'Verified H0 random512 FP32 EMA 80e checkpoint, saved epoch={epoch}', flush=True)
+    print(f'Verified {name} checkpoint, saved epoch={epoch}', flush=True)
     if args.check_only:
         return
     candidates = []
@@ -50,9 +63,9 @@ def main():
     test = []
     if args.selection:
         selection = json.loads(args.selection.read_text(encoding='utf-8'))
-        if selection.get('selected_on') != 'val' or NAME not in selection.get('models', {}):
+        if selection.get('selected_on') != 'val' or name not in selection.get('models', {}):
             p.error('Selection is not a validation selection for this H0 model')
-        threshold = float(selection['models'][NAME]['threshold'])
+        threshold = float(selection['models'][name]['threshold'])
         directory = args.predictions_root / 'test' / f'threshold_{threshold:.2f}' / 'surface'
         if not directory.is_dir():
             p.error(f'Missing selected test masks: {directory}')
@@ -65,12 +78,15 @@ def main():
                     'evaluation/road_comparison/compare_predictions.py',
                     'evaluation/road_comparison/road_metrics.py']
     manifest = dict(data_root=str(args.data_root),
-                    protocol=dict(image_size=1024, short_area_threshold=20,
+                    protocol=dict(image_size=source_size, short_area_threshold=20,
                                   apls_max_nodes=64, apls_snap_radius=5.0),
-                    models=[dict(name=NAME, provenance=dict(
+                    models=[dict(name=name, provenance=dict(
                         checkpoint=str(args.checkpoint), checkpoint_epoch=epoch,
                         checkpoint_args_verified=True, base_model_commit=BASE,
-                        training_crop='one random512 crop per native1024 image each epoch; shared epoch',
+                        ablate_h0_stream=ablated,
+                        seed=saved.get('seed'),
+                        global_topology_structure_source='projected Stage 3 G3' if ablated else 'updated high-resolution H2',
+                        training_crop=f'one random512 crop per native{source_size} image each epoch; shared epoch',
                         training_precision='FP32', training_max_epochs=80,
                         weights='EMA', ema_decay=0.999,
                         inference_tile_size=512, overlap_stride=256,
