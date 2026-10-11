@@ -14,6 +14,29 @@ from networks.WeavingUnet import WeavingUnet
 THRESHOLDS = (0.05, 0.1, 0.2, 0.5)
 
 
+def set_probe_mode(model, mode):
+    model.eval()
+    if mode == "train":
+        model.train()
+        return
+    if mode == "eval":
+        return
+    groups = {
+        "bn_ciwm": {id(child) for module in model.modules()
+                    if module.__class__.__name__ == "CIWM" for child in module.modules()},
+        "bn_mswd": {id(child) for module in model.modules()
+                    if module.__class__.__name__ == "MSWD" for child in module.modules()},
+    }
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            continue
+        selected = (mode == "bn_all" or
+                    (mode == "bn_encoder" and name.startswith(("encoder", "downsampling"))) or
+                    id(module) in groups.get(mode, set()))
+        if selected:
+            module.train()
+
+
 def describe(probability, target):
     probability = probability.detach().float().cpu()
     target = target.detach().bool().cpu()
@@ -45,6 +68,8 @@ def main():
     parser.add_argument("--data_root", type=Path, required=True)
     parser.add_argument("--run_dir", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=2)
+    parser.add_argument("--skip_overlap", action="store_true",
+                        help="Only run paired tile probes; skip full-image sliding windows.")
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -63,8 +88,9 @@ def main():
         with torch.inference_mode():
             for split, dataset in datasets.items():
                 samples = [dataset[i] for i in range(min(args.samples, len(dataset)))]
+                model.load_state_dict(checkpoint["model_state_dict"], strict=True)
                 model.eval()
-                for case, image, label in samples:
+                for case, image, label in ([] if args.skip_overlap else samples):
                     probability = predict_full(model, image[None].to(device))[0, 0]
                     print(json.dumps({"checkpoint": checkpoint_name, "split": split,
                                       "mode": "eval_overlap", "case": case,
@@ -73,9 +99,9 @@ def main():
                     tiles = [road_rich_tile(image, label) for _, image, label in samples]
                     image_batch = torch.stack([item[0] for item in tiles]).to(device)
                     label_batch = torch.stack([item[1] for item in tiles])
-                    for mode in ("eval", "train"):
+                    for mode in ("eval", "bn_all", "bn_encoder", "bn_ciwm", "bn_mswd", "train"):
                         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-                        model.eval() if mode == "eval" else model.train()
+                        set_probe_mode(model, mode)
                         probabilities = model(image_batch)[:, 0]
                         for i, (case, _, _) in enumerate(samples):
                             print(json.dumps({"checkpoint": checkpoint_name, "split": split,
