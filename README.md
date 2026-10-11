@@ -1,64 +1,101 @@
-# Swin-Unet
-[ECCVW2022] The codes for the work "Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation"(https://arxiv.org/abs/2105.05537). Our paper has been accepted by ECCV 2022 MEDICAL COMPUTER VISION WORKSHOP (https://mcv-workshop.github.io/). We updated the Reproducibility. I hope this will help you to reproduce the results.
+# Original H0 on Massachusetts Roads
 
-## 1. Download pre-trained swin transformer model (Swin-T)
-* [Get pre-trained model in this link] (https://drive.google.com/drive/folders/1UC3XOoezeum0uck4KBVGa8osahs6rKUY?usp=sharing): Put pretrained Swin-T into folder "pretrained_ckpt/"
+Base architecture: `599a410de8d341850e1810417307e4b3bbdfc82d`.
+The 14 model, loss, and direction-target files in `BASE_MODEL_SHA256.json` are
+byte-for-byte identical to that commit. This package changes data handling,
+training/evaluation entry points, and the unified metric adapter.
 
-## 2. Prepare data
+## Fixed experiment
 
-- The datasets we used are provided by TransUnet's authors. [Get processed data in this link] (Synapse/BTCV: https://drive.google.com/drive/folders/1ACJEoTp-uqfFJ73qS3eUObQh52nGuzCd and ACDC: https://drive.google.com/drive/folders/1KQcrci7aKsYZi1hQoZ3T3QUtcy7b--n4).
+- Native RGB images and binary labels: 1500 x 1500, no resizing.
+- Training: one 512 x 512 crop per image per epoch, 80 epochs, batch size 2,
+  accumulation 1, FP32, no EMA, seed 1234.
+- Workers share the current epoch; crop coordinates change between epochs
+  even with persistent workers. Each image follows a seeded permutation of
+  valid crop coordinates, avoiding repeats within the 80 epochs.
+- Validation/test: 512 windows with stride 256; starts 0, 256, 512, 768, 988
+  on both axes, covering the whole native image with 25 windows.
+- The same taper-weighted logit stitching is used for training validation,
+  threshold sweeping, and test inference. Sigmoid and thresholding occur
+  after stitching. No TTA or automatic component removal.
+- Training validation every 5 epochs; step-based trend validation disabled.
+- ImageNet SwinV2 Tiny window8/256 pretraining; no data1 checkpoint warm start.
+- Original H0 learning rates: pretrained 5e-5 -> 5e-6, new 2e-4 -> 1e-5,
+  warmup 10 epochs. Original H0 skeleton/connectivity/direction/surface losses.
 
-## 3. Environment
+Required dataset layout:
 
-- Please prepare an environment with python=3.7, and then use the command "pip install -r requirements.txt" for the dependencies.
+```
+/home/gjj/Swin-Unet-main/Massachusetts/tiff/
+  train/         train_labels/
+  val/           val_labels/
+  test/          test_labels/
+```
 
-## 4. Train/Test
+Image and label stems must pair completely, including `.tiff` images and `.tif`
+labels. Missing/extra labels and invalid image dimensions fail explicitly.
 
-- Run the train script on synapse dataset. The batch size we used is 24. If you do not have enough GPU memory, the bacth size can be reduced to 12 or 6 to save memory.
+## Server commands (run from this package directory)
 
-- Train
+Use the existing `swinunet` environment. If dependencies are missing, install
+`requirements-mass.txt` there; do not replace its CUDA-enabled PyTorch.
 
 ```bash
-sh train.sh 
-# or 
-python train.py --dataset Synapse --cfg configs/swin_tiny_patch4_window7_224_lite.yaml --root_path your DATA_DIR --max_epochs 150 --output_dir your OUT_DIR  --img_size 224 --base_lr 0.05 --batch_size 24
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate swinunet
+
+DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
+OUT=/home/gjj/SwinNet-h0-mass/model_out
+RUN="mass_h0_599a410_random512_fp32_80e_bs2_$(date +%Y%m%d_%H%M%S)"
+printf '%s\n' "$RUN" > mass_run_name.txt
+
+python -u mass_h0.py train --gpu 2 \
+  --root_path "$DATA" --output_dir "$OUT" --run_name "$RUN" \
+  --pretrain_ckpt /home/gjj/Swin-Unet-main/pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth \
+  --num_workers 4
 ```
 
-- Test 
+After training, including in a new terminal in the same package directory:
 
 ```bash
-sh test.sh 
-# or 
-python test.py --dataset Synapse --cfg configs/swin_tiny_patch4_window7_224_lite.yaml --is_saveni --volume_path your DATA_DIR --output_dir your OUT_DIR --max_epoch 150 --base_lr 0.05 --img_size 224 --batch_size 24
+DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
+OUT=/home/gjj/SwinNet-h0-mass/model_out
+RUN=$(cat mass_run_name.txt)
+CKPT="$OUT/$RUN/best.pth"
+REPORT="$OUT/$RUN/unified"
+
+python -u mass_h0.py sweep --gpu 2 \
+  --root_path "$DATA" --model_path "$CKPT" --output_dir "$REPORT"
+
+python -u mass_h0.py test --gpu 2 \
+  --root_path "$DATA" --model_path "$CKPT" --output_dir "$REPORT"
+
+python -u mass_h0.py topology --gpu 2 \
+  --root_path "$DATA" --model_path "$CKPT" --output_dir "$REPORT"
 ```
 
-## Reproducibility
+## Unified evaluation
 
+`mass_h0.py` calls `test_image.py` to export native 1500 binary surface masks,
+then uses `evaluation/road_comparison/compare_predictions.py` for selection and
+reporting. The unified metric implementation is unchanged; its configured
+image size is 1500 for Massachusetts.
 
-- Codes
+- Sweep: validation only, thresholds 0.05 through 0.95 in steps of 0.05.
+  Select by global pixel IoU. No validation topology computation.
+- Test: read `val/val_selection.json`, export test masks at that fixed threshold,
+  report segmentation and topology with the unified tool.
+- Topology: display the report already computed by `test`. Add `--recompute`
+  to generate a fresh topology report from the existing masks, without GPU
+  inference or overwriting the previous report.
+- Fixed Zhang-Suen skeletonization, 8-neighbor connectivity, short-component
+  area <20 pixels, APLS proxy maximum 64 nodes, matching distance <=5 pixels.
+  Reports GT-to-prediction, prediction-to-GT, and bidirectional approximate
+  APLS. This raster graph proxy is not the official SpaceNet APLS evaluator.
+- Strict image/GT/prediction pairing; native resolution required.
 
-Our trained model is stored on the Huawei cloud. The interns do not have the right to send any files out from the internal system, so I can't share our trained model weights. Regarding how to reproduce the segmentation results presented in the paper, we discovered that different GPU types would generate different results. In our code, we carefully set the random seed, so the results should be consistent when trained multiple times on the same type of GPU. If the training does not give the same segmentation results as in the paper, it is recommended to adjust the learning rate. And, the type of GPU we used in this work is Tesla v100. Finaly, pre-training is very important for pure transformer models. In our experiments, both the encoder and decoder are initialized with pretrained weights rather than initializing the encoder with pretrained weights only.
-
-## References
-* [TransUnet](https://github.com/Beckschen/TransUNet)
-* [SwinTransformer](https://github.com/microsoft/Swin-Transformer)
-
-## Citation
-
-```bibtex
-@InProceedings{swinunet,
-author = {Hu Cao and Yueyue Wang and Joy Chen and Dongsheng Jiang and Xiaopeng Zhang and Qi Tian and Manning Wang},
-title = {Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation},
-booktitle = {Proceedings of the European Conference on Computer Vision Workshops(ECCVW)},
-year = {2022}
-}
-
-@misc{cao2021swinunet,
-      title={Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation}, 
-      author={Hu Cao and Yueyue Wang and Joy Chen and Dongsheng Jiang and Xiaopeng Zhang and Qi Tian and Manning Wang},
-      year={2021},
-      eprint={2105.05537},
-      archivePrefix={arXiv},
-      primaryClass={eess.IV}
-}
-```
+Outputs include `val/val_threshold_scores.csv`, `val/val_selection.json`,
+`test/test_comparison.csv`, and per-image topology CSV files. Exported masks are
+under `predictions/{val,test}/threshold_0.XX/surface/`. The manifest records
+checkpoint identity and source hashes. Use a fresh report directory for a
+different checkpoint; nonempty mask/report directories are not overwritten.
