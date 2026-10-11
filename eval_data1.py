@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from data1 import FullImageData1
+from bn_recovery import load_checkpoint_model
 from inference import counts, metrics, predict_full
 from networks.WeavingUnet import WeavingUnet
 
@@ -37,7 +38,7 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = WeavingUnet(pretrained_encoder=False).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    load_checkpoint_model(model, checkpoint)
     model.eval()
     dataset = FullImageData1(args.data_root, args.split)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.workers)
@@ -67,6 +68,9 @@ def main():
               "tile_size": args.tile_size, "overlap_stride": args.stride,
               "fusion": "taper-weighted probabilities", "tta": False, "postprocessing": "none",
               "threshold_scores": {str(t): metrics(*totals[t]) for t in thresholds}}
+    if "bn_recovery" in checkpoint:
+        report["bn_recovery"] = {key: value for key, value in checkpoint["bn_recovery"].items()
+                                 if key != "crops"}
     (args.output_dir / "inference_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2), flush=True)
 

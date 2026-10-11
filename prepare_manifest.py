@@ -18,13 +18,15 @@ def main():
     parser.add_argument("--run_dir", required=True, type=Path)
     parser.add_argument("--data_root", required=True, type=Path)
     parser.add_argument("--selection", type=Path)
+    parser.add_argument("--checkpoint", type=Path,
+                        help="Explicit evaluated checkpoint; defaults to run_dir/best.pth")
     args = parser.parse_args()
     run = args.run_dir.resolve()
-    checkpoint = run / "best.pth"
+    checkpoint = (args.checkpoint or run / "best.pth").resolve()
     report = json.loads((run / "unified_val_predictions" / "inference_report.json").read_text(encoding="utf-8"))
     if (report["split"] != "val" or Path(report["checkpoint"]).resolve() != checkpoint.resolve()
             or report["tile_size"] != 512 or report["overlap_stride"] != 256):
-        parser.error("Validation predictions must be 512/256 tiles from this best.pth")
+        parser.error("Validation predictions must be 512/256 tiles from the selected checkpoint")
     thresholds = [float(value) for value in report["threshold_scores"]]
     val_sources = [{"threshold": threshold,
                     "path": str(run / "unified_val_predictions" / f"threshold_{threshold:.12g}" / "surface")}
@@ -41,6 +43,8 @@ def main():
                   "inference_tile_size": 512, "overlap_stride": 256,
                   "merge": "taper-weighted probabilities", "tta": False,
                   "postprocessing": "threshold only"}
+    if "bn_recovery" in report:
+        provenance["bn_recovery"] = report["bn_recovery"]
     test_sources = []
     if args.selection:
         selection = json.loads(args.selection.read_text(encoding="utf-8"))

@@ -421,6 +421,7 @@ class MSWD(nn.Module):
         self.conv11 = nn.Conv2d(in_channels, out_channels, 1)
         self.deconv = nn.ConvTranspose2d(out_channels, out_channels, 3, stride=2, padding=1, output_padding=1)
         self.norm = nn.BatchNorm2d(out_channels)
+        self.norm_second = None
 
         self.h_conv1 = ConvModule(out_channels, out_channels, (1, 4 * (2 ** (4 - num) - 1) + 3 + 2 ** (5 - num)), 1,
                                   (0, 2 * (2 ** (4 - num) - 1) + 1 + 2 ** (4 - num)), groups=out_channels,
@@ -448,7 +449,8 @@ class MSWD(nn.Module):
         x = torch.cat((x1, x2, x), 1)
 
         x = self.conv12(x)
-        x = nonlinearity(self.norm(x))
+        norm = self.norm if self.norm_second is None else self.norm_second
+        x = nonlinearity(norm(x))
 
         return x
 

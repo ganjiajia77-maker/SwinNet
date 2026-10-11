@@ -79,6 +79,8 @@ def main():
     start_epoch, best_iou = 0, -1.0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if checkpoint.get("inference_only"):
+            raise ValueError("BN-recovered checkpoint is inference-only; do not use it to resume training")
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
