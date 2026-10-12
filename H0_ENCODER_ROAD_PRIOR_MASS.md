@@ -71,6 +71,10 @@ bash scripts/run_h0_road_prior_mass.sh test
 bash scripts/run_h0_road_prior_mass.sh topology
 ```
 
+If training stops after a checkpoint was saved, keep the same `RUN` and use
+`bash scripts/run_h0_road_prior_mass.sh resume`. The runner verifies the saved
+Mass protocol before resuming optimizer and model state from `last.pth`.
+
 `sweep` exports binary validation masks for 0.05-0.95 and selects the threshold
 on validation IoU. `test` exports native 1500 test masks at that threshold.
 `topology` runs the unified metrics tool and writes a summary CSV plus per-image

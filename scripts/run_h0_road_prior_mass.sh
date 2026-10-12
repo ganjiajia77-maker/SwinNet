@@ -11,8 +11,8 @@ export OPENCV_LOG_LEVEL=ERROR
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MODE=${1:-}
-if [[ "$MODE" != train && "$MODE" != sweep && "$MODE" != test && "$MODE" != topology ]]; then
-  echo "Usage: bash scripts/run_h0_road_prior_mass.sh train|sweep|test|topology" >&2
+if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != sweep && "$MODE" != test && "$MODE" != topology ]]; then
+  echo "Usage: bash scripts/run_h0_road_prior_mass.sh train|resume|sweep|test|topology" >&2
   exit 2
 fi
 
@@ -35,10 +35,19 @@ RUN_DIR="$RESULTS/$RUN"
 CFG="$REPO/configs/swin_tiny_patch4_window7_224_lite.yaml"
 EVAL="$REPO/evaluation/road_comparison"
 
-if [[ "$MODE" == train ]]; then
+if [[ "$MODE" == train || "$MODE" == resume ]]; then
+  resume_args=()
+  if [[ "$MODE" == resume ]]; then
+    test -s "$RUN_DIR/last.pth" || { echo "Missing $RUN_DIR/last.pth; start a fresh run instead" >&2; exit 1; }
+    python "$EVAL/build_h0_manifest.py" --checkpoint "$RUN_DIR/last.pth" \
+      --data_root "$DATA" --predictions_root "$RUN_DIR" --output "$RUN_DIR/resume_check.json" \
+      --expected_accumulation_steps 1 --check_only
+    resume_args+=(--resume "$RUN_DIR/last.pth")
+  fi
   echo "RUN_DIR=$RUN_DIR; GPU=$CUDA_VISIBLE_DEVICES; FP32; no EMA; physical batch 2; accumulation 1"
   python -u train_image.py \
     --root_path "$DATA" --output_dir "$RESULTS" --run_name "$RUN" \
+    "${resume_args[@]}" \
     --cfg "$CFG" --pretrain_ckpt "$PRETRAIN" \
     --img_size 512 --source_patch_size 1500 --overlap_stride 256 \
     --random_crop_train --random_crops_per_image 1 --max_epochs 80 \
@@ -64,7 +73,7 @@ if [[ "$MODE" == train ]]; then
     --connectivity_focal_gamma 1.5 --edge_contrastive_margin 0.1 \
     --directional_pos_weight_cardinal 1.0 --directional_pos_weight_diagonal 2.5 \
     --surface_focal_gamma 1.0 \
-    2>&1 | tee "$RESULTS/${RUN}.log"
+    2>&1 | tee -a "$RESULTS/${RUN}.log"
   echo "BEST=$RUN_DIR/best.pth"
   exit 0
 fi
