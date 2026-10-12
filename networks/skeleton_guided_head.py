@@ -30,13 +30,16 @@ class ConvBNReLU(nn.Module):
 
 
 class BidirectionalSkeletonFeatureFusion(nn.Module):
-    def __init__(self, highres_channels, stage_channels):
+    def __init__(self, highres_channels, stage_channels, update_highres=True):
         super().__init__()
+        self.update_highres = bool(update_highres)
         self.highres_refine = ConvBNReLU(highres_channels, highres_channels)
         self.stage_refine = ConvBNReLU(stage_channels, stage_channels)
-        self.stage_to_highres = nn.Sequential(
-            nn.Conv2d(stage_channels, highres_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(highres_channels),
+        self.stage_to_highres = (
+            nn.Sequential(
+                nn.Conv2d(stage_channels, highres_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(highres_channels),
+            ) if self.update_highres else None
         )
         self.highres_to_stage = nn.Sequential(
             nn.Conv2d(highres_channels, stage_channels, kernel_size=1, bias=False),
@@ -54,8 +57,9 @@ class BidirectionalSkeletonFeatureFusion(nn.Module):
             )
         highres_refined = self.highres_refine(highres_feature)
         stage_refined = self.stage_refine(stage_feature)
-        updated_highres = self.activation(
-            highres_refined + self.stage_to_highres(stage_refined)
+        updated_highres = (
+            self.activation(highres_refined + self.stage_to_highres(stage_refined))
+            if self.update_highres else highres_feature
         )
         updated_stage = self.activation(
             stage_refined + self.highres_to_stage(highres_refined)
@@ -660,6 +664,7 @@ class DecoderStructureRefinement(nn.Module):
         gate_topology_gradient_ratio=0.0,
         previous_structure_channels=None,
         highres_structure_channels=None,
+        update_highres_structure=True,
         use_structure_residual=False,
     ):
         super().__init__()
@@ -681,7 +686,8 @@ class DecoderStructureRefinement(nn.Module):
         )
         if highres_structure_channels is not None:
             self.highres_skeleton_fusion = BidirectionalSkeletonFeatureFusion(
-                int(highres_structure_channels), channels
+                int(highres_structure_channels), channels,
+                update_highres=update_highres_structure,
             )
         else:
             self.highres_skeleton_fusion = None

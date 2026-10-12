@@ -13,12 +13,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd "$REPO"
 
 MODE=${1:-}
-if [[ "$VARIANT" != a && "$VARIANT" != full ]]; then
-  echo "VARIANT must be a or full" >&2
+if [[ "$VARIANT" != a && "$VARIANT" != b && "$VARIANT" != full ]]; then
+  echo "VARIANT must be a, b or full" >&2
   exit 2
 fi
 if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != val && "$MODE" != test && "$MODE" != topology ]]; then
-  echo "Usage: VARIANT=a|full bash scripts/run_h0_mass1500.sh train|resume|val|test|topology" >&2
+  echo "Usage: VARIANT=a|b|full bash scripts/run_h0_mass1500.sh train|resume|val|test|topology" >&2
   exit 2
 fi
 mkdir -p "$RESULTS"
@@ -39,6 +39,8 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
   extra=()
   if [[ "$VARIANT" == a ]]; then
     extra+=(--ablate_h0_stream)
+  elif [[ "$VARIANT" == b ]]; then
+    extra+=(--enable_highres_structure_stream --static_h0_stage_fusion)
   else
     extra+=(--enable_highres_structure_stream)
   fi

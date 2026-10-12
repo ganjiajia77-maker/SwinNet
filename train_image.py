@@ -93,6 +93,7 @@ parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
 parser.add_argument('--ablate_h0_stream', action='store_true', help='remove the H0 bypass and use Stage 3 structure features for global topology')
+parser.add_argument('--static_h0_stage_fusion', action='store_true', help='use the initial H0 at both decoder stages without stage-to-H0 updates')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
 parser.add_argument(
     '--highres_structure_fuse_stages',
@@ -293,6 +294,8 @@ if args.freeze_post_refine_interaction_only:
     args.enable_post_refine_structure_interaction = True
 if args.ablate_h0_stream and args.enable_highres_structure_stream:
     parser.error('--ablate_h0_stream cannot be combined with --enable_highres_structure_stream')
+if args.static_h0_stage_fusion and not args.enable_highres_structure_stream:
+    parser.error('--static_h0_stage_fusion requires --enable_highres_structure_stream')
 if args.enable_global_topology and not (args.enable_highres_structure_stream or args.ablate_h0_stream):
     parser.error("--enable_global_topology requires --enable_highres_structure_stream")
 
@@ -424,6 +427,8 @@ def format_training_config_lines(args, loss_weights):
     ]
     if args.enable_highres_structure_stream:
         lines.append(
+            "  Skeleton feature flow: z_struct -> H0 -> G2 and H0 -> G3"
+            if args.static_h0_stage_fusion else
             "  Skeleton feature flow: z_struct -> H0 <-> G2 -> H1 <-> G3 -> H2"
         )
     if args.structure_profile in {
@@ -598,6 +603,8 @@ def inherit_resume_architecture_args(args):
         args.overlap_stride = int(saved_args["overlap_stride"])
     if "enable_highres_structure_stream" in saved_args and not _cli_has("--enable_highres_structure_stream"):
         args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
+    if "static_h0_stage_fusion" in saved_args and not _cli_has("--static_h0_stage_fusion"):
+        args.static_h0_stage_fusion = bool(saved_args["static_h0_stage_fusion"])
     for name in ("remove_stage2_pre_topology_source",):
         if name in saved_args and not _cli_has("--" + name):
             setattr(args, name, bool(saved_args[name]))
@@ -1227,6 +1234,7 @@ if __name__ == "__main__":
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
                     ablate_h0_stream=args.ablate_h0_stream,
+                    static_h0_stage_fusion=args.static_h0_stage_fusion,
                     highres_structure_channels=args.highres_structure_channels,
                     highres_structure_fuse_stages=args.highres_structure_fuse_stages,
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,

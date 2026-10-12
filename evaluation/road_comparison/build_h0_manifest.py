@@ -10,6 +10,7 @@ import torch
 
 NAME_FULL = 'h0_599a410_mass1500_random512_fp32_ema80'
 NAME_A = 'h0_a_no_highres_mass1500_random512_fp32_ema80'
+NAME_B = 'h0_b_static_highres_mass1500_random512_fp32_ema80'
 NAME_DATA1 = 'h0_599a410_random512_fp32_ema80'
 BASE = '599a410de8d341850e1810417307e4b3bbdfc82d'
 
@@ -29,9 +30,12 @@ def main():
     if source_size not in (1024, 1500):
         p.error(f'Unsupported source_patch_size: {source_size}')
     ablated = bool(saved.get('ablate_h0_stream', False))
-    if source_size == 1024 and ablated:
-        p.error('The A ablation is only configured for native-1500 Massachusetts data')
-    name = (NAME_A if ablated else NAME_FULL) if source_size == 1500 else NAME_DATA1
+    static = bool(saved.get('static_h0_stage_fusion', False))
+    if ablated and static:
+        p.error('A and B ablation flags cannot be combined')
+    if source_size == 1024 and (ablated or static):
+        p.error('A and B ablations are only configured for native-1500 Massachusetts data')
+    name = (NAME_A if ablated else NAME_B if static else NAME_FULL) if source_size == 1500 else NAME_DATA1
     expected = dict(img_size=512, source_patch_size=source_size, random_crop_train=True,
                     random_crops_per_image=1, direct_resize_train=False,
                     amp_dtype='none', use_ema=True, ema_decay=0.999, max_epochs=80,
@@ -41,6 +45,8 @@ def main():
                     remove_stage2_pre_topology_source=True)
     if source_size == 1500:
         expected.update(ablate_h0_stream=ablated, batch_size=2, overlap_stride=256)
+        if static:
+            expected['static_h0_stage_fusion'] = True
         if not isinstance(saved.get('seed'), int):
             p.error('Massachusetts checkpoint must record its random seed')
     mismatches = {key: [saved.get(key), value] for key, value in expected.items()
@@ -84,8 +90,13 @@ def main():
                         checkpoint=str(args.checkpoint), checkpoint_epoch=epoch,
                         checkpoint_args_verified=True, base_model_commit=BASE,
                         ablate_h0_stream=ablated,
+                        static_h0_stage_fusion=static,
                         seed=saved.get('seed'),
-                        global_topology_structure_source='projected Stage 3 G3' if ablated else 'updated high-resolution H2',
+                        global_topology_structure_source=(
+                            'projected Stage 3 G3' if ablated else
+                            'initial high-resolution H0' if static else
+                            'updated high-resolution H2'
+                        ),
                         training_crop=f'one random512 crop per native{source_size} image each epoch; shared epoch',
                         training_precision='FP32', training_max_epochs=80,
                         weights='EMA', ema_decay=0.999,
