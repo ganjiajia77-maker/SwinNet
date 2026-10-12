@@ -99,6 +99,7 @@ parser.add_argument(
     help='ablate MSFE blocks on decoder skip stages inx=2,3; auto-read from checkpoint when omitted',
 )
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
+parser.add_argument('--enable_encoder_road_prior', action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument('--ablate_h0_stream', action='store_true')
 parser.add_argument('--static_h0_stage_fusion', action='store_true')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
@@ -280,6 +281,7 @@ if __name__ == "__main__":
                 "stage3_gate_topology_gradient_ratio",
                 "final_skeleton_gradient_ratio",
                 "enable_highres_structure_stream",
+                "enable_encoder_road_prior",
                 "ablate_h0_stream",
                 "static_h0_stage_fusion",
                 "highres_structure_channels",
@@ -322,6 +324,7 @@ if __name__ == "__main__":
                     stage3_gate_topology_gradient_ratio=args.stage3_gate_topology_gradient_ratio,
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
+                    enable_encoder_road_prior=args.enable_encoder_road_prior,
                     ablate_h0_stream=args.ablate_h0_stream,
                     static_h0_stage_fusion=args.static_h0_stage_fusion,
                     highres_structure_channels=args.highres_structure_channels,

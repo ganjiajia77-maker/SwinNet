@@ -92,6 +92,8 @@ parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='ini
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
+parser.add_argument('--enable_encoder_road_prior', action=argparse.BooleanOptionalAction, default=True,
+                    help='allow A1/A2 to modulate the first two Patch Merging inputs and encoder Stage 3 attention')
 parser.add_argument('--ablate_h0_stream', action='store_true', help='remove the H0 bypass and use Stage 3 structure features for global topology')
 parser.add_argument('--static_h0_stage_fusion', action='store_true', help='use the initial H0 at both decoder stages without stage-to-H0 updates')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
@@ -416,6 +418,7 @@ def format_training_config_lines(args, loss_weights):
         f"  结构配置: {args.structure_profile}",
         f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
         f"  Training AMP: {args.amp_dtype}",
+        f"  Encoder A1/A2 road prior injection: {'enabled' if args.enable_encoder_road_prior else 'disabled'}",
         "  Decoder computation: dense Stage 2/3",
             "  Stage skeleton mode: {}; pre-Stage2 topology source removed: {}".format(
                 args.stage_skeleton_mode,
@@ -507,6 +510,7 @@ def format_training_config_lines(args, loss_weights):
         f"connectivity_factor={args.stage_connectivity_factor}, "
         f"direction_factor={args.stage_direction_factor}, "
         f"road_attention={args.road_attention_weight}",
+        f"  Encoder A1/A2 road prior injection: {'enabled' if args.enable_encoder_road_prior else 'disabled'}",
         "  High-res structure stream: "
         f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
         f"channels={args.highres_structure_channels}, "
@@ -603,6 +607,10 @@ def inherit_resume_architecture_args(args):
         args.overlap_stride = int(saved_args["overlap_stride"])
     if "enable_highres_structure_stream" in saved_args and not _cli_has("--enable_highres_structure_stream"):
         args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
+    if "enable_encoder_road_prior" in saved_args and not (
+        _cli_has("--enable_encoder_road_prior") or _cli_has("--no-enable_encoder_road_prior")
+    ):
+        args.enable_encoder_road_prior = bool(saved_args["enable_encoder_road_prior"])
     if "static_h0_stage_fusion" in saved_args and not _cli_has("--static_h0_stage_fusion"):
         args.static_h0_stage_fusion = bool(saved_args["static_h0_stage_fusion"])
     for name in ("remove_stage2_pre_topology_source",):
@@ -1233,6 +1241,7 @@ if __name__ == "__main__":
                     ),
                     final_skeleton_gradient_ratio=args.final_skeleton_gradient_ratio,
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
+                    enable_encoder_road_prior=args.enable_encoder_road_prior,
                     ablate_h0_stream=args.ablate_h0_stream,
                     static_h0_stage_fusion=args.static_h0_stage_fusion,
                     highres_structure_channels=args.highres_structure_channels,

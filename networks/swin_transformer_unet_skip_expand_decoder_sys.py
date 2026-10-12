@@ -1262,6 +1262,7 @@ class SwinTransformerSys(nn.Module):
                  stage3_gate_topology_gradient_ratio=0.0,
                  final_skeleton_gradient_ratio=0.0,
                  enable_highres_structure_stream=False,
+                 enable_encoder_road_prior=True,
                  ablate_h0_stream=False,
                  static_h0_stage_fusion=False,
                  highres_structure_channels=64,
@@ -1320,6 +1321,7 @@ class SwinTransformerSys(nn.Module):
         self.stage3_gate_topology_gradient_ratio = float(stage3_gate_topology_gradient_ratio)
         self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
         self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
+        self.enable_encoder_road_prior = bool(enable_encoder_road_prior)
         self.ablate_h0_stream = bool(ablate_h0_stream)
         if self.ablate_h0_stream and self.enable_highres_structure_stream:
             raise ValueError("ablate_h0_stream requires the high-resolution stream to be disabled")
@@ -1390,10 +1392,13 @@ class SwinTransformerSys(nn.Module):
         self.encoder_stage1_road_attention_head = RoadAttentionHead(embed_dim)
         self.encoder_stage2_road_attention_head = RoadAttentionHead(embed_dim * 2)
         print(
-            "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
-            "Stage3 attention bias; A1/A2 -> residual PatchMerging priors".format(
+            "[INFO] Encoder A1/A2 road prior injection: {}; "
+            "A1 channels={}, A2 channels={}; PatchMerging modulation and "
+            "encoder Stage3 attention bias {}".format(
+                "enabled" if self.enable_encoder_road_prior else "disabled",
                 embed_dim,
                 embed_dim * 2,
+                "enabled" if self.enable_encoder_road_prior else "disabled",
             )
         )
         for i_layer in range(self.num_layers):
@@ -1421,7 +1426,9 @@ class SwinTransformerSys(nn.Module):
                                    0.1
                                ),
                                use_road_bias=(i_layer == 2),
-                               road_attention_modulates_downsample=(i_layer in (0, 1)),
+                               road_attention_modulates_downsample=(
+                                   self.enable_encoder_road_prior and i_layer in (0, 1)
+                               ),
                                road_attention_merge_mode=(
                                    "residual"
                                ))
@@ -1802,7 +1809,7 @@ class SwinTransformerSys(nn.Module):
                 x,
                 road_prior=(
                     (stage1_road_attention, stage2_road_attention)
-                    if i_layer == 2
+                    if self.enable_encoder_road_prior and i_layer == 2
                     else None
                 ),
             )

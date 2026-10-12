@@ -9,6 +9,7 @@ import torch
 
 
 NAME_FULL = 'h0_599a410_mass1500_random512_fp32_ema80'
+NAME_NO_ROAD = 'h0_599a410_no_encoder_road_prior_mass1500_random512_fp32_ema80'
 NAME_A = 'h0_a_no_highres_mass1500_random512_fp32_ema80'
 NAME_B = 'h0_b_static_highres_mass1500_random512_fp32_ema80'
 NAME_DATA1 = 'h0_599a410_random512_fp32_ema80'
@@ -36,11 +37,19 @@ def main():
         p.error('The legacy Data1 comparison expects EMA weights')
     ablated = bool(saved.get('ablate_h0_stream', False))
     static = bool(saved.get('static_h0_stage_fusion', False))
+    encoder_road_prior = saved.get('enable_encoder_road_prior', True)
+    if type(encoder_road_prior) is not bool:
+        p.error('enable_encoder_road_prior must be a boolean')
     if ablated and static:
         p.error('A and B ablation flags cannot be combined')
     if source_size == 1024 and (ablated or static):
         p.error('A and B ablations are only configured for native-1500 Massachusetts data')
-    name = (NAME_A if ablated else NAME_B if static else NAME_FULL) if source_size == 1500 else NAME_DATA1
+    if source_size == 1500 and not encoder_road_prior and (ablated or static):
+        p.error('The encoder road prior ablation requires the full H0 model')
+    name = (
+        NAME_A if ablated else NAME_B if static else
+        NAME_NO_ROAD if not encoder_road_prior else NAME_FULL
+    ) if source_size == 1500 else NAME_DATA1
     if source_size == 1500 and not use_ema:
         name = name.removesuffix('ema80') + 'noema80'
     expected = dict(img_size=512, source_patch_size=source_size, random_crop_train=True,
@@ -51,7 +60,11 @@ def main():
                     stage_skeleton_mode='direct', enable_h3_surface_fusion=True,
                     remove_stage2_pre_topology_source=True)
     if source_size == 1500:
-        expected.update(ablate_h0_stream=ablated, batch_size=2, overlap_stride=256)
+        expected.update(ablate_h0_stream=ablated, batch_size=2,
+                        accumulation_steps=2, overlap_stride=256,
+                        road_attention_weight=0.0)
+        if 'enable_encoder_road_prior' in saved:
+            expected['enable_encoder_road_prior'] = encoder_road_prior
         if static:
             expected['static_h0_stage_fusion'] = True
         if not isinstance(saved.get('seed'), int):
@@ -98,6 +111,7 @@ def main():
                         checkpoint=str(args.checkpoint), checkpoint_epoch=epoch,
                         checkpoint_args_verified=True, base_model_commit=BASE,
                         ablate_h0_stream=ablated,
+                        enable_encoder_road_prior=encoder_road_prior,
                         static_h0_stage_fusion=static,
                         seed=saved.get('seed'),
                         global_topology_structure_source=(
