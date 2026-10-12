@@ -1,9 +1,24 @@
+import math
 import os
 
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+def mass_crop_position(seed, image_index, crop_ordinal, epoch, height, width, size):
+    rows, cols = height - size + 1, width - size + 1
+    if rows < 1 or cols < 1:
+        raise ValueError("Native image is smaller than the requested crop")
+    total = rows * cols
+    if total == 1:
+        return 0, 0
+    rng = np.random.RandomState((seed + image_index * 9176 + crop_ordinal * 101) % (2 ** 32))
+    offset, step = int(rng.randint(total)), int(rng.randint(1, total))
+    while math.gcd(step, total) != 1:
+        step = (step + 1) % total or 1
+    return divmod((offset + int(epoch) * step) % total, cols)
 
 
 class RoadSkeletonDataset(Dataset):
@@ -337,7 +352,7 @@ class RoadSkeletonDataset(Dataset):
                 + image_index * 9176
                 + crop_ordinal * 101
             )
-            rng = np.random.RandomState(rng_seed)
+            rng = np.random.RandomState(rng_seed % (2 ** 32))
             tile_position = None
         elif self.tile_positions is None:
             image_index = idx
@@ -378,10 +393,16 @@ class RoadSkeletonDataset(Dataset):
             if crop_size is None:
                 raise ValueError("random_crop_train requires tile_size or image_size.")
             height, width = image.shape[:2]
-            max_top = max(height - crop_size, 0)
-            max_left = max(width - crop_size, 0)
-            top = rng.randint(0, max_top + 1) if max_top > 0 else 0
-            left = rng.randint(0, max_left + 1) if max_left > 0 else 0
+            if self.source_patch_size == 1500:
+                top, left = mass_crop_position(
+                    self.random_crop_seed, image_index, crop_ordinal,
+                    self.epoch, height, width, crop_size,
+                )
+            else:
+                max_top = max(height - crop_size, 0)
+                max_left = max(width - crop_size, 0)
+                top = rng.randint(0, max_top + 1) if max_top > 0 else 0
+                left = rng.randint(0, max_left + 1) if max_left > 0 else 0
             tile_position = (top, left)
 
         if tile_position is not None:

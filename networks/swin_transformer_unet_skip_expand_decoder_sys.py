@@ -1417,9 +1417,9 @@ class SwinTransformerSys(nn.Module):
                                use_checkpoint=use_checkpoint,
                                road_attention_head=(
                                    self.encoder_stage1_road_attention_head
-                                   if i_layer == 0
+                                   if self.enable_encoder_road_prior and i_layer == 0
                                    else self.encoder_stage2_road_attention_head
-                                   if i_layer == 1
+                                   if self.enable_encoder_road_prior and i_layer == 1
                                    else None
                                ),
                                road_alpha_init=(

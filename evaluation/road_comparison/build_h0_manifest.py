@@ -65,6 +65,12 @@ def main():
         expected.update(ablate_h0_stream=ablated, batch_size=2,
                         accumulation_steps=args.expected_accumulation_steps, overlap_stride=256,
                         road_attention_weight=0.0)
+        if not encoder_road_prior:
+            expected.update(enable_encoder_road_prior=False, static_h0_stage_fusion=False,
+                            threshold=0.5, trend_val_every_steps=0, val_interval=5,
+                            base_lr=5e-4, pretrained_lr=5e-5, new_lr=2e-4,
+                            stage_skeleton_loss_factor=1.0,
+                            stage_skeleton_only_loss_factor=1.0)
         if 'enable_encoder_road_prior' in saved:
             expected['enable_encoder_road_prior'] = encoder_road_prior
         if static:
@@ -122,6 +128,12 @@ def main():
                             'updated high-resolution H2'
                         ),
                         training_crop=f'one random512 crop per native{source_size} image each epoch; shared epoch',
+                        crop_schedule=(
+                            'seeded non-repeating coordinate permutation, matching Mass H0'
+                            if source_size == 1500 else 'epoch-seeded random crop'
+                        ),
+                        physical_batch_size=saved.get('batch_size'),
+                        accumulation_steps=saved.get('accumulation_steps'),
                         training_precision='FP32', training_max_epochs=80,
                         weights='EMA' if use_ema else 'model_state_dict',
                         ema_decay=0.999 if use_ema else None,
