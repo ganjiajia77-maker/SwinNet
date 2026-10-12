@@ -1750,6 +1750,11 @@ class SwinTransformerSys(nn.Module):
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.weight)
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.bias)
 
+        # Initialize in the same order as full H0, then discard the ablated
+        # module. With the same seed, every retained layer starts identically.
+        if not self.enable_global_topology and self.return_skeleton:
+            self.global_topology = None
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)

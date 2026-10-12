@@ -9,7 +9,7 @@ SOURCE_SIZE = 1500
 TILE_SIZE = 512
 STRIDE = 256
 BASE_COMMIT = '599a410de8d341850e1810417307e4b3bbdfc82d'
-MODEL_NAME = 'h0_599a410_mass_random512_fp32_80e_bs2'
+MODEL_NAME = 'h0_599a410_mass_no_global_random512_fp32_80e_bs2'
 
 
 def blend_weight(size, device):
@@ -82,7 +82,7 @@ def validate_training_args(args):
                     max_epochs=80, batch_size=2, accumulation_steps=1,
                     amp_dtype='none', use_ema=False, trend_val_every_steps=0,
                     val_crop_list='', structure_profile='stage23_boundary_0626',
-                    enable_highres_structure_stream=True, enable_global_topology=True,
+                    enable_highres_structure_stream=True, enable_global_topology=False,
                     enable_h3_surface_fusion=True, remove_stage2_pre_topology_source=True,
                     highres_structure_channels=64, highres_structure_fuse_stages='stage23',
                     highres_structure_fusion_mode='stage23', stage_skeleton_mode='direct')

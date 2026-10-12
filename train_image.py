@@ -553,10 +553,16 @@ def make_unique_dir(base_dir, run_name):
 
 
 def save_checkpoint_safely(checkpoint, target_path):
-    """Save directly on Windows to avoid orphaned temporary checkpoint files."""
+    """Preserve the previous checkpoint if a write fails, including disk-full."""
     target_dir = os.path.dirname(target_path)
     os.makedirs(target_dir, exist_ok=True)
-    torch.save(checkpoint, target_path, _use_new_zipfile_serialization=False)
+    temporary_path = target_path + '.tmp'
+    try:
+        torch.save(checkpoint, temporary_path, _use_new_zipfile_serialization=False)
+        os.replace(temporary_path, target_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def inherit_resume_architecture_args(args):
@@ -2185,7 +2191,7 @@ if __name__ == "__main__":
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
                 'experiment_base_commit': BASE_COMMIT,
-                'experiment_protocol': 'h0-mass-native1500-random512-fp32-80e-bs2-v1',
+                'experiment_protocol': 'h0-mass-no-global-native1500-random512-fp32-80e-bs2-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),
