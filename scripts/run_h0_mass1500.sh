@@ -8,6 +8,7 @@ PRETRAIN=${PRETRAIN:-/home/gjj/Swin-Unet-main/pretrained_ckpt/swinv2_tiny_patch4
 VARIANT=${VARIANT:-a}
 SEED=${SEED:-1234}
 USE_EMA=${USE_EMA:-0}
+ACCUMULATION_STEPS=${ACCUMULATION_STEPS:-1}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export OPENCV_LOG_LEVEL=ERROR
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -22,6 +23,10 @@ if [[ "$USE_EMA" != 0 && "$USE_EMA" != 1 ]]; then
   echo "USE_EMA must be 0 or 1" >&2
   exit 2
 fi
+if [[ ! "$ACCUMULATION_STEPS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ACCUMULATION_STEPS must be a positive integer" >&2
+  exit 2
+fi
 if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != val && "$MODE" != test && "$MODE" != topology ]]; then
   echo "Usage: VARIANT=a|b|full bash scripts/run_h0_mass1500.sh train|resume|val|test|topology" >&2
   exit 2
@@ -34,7 +39,7 @@ if [[ "$MODE" == train ]]; then
   python -u scripts/check_mass_layout.py --root_path "$DATA" --source_size 1500
   ema_label=noema
   if [[ "$USE_EMA" == 1 ]]; then ema_label=ema; fi
-  RUN=${RUN:-h0_mass1500_${VARIANT}_random512_fp32_${ema_label}80_s${SEED}_$(date +%Y%m%d_%H%M%S)}
+  RUN=${RUN:-h0_mass1500_${VARIANT}_random512_fp32_${ema_label}80_b2_acc${ACCUMULATION_STEPS}_s${SEED}_$(date +%Y%m%d_%H%M%S)}
   test ! -e "$RESULTS/$RUN" || { echo "Existing run: $RUN" >&2; exit 1; }
   printf '%s\n' "$RUN" > "$LATEST"
 else
@@ -63,6 +68,11 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
       echo "Resume checkpoint uses EMA=$saved_ema; set USE_EMA=$saved_ema" >&2
       exit 1
     fi
+    saved_acc=$(python -c 'import sys,torch; c=torch.load(sys.argv[1],map_location="cpu",weights_only=False); print(c["args"]["accumulation_steps"])' "$RUN_DIR/last.pth")
+    if [[ "$saved_acc" != "$ACCUMULATION_STEPS" ]]; then
+      echo "Resume checkpoint uses ACCUMULATION_STEPS=$saved_acc; set ACCUMULATION_STEPS=$saved_acc" >&2
+      exit 1
+    fi
     extra+=(--resume "$RUN_DIR/last.pth")
   fi
   python -u train_image.py \
@@ -73,7 +83,7 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
     --pretrained_lr 5e-5 --pretrained_min_lr 5e-6 \
     --new_lr 2e-4 --new_min_lr 1e-5 --warmup_epochs 10 \
     --amp_dtype none --max_epochs 80 --val_interval 5 \
-    --batch_size 2 --accumulation_steps 2 --num_workers 4 \
+    --batch_size 2 --accumulation_steps "$ACCUMULATION_STEPS" --num_workers 4 \
     --img_size 512 --source_patch_size 1500 --overlap_stride 256 \
     --random_crop_train --random_crops_per_image 1 \
     --ema_decay 0.999 --seed "$SEED" --threshold 0.2 \

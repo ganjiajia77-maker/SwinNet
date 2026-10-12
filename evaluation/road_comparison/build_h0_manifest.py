@@ -43,6 +43,12 @@ def main():
     name = (NAME_A if ablated else NAME_B if static else NAME_FULL) if source_size == 1500 else NAME_DATA1
     if source_size == 1500 and not use_ema:
         name = name.removesuffix('ema80') + 'noema80'
+    accumulation_steps = saved.get('accumulation_steps')
+    if source_size == 1500:
+        if type(accumulation_steps) is not int or accumulation_steps < 1:
+            p.error('Massachusetts checkpoint must record a positive accumulation_steps')
+        if accumulation_steps != 2:
+            name += f'_acc{accumulation_steps}'
     expected = dict(img_size=512, source_patch_size=source_size, random_crop_train=True,
                     random_crops_per_image=1, direct_resize_train=False,
                     amp_dtype='none', use_ema=use_ema, ema_decay=0.999, max_epochs=80,
@@ -100,6 +106,10 @@ def main():
                         ablate_h0_stream=ablated,
                         static_h0_stage_fusion=static,
                         seed=saved.get('seed'),
+                        physical_batch_size=saved.get('batch_size'),
+                        accumulation_steps=accumulation_steps,
+                        effective_batch_size=(saved.get('batch_size') * accumulation_steps
+                                              if accumulation_steps is not None else None),
                         global_topology_structure_source=(
                             'projected Stage 3 G3' if ablated else
                             'initial high-resolution H0' if static else
