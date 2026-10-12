@@ -339,7 +339,7 @@ if __name__ == "__main__":
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device
     
-    # The unified experiment requires the EMA snapshot, never raw fallback.
+    # Load EMA explicitly only when the checkpoint protocol requests it.
     if args.require_ema:
         if not isinstance(checkpoint, dict) or checkpoint.get('ema_state_dict') is None:
             raise ValueError('--require_ema: checkpoint has no EMA state')

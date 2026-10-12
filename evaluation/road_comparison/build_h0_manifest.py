@@ -1,4 +1,4 @@
-"""Verify the H0 random512 EMA checkpoint and describe its exported masks."""
+"""Verify an H0 random512 checkpoint and describe its exported masks."""
 import argparse
 import hashlib
 import json
@@ -29,6 +29,11 @@ def main():
     source_size = int(saved.get('source_patch_size', 0))
     if source_size not in (1024, 1500):
         p.error(f'Unsupported source_patch_size: {source_size}')
+    use_ema = saved.get('use_ema')
+    if type(use_ema) is not bool:
+        p.error('Checkpoint must record use_ema as a boolean')
+    if source_size == 1024 and not use_ema:
+        p.error('The legacy Data1 comparison expects EMA weights')
     ablated = bool(saved.get('ablate_h0_stream', False))
     static = bool(saved.get('static_h0_stage_fusion', False))
     if ablated and static:
@@ -36,9 +41,11 @@ def main():
     if source_size == 1024 and (ablated or static):
         p.error('A and B ablations are only configured for native-1500 Massachusetts data')
     name = (NAME_A if ablated else NAME_B if static else NAME_FULL) if source_size == 1500 else NAME_DATA1
+    if source_size == 1500 and not use_ema:
+        name = name.removesuffix('ema80') + 'noema80'
     expected = dict(img_size=512, source_patch_size=source_size, random_crop_train=True,
                     random_crops_per_image=1, direct_resize_train=False,
-                    amp_dtype='none', use_ema=True, ema_decay=0.999, max_epochs=80,
+                    amp_dtype='none', use_ema=use_ema, ema_decay=0.999, max_epochs=80,
                     structure_profile='stage23_boundary_0626',
                     enable_highres_structure_stream=not ablated, enable_global_topology=True,
                     stage_skeleton_mode='direct', enable_h3_surface_fusion=True,
@@ -51,9 +58,10 @@ def main():
             p.error('Massachusetts checkpoint must record its random seed')
     mismatches = {key: [saved.get(key), value] for key, value in expected.items()
                   if saved.get(key) != value}
-    if mismatches or checkpoint.get('ema_state_dict') is None:
+    ema_present = checkpoint.get('ema_state_dict') is not None
+    if mismatches or ema_present != use_ema:
         p.error(f'Unexpected checkpoint args: {mismatches}; '
-                f'EMA present={checkpoint.get("ema_state_dict") is not None}')
+                f'EMA present={ema_present}; use_ema={use_ema}')
     epoch = checkpoint.get('epoch')
     del checkpoint
     print(f'Verified {name} checkpoint, saved epoch={epoch}', flush=True)
@@ -99,7 +107,8 @@ def main():
                         ),
                         training_crop=f'one random512 crop per native{source_size} image each epoch; shared epoch',
                         training_precision='FP32', training_max_epochs=80,
-                        weights='EMA', ema_decay=0.999,
+                        weights='EMA' if use_ema else 'model_state_dict',
+                        ema_decay=0.999 if use_ema else None,
                         inference_tile_size=512, overlap_stride=256,
                         merge='taper-weighted logits, divisor clamp1e-8, sigmoid',
                         tta='none', postprocessing='surface threshold only',

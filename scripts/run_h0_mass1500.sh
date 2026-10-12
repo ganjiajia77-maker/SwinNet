@@ -7,6 +7,7 @@ RESULTS=${RESULTS:-/home/gjj/SwinNet-roadbias/model_out}
 PRETRAIN=${PRETRAIN:-/home/gjj/Swin-Unet-main/pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth}
 VARIANT=${VARIANT:-a}
 SEED=${SEED:-1234}
+USE_EMA=${USE_EMA:-0}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 export OPENCV_LOG_LEVEL=ERROR
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -15,6 +16,10 @@ cd "$REPO"
 MODE=${1:-}
 if [[ "$VARIANT" != a && "$VARIANT" != b && "$VARIANT" != full ]]; then
   echo "VARIANT must be a, b or full" >&2
+  exit 2
+fi
+if [[ "$USE_EMA" != 0 && "$USE_EMA" != 1 ]]; then
+  echo "USE_EMA must be 0 or 1" >&2
   exit 2
 fi
 if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != val && "$MODE" != test && "$MODE" != topology ]]; then
@@ -27,7 +32,9 @@ RUN=${RUN:-}
 if [[ "$MODE" == train ]]; then
   test -f "$PRETRAIN" || { echo "Missing pretrained checkpoint: $PRETRAIN" >&2; exit 1; }
   python -u scripts/check_mass_layout.py --root_path "$DATA" --source_size 1500
-  RUN=${RUN:-h0_mass1500_${VARIANT}_random512_fp32_ema80_s${SEED}_$(date +%Y%m%d_%H%M%S)}
+  ema_label=noema
+  if [[ "$USE_EMA" == 1 ]]; then ema_label=ema; fi
+  RUN=${RUN:-h0_mass1500_${VARIANT}_random512_fp32_${ema_label}80_s${SEED}_$(date +%Y%m%d_%H%M%S)}
   test ! -e "$RESULTS/$RUN" || { echo "Existing run: $RUN" >&2; exit 1; }
   printf '%s\n' "$RUN" > "$LATEST"
 else
@@ -37,6 +44,11 @@ RUN_DIR="$RESULTS/$RUN"
 
 if [[ "$MODE" == train || "$MODE" == resume ]]; then
   extra=()
+  if [[ "$USE_EMA" == 1 ]]; then
+    extra+=(--use_ema)
+  else
+    extra+=(--no-use_ema)
+  fi
   if [[ "$VARIANT" == a ]]; then
     extra+=(--ablate_h0_stream)
   elif [[ "$VARIANT" == b ]]; then
@@ -46,6 +58,11 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
   fi
   if [[ "$MODE" == resume ]]; then
     test -s "$RUN_DIR/last.pth" || { echo "Missing $RUN_DIR/last.pth" >&2; exit 1; }
+    saved_ema=$(python -c 'import sys,torch; c=torch.load(sys.argv[1],map_location="cpu",weights_only=False); print(int(c["args"]["use_ema"]))' "$RUN_DIR/last.pth")
+    if [[ "$saved_ema" != "$USE_EMA" ]]; then
+      echo "Resume checkpoint uses EMA=$saved_ema; set USE_EMA=$saved_ema" >&2
+      exit 1
+    fi
     extra+=(--resume "$RUN_DIR/last.pth")
   fi
   python -u train_image.py \
@@ -59,7 +76,7 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
     --batch_size 2 --accumulation_steps 2 --num_workers 4 \
     --img_size 512 --source_patch_size 1500 --overlap_stride 256 \
     --random_crop_train --random_crops_per_image 1 \
-    --use_ema --ema_decay 0.999 --seed "$SEED" --threshold 0.2 \
+    --ema_decay 0.999 --seed "$SEED" --threshold 0.2 \
     --structure_profile stage23_boundary_0626 --stage_skeleton_mode direct \
     --enable_h3_surface_fusion --remove_stage2_pre_topology_source \
     --highres_structure_fuse_stages stage23 --highres_structure_fusion_mode stage23 \
@@ -81,6 +98,10 @@ fi
 
 CKPT="$RUN_DIR/best.pth"
 test -s "$CKPT" || { echo "Missing $CKPT" >&2; exit 1; }
+eval_weights=()
+if [[ "$(python -c 'import sys,torch; c=torch.load(sys.argv[1],map_location="cpu",weights_only=False); print(int(c["args"]["use_ema"]))' "$CKPT")" == 1 ]]; then
+  eval_weights+=(--require_ema)
+fi
 EVAL="$REPO/evaluation/road_comparison"
 if [[ "$MODE" == val ]]; then
   AUDIT="$RUN_DIR/unified_$(date +%Y%m%d_%H%M%S)"
@@ -91,7 +112,7 @@ if [[ "$MODE" == val ]]; then
   printf '%s\n' "$AUDIT" > "$RUN_DIR/latest_unified_audit.txt"
   python -u test_image.py --root_path "$DATA" --model_path "$CKPT" \
     --cfg "$REPO/configs/swin_tiny_patch4_window7_224_lite.yaml" \
-    --split val --img_size 512 --source_patch_size 1500 --overlap_infer --require_ema \
+    --split val --img_size 512 --source_patch_size 1500 --overlap_infer "${eval_weights[@]}" \
     --output_dir "$AUDIT/predictions/val" \
     --export_thresholds 0.05 0.10 0.15 0.20 0.25 0.30 0.35 0.40 0.45 0.50 0.55 0.60 \
     2>&1 | tee "$AUDIT/val_inference.log"
@@ -112,7 +133,7 @@ echo "Validation-selected threshold: $THRESHOLD"
 if [[ "$MODE" == test ]]; then
   python -u test_image.py --root_path "$DATA" --model_path "$CKPT" \
     --cfg "$REPO/configs/swin_tiny_patch4_window7_224_lite.yaml" \
-    --split test --img_size 512 --source_patch_size 1500 --overlap_infer --require_ema \
+    --split test --img_size 512 --source_patch_size 1500 --overlap_infer "${eval_weights[@]}" \
     --output_dir "$AUDIT/predictions/test" --threshold "$THRESHOLD" --export_thresholds "$THRESHOLD" \
     2>&1 | tee "$AUDIT/test_inference.log"
   python "$EVAL/build_h0_manifest.py" --checkpoint "$CKPT" --data_root "$DATA" \
