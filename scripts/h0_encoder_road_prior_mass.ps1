@@ -47,10 +47,10 @@ if ($Mode -eq 'train') {
         '--pretrained_lr', '5e-5', '--pretrained_min_lr', '5e-6',
         '--new_lr', '2e-4', '--new_min_lr', '1e-5', '--warmup_epochs', '10',
         '--amp_dtype', 'none', '--max_epochs', '80', '--val_interval', '5',
-        '--batch_size', '2', '--accumulation_steps', '2', '--num_workers', '4',
+        '--batch_size', '2', '--accumulation_steps', '1', '--num_workers', '4',
         '--img_size', '512', '--source_patch_size', '1500', '--overlap_stride', '256',
         '--random_crop_train', '--random_crops_per_image', '1',
-        '--no-use_ema', '--ema_decay', '0.999', '--seed', [string]$Seed, '--threshold', '0.2',
+        '--no-use_ema', '--ema_decay', '0.999', '--seed', [string]$Seed, '--threshold', '0.5',
         '--structure_profile', 'stage23_boundary_0626', '--stage_skeleton_mode', 'direct',
         '--enable_highres_structure_stream', '--enable_h3_surface_fusion',
         '--remove_stage2_pre_topology_source',
@@ -93,7 +93,7 @@ if ($Mode -eq 'sweep') {
 
     & $Python (Join-Path $Evaluation 'build_h0_manifest.py') `
         --checkpoint $Best --data_root $DataRoot `
-        --predictions_root $PredictionRoot --output $Manifest --check_only
+        --predictions_root $PredictionRoot --output $Manifest --expected_accumulation_steps 1 --check_only
     Require-Success 'Checkpoint protocol check'
     $InferenceArgs = @(
         '.\test_image.py', '--root_path', $DataRoot, '--model_path', $Best,
@@ -105,7 +105,7 @@ if ($Mode -eq 'sweep') {
     Require-Success 'Validation sliding inference'
     & $Python (Join-Path $Evaluation 'build_h0_manifest.py') `
         --checkpoint $Best --data_root $DataRoot `
-        --predictions_root $PredictionRoot --output $Manifest
+        --predictions_root $PredictionRoot --output $Manifest --expected_accumulation_steps 1
     Require-Success 'Validation manifest'
     & $Python (Join-Path $Evaluation 'compare_predictions.py') `
         --manifest $Manifest --split val --select_threshold_only `
@@ -138,7 +138,7 @@ if ($Mode -eq 'test') {
     Require-Success 'Test sliding inference'
     & $Python (Join-Path $Evaluation 'build_h0_manifest.py') `
         --checkpoint $Best --data_root $DataRoot `
-        --predictions_root $PredictionRoot --output $Manifest --selection $Selection
+        --predictions_root $PredictionRoot --output $Manifest --expected_accumulation_steps 1 --selection $Selection
     Require-Success 'Test manifest'
 }
 

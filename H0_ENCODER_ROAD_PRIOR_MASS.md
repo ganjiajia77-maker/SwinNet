@@ -10,24 +10,31 @@ remain active. A1/A2 prediction heads remain instantiated in both variants.
 
 The paired protocol uses native 1500 Massachusetts TIFF images, one random 512
 crop per training image per epoch, and 512 sliding-window inference with stride
-256. It uses FP32, 80 epochs, physical batch size 2, accumulation 2 (effective
-batch size 4), no EMA, and identical ImageNet checkpoint, losses, LR schedule,
+256. It uses FP32, 80 epochs, physical batch size 2, accumulation 1 (effective
+batch size 2), no EMA, and identical ImageNet checkpoint, losses, LR schedule,
 augmentation, and seed for both variants. The A1/A2 auxiliary loss weight is
 0.0 for both variants. Each run selects its final threshold on its own validation
-predictions by global IoU. Test metrics use the selected threshold. The sampled
+predictions by global IoU. Training selects the best checkpoint using surface
+IoU at threshold 0.5, matching `baselines/h0_mass/mass_h0.py`. Test metrics use
+the validation-selected threshold. The sampled
 raster-skeleton APLS is an approximation, not the official SpaceNet APLS.
 
-Run from a local VS Code PowerShell terminal. Use the same seed in both commands:
+The earlier script used accumulation 2 and a training selection threshold of
+0.2. Runs made with that script have effective batch 4 and must be recorded as
+a different protocol. Resuming them does not remove the difference in their
+earlier training. The corrected script creates a fresh output directory.
+
+Run the requested off ablation from a local VS Code PowerShell terminal. Use
+the same seed as the existing original H0 control:
 
 ```powershell
 Set-Location D:\Code\Swin-Unet-main\.worktrees\h0-no-encoder-road-prior-mass1500
 
-& .\scripts\h0_encoder_road_prior_mass.ps1 -Mode train -Variant full -Seed 1234
 & .\scripts\h0_encoder_road_prior_mass.ps1 -Mode train -Variant off -Seed 1234
 ```
 
 Each training command prints `RUN_DIR=...`. Keep that exact directory for the
-following commands; repeat them separately for full and off:
+following commands:
 
 ```powershell
 $RunDir = 'PASTE_THE_PRINTED_RUN_DIR'

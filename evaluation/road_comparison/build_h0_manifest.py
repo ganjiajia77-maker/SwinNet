@@ -24,6 +24,8 @@ def main():
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--selection', type=Path)
     p.add_argument('--check_only', action='store_true')
+    p.add_argument('--expected_accumulation_steps', type=int, default=2,
+                   help='Expected training accumulation; use 1 for the original H0 Mass protocol')
     args = p.parse_args()
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     saved = checkpoint.get('args', {})
@@ -61,7 +63,7 @@ def main():
                     remove_stage2_pre_topology_source=True)
     if source_size == 1500:
         expected.update(ablate_h0_stream=ablated, batch_size=2,
-                        accumulation_steps=2, overlap_stride=256,
+                        accumulation_steps=args.expected_accumulation_steps, overlap_stride=256,
                         road_attention_weight=0.0)
         if 'enable_encoder_road_prior' in saved:
             expected['enable_encoder_road_prior'] = encoder_road_prior
