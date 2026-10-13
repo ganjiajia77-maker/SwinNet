@@ -3,6 +3,7 @@
 import torch
 
 from .skeleton_guided_head import (
+    PairwiseConnectivityHead,
     LegacyConvConnectivityHead,
     LegacyPairwisePriorConnectivityHead,
 )
@@ -12,6 +13,16 @@ from .skeleton_guided_head_selective_fusion import (
 
 
 def adapt_connectivity_modules_for_checkpoint(model, state_dict, model_impl):
+    # Reject baseline prior-conditioned heads instead of silently reinitializing C.
+    for name, head in model.named_modules():
+        if not isinstance(head, PairwiseConnectivityHead):
+            continue
+        key = f"{name}.edge_linear.weight"
+        weight = state_dict.get(key)
+        if weight is None or weight.shape != head.edge_linear.weight.shape:
+            raise ValueError(f"Expected feature-pair-only connectivity weights: {key}")
+        if any(key.startswith(name + '.prior_embed.') for key in state_dict):
+            raise ValueError(f"S/D-conditioned checkpoint cannot load into this ablation: {name}")
     keys = [str(key) for key in state_dict]
     has_pairwise_head = any(".connectivity_head.edge_mlp." in key for key in keys)
     has_legacy_conv_head = any(key.endswith(".connectivity_head.weight") for key in keys)
