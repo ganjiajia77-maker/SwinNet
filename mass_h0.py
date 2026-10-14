@@ -1,5 +1,6 @@
-"""Run the original 599a410 H0 on Massachusetts with a fixed native-image protocol."""
+"""Run H0 with S+D conditioning and final-surface soft-clDice on Massachusetts."""
 import argparse
+import csv
 from datetime import datetime
 import hashlib
 import json
@@ -51,7 +52,8 @@ def train_command(args):
             '--masked_connectivity_center_experiment', '--connectivity_pos_weight', '2.0',
             '--connectivity_focal_gamma', '1.5', '--edge_contrastive_margin', '0.1',
             '--directional_pos_weight_cardinal', '1.0', '--directional_pos_weight_diagonal', '2.5',
-            '--surface_focal_gamma', '1.0'] + architecture_flags()
+            '--surface_focal_gamma', '1.0', '--surface_cldice_weight', '0.1',
+            '--surface_cldice_iterations', '10'] + architecture_flags()
 
 
 def run(command, env):
@@ -64,7 +66,7 @@ def verify_base_model():
     changed = [name for name, digest in expected.items()
                if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest]
     if changed:
-        raise ValueError(f'Model/loss differs from original {BASE_COMMIT}: {changed}')
+        raise ValueError(f'Unchanged H0 sources differ from original {BASE_COMMIT}: {changed}')
 
 
 def verify_checkpoint(path):
@@ -73,6 +75,8 @@ def verify_checkpoint(path):
         raise ValueError('Expected a checkpoint produced by this Massachusetts H0 training entry')
     if checkpoint.get('experiment_base_commit') != BASE_COMMIT:
         raise ValueError('Checkpoint does not record the original 599a410 H0 architecture')
+    if checkpoint.get('experiment_protocol') != 'h0-mass-sd-surfacecldice01-native1500-random512-fp32-80e-bs2-v1':
+        raise ValueError('Use a checkpoint from this H0 S+D / surface-clDice experiment')
     validate_training_args(checkpoint.get('args', {}))
     if checkpoint.get('ema_state_dict') is not None:
         raise ValueError('This experiment requires raw weights without EMA')
@@ -104,12 +108,19 @@ def manifest(args, checkpoint_info, selection=None):
                     'evaluation/road_comparison/compare_predictions.py',
                     'evaluation/road_comparison/road_metrics.py']
     source_files += list(json.loads((ROOT / 'BASE_MODEL_SHA256.json').read_text(encoding='utf-8')))
+    source_files += ['networks/skeleton_guided_head.py', 'networks/keypoint_global_topology.py',
+                     'networks/swin_transformer_unet_skip_expand_decoder_sys.py', 'losses/road_losses.py']
     data = {'data_root': str(args.root_path),
             'protocol': {'image_size': 1500, 'short_area_threshold': 20,
                          'apls_max_nodes': 64, 'apls_snap_radius': 5.0},
             'models': [{'name': MODEL_NAME, 'provenance': {
                 'checkpoint': str(args.model_path), 'checkpoint_epoch': checkpoint_info['epoch'],
                 'base_model_commit': BASE_COMMIT, 'checkpoint_args_verified': True,
+                'variant': 'S+D -> C prior; |D| -> gate; C/D -> global tokens and bias; surface soft-clDice0.1',
+                'global_anchor_source': 'updated high-resolution structure features after H0 stage interactions',
+                'conditioning_reference_commit': 'e2020d9',
+                'surface_cldice_weight': 0.1, 'surface_cldice_iterations': 10,
+                'random_seed': checkpoint_info['args'].get('seed'),
                 'training_crop': 'one random512 crop per native1500 image per epoch; shared epoch',
                 'training_precision': 'FP32', 'training_max_epochs': 80,
                 'micro_batch_size': 2, 'accumulation_steps': 1, 'weights': 'raw; no EMA',
@@ -144,6 +155,18 @@ def compare_command(args, split, manifest_path, selection_path=None, output_dir=
     return command
 
 
+def print_focus_metrics(report_path):
+    fields = ('iou', 'f1', 'cldice', 'break_rate', 'short_pred_components',
+              'fragment_density_per_1000_px', 'apls_gt_to_pred_approx',
+              'apls_pred_to_gt_approx', 'apls_bidirectional_approx')
+    with report_path.open(newline='', encoding='utf-8') as handle:
+        rows = list(csv.DictReader(handle))
+    if len(rows) != 1 or any(field not in rows[0] for field in fields):
+        raise ValueError(f'Missing experiment metrics in {report_path}')
+    for field in fields:
+        print(f'{field}: {rows[0][field]}', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=['train', 'sweep', 'test', 'topology'])
@@ -169,7 +192,7 @@ def main():
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or 'mass_h0_599a410_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.run_name = args.run_name or f'mass_h0_sd_cldice01_seed{args.seed}_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
             parser.error(f'Fresh run directory already exists: {run_dir}')
@@ -206,6 +229,7 @@ def main():
     if args.mode == 'test' or args.recompute or not report.is_file():
         run(compare_command(args, 'test', destination, selection_path, metric_dir), env)
     print(report.read_text(encoding='utf-8'))
+    print_focus_metrics(report)
     print(f'Per-image topology: {metric_dir / (MODEL_NAME + "_test_per_image.csv")}')
 
 

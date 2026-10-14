@@ -257,6 +257,8 @@ if __name__ == "__main__":
     if os.path.exists(args.model_path):
         checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
         if isinstance(checkpoint, dict):
+            if checkpoint.get('experiment_protocol') != 'h0-mass-sd-surfacecldice01-native1500-random512-fp32-80e-bs2-v1':
+                raise ValueError('Expected this H0 S+D / surface-soft-clDice checkpoint')
             saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
             validate_training_args(saved_args)
             if args.img_size != 512 or args.source_patch_size != 1500 or not args.overlap_infer:

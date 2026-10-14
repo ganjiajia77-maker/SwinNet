@@ -1727,9 +1727,9 @@ class SwinTransformerSys(nn.Module):
                     )
                 if self.enable_global_topology:
                     print(
-                        "[INFO] Global topology residual: anchors=H2*surface, "
-                        "tokens=[H2,decoder_feature,connectivity], "
-                        "relation_bias=relative_xy_distance+connectivity"
+                        "[INFO] Global topology residual: anchors=updated_highres*surface, "
+                        "tokens=[updated_highres,decoder_feature,C,D], "
+                        "relation_bias=relative_xy_distance+C_similarity+D_similarity"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
@@ -2040,20 +2040,22 @@ class SwinTransformerSys(nn.Module):
     @staticmethod
     def _latest_local_topology_features(structure_outputs):
         if not structure_outputs:
-            return None
+            return None, None
         for item in reversed(structure_outputs):
             if not isinstance(item, dict):
                 continue
             connectivity = item.get("connectivity")
-            if connectivity is None:
+            direction = item.get("direction")
+            if connectivity is None and direction is None:
                 continue
             connectivity_feature = (
                 torch.sigmoid(connectivity).detach()
                 if connectivity is not None
                 else None
             )
-            return connectivity_feature
-        return None
+            direction_feature = direction.detach() if direction is not None else None
+            return connectivity_feature, direction_feature
+        return None, None
 
     # Decoder and skip connection with DCA-FPN.
     def forward_up_features(
@@ -2378,14 +2380,17 @@ class SwinTransformerSys(nn.Module):
                         x,
                         highres_skeleton_feat,
                     )
-                    connectivity_feature = self._latest_local_topology_features(
+                    connectivity_feature, direction_feature = self._latest_local_topology_features(
                         structure_outputs
                     )
+                    if connectivity_feature is None or direction_feature is None:
+                        raise RuntimeError('H0 S+D global topology requires both latest C and D predictions')
                     x = self.global_topology.forward_feature_anchors(
                         x,
                         highres_skeleton_feat,
                         surface_prob,
                         connectivity_feature=connectivity_feature,
+                        direction_feature=direction_feature,
                     )
                 if (
                     self.enable_h3_surface_fusion

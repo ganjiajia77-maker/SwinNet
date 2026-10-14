@@ -1,9 +1,25 @@
-# Original H0 on Massachusetts Roads
+# H0 S+D conditioning and final-surface soft-clDice on Massachusetts
 
 Base architecture: `599a410de8d341850e1810417307e4b3bbdfc82d`.
-The 14 model, loss, and direction-target files in `BASE_MODEL_SHA256.json` are
-byte-for-byte identical to that commit. This package changes data handling,
-training/evaluation entry points, and the unified metric adapter.
+This branch starts from the published H0 Massachusetts package `fe3b730`.
+The 10 unchanged model/loss utility files in `BASE_MODEL_SHA256.json` are
+byte-for-byte identical to the original H0 commit. The four changed model/loss
+files implement these additions:
+
+- The connectivity prior is [S at center, S at neighbor, D alignment to the
+  connection axis]. D uses the same normalized double-angle basis as e2020d9.
+- The gate gains a learned correction driven by semantic features and |D|;
+  its scalar beta starts at zero, matching e2020d9.
+- Global anchor tokens include C and D. Their relation bias includes both
+  connectivity similarity and double-angle direction similarity.
+- Global structure features are still the UPDATED high-resolution stream
+  after the original bidirectional H0 Stage 2/3 interactions.
+- As in e2020d9, D alignment into C, |D| into the gate, and C/D sampled for
+  global context are detached. Existing direction supervision trains D.
+- Final surface loss is focal BCE (gamma1) + 0.5 Dice + 0.1 soft-clDice.
+  Soft-clDice uses the final 512x512 logits and aligned 512x512 surface GT,
+  10 soft skeletonization iterations, and smoothing 1e-6. Stage S2/S3 logits
+  are not inputs to this auxiliary loss. Existing stage losses remain.
 
 ## Fixed experiment
 
@@ -45,22 +61,24 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate swinunet
 
 DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
-OUT=/home/gjj/SwinNet-h0-mass/model_out
-RUN="mass_h0_599a410_random512_fp32_80e_bs2_$(date +%Y%m%d_%H%M%S)"
-printf '%s\n' "$RUN" > mass_run_name.txt
+OUT=/home/gjj/SwinNet-h0-mass-sd-cldice/model_out
+SEED=1234
+RUN="mass_h0_sd_cldice01_seed${SEED}_fp32_80e_bs2_$(date +%Y%m%d_%H%M%S)"
+printf '%s\n' "$RUN" > "mass_run_seed${SEED}.txt"
 
 python -u mass_h0.py train --gpu 2 \
   --root_path "$DATA" --output_dir "$OUT" --run_name "$RUN" \
   --pretrain_ckpt /home/gjj/Swin-Unet-main/pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth \
-  --num_workers 4
+  --num_workers 4 --seed "$SEED"
 ```
 
 After training, including in a new terminal in the same package directory:
 
 ```bash
 DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
-OUT=/home/gjj/SwinNet-h0-mass/model_out
-RUN=$(cat mass_run_name.txt)
+OUT=/home/gjj/SwinNet-h0-mass-sd-cldice/model_out
+SEED=1234
+RUN=$(cat "mass_run_seed${SEED}.txt")
 CKPT="$OUT/$RUN/best.pth"
 REPORT="$OUT/$RUN/unified"
 
@@ -93,6 +111,19 @@ image size is 1500 for Massachusetts.
   Reports GT-to-prediction, prediction-to-GT, and bidirectional approximate
   APLS. This raster graph proxy is not the official SpaceNet APLS evaluator.
 - Strict image/GT/prediction pairing; native resolution required.
+
+The focus report includes IoU/F1, clDice, break_rate, short_pred_components,
+fragment_density_per_1000_px, and all three approximate APLS directions.
+Here break_rate means GT skeleton pixels outside the prediction divided by
+GT skeleton pixels. Short fragment counts are per-image counts with area<20;
+the summary is the mean count. Fragment density uses 1000 predicted road
+pixels as its denominator. Other topology fields are per-image means.
+
+For paired multi-seed experiments, repeat this branch and full H0 with the
+same seed values (e.g. 1234, 2026, 3407), the same data split and pretraining.
+Each model selects its own threshold on val. Compare per-seed test results
+before reporting their mean and variation. This is a combined S+D and
+surface-clDice variant; separate variants are needed to isolate each change.
 
 Outputs include `val/val_threshold_scores.csv`, `val/val_selection.json`,
 `test/test_comparison.csv`, and per-image topology CSV files. Exported masks are

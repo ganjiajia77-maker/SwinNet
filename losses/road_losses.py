@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from losses.cldice_loss import SoftCLDiceLoss
 
 from direction_target_utils import build_continuous_direction_target
 from topology_direction_constants import CONNECTIVITY_DIRECTIONS, CONNECTIVITY_OPPOSITE
@@ -351,6 +352,8 @@ class SurfaceStructureLoss(nn.Module):
         directional_pos_weight_diagonal=2.5,
         connectivity_focal_gamma=0.0,
         surface_focal_gamma=0.0,
+        surface_cldice_weight=0.0,
+        surface_cldice_iterations=10,
         edge_contrastive_margin=0.0,
         surface_pos_weight=None,
         skeleton_pos_weight=None,
@@ -366,6 +369,12 @@ class SurfaceStructureLoss(nn.Module):
             bce_weight=1.0,
             pos_weight=surface_pos_weight,
             focal_gamma=surface_focal_gamma,
+        )
+        self.surface_cldice_weight = float(surface_cldice_weight)
+        if self.surface_cldice_weight < 0 or int(surface_cldice_iterations) < 1:
+            raise ValueError('Invalid final-surface soft-clDice settings')
+        self.surface_cldice_loss = SoftCLDiceLoss(
+            iter_num=int(surface_cldice_iterations), smooth=1e-6,
         )
         self.skeleton_loss = BCEDiceLoss(
             dice_weight=skeleton_dice_weight,
@@ -978,6 +987,15 @@ class SurfaceStructureLoss(nn.Module):
             raise ValueError("surface_gt and skeleton_gt are required.")
 
         loss_surface, bce_surface, dice_surface = self.surface_loss(surface_logits, surface_gt)
+        if self.surface_cldice_weight > 0:
+            if surface_gt.shape != surface_logits.shape:
+                raise ValueError('Final-surface soft-clDice requires aligned surface logits and GT')
+            with torch.autocast(device_type=surface_logits.device.type, enabled=False):
+                loss_surface_cldice = self.surface_cldice_loss(
+                    surface_logits.float(), surface_gt.float(),
+                )
+        else:
+            loss_surface_cldice = surface_logits.sum() * 0.0
         if skeleton_dilate_gt is None:
             skeleton_dilate_gt = skeleton_gt
 
@@ -1091,6 +1109,7 @@ class SurfaceStructureLoss(nn.Module):
 
         total_loss = (
             loss_surface
+            + self.surface_cldice_weight * loss_surface_cldice
             + self.skeleton_weight * loss_skeleton
             + self.connectivity_weight * loss_connectivity
             + self.skeleton_stage_weight * loss_skeleton_stage
@@ -1102,7 +1121,11 @@ class SurfaceStructureLoss(nn.Module):
         loss_dict = {
             "total_loss": total_loss.detach(),
             "surface_loss": loss_surface.detach(),
-            "surface_total_loss": loss_surface.detach(),
+            "surface_total_loss": (
+                loss_surface + self.surface_cldice_weight * loss_surface_cldice
+            ).detach(),
+            "surface_cldice_loss": loss_surface_cldice.detach(),
+            "surface_cldice_weighted": (self.surface_cldice_weight * loss_surface_cldice).detach(),
             "skeleton_loss": loss_skeleton.detach(),
             "connectivity_loss": loss_connectivity.detach(),
             "boundary_loss": loss_boundary.detach(),
