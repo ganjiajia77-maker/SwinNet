@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import inspect
 import json
 import sys
@@ -15,6 +16,50 @@ import torch
 
 MODES = ("baseline", "stage2_off", "stage3_off", "both_off")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+MODEL_FILES = (
+    "networks/vision_transformer.py",
+    "networks/swin_transformer_unet_skip_expand_decoder_sys.py",
+    "networks/skeleton_guided_head.py",
+)
+MODEL_BLOBS = {
+    "h0": (
+        "9bea85f391344b8803f4efa82b6e55e0aa7cfd72",
+        "4aa0379d9316cd019a29517151f8ae0dc305af6d",
+        "078474a6c3907d66c617989b324a17744fa5c2e7",
+    ),
+    "e202": (
+        "551739b9106a666129c55b823f4c89f1adf0a1d9",
+        "a928cb6998517a0f6aa395d9848161e8c62bec5f",
+        "e7bb52e1ed23888a6c4eb249ddf2d752c4582345",
+    ),
+}
+
+
+def git_blob_id(path):
+    payload = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
+
+
+def matches_model_code(root, family):
+    return all((root / path).is_file() and git_blob_id(root / path) == expected
+               for path, expected in zip(MODEL_FILES, MODEL_BLOBS[family]))
+
+
+def discover_code_root(saved_cfg, family):
+    candidates = []
+    if saved_cfg.is_absolute():
+        candidates.append(saved_cfg.parent.parent)
+    home = Path.home()
+    for pattern in ("SwinNet*/networks/vision_transformer.py",
+                    "SwinNet*/*/networks/vision_transformer.py"):
+        candidates.extend(path.parent.parent for path in home.glob(pattern))
+    for root in dict.fromkeys(candidates):
+        if matches_model_code(root, family):
+            return root
+    raise FileNotFoundError(
+        f"No checkout matching {family} model code under {home}/SwinNet*. "
+        "Pass --code_root pointing to the exact training code checkout."
+    )
 
 
 def parse_args():
@@ -51,21 +96,20 @@ def load_model(args):
     if not isinstance(saved, dict):
         raise ValueError("Checkpoint args are not a dictionary")
     saved_cfg = Path(saved.get("cfg") or "")
+    family = "h0" if any("highres_skeleton_adapter." in key for key in weights) else "e202"
     if args.code_root is None:
-        if not saved_cfg.is_absolute() or not saved_cfg.is_file():
-            raise ValueError("Cannot infer model code from checkpoint args.cfg; pass --code_root")
-        args.code_root = saved_cfg.parent.parent
+        args.code_root = discover_code_root(saved_cfg, family)
     args.code_root = args.code_root.resolve()
     if not (args.code_root / "networks/vision_transformer.py").is_file():
         raise FileNotFoundError(f"Not a model code checkout: {args.code_root}")
-    print(f"[PROBE] model code: {args.code_root}", flush=True)
+    print(f"[PROBE] model family={family}; model code={args.code_root}", flush=True)
     sys.path.insert(0, str(args.code_root))
     from config import get_config
     from networks.vision_transformer import SwinUnet, load_topology_checkpoint_state
 
-    cfg = saved.get("cfg")
-    if not cfg or not Path(cfg).is_file():
-        cfg = args.code_root / "configs/swin_tiny_patch4_window7_224_lite.yaml"
+    cfg = args.code_root / "configs/swin_tiny_patch4_window7_224_lite.yaml"
+    if not cfg.is_file():
+        raise FileNotFoundError(f"Missing model config in {args.code_root}: {cfg}")
     options = SimpleNamespace(
         cfg=str(cfg), opts=None, batch_size=1, img_size=args.tile_size,
         zip=False, cache_mode="", resume="", accumulation_steps=1,

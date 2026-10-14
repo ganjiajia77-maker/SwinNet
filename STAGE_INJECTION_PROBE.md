@@ -37,5 +37,7 @@ indicates the reverse. The small fixed subset is for diagnosis only, not a
 replacement for full-test topology evaluation or a retrained ablation.
 Use `--weight_floor 0.05` for the original H0 overlap test and `0.10` for
 e2020d9, matching their respective test scripts.
-The code checkout is inferred from the absolute `args.cfg` saved in each
-checkpoint. If that path no longer exists, pass `--code_root` explicitly.
+The matching code checkout is located by comparing the three model-source Git
+blob IDs with the known H0/e202 revisions in `/home/gjj/SwinNet*`. A stale or
+relative `args.cfg` in the checkpoint is fine. If the original checkout has
+been removed, pass `--code_root` after restoring that revision.
