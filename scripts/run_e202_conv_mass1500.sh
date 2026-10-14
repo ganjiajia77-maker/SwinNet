@@ -31,6 +31,10 @@ else
     RUN=$(<"$LATEST")
   fi
 fi
+if [[ "$RUN" != e202_conv_c_mass1500_* ]]; then
+  echo "RUN=$RUN is not a conv-C experiment. Run 'unset RUN' to use this script's own run name." >&2
+  exit 2
+fi
 RUN_DIR="$RESULTS/$RUN"
 CFG="$REPO/configs/swin_tiny_patch4_window7_224_lite.yaml"
 EVAL="$REPO/evaluation/road_comparison"

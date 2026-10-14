@@ -18,6 +18,7 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate swinunet
 export CUDA_VISIBLE_DEVICES=1
 export SEED=1234
+unset RUN  # Clear any run name exported for the pairwise-C baseline.
 bash scripts/run_e202_conv_mass1500.sh train
 bash scripts/run_e202_conv_mass1500.sh sweep
 bash scripts/run_e202_conv_mass1500.sh test
