@@ -13,15 +13,15 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 
 MODE=${1:-}
 if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != sweep && "$MODE" != test && "$MODE" != topology ]]; then
-  echo "Usage: bash scripts/run_e202_mass1500.sh train|resume|sweep|test|topology" >&2
+  echo "Usage: bash scripts/run_e202_conv_mass1500.sh train|resume|sweep|test|topology" >&2
   exit 2
 fi
 cd "$REPO"
 mkdir -p "$RESULTS"
-LATEST="$RESULTS/latest_e202_mass1500_run.txt"
+LATEST="$RESULTS/latest_e202_conv_mass1500_run.txt"
 if [[ "$MODE" == train ]]; then
   test -s "$PRETRAIN" || { echo "Missing pretrained checkpoint: $PRETRAIN" >&2; exit 1; }
-  RUN=${RUN:-e202_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)}
+  RUN=${RUN:-e202_conv_c_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)}
   test ! -e "$RESULTS/$RUN" || { echo "Existing run: $RUN; use resume or a new RUN" >&2; exit 1; }
   python -u scripts/check_mass_layout.py --root_path "$DATA" --source_size 1500
   printf '%s\n' "$RUN" > "$LATEST"
@@ -50,7 +50,7 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
     --img_size 512 --source_patch_size 1500 --random_crop_train --random_crops_per_image 1 \
     --overlap_stride 256 --batch_size 2 --accumulation_steps 1 --max_epochs 80 \
     --warmup_epochs 10 --val_interval 5 --num_workers 4 --trend_val_every_steps 0 \
-    --amp_dtype none --no-use_ema --seed "$SEED" --deterministic 1 \
+    --amp_dtype none --no-use_ema --connectivity_head_type conv --seed "$SEED" --deterministic 1 \
     --base_lr 5e-4 --min_lr 1e-5 --pretrained_lr 5e-5 --pretrained_min_lr 5e-6 \
     --new_lr 2e-4 --new_min_lr 1e-5 --threshold 0.2 --skeleton_threshold 0.5 \
     --structure_profile stage23_boundary_0626 --stage_skeleton_mode direct \

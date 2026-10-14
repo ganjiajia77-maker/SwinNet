@@ -1258,8 +1258,12 @@ class SwinTransformerSys(nn.Module):
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False,
+                 connectivity_head_type="pairwise",
                   **kwargs):
         super().__init__()
+        if connectivity_head_type not in ("pairwise", "conv"):
+            raise ValueError("connectivity_head_type must be pairwise or conv")
+        self.connectivity_head_type = connectivity_head_type
 
         print(
             "SwinTransformerSys expand initial----depths:{};drop_path_rate:{};num_classes:{}".format(
@@ -1729,6 +1733,14 @@ class SwinTransformerSys(nn.Module):
             if self.stage2_topology_source is not None:
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.weight)
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.bias)
+        if self.connectivity_head_type == "conv":
+            # Replace only the two C heads after all shared weights have been initialized.
+            with torch.random.fork_rng(devices=[]):
+                for stage_index in (2, 3):
+                    block = self.decoder_structure_blocks[str(stage_index)]
+                    block.connectivity_head = nn.Conv2d(
+                        block.connectivity_context.fuse[0].out_channels, 8, kernel_size=1
+                    )
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

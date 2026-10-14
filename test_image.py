@@ -127,6 +127,7 @@ parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
 parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])
 parser.add_argument('--enable_e128_stage_fusion', action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
+parser.add_argument('--connectivity_head_type', choices=['pairwise', 'conv'], default=None)
 parser.add_argument('--is_savenii', action="store_true", help='whether to save results during inference')
 parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
 parser.add_argument('--seed', type=int, default=1234, help='random seed')
@@ -292,6 +293,7 @@ if __name__ == "__main__":
                 "stage_skeleton_mode",
                 "enable_e128_stage_fusion",
                 "remove_stage2_pre_topology_source",
+                "connectivity_head_type",
             ):
                 if name in saved_args and not _cli_has(name):
                     setattr(args, name, saved_args[name])
@@ -303,6 +305,7 @@ if __name__ == "__main__":
                 args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
 
     for name, default in (
+        ("connectivity_head_type", "pairwise"),
         ("stage_skeleton_mode", "prior_residual"),
         ("enable_e128_stage_fusion", False),
         ("enable_h3_surface_fusion", False),
@@ -335,7 +338,8 @@ if __name__ == "__main__":
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     enable_e128_stage_fusion=args.enable_e128_stage_fusion,
-                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
+                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+                    connectivity_head_type=args.connectivity_head_type).cuda()
     device = next(model.parameters()).device
     
     # 加载模型

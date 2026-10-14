@@ -10,8 +10,9 @@ import torch
 
 
 BASE = "e2020d9a8df311f9f680cd3637466a674d76688e"
-NAME = "e2020d9_mass1500_random512_fp32_noema80_b2_acc1"
+NAME = "e2020d9_conv_c_mass1500_random512_fp32_noema80_b2_acc1"
 EXPECTED = dict(
+    connectivity_head_type="conv",
     img_size=512, source_patch_size=1500, random_crop_train=True,
     random_crops_per_image=1, direct_resize_train=False, augment=True,
     batch_size=2, accumulation_steps=1, max_epochs=80, overlap_stride=256,
@@ -94,6 +95,7 @@ def build_manifest(checkpoint, data_root, predictions_root, selection=None):
             crop_schedule="original e2020d9 epoch-seeded RNG; shared worker epoch",
             skeleton_target="original e2020d9 full-source thinning, then matching crop",
             physical_batch_size=2, accumulation_steps=1, training_max_epochs=80,
+            connectivity_head="shared connectivity_context then Conv2d(96,8,1); no pair or S/D priors",
             training_precision="FP32", weights="model_state_dict", ema=False,
             inference_tile_size=512, overlap_stride=256,
             merge="taper0.1-weighted logits, divisor clamp1e-8, sigmoid",

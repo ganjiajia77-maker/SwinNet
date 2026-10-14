@@ -121,6 +121,7 @@ parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual',
 parser.add_argument('--enable_e128_stage_fusion', action='store_true')
 parser.add_argument('--enable_h3_surface_fusion', action='store_true')
 parser.add_argument('--remove_stage2_pre_topology_source', action='store_true')
+parser.add_argument('--connectivity_head_type', choices=['pairwise', 'conv'], default='pairwise')
 parser.add_argument(
     '--enable_global_topology',
     action='store_true',
@@ -579,6 +580,7 @@ def inherit_resume_architecture_args(args):
         ("stage_skeleton_bias_init", str),
         ("stage_skeleton_positive_prior", float),
         ("random_crops_per_image", int),
+        ("connectivity_head_type", str),
     ):
         if name in saved_args and not _cli_has(f"--{name}"):
             setattr(args, name, cast(saved_args[name]))
@@ -1258,7 +1260,8 @@ if __name__ == "__main__":
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
-                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
+                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+                    connectivity_head_type=args.connectivity_head_type).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:

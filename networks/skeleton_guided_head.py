@@ -864,15 +864,18 @@ class DecoderStructureRefinement(nn.Module):
             runtime_connectivity_skeleton = connectivity_override
 
         direction_logits = self.direction_head(structure_feat)
-        direction_alignment = self.connectivity_head.direction_alignment(
-            direction_logits
-        ).detach()
         connectivity_feat = self.connectivity_context(structure_feat)
-        connectivity_logits = self.connectivity_head(
-            connectivity_feat,
-            direction_alignment,
-            skeleton_prob=runtime_connectivity_skeleton.detach(),
-        )
+        if isinstance(self.connectivity_head, nn.Conv2d):
+            connectivity_logits = self.connectivity_head(connectivity_feat)
+        else:
+            direction_alignment = self.connectivity_head.direction_alignment(
+                direction_logits
+            ).detach()
+            connectivity_logits = self.connectivity_head(
+                connectivity_feat,
+                direction_alignment,
+                skeleton_prob=runtime_connectivity_skeleton.detach(),
+            )
 
         connectivity_prob = torch.sigmoid(connectivity_logits)
         topk = min(2, self.connectivity_channels)
