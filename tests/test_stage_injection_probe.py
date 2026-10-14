@@ -7,11 +7,24 @@ import numpy as np
 import torch
 
 from config import get_config
-from diagnostics.probe_stage_injections import InjectionHooks, infer_full, load_model
+from diagnostics.probe_stage_injections import InjectionHooks, infer_full, load_cases, load_model
 from networks.vision_transformer import SwinUnet
 
 
 class StageInjectionProbeTests(unittest.TestCase):
+    def test_data1_sat_image_matches_mask_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_dir = root / "test" / "image"
+            label_dir = root / "test" / "label"
+            image_dir.mkdir(parents=True)
+            label_dir.mkdir(parents=True)
+            image = image_dir / "100703_sat.jpg"
+            label = label_dir / "100703_mask.png"
+            image.touch()
+            label.touch()
+            self.assertEqual(list(load_cases(root, "test", 1)), [(image, label)])
+
     def test_overlap_positions_and_hook_identity(self):
         from diagnostics.probe_stage_injections import positions
 

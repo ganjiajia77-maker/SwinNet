@@ -168,9 +168,11 @@ def load_cases(root, split, maximum):
         raise FileNotFoundError(f"No label directory for {split}: {label_dir}")
     images = sorted(path for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
     for image_path in images[:maximum]:
-        label_path = next((label_dir / f"{image_path.stem}{extension}"
-                           for extension in (image_path.suffix, ".png", ".tif", ".tiff")
-                           if (label_dir / f"{image_path.stem}{extension}").is_file()), None)
+        candidates = [image_path.name]
+        for stem in (image_path.stem, image_path.stem.replace("_sat", "_mask")):
+            candidates.extend(f"{stem}{extension}" for extension in (".png", ".tif", ".tiff"))
+        label_path = next((label_dir / name for name in candidates
+                           if (label_dir / name).is_file()), None)
         if label_path is None:
             raise FileNotFoundError(f"No label for {image_path.name} in {label_dir}")
         yield image_path, label_path
