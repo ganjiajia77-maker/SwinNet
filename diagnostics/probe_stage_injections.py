@@ -243,6 +243,45 @@ def gap_components(gt_skeleton, pred):
     return int(cv2.connectedComponents(missed, connectivity=8)[0] - 1)
 
 
+def zhang_suen_skeletonize(mask):
+    image = np.asarray(mask, dtype=np.uint8).copy()
+    center = image[1:-1, 1:-1]
+    if not center.size:
+        return image.astype(bool)
+    while True:
+        changed = False
+        for phase in (0, 1):
+            p2, p3, p4 = image[:-2, 1:-1], image[:-2, 2:], image[1:-1, 2:]
+            p5, p6, p7 = image[2:, 2:], image[2:, 1:-1], image[2:, :-2]
+            p8, p9 = image[1:-1, :-2], image[:-2, :-2]
+            neighbors = (p2, p3, p4, p5, p6, p7, p8, p9)
+            count = sum(neighbors)
+            transitions = np.zeros_like(center)
+            for index in range(8):
+                transitions += (neighbors[index] == 0) & (neighbors[(index + 1) % 8] == 1)
+            if phase == 0:
+                keep_clear = (p2 * p4 * p6 == 0) & (p4 * p6 * p8 == 0)
+            else:
+                keep_clear = (p2 * p4 * p8 == 0) & (p2 * p6 * p8 == 0)
+            remove = ((center == 1) & (count >= 2) & (count <= 6)
+                      & (transitions == 1) & keep_clear)
+            if np.any(remove):
+                center[remove] = 0
+                changed = True
+        if not changed:
+            return image.astype(bool)
+
+
+def skeletonize(mask):
+    ximgproc = getattr(cv2, "ximgproc", None)
+    if ximgproc is not None and hasattr(ximgproc, "thinning") and hasattr(ximgproc, "THINNING_ZHANGSUEN"):
+        return ximgproc.thinning(
+            np.asarray(mask, dtype=np.uint8) * 255,
+            thinningType=ximgproc.THINNING_ZHANGSUEN,
+        ) > 127
+    return zhang_suen_skeletonize(mask)
+
+
 def summarize(rows):
     numeric = sorted({key for row in rows for key, value in row.items()
                       if isinstance(value, (int, float))})
@@ -251,8 +290,12 @@ def summarize(rows):
 
 def main():
     args = parse_args()
-    if not hasattr(cv2, "ximgproc"):
-        raise RuntimeError("OpenCV ximgproc.thinning is required for the GT skeleton diagnostic")
+    ximgproc = getattr(cv2, "ximgproc", None)
+    skeleton_method = ("OpenCV Zhang-Suen" if ximgproc is not None
+                       and hasattr(ximgproc, "thinning")
+                       and hasattr(ximgproc, "THINNING_ZHANGSUEN")
+                       else "NumPy Zhang-Suen fallback")
+    print(f"[PROBE] GT skeleton method: {skeleton_method}", flush=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model, checkpoint, source = load_model(args)
     hooks = InjectionHooks(model)
@@ -273,7 +316,7 @@ def main():
                 image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 if image.shape[:2] != label.shape:
                     raise ValueError(f"Image/label size mismatch for {image_path.name}")
-                gt_skeleton = cv2.ximgproc.thinning((label > 127).astype(np.uint8) * 255) > 0
+                gt_skeleton = skeletonize(label > 127)
                 results = {}
                 for mode in MODES:
                     probability, stats = infer_full(model, image, args, hooks, mode, tile_weight)
@@ -306,6 +349,7 @@ def main():
         writer.writerows(rows)
     report = dict(checkpoint=str(args.checkpoint), checkpoint_epoch=checkpoint.get("epoch"),
                   code_root=str(args.code_root), split=args.split, threshold=args.threshold,
+                  skeleton_method=skeleton_method,
                   source=source, images=len(rows) // len(MODES), tile_size=args.tile_size,
                   overlap_stride=args.overlap_stride, weight_floor=args.weight_floor,
                   modes={mode: summarize([

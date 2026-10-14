@@ -2,16 +2,29 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+import cv2
 import numpy as np
 import torch
 
 from config import get_config
-from diagnostics.probe_stage_injections import InjectionHooks, infer_full, load_cases, load_model
+from diagnostics.probe_stage_injections import (InjectionHooks, infer_full, load_cases,
+                                                load_model, skeletonize)
 from networks.vision_transformer import SwinUnet
 
 
 class StageInjectionProbeTests(unittest.TestCase):
+    def test_skeleton_fallback_without_ximgproc_thinning(self):
+        mask = np.zeros((9, 9), dtype=bool)
+        mask[2:7, 2:7] = True
+        with mock.patch.object(cv2, "ximgproc", SimpleNamespace(), create=True):
+            result = skeletonize(mask)
+        self.assertEqual(result.dtype, np.bool_)
+        self.assertEqual(result.shape, mask.shape)
+        self.assertTrue(result[4, 4])
+        self.assertEqual(int(result.sum()), 1)
+
     def test_data1_sat_image_matches_mask_label(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

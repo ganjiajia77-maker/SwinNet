@@ -5,6 +5,8 @@ weights. Each run uses one checkpoint and the first `--max_images` sorted images
 from the selected split. For each image it performs native-resolution 512-tile
 inference with stride 256, tapered logit fusion, and four modes: baseline,
 Stage 2 off, Stage 3 off, and both off.
+GT skeletons use Zhang-Suen thinning, with a NumPy fallback when OpenCV lacks
+`ximgproc.thinning`; the method used is recorded in `summary.json`.
 
 The script hooks `highres_structure_fusion["2"]` and `["3"]`. It measures
 `||fusion_output - decoder_input||_2 / ||decoder_input||_2` and the mean
