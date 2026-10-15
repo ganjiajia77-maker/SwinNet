@@ -109,6 +109,19 @@ SELECTION="$AUDIT/val/val_selection.json"
 test -s "$SELECTION" || { echo "Missing $SELECTION" >&2; exit 1; }
 THRESHOLD=$(python -c 'import json,sys; print(next(iter(json.load(open(sys.argv[1]))["models"].values()))["threshold"])' "$SELECTION")
 echo "Validation-selected threshold=$THRESHOLD"
+if [[ "$MODE" == topology ]]; then
+  if [[ -s "$AUDIT/test/test_comparison.csv" ]]; then
+    echo "TEST_TOPOLOGY_CSV=$AUDIT/test/test_comparison.csv"
+    exit 0
+  fi
+  test -d "$AUDIT/predictions/test" || { echo "Run test to generate predictions first" >&2; exit 1; }
+  TOPOLOGY_DIR="$AUDIT/topology_$(date +%Y%m%d_%H%M%S)"
+  test ! -e "$TOPOLOGY_DIR" || { echo "Existing topology directory: $TOPOLOGY_DIR" >&2; exit 1; }
+  python -u "$EVAL/compare_predictions.py" --manifest "$MANIFEST" --split test \
+    --selection "$SELECTION" --output_dir "$TOPOLOGY_DIR" --progress_every 1
+  echo "TEST_TOPOLOGY_CSV=$TOPOLOGY_DIR/test_comparison.csv"
+  exit 0
+fi
 if [[ "$MODE" == test ]]; then
   python "$EVAL/build_e202_mass_manifest.py" --checkpoint "$CKPT" \
     --data_root "$DATA" --predictions_root "$AUDIT/predictions" --output "$MANIFEST"
