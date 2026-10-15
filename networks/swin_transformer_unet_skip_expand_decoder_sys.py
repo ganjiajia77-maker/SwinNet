@@ -1368,7 +1368,7 @@ class SwinTransformerSys(nn.Module):
                     or self.enable_post_refine_structure_interaction
                     or self.highres_structure_fusion_mode != "stage23"):
                 raise ValueError(
-                    "Skeleton-feature v1 requires highres64, embed96, stage23_boundary_0626, "
+                    "Skeleton-feature SD/gate v2 requires highres64, embed96, stage23_boundary_0626, "
                     "removed stage2 pre-topology, fusion mode stage23, and no post-refine interaction"
                 )
 

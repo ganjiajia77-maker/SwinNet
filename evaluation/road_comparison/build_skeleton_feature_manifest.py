@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from networks.skeleton_feature_architecture import BASE_COMMIT, require_checkpoint_architecture
 
-NAME = "h0_skeleton_feature_mass1500_random512_fp32_noema80_b2_acc1"
+NAME = "h0_skeleton_feature_sdgate_mass1500_random512_fp32_noema80_b2_acc1"
 EXPECTED = dict(
     img_size=512, source_patch_size=1500, random_crop_train=True,
     random_crops_per_image=1, direct_resize_train=False, augment=True,
@@ -60,6 +60,12 @@ def verify_checkpoint(path):
                     "skeleton_head.out.weight", "connectivity_head.edge_linear.weight"):
             if prefix + key not in state:
                 raise ValueError(f"Missing stage {stage} parameter: {key}")
+        if tuple(state[prefix + "connectivity_head.prior_embed.0.weight"].shape) != (16, 3, 1, 1):
+            raise ValueError("C must read S_center/S_neighbor/D_alignment")
+        if tuple(state[prefix + "reliability_correction.0.weight"].shape) != (48, 97, 3, 3):
+            raise ValueError("Gate must contain the e2020d9 direction confidence correction")
+        if prefix + "reliability_beta" not in state:
+            raise ValueError("Gate reliability beta is missing")
     if tuple(state["swin_unet.surface_feature_delta.weight"].shape) != (96, 160, 1, 1):
         raise ValueError("Incorrect final surface fusion shape")
     return saved, checkpoint.get("epoch"), meta

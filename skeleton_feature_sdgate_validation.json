@@ -1,0 +1,15 @@
+{
+  "architecture_id": "h0_skeleton_feature_stream_sdgate_v2",
+  "reference_commit": "e2020d9a8df311f9f680cd3637466a674d76688e",
+  "connectivity_head_AST_identical_to_reference": true,
+  "S_changes_C": true,
+  "D_alignment_changes_C": true,
+  "C_does_not_backpropagate_through_S_or_D_prior": true,
+  "D_norm_changes_gate_when_beta_nonzero": true,
+  "D_to_gate_confidence_is_detached": true,
+  "gate_formula_matches_reference": true,
+  "reliability_beta_initial": 0.0,
+  "zero_beta_gate_equals_old_gate": true,
+  "correction_module_has_gradient_when_beta_nonzero": true,
+  "v1_checkpoint_rejected": true
+}

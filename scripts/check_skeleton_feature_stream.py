@@ -18,7 +18,7 @@ from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss, build_soft_stage_skeleton_target
 from networks.skeleton_feature_architecture import (
-    architecture_metadata, require_checkpoint_architecture, restore_saved_config, restore_model_config,
+    ARCHITECTURE_ID, architecture_metadata, require_checkpoint_architecture, restore_saved_config, restore_model_config,
 )
 from networks.vision_transformer import SwinUnet
 
@@ -91,7 +91,7 @@ def main():
                                       "BidirectionalSkeletonFeatureFusion"} for m in model.modules())
     assert torch.count_nonzero(core.surface_feature_delta.weight) == 0
     assert torch.count_nonzero(core.surface_feature_delta.bias) == 0
-    report = dict(device=str(device), torch_version=torch.__version__,
+    report = dict(architecture_id=ARCHITECTURE_ID, device=str(device), torch_version=torch.__version__,
                   parameters=sum(p.numel() for p in model.parameters()))
     with torch.no_grad(), FlopCounterMode(display=False) as counter:
         model(torch.randn(1, 3, 512, 512, device=device))

@@ -2,7 +2,7 @@
 
 独立分支：`codex/h0-skeleton-feature-mass1500`。
 直接基于 `599a410de8d341850e1810417307e4b3bbdfc82d`；架构标识为
-`h0_skeleton_feature_stream_v1`。原工作树和实验记录保留。本次没有启动正式训练。
+`h0_skeleton_feature_stream_sdgate_v2`。原工作树和实验记录保留。本次没有启动正式训练。
 
 ## 改动与前向流程
 
@@ -14,7 +14,7 @@
 3. 从同一组交互前特征同步计算
    `F_H1=F_H0+alpha2*T_BH(B2_base)`、`B2_new=B2_base+beta2*T_HB(F_H0)`；
    原 out 层读出 S2；`G2_new=G2_base+R2(B2_new-B2_base)`。
-   C2/D2 和原局部精化使用更新后的 G2；C2 的 S2 概率先验仍 detach。
+   C2/D2 和原局部精化使用更新后的 G2；C2 同时读取 S2 与 D2 先验，二者仍 detach。
 4. 原 G2→G3 结构传递保留。Stage 3 同样从 `G3_base` 得到 `B3_base`，
    与 F_H1 同步交互，得到 F_H2、B3_new、S3、G3_new、C3/D3。
 5. 最终仅一个 64→1 的 1×1 卷积从 F_H2 读出 S_H；没有 S_H0/S_H1 监督头。
@@ -30,12 +30,21 @@ T_BH/T_HB 使用输入 GroupNorm 和 1×1 投影，R 使用无归一化、无 bi
 surface_h3_fusion 被替换。KeypointGuidedGlobalTopology 不实例化、不运行；
 其 surface 预估前向已移除。原 bottleneck 上下文与 GAP→Stage 3 局部 gate 校准保留。
 
-没有移植 e2020d9 的 D→C、D→gate 或 D→全局关系路径，没有 PSI、P64/P8 mask、
-骨架硬 mask 修正或预测一致性等附加损失。
+按用户追加要求，S+D→C 和 D→gate 与 Overlap Test 提交
+`e2020d9a8df311f9f680cd3637466a674d76688e` 保持一致：
+
+- C 每个方向的先验为中心 S、邻点 S、D 的双角轴向匹配度，先经过3→16先验嵌入，
+  再与原像素对特征一起分类；S和D匹配度均detach。
+- gate 保留原 S/C gate，再加入 `reliability_beta * reliability_correction([decoder_x, ||D||])`。
+  D向量模长detach，reliability_beta从0初始化并学习。它在初始化时为零，后续可学习方向置信度修正。
+- 不引入 D→全局关系路径；全局模块仍移除。没有 PSI、P64/P8 mask、骨架硬mask修正或附加损失。
+
+该版本与上一提交6edae61的checkpoint不兼容，使用新的架构标识、运行名前缀和latest指针。
+请启动新实验；严格恢复会拒绝上一版checkpoint。
 
 ## 损失、训练与 checkpoint
 
-只监督 S2、S3、最终 S_H。三个骨架输出统一使用
+骨架监督只包括 S2、S3、最终 S_H，C/D监督按原设置保留。三个骨架输出统一使用
 `build_soft_stage_skeleton_target + soft_stage_skeleton_loss`；真值优先使用
 stage_skeleton_gt，否则 skeleton_gt。S_H 仅在独立高分辨率损失里计算一次。
 
@@ -68,6 +77,8 @@ checkpoint 保存完整模型 YAML、架构标识、特征尺寸/通道、全局
 
 ## 实现自检与计算量
 
+`scripts/check_sdgate_conditioning.py` 核对C头AST与e2020d9参考一致，并验证S与D均能改变C、
+D模长能通过非零beta改变gate、S/D先验detach、beta0时gate等于原gate。
 `scripts/check_skeleton_feature_stream.py` 检查物理 batch2、512 输入：
 
 - F_H0/F_H1/F_H2 为 2×64×128×128；G2/G3/B2/B3 为 2×96×128×128。
@@ -83,9 +94,11 @@ checkpoint 保存完整模型 YAML、架构标识、特征尺寸/通道、全局
 |---|---:|---:|
 | 原 599a410 H0，开启全局拓扑 | 77,215,744 | 410.806 G |
 | 原 H0，关闭并移除全局拓扑模块 | 77,114,449 | 327.829 G |
-| 本次骨架特征流 | 76,499,268 | 299.408 G |
+| 前一版骨架特征流6edae61，未含S+D/gate | 76,499,268 | 299.408 G |
+| 当前骨架特征流，含S+D/gate | 76,583,400 | 302.166 G |
 
-相对同样无全局模块的 H0，参数减少615,181（约0.80%），上述前向运算量减少约8.67%。
+当前版本相对同样无全局模块的原 H0，参数减少531,049（约0.69%），上述运算量减少约7.83%；
+原 H0 对照不含本次新增的S+D/gate，计算量差异包含这两项。
 统计使用 PyTorch2.11 FlopCounterMode，乘加按2 FLOPs；部分归一化、逐元素和插值运算
 未计入，不能据此直接换算训练速度。原 H0 统计来自该精确提交的独立只读代码副本。
 详细数值在 skeleton_feature_compute_comparison.json 和 skeleton_feature_validation.json。
@@ -146,7 +159,7 @@ bash scripts/run_h0_skeleton_feature_mass1500.sh topology
 默认 DATA 如上，RESULTS=/home/gjj/SwinNet-roadbias/model_out，预训练权重为
 /home/gjj/Swin-Unet-main/pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth。
 可通过 DATA、RESULTS、PRETRAIN 环境变量指定实际路径；每次新训练使用唯一 RUN。
-后续命令默认读取 latest_h0_skeleton_feature_mass1500_run.txt，也可设置 RUN 指定实验。
+后续命令默认读取 latest_h0_skeleton_feature_sdgate_mass1500_run.txt，也可设置 RUN 指定实验。
 
 统一工具直接评估原生1500×1500二值 mask，固定 Zhang–Suen、8邻域、短块面积<20、
 APLS最多64节点、匹配距离≤5；报告 IoU/F1/P/R、clDice、碎片/断裂等指标和

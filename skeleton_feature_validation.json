@@ -1,8 +1,9 @@
 {
+  "architecture_id": "h0_skeleton_feature_stream_sdgate_v2",
   "device": "cuda",
   "torch_version": "2.11.0+cu128",
-  "parameters": 76499268,
-  "forward_flops_batch1_512": 299408279552,
+  "parameters": 76583400,
+  "forward_flops_batch1_512": 302166034432,
   "surface_forward_calls_per_model_call": {
     "guided_head": 1,
     "surface_head": 1
@@ -52,24 +53,24 @@
     ]
   },
   "SH_gradient_abs_sum": {
-    "encoder": 0.32145573874004185,
-    "adapter": 352.7311767311767,
-    "stage2_interaction": 0.0019678843586716788,
-    "stage3_interaction": 0.0020398347455738985
+    "encoder": 0.5444454337703064,
+    "adapter": 525.9974949620664,
+    "stage2_interaction": 0.0027199914573635686,
+    "stage3_interaction": 0.002610025253943604
   },
   "skeleton_loss_accounting": {
-    "total_loss": 1.9217987060546875,
-    "highres_structure_skeleton_raw": 1.512166976928711,
-    "highres_structure_skeleton_weighted": 0.015121669508516788,
+    "total_loss": 1.2256327867507935,
+    "highres_structure_skeleton_raw": 1.77534818649292,
+    "highres_structure_skeleton_weighted": 0.0177534818649292,
     "stage2_skeleton_raw": 1.635882019996643,
     "stage2_skeleton_weighted": 0.006543528288602829,
     "stage3_skeleton_raw": 1.635882019996643,
     "stage3_skeleton_weighted": 0.009815292432904243
   },
   "surface_gradient_after_delta_update": {
-    "FH2": 0.004790471866726875,
-    "H_projection": 0.016670873039402068,
-    "encoder": 0.018061635655612918
+    "FH2": 0.0015331115573644638,
+    "H_projection": 0.005179656815016642,
+    "encoder": 0.00561182185447251
   },
   "legacy_checkpoint_rejected": true,
   "checkpoint_roundtrip_exact": true,

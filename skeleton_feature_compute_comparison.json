@@ -15,14 +15,15 @@
     "no_global_forward_flops": 327828883456
   },
   "new": {
-    "parameters": 76499268,
-    "forward_flops_batch1_512": 299408279552
+    "parameters": 76583400,
+    "forward_flops_batch1_512": 302166034432
   },
   "delta_vs_no_global": {
-    "parameters": -615181,
-    "parameter_percent": -0.7977506264746803,
-    "forward_flops": -28420603904,
-    "forward_flops_percent": -8.669341030719313
+    "parameters": -531049,
+    "parameter_percent": -0.6886504499305945,
+    "forward_flops": -25662849024,
+    "forward_flops_percent": -7.82812324327865
   },
-  "note": "No-global baseline uses exact 599a410 with old H0 fusion and physically removes disabled KeypointGuidedGlobalTopology. Parameter totals include other instantiated modules. FLOP counter omits some normalization/elementwise/interpolation operations; no speed or accuracy claim."
+  "note": "New architecture includes e2020d9 S+D-to-C and D-confidence-to-gate. Original H0 baseline does not. No-global baseline uses exact 599a410 with old H0 fusion and physically removes disabled KeypointGuidedGlobalTopology. Parameter totals include other instantiated modules. FLOP counter omits some normalization/elementwise/interpolation operations; no speed or accuracy claim.",
+  "architecture_id": "h0_skeleton_feature_stream_sdgate_v2"
 }

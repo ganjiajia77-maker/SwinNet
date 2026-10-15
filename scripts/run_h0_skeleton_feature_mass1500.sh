@@ -18,10 +18,10 @@ if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != sweep && "$MODE" != te
 fi
 cd "$REPO"
 mkdir -p "$RESULTS"
-LATEST="$RESULTS/latest_h0_skeleton_feature_mass1500_run.txt"
+LATEST="$RESULTS/latest_h0_skeleton_feature_sdgate_mass1500_run.txt"
 if [[ "$MODE" == train ]]; then
   test -s "$PRETRAIN" || { echo "Missing pretrained checkpoint: $PRETRAIN" >&2; exit 1; }
-  RUN=${RUN:-h0_skeleton_feature_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)}
+  RUN=${RUN:-h0_skeleton_feature_sdgate_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)}
   test ! -e "$RESULTS/$RUN" || { echo "Existing run: $RUN; use resume or a new RUN" >&2; exit 1; }
   python -u scripts/check_mass_layout.py --root_path "$DATA" --source_size 1500
   printf '%s\n' "$RUN" > "$LATEST"

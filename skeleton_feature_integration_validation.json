@@ -1,4 +1,5 @@
 {
+  "architecture_id": "h0_skeleton_feature_stream_sdgate_v2",
   "training_command_matches_protocol": true,
   "manifest_checkpoint_verified": true,
   "saved_config_restored_by_test_entry": true,

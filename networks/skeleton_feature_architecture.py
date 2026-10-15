@@ -1,6 +1,6 @@
 """Identity and strict checkpoint contract for the H0 skeleton feature experiment."""
 
-ARCHITECTURE_ID = "h0_skeleton_feature_stream_v1"
+ARCHITECTURE_ID = "h0_skeleton_feature_stream_sdgate_v2"
 BASE_COMMIT = "599a410de8d341850e1810417307e4b3bbdfc82d"
 
 SAVED_CONFIG_KEYS = (
@@ -50,6 +50,9 @@ def architecture_metadata(model, args):
         "interaction": "synchronous_BH_HB_residual_then_delta_B_to_G",
         "surface_fusion": "pre_x4_concat_decoder96_G3proj32_FH2proj32_zero_delta",
         "global_topology": False,
+        "conditioning_reference": "e2020d9a8df311f9f680cd3637466a674d76688e",
+        "connectivity_conditioning": "S_center_S_neighbor_D_axial_alignment_detached",
+        "direction_gate": "detached_D_norm_reliability_residual_beta0",
         "skeleton_effective_weights": {
             "S2": args.stage2_skeleton_weight * args.stage_skeleton_loss_factor
             * args.stage_skeleton_only_loss_factor,
@@ -63,6 +66,8 @@ def architecture_metadata(model, args):
                                .skeleton_feature_interaction.alpha.detach().cpu()),
                 "beta": float(core.decoder_structure_blocks[str(stage)]
                               .skeleton_feature_interaction.beta.detach().cpu()),
+                "reliability_beta": float(core.decoder_structure_blocks[str(stage)]
+                                          .reliability_beta.detach().cpu()),
             } for stage in (2, 3)
         },
     }
