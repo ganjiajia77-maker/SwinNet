@@ -53,3 +53,5 @@ visualization/
 .idea/
 .DS_Store
 Thumbs.db
+
+.validation/

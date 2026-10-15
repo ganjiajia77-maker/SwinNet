@@ -30,6 +30,15 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
+from networks.skeleton_feature_architecture import (
+    architecture_metadata, require_checkpoint_architecture, restore_saved_config, restore_model_config,
+)
+
+SKELETON_LOG_KEYS = [
+    'stage2_skeleton_raw', 'stage2_skeleton_weighted',
+    'stage3_skeleton_raw', 'stage3_skeleton_weighted',
+    'highres_structure_skeleton_weighted',
+]
 
 
 def seed_worker(worker_id):
@@ -559,19 +568,16 @@ def save_checkpoint_safely(checkpoint, target_path):
 
 
 def inherit_resume_architecture_args(args):
-    if not args.resume or not os.path.isfile(args.resume):
-        return
-    try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
-    except Exception as exc:
-        print(
-            f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
-            flush=True,
-        )
-        return
-    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("args"), dict):
-        return
+    if not args.resume:
+        return None
+    if not os.path.isfile(args.resume):
+        raise FileNotFoundError(args.resume)
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+    require_checkpoint_architecture(checkpoint)
+    if not isinstance(checkpoint.get("args"), dict):
+        raise ValueError("Resume checkpoint has no saved architecture arguments")
 
+    restore_saved_config(args, checkpoint, lambda name: _cli_has("--" + name))
     saved_args = checkpoint["args"]
     for name, cast in (
         ("surface_focal_gamma", float),
@@ -630,6 +636,8 @@ def inherit_resume_architecture_args(args):
         f"global_topology={args.enable_global_topology}",
         flush=True,
     )
+
+    return checkpoint["model_config"]
 
 
 def model_state_is_finite(model):
@@ -1186,11 +1194,13 @@ if __name__ == "__main__":
     batch_loss_log_path = os.path.join(args.output_dir, 'batch_losses.csv')
     training_log_path = os.path.join(args.output_dir, 'training_log.txt')  # 统一日志文件
     
-    inherit_resume_architecture_args(args)
+    saved_model_config = inherit_resume_architecture_args(args)
     apply_structure_profile_defaults(args)
 
     # 加载配置
     config = get_config(args)
+    if saved_model_config is not None:
+        config = restore_model_config(config, saved_model_config)
     if args.pretrain_ckpt:
         config.defrost()
         config.MODEL.PRETRAIN_CKPT = args.pretrain_ckpt
@@ -1328,7 +1338,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1368,11 +1378,12 @@ if __name__ == "__main__":
             ),
             flush=True,
         )
+        print(f"[INFO] Warm-start removed tensors: {skipped_missing}", flush=True)
+        print(f"[INFO] Warm-start newly initialized tensors: {result.missing_keys}", flush=True)
         if skipped_shape:
             print(
                 "[INFO] Warm-start skipped shape-mismatch tensors: "
-                + ", ".join(skipped_shape[:12])
-                + (" ..." if len(skipped_shape) > 12 else ""),
+                + ", ".join(skipped_shape),
                 flush=True,
             )
         return set(compatible)
@@ -1450,218 +1461,15 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            checkpoint_state = checkpoint["model_state_dict"]
-            model_state = model.state_dict()
-            filtered_checkpoint_state = {}
-            skipped_gate_keys = []
-            skipped_removed_keys = []
-            skipped_shape_keys = []
-            removed_direction_embedding_prefixes = (
-                "swin_unet.decoder_structure_blocks.0.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.1.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.2.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.3.directional_embedding.",
-                "swin_unet.stage2_topology_source.directional_embedding.",
-            )
-            removed_surface_uncertainty_prefixes = (
-                "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
-                "swin_unet.stage2_topology_source.surface_uncertainty_head.",
-            )
-            for key, value in checkpoint_state.items():
-                if key not in model_state:
-                    skipped_removed_keys.append(key)
-                    continue
-                if value.shape != model_state[key].shape:
-                    if (
-                        key.endswith("connectivity_head.prior_embed.0.weight")
-                        and value.ndim == model_state[key].ndim == 4
-                        and value.shape[0] == model_state[key].shape[0]
-                        and value.shape[1] >= 2
-                        and model_state[key].shape[1] == 2
-                        and value.shape[2:] == model_state[key].shape[2:]
-                    ):
-                        adapted_weight = model_state[key].detach().clone()
-                        adapted_weight.copy_(
-                            value[:, :2].to(
-                                device=adapted_weight.device,
-                                dtype=adapted_weight.dtype,
-                            )
-                        )
-                        filtered_checkpoint_state[key] = adapted_weight
-                        skipped_shape_keys.append(
-                            key + " (dropped direction prior channel)"
-                        )
-                        continue
-                    skipped_shape_keys.append(key)
-                    continue
-                if (
-                    key in model_state
-                    and value.shape != model_state[key].shape
-                    and key.endswith("structure_gate.0.weight")
-                ):
-                    skipped_gate_keys.append(key)
-                    continue
-                filtered_checkpoint_state[key] = value
-            if skipped_gate_keys:
-                print(
-                    "[WARN] Reinitialized structure-gate input weights: "
-                    + ", ".join(skipped_gate_keys),
-                    flush=True,
-                )
-            if skipped_removed_keys:
-                print(
-                    "[WARN] Ignored removed checkpoint keys: "
-                    + ", ".join(skipped_removed_keys[:12])
-                    + (" ..." if len(skipped_removed_keys) > 12 else ""),
-                    flush=True,
-                )
-            if skipped_shape_keys:
-                print(
-                    "[WARN] Reinitialized shape-incompatible checkpoint keys: "
-                    + ", ".join(skipped_shape_keys[:12])
-                    + (" ..." if len(skipped_shape_keys) > 12 else ""),
-                    flush=True,
-                )
-            if skipped_gate_keys or skipped_removed_keys or skipped_shape_keys:
-                checkpoint_state = filtered_checkpoint_state
-            strict_load = args.bottleneck_type == 'global_local'
-            try:
-                model.load_state_dict(checkpoint_state, strict=strict_load)
-            except RuntimeError as exc:
-                allowed_missing_prefixes = (
-                        "swin_unet.stage2_topology_source.",
-                        "swin_unet.stage_topology_scales.",
-                        "swin_unet.global_topology.",
-                        "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
-                        "swin_unet.highres_structure_encoder.",
-                        "swin_unet.prepatch_structure_encoder.",
-                        "swin_unet.highres_skeleton_adapter.",
-                        "swin_unet.highres_structure_skeleton_head.",
-                        "swin_unet.highres_structure_fusion.",
-                        "swin_unet.decoder_structure_blocks.2.highres_skeleton_fusion.",
-                        "swin_unet.decoder_structure_blocks.3.highres_skeleton_fusion.",
-                        "swin_unet.decoder_structure_blocks.0.direction_head.",
-                        "swin_unet.decoder_structure_blocks.1.direction_head.",
-                        "swin_unet.decoder_structure_blocks.2.direction_head.",
-                        "swin_unet.decoder_structure_blocks.3.direction_head.",
-                        "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.1.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.2.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.3.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.0.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.1.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.2.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.3.gate_branch.",
-                        "swin_unet.stage2_topology_source.direction_head.",
-                        "swin_unet.stage2_topology_source.structure_gate.0.weight",
-                        "swin_unet.stage2_topology_source.reliability_correction.",
-                        "swin_unet.stage2_topology_source.reliability_local.",
-                        "swin_unet.stage2_topology_source.reliability_context.",
-                        "swin_unet.stage2_topology_source.reliability_direction.",
-                        "swin_unet.stage2_topology_source.reliability_fuse.",
-                        "swin_unet.stage2_topology_source.reliability_beta",
-                        "swin_unet.stage2_topology_source.gate_branch.",
-                        "swin_unet.guided_head.detached_skeleton_refine.",
-                        "swin_unet.guided_head.detached_skeleton_head.",
-                        "swin_unet.guided_head.final_skeleton_aux_head.",
-                        "swin_unet.guided_head.post_refine_structure_interaction.",
-                )
-                allowed_unexpected_prefixes = (
-                        "swin_unet.coarse_road_mask_head.",
-                        "swin_unet.bottleneck_coarse_road_mask_head.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
-                        "swin_unet.stage2_topology_source.reliability_correction.",
-                        "swin_unet.guided_head.skeleton_proj.",
-                        "swin_unet.guided_head.structure_branch.",
-                        "swin_unet.guided_head.skeleton_head.",
-                        "swin_unet.guided_head.detached_skeleton_refine.",
-                        "swin_unet.guided_head.detached_skeleton_head.",
-                        "swin_unet.guided_head.connectivity_context.",
-                        "swin_unet.guided_head.connectivity_head.",
-                        "swin_unet.guided_head.structure_to_surface.",
-                        "swin_unet.guided_head.structure_to_surface_gamma",
-                        "swin_unet.guided_head.final_topology_attention.",
-                        "swin_unet.guided_head.structure_fusion.",
-                        "swin_unet.guided_head.structure_residual.",
-                        "swin_unet.decoder_structure_blocks.0.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.1.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.2.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.3.directional_embedding.",
-                        "swin_unet.stage2_topology_source.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
-                        "swin_unet.stage2_topology_source.surface_uncertainty_head.",
-                )
-                result = model.load_state_dict(
-                    checkpoint_state,
-                    strict=False,
-                )
-                invalid_missing = [
-                    key
-                    for key in result.missing_keys
-                    if not key.startswith(allowed_missing_prefixes)
-                ]
-                invalid_unexpected = [
-                    key
-                    for key in result.unexpected_keys
-                    if not key.startswith(allowed_unexpected_prefixes)
-                ]
-                if invalid_missing or invalid_unexpected:
-                    raise RuntimeError(
-                        "Checkpoint mismatch on resume: "
-                        f"missing={invalid_missing}, unexpected={invalid_unexpected}"
-                    ) from exc
-                print(
-                    "[WARN] Loaded checkpoint with strict=False; "
-                    "some modules use fresh initialization.",
-                    flush=True,
-                )
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            require_checkpoint_architecture(checkpoint)
+            checkpoint_state = checkpoint.get("training_model_state_dict", checkpoint["model_state_dict"])
+            model.load_state_dict(checkpoint_state, strict=True)
             start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_post_refine_interaction_only:
-                try:
-                    loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
-                    optimizer = build_layerwise_optimizer()
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                except (ValueError, RuntimeError) as exc:
-                    print(
-                        "[WARN] Optimizer state not restored; "
-                        "continuing with a fresh optimizer for current parameters.",
-                        flush=True,
-                    )
-                    print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
+                loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
+                optimizer = build_layerwise_optimizer()
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"从epoch {start_epoch} 继续训练...")
         else:
             print(f"Warning: checkpoint未找到 {args.resume}")
@@ -1732,7 +1540,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -1806,6 +1614,7 @@ if __name__ == "__main__":
                 'structure_delta_weak_skeleton_fn_mean',
                 'structure_delta_skeleton_tp_mean',
                 'structure_delta_background_mean',
+                *SKELETON_LOG_KEYS,
             ])
             batch_loss_writer.writerow([
                 'epoch', 'batch', 'loss',
@@ -1815,6 +1624,7 @@ if __name__ == "__main__":
                 'structure_delta_skeleton_tp_mean',
                 'structure_delta_background_mean',
                 'ms_per_batch',
+                *SKELETON_LOG_KEYS,
             ])
             loss_log_file.flush()
             batch_loss_log_file.flush()
@@ -1869,6 +1679,7 @@ if __name__ == "__main__":
             optimizer.zero_grad(set_to_none=True)
             accumulation_count = 0
             highres_stat_sums = {
+                **{key: 0.0 for key in SKELETON_LOG_KEYS},
                 "highres_structure_skeleton_raw": 0.0,
                 "structure_delta_mean": 0.0,
                 "structure_delta_abs_mean": 0.0,
@@ -2007,6 +1818,7 @@ if __name__ == "__main__":
                     f"{loss_dict['structure_delta_skeleton_tp_mean'].item():.6f}",
                     f"{loss_dict['structure_delta_background_mean'].item():.6f}",
                     f"{ms_per_batch:.3f}",
+                    *[f"{loss_dict[key].item():.8f}" for key in SKELETON_LOG_KEYS],
                 ])
                 batch_loss_log_file.flush()
 
@@ -2061,6 +1873,9 @@ if __name__ == "__main__":
                     f"Conn: {loss_dict['connectivity_loss'].item():.4f}, "
                     f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
                     f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
+                        f"S2(raw/w): {loss_dict['stage2_skeleton_raw'].item():.5f}/{loss_dict['stage2_skeleton_weighted'].item():.5f}, "
+                        f"S3(raw/w): {loss_dict['stage3_skeleton_raw'].item():.5f}/{loss_dict['stage3_skeleton_weighted'].item():.5f}, "
+                        f"SH(w): {loss_dict['highres_structure_skeleton_weighted'].item():.5f}, "
                         f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
                         f"RoadAttn: {loss_dict['road_attention_loss'].item():.4f}, "
                         f"ms/batch: {ms_per_batch:.1f}",
@@ -2140,6 +1955,10 @@ if __name__ == "__main__":
                 "[HighRes Skeleton] "
                 f"highres_skeleton_loss={highres_epoch_stats['highres_structure_skeleton_raw']:.4f}"
             )
+            highres_skeleton_msg += " " + " ".join(
+                f"{key}={highres_epoch_stats[key]:.6f}" for key in SKELETON_LOG_KEYS
+            )
+            highres_skeleton_msg += " strengths=" + str(architecture_metadata(model, args)["interaction_strengths"])
             print(highres_skeleton_msg, flush=True)
             structure_delta_msg = (
                 "[Structure Surface Delta] "
@@ -2170,6 +1989,7 @@ if __name__ == "__main__":
                 f"{highres_epoch_stats['structure_delta_weak_skeleton_fn_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_skeleton_tp_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_background_mean']:.6f}",
+                *[f"{highres_epoch_stats[key]:.8f}" for key in SKELETON_LOG_KEYS],
             ])
             loss_log_file.flush()
             
@@ -2206,6 +2026,8 @@ if __name__ == "__main__":
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
                 'epoch': epoch + 1,
+                'skeleton_feature_architecture': architecture_metadata(model, args),
+                'model_config': config.dump(),
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),
                 'ema_state_dict': ema.ema.state_dict() if ema is not None else None,
@@ -2247,8 +2069,9 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
-        model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
+        best_checkpoint = torch.load(best_path, map_location='cuda', weights_only=False)
+        require_checkpoint_architecture(best_checkpoint)
+        model.load_state_dict(best_checkpoint['model_state_dict'], strict=True)
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(
                 model,

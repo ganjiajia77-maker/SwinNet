@@ -9,7 +9,6 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from .dca_fpn_lite import DCAFPNLite
 from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
-from .keypoint_global_topology import KeypointGuidedGlobalTopology
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
 from .skeleton_guided_head import (
@@ -1320,9 +1319,13 @@ class SwinTransformerSys(nn.Module):
         self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
         self.highres_structure_channels = int(highres_structure_channels)
         self.enable_global_topology = bool(enable_global_topology)
+        if self.enable_global_topology:
+            raise ValueError("This skeleton-feature architecture removes global topology")
         self.stage_skeleton_mode = str(stage_skeleton_mode).lower()
         if self.stage_skeleton_mode not in {"direct", "prior_residual"}:
             raise ValueError("stage_skeleton_mode must be direct or prior_residual")
+        if self.return_skeleton and self.stage_skeleton_mode != "direct":
+            raise ValueError("Skeleton-feature architecture requires direct stage skeleton heads")
         self.stage_skeleton_bias_init = str(stage_skeleton_bias_init).lower()
         self.stage_skeleton_positive_prior = float(stage_skeleton_positive_prior)
         if self.stage_skeleton_bias_init not in {"zero", "prior"}:
@@ -1358,6 +1361,16 @@ class SwinTransformerSys(nn.Module):
             or self.highres_structure_fusion_mode == "post_refine_interaction"
         )
         self.enable_h3_surface_fusion = bool(enable_h3_surface_fusion)
+        if self.return_skeleton:
+            if (not self.enable_highres_structure_stream or self.highres_structure_channels != 64
+                    or embed_dim != 96 or self.structure_profile != "stage23_boundary_0626"
+                    or not self.remove_stage2_pre_topology_source
+                    or self.enable_post_refine_structure_interaction
+                    or self.highres_structure_fusion_mode != "stage23"):
+                raise ValueError(
+                    "Skeleton-feature v1 requires highres64, embed96, stage23_boundary_0626, "
+                    "removed stage2 pre-topology, fusion mode stage23, and no post-refine interaction"
+                )
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -1591,15 +1604,9 @@ class SwinTransformerSys(nn.Module):
             kernel_size=1,
             bias=True,
         )
-        self.highres_structure_fusion = nn.ModuleDict(
-            {
-                "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-                "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-            }
-        )
-        self.structure_surface_correction_head = StructureSurfaceCorrectionHead(
-            self.highres_structure_channels,
-        )
+        # High-resolution features enter through B2/B3 and the final surface fusion.
+        self.highres_structure_fusion = None
+        self.structure_surface_correction_head = None
         print(
             "[INFO] High-res structure stream: {}, source=prepatch, channels={}, fuse_stages={}, fusion_mode={}".format(
                 "enabled" if self.enable_highres_structure_stream else "disabled",
@@ -1660,15 +1667,7 @@ class SwinTransformerSys(nn.Module):
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
             if self.return_skeleton:
-                self.global_topology = KeypointGuidedGlobalTopology(
-                    channels=embed_dim,
-                    struct_channels=self.highres_structure_channels,
-                    max_nodes=global_topology_max_nodes,
-                    heads=global_topology_heads,
-                    alpha_max=global_topology_alpha_max,
-                    enabled=self.enable_global_topology,
-                    connectivity_channels=8,
-                )
+                self.global_topology = None
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,
                     hidden_channels=max(embed_dim // 2, 32),
@@ -1688,32 +1687,15 @@ class SwinTransformerSys(nn.Module):
                     ),
                     highres_structure_channels=self.highres_structure_channels,
                 )
-                if self.enable_h3_surface_fusion:
-                    self.h3_surface_proj = nn.Conv2d(
-                        decoder_structure_channels[3],
-                        embed_dim,
-                        kernel_size=1,
-                        bias=True,
-                    )
-                    self.surface_h3_fusion = nn.Conv2d(
-                        embed_dim * 2,
-                        embed_dim,
-                        kernel_size=1,
-                        bias=True,
-                    )
-                    with torch.no_grad():
-                        nn.init.zeros_(self.h3_surface_proj.bias)
-                        nn.init.zeros_(self.surface_h3_fusion.bias)
-                        self.surface_h3_fusion.weight.zero_()
-                        self.surface_h3_fusion.weight[:, :embed_dim, 0, 0].copy_(
-                            torch.eye(embed_dim)
-                        )
-                        self.surface_h3_fusion.weight[:, embed_dim:, 0, 0].normal_(
-                            mean=0.0, std=0.01
-                        )
-                else:
-                    self.h3_surface_proj = None
-                    self.surface_h3_fusion = None
+                self.surface_g3_proj = nn.Sequential(
+                    nn.Conv2d(decoder_structure_channels[3], 32, 1),
+                    nn.GroupNorm(8, 32), nn.GELU(),
+                )
+                self.surface_h_proj = nn.Sequential(
+                    nn.Conv2d(self.highres_structure_channels, 32, 1),
+                    nn.GroupNorm(8, 32), nn.GELU(),
+                )
+                self.surface_feature_delta = nn.Conv2d(embed_dim + 64, embed_dim, 1)
                 if self.structure_profile == "stage23_boundary_0626":
                     print(
                         "[INFO] Final head: surface + boundary residual only "
@@ -1735,6 +1717,9 @@ class SwinTransformerSys(nn.Module):
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
         self.apply(self._init_weights)
+        if self.return_skeleton:
+            nn.init.zeros_(self.surface_feature_delta.weight)
+            nn.init.zeros_(self.surface_feature_delta.bias)
         if self.enable_highres_structure_stream:
             skeleton_bias = 0.0
             if self.stage_skeleton_bias_init == "prior":
@@ -1812,16 +1797,6 @@ class SwinTransformerSys(nn.Module):
         return x, x_downsample, road_attentions
 
     def _highres_structure_stage_enabled(self, stage):
-        if not self.enable_highres_structure_stream:
-            return False
-        if self.highres_structure_fusion_mode not in {"stage23", "stage23_final_correction"}:
-            return False
-        if self.highres_structure_fuse_stages == "stage23":
-            return stage in (2, 3)
-        if self.highres_structure_fuse_stages == "stage2":
-            return stage == 2
-        if self.highres_structure_fuse_stages == "stage3":
-            return stage == 3
         return False
 
     def _build_highres_structure_outputs(self, structure_input):
@@ -1850,45 +1825,12 @@ class SwinTransformerSys(nn.Module):
     def _apply_highres_structure_fusion(
         self, x, highres_skeleton_feat, stage, target_hw
     ):
-        if (
-            highres_skeleton_feat is None
-            or not self._highres_structure_stage_enabled(stage)
-        ):
-            return x
-        feature_map = token_to_map(x, target_hw[0], target_hw[1])
-        feature_map = self.highres_structure_fusion[str(stage)](
-            feature_map,
-            highres_skeleton_feat,
-        )
-        return map_to_token(feature_map)
+        return x
 
     def _apply_structure_surface_correction(
         self, outputs, highres_skeleton_feat, structure_outputs
     ):
-        if (
-            not self.enable_highres_structure_stream
-            or self.highres_structure_fusion_mode
-            not in {"final_correction", "stage23_final_correction"}
-            or highres_skeleton_feat is None
-            or not isinstance(outputs, tuple)
-        ):
-            return outputs
-
-        base_surface_logits = outputs[0]
-        delta_surface_logits = self.structure_surface_correction_head(
-            highres_skeleton_feat,
-            base_surface_logits.shape[-2:],
-        )
-        final_surface_logits = base_surface_logits + delta_surface_logits
-        if structure_outputs is not None:
-            structure_outputs.append(
-                {
-                    "stage": "structure_surface_correction",
-                    "structure_surface_base_logits": base_surface_logits.detach(),
-                    "structure_surface_delta_logits": delta_surface_logits,
-                }
-            )
-        return (final_surface_logits, *outputs[1:])
+        return outputs
 
     def _decoder_structure_enabled(self, stage):
         return stage in (2, 3)
@@ -2167,6 +2109,7 @@ class SwinTransformerSys(nn.Module):
                             "highres_skeleton_feat", highres_skeleton_feat
                         )
                         self.last_stage_features["G3"] = stage3_structure_feat
+                        self.last_stage_features["B3"] = roadness_i.pop("skeleton_feature", None)
                         self.last_stage_features["H2"] = highres_skeleton_feat
                     else:
                         stage3_structure_feat = None
@@ -2269,6 +2212,7 @@ class SwinTransformerSys(nn.Module):
                         "highres_skeleton_feat", highres_skeleton_feat
                     )
                     self.last_stage_features["G2"] = stage2_structure_feat
+                    self.last_stage_features["B2"] = roadness_i.pop("skeleton_feature", None)
                     self.last_stage_features["H1"] = highres_skeleton_feat
                 x = map_to_token(x_map)
                 self._append_structure_output(
@@ -2329,81 +2273,29 @@ class SwinTransformerSys(nn.Module):
 
         return x, structure_outputs, highres_skeleton_feat
 
-    def _surface_prior_for_global_topology(self, x, highres_skeleton_feat):
-        prior_modules = (
-            self.guided_head.surface_proj,
-            self.guided_head.surface_branch,
-            self.guided_head.surface_refine,
-            self.guided_head.surface_head,
-        )
-        if getattr(
-            self.guided_head,
-            "enable_post_refine_structure_interaction",
-            False,
-        ):
-            prior_modules = (
-                *prior_modules,
-                self.guided_head.post_refine_structure_interaction,
-            )
-        prior_training = [module.training for module in prior_modules]
-        for module in prior_modules:
-            module.eval()
-        try:
-            with torch.no_grad():
-                surface_feat = self.guided_head.surface_branch(
-                    self.guided_head.surface_proj(x)
-                )
-                surface_feat = self.guided_head.surface_refine(surface_feat)
-                surface_feat = self.guided_head._apply_post_refine_structure_interaction(
-                    surface_feat,
-                    highres_skeleton_feat,
-                )
-                return torch.sigmoid(self.guided_head.surface_head(surface_feat))
-        finally:
-            for module, was_training in zip(prior_modules, prior_training):
-                module.train(was_training)
-
     def up_x4(self, x, structure_outputs=None, highres_skeleton_feat=None):
         H, W = self.patches_resolution
         B, L, C = x.shape
         assert L == H * W, "input features has wrong size"
 
         if self.final_upsample == "expand_first":
+            if self.return_skeleton:
+                g3 = self.last_stage_features.get("G3")
+                if g3 is None or highres_skeleton_feat is None:
+                    raise RuntimeError("Final surface fusion requires G3 and F_H2")
+                decoder_feature = token_to_map(x, H, W)
+                if g3.shape[-2:] != (H, W) or highres_skeleton_feat.shape[-2:] != (H, W):
+                    raise RuntimeError("G3/F_H2 spatial shape must equal decoder resolution")
+                delta = self.surface_feature_delta(torch.cat([
+                    decoder_feature,
+                    self.surface_g3_proj(g3),
+                    self.surface_h_proj(highres_skeleton_feat),
+                ], dim=1))
+                x = map_to_token(decoder_feature + delta)
             x = self.up(x)
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                if self.enable_global_topology and highres_skeleton_feat is not None:
-                    surface_prob = self._surface_prior_for_global_topology(
-                        x,
-                        highres_skeleton_feat,
-                    )
-                    connectivity_feature = self._latest_local_topology_features(
-                        structure_outputs
-                    )
-                    x = self.global_topology.forward_feature_anchors(
-                        x,
-                        highres_skeleton_feat,
-                        surface_prob,
-                        connectivity_feature=connectivity_feature,
-                    )
-                if (
-                    self.enable_h3_surface_fusion
-                    and self.h3_surface_proj is not None
-                    and self.surface_h3_fusion is not None
-                ):
-                    g3 = self.last_stage_features.get("G3")
-                    if g3 is not None:
-                        h3_surface = self.h3_surface_proj(g3)
-                        h3_surface = F.interpolate(
-                            h3_surface,
-                            size=x.shape[-2:],
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        x = self.surface_h3_fusion(
-                            torch.cat([x, h3_surface], dim=1)
-                        )
                 x = self.guided_head(x, z_struct=highres_skeleton_feat)
             else:
                 x = self.output(x)

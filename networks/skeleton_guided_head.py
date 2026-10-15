@@ -29,20 +29,20 @@ class ConvBNReLU(nn.Module):
         return self.block(x)
 
 
-class BidirectionalSkeletonFeatureFusion(nn.Module):
+class BidirectionalSkeletonBranchInteraction(nn.Module):
     def __init__(self, highres_channels, stage_channels):
         super().__init__()
-        self.highres_refine = ConvBNReLU(highres_channels, highres_channels)
-        self.stage_refine = ConvBNReLU(stage_channels, stage_channels)
         self.stage_to_highres = nn.Sequential(
-            nn.Conv2d(stage_channels, highres_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(highres_channels),
+            nn.GroupNorm(8, stage_channels),
+            nn.Conv2d(stage_channels, highres_channels, kernel_size=1),
         )
         self.highres_to_stage = nn.Sequential(
-            nn.Conv2d(highres_channels, stage_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(stage_channels),
+            nn.GroupNorm(8, highres_channels),
+            nn.Conv2d(highres_channels, stage_channels, kernel_size=1),
         )
-        self.activation = nn.GELU()
+        self.stage_restore = nn.Conv2d(stage_channels, stage_channels, kernel_size=1, bias=False)
+        self.alpha = nn.Parameter(torch.tensor(0.05))
+        self.beta = nn.Parameter(torch.tensor(0.05))
 
     def forward(self, highres_feature, stage_feature):
         if highres_feature.shape[-2:] != stage_feature.shape[-2:]:
@@ -52,15 +52,11 @@ class BidirectionalSkeletonFeatureFusion(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-        highres_refined = self.highres_refine(highres_feature)
-        stage_refined = self.stage_refine(stage_feature)
-        updated_highres = self.activation(
-            highres_refined + self.stage_to_highres(stage_refined)
-        )
-        updated_stage = self.activation(
-            stage_refined + self.highres_to_stage(highres_refined)
-        )
-        return updated_stage, updated_highres
+        # Both directions read the same pre-interaction features.
+        updated_highres = highres_feature + self.alpha * self.stage_to_highres(stage_feature)
+        updated_stage = stage_feature + self.beta * self.highres_to_stage(highres_feature)
+        stage_delta = self.stage_restore(updated_stage - stage_feature)
+        return updated_stage, updated_highres, stage_delta
 
 
 class SkeletonSpatialHead(nn.Module):
@@ -81,12 +77,15 @@ class SkeletonSpatialHead(nn.Module):
         )
         self.out = nn.Conv2d(channels, 1, kernel_size=1)
 
-    def forward(self, x):
+    def forward_features(self, x):
         x = self.proj(x)
         x = self.context(x)
         x = self.depthwise(x)
         x = self.dir_fuse(self.dir_h(x) + self.dir_v(x))
-        return self.out(x)
+        return x
+
+    def forward(self, x):
+        return self.out(self.forward_features(x))
 
 
 class FinalSkeletonAuxHead(nn.Module):
@@ -680,11 +679,11 @@ class DecoderStructureRefinement(nn.Module):
             ConvBNReLU(channels, channels),
         )
         if highres_structure_channels is not None:
-            self.highres_skeleton_fusion = BidirectionalSkeletonFeatureFusion(
+            self.skeleton_feature_interaction = BidirectionalSkeletonBranchInteraction(
                 int(highres_structure_channels), channels
             )
         else:
-            self.highres_skeleton_fusion = None
+            self.skeleton_feature_interaction = None
         if previous_structure_channels is not None:
             self.previous_structure_fusion = ConvBNReLU(
                 channels + int(previous_structure_channels),
@@ -785,14 +784,14 @@ class DecoderStructureRefinement(nn.Module):
             structure_feat = self.previous_structure_fusion(
                 torch.cat([structure_feat, previous_structure_feat], dim=1)
             )
-        if (
-            self.highres_skeleton_fusion is not None
-            and highres_skeleton_feat is not None
-        ):
-            structure_feat, highres_skeleton_feat = self.highres_skeleton_fusion(
-                highres_skeleton_feat,
-                structure_feat,
+        skeleton_feature = self.skeleton_head.forward_features(structure_feat)
+        if self.skeleton_feature_interaction is not None:
+            if highres_skeleton_feat is None:
+                raise ValueError("Skeleton branch interaction requires F_H input")
+            skeleton_feature, highres_skeleton_feat, stage_delta = (
+                self.skeleton_feature_interaction(highres_skeleton_feat, skeleton_feature)
             )
+            structure_feat = structure_feat + stage_delta
         if disable_skeleton_prediction:
             if skeleton_prior is None:
                 skeleton_logits = None
@@ -804,11 +803,11 @@ class DecoderStructureRefinement(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
-                skeleton_delta = self.skeleton_head(structure_feat)
+                skeleton_delta = self.skeleton_head.out(skeleton_feature)
                 skeleton_logits = resized_prior_logits + skeleton_delta
                 skeleton_prob = torch.sigmoid(skeleton_logits)
         else:
-            skeleton_logits = self.skeleton_head(structure_feat)
+            skeleton_logits = self.skeleton_head.out(skeleton_feature)
             skeleton_prob = torch.sigmoid(skeleton_logits)
         runtime_skeleton = skeleton_prob
         runtime_gate_skeleton = skeleton_prob
@@ -918,6 +917,7 @@ class DecoderStructureRefinement(nn.Module):
             "gate_residual": gate_residual,
             "structure_gate_final": structure_gate,
             "structure_feat": structure_feat,
+            "skeleton_feature": skeleton_feature,
         }
         if highres_skeleton_feat is not None:
             diagnostics["highres_skeleton_feat"] = highres_skeleton_feat

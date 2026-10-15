@@ -38,6 +38,9 @@ class RoadSkeletonDataset(Dataset):
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
         self.epoch = 0
+        # Persistent DataLoader workers hold dataset copies. Share the epoch so
+        # each worker samples a new crop for the same image on the next epoch.
+        self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
         self.image_dir = self._resolve_image_dir(root_dir, split)
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -79,6 +82,7 @@ class RoadSkeletonDataset(Dataset):
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
+        self._shared_epoch.fill_(self.epoch)
 
     def _load_crop_list(self, crop_list_path):
         if not crop_list_path:
@@ -328,7 +332,7 @@ class RoadSkeletonDataset(Dataset):
             crop_ordinal = idx % self.random_crops_per_image
             rng_seed = (
                 self.random_crop_seed
-                + self.epoch * 1000003
+                + int(self._shared_epoch.item()) * 1000003
                 + image_index * 9176
                 + crop_ordinal * 101
             )

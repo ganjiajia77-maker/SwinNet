@@ -1,0 +1,16 @@
+{
+  "training_command_matches_protocol": true,
+  "manifest_checkpoint_verified": true,
+  "saved_config_restored_by_test_entry": true,
+  "native_mask_hw": [
+    1500,
+    1500
+  ],
+  "val_export_thresholds": [
+    0.2,
+    0.3
+  ],
+  "validation_skips_topology": true,
+  "test_topology_pipeline": true,
+  "note": "Synthetic one-image correctness check; no performance claims; test mask copied from val export to exercise evaluator only."
+}

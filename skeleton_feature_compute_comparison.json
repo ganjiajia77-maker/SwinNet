@@ -1,0 +1,28 @@
+{
+  "method": "PyTorch 2.11 FlopCounterMode, FP32 eval forward, batch1 RGB512; matmul/conv FLOPs incl multiply+add; not a full runtime cost model",
+  "base": {
+    "base_commit": "599a410de8d341850e1810417307e4b3bbdfc82d",
+    "input": [
+      1,
+      3,
+      512,
+      512
+    ],
+    "original_instantiated_parameters": 77215744,
+    "global_topology_parameters": 101295,
+    "original_forward_flops": 410806171648,
+    "no_global_parameters": 77114449,
+    "no_global_forward_flops": 327828883456
+  },
+  "new": {
+    "parameters": 76499268,
+    "forward_flops_batch1_512": 299408279552
+  },
+  "delta_vs_no_global": {
+    "parameters": -615181,
+    "parameter_percent": -0.7977506264746803,
+    "forward_flops": -28420603904,
+    "forward_flops_percent": -8.669341030719313
+  },
+  "note": "No-global baseline uses exact 599a410 with old H0 fusion and physically removes disabled KeypointGuidedGlobalTopology. Parameter totals include other instantiated modules. FLOP counter omits some normalization/elementwise/interpolation operations; no speed or accuracy claim."
+}

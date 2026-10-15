@@ -695,8 +695,11 @@ class SurfaceStructureLoss(nn.Module):
         direction_gt=None,
         valid_mask=None,
     ):
+        zero = skeleton_gt.sum() * 0.0
+        skeleton_stats = {f"stage{i}_skeleton_{kind}": zero.detach()
+                          for i in (2, 3) for kind in ("raw", "weighted")}
         if not stage_outputs:
-            return skeleton_gt.sum() * 0.0
+            return zero, skeleton_stats
 
         total = skeleton_gt.sum() * 0.0
         for idx, stage_output in enumerate(stage_outputs):
@@ -752,6 +755,12 @@ class SurfaceStructureLoss(nn.Module):
                     stage_skeleton_logits,
                     stage_skel_soft,
                 )
+                if stage_index in (2, 3):
+                    skeleton_stats[f"stage{stage_index}_skeleton_raw"] = loss_skeleton_stage.detach()
+                    skeleton_stats[f"stage{stage_index}_skeleton_weighted"] = (
+                        stage_weight * self.stage_skeleton_loss_factor
+                        * self.stage_skeleton_only_loss_factor * loss_skeleton_stage
+                    ).detach()
             else:
                 loss_skeleton_stage = reference_logits.sum() * 0.0
             loss_connectivity_stage = reference_logits.sum() * 0.0
@@ -807,7 +816,7 @@ class SurfaceStructureLoss(nn.Module):
                 + direction_factor * loss_direction_stage
             )
 
-        return total
+        return total, skeleton_stats
 
     def build_direction_target(self, skeleton):
         skel = (skeleton > 0.5).to(dtype=skeleton.dtype)
@@ -863,6 +872,7 @@ class SurfaceStructureLoss(nn.Module):
         stage_outputs,
         skeleton_gt,
         skeleton_dilate_gt,
+        stage_skeleton_gt=None,
     ):
         if not stage_outputs or self.highres_structure_skeleton_weight <= 0:
             zero = skeleton_gt.sum() * 0.0
@@ -875,17 +885,14 @@ class SurfaceStructureLoss(nn.Module):
             skeleton_logits = stage_output.get("highres_structure_skeleton")
             if skeleton_logits is None:
                 continue
+            if stat_count:
+                raise ValueError("Exactly one final high-resolution skeleton output is allowed")
             target_size = skeleton_logits.shape[-2:]
-            stage_skel = build_stage_skeleton_target(skeleton_gt, target_size)
-            stage_skel_dilate = build_stage_skeleton_target(
-                skeleton_dilate_gt,
-                target_size,
+            source_skeleton = stage_skeleton_gt if stage_skeleton_gt is not None else skeleton_gt
+            _, stage_skel_soft = build_soft_stage_skeleton_target(
+                source_skeleton, target_size
             )
-            loss_skeleton, _, _ = self.skeleton_pixel_loss(
-                skeleton_logits,
-                stage_skel,
-                stage_skel_dilate,
-            )
+            loss_skeleton = self.soft_stage_skeleton_loss(skeleton_logits, stage_skel_soft)
             total = total + self.highres_structure_skeleton_weight * loss_skeleton
             raw_total = raw_total + loss_skeleton
             stat_count += 1
@@ -1066,7 +1073,7 @@ class SurfaceStructureLoss(nn.Module):
         else:
             loss_skeleton_stage = surface_logits.sum() * 0.0
 
-        loss_stage_structure = self.stage_structure_loss(
+        loss_stage_structure, stage_skeleton_stats = self.stage_structure_loss(
             stage_outputs,
             skeleton_gt,
             skeleton_dilate_gt,
@@ -1081,6 +1088,7 @@ class SurfaceStructureLoss(nn.Module):
             stage_outputs,
             skeleton_gt,
             skeleton_dilate_gt,
+            stage_skeleton_gt=stage_skeleton_gt,
         )
         delta_stats = self.structure_surface_delta_stats(
             stage_outputs,
@@ -1111,6 +1119,8 @@ class SurfaceStructureLoss(nn.Module):
             "road_attention_loss": loss_road_attention.detach(),
             "loss_highres_structure_skeleton": loss_highres_structure_skeleton.detach(),
             "highres_structure_skeleton_raw": highres_stats["highres_structure_skeleton_raw"],
+            "highres_structure_skeleton_weighted": loss_highres_structure_skeleton.detach(),
+            **stage_skeleton_stats,
             "structure_delta_mean": delta_stats["structure_delta_mean"],
             "structure_delta_abs_mean": delta_stats["structure_delta_abs_mean"],
             "structure_delta_abs_max": delta_stats["structure_delta_abs_max"],
