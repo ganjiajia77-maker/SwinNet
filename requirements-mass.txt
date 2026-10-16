@@ -1,0 +1,10 @@
+# Install into the existing swinunet environment; keep its PyTorch installation.
+numpy
+scipy
+opencv-python
+timm
+einops
+yacs
+PyYAML
+tqdm
+Pillow

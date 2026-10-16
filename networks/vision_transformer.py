@@ -36,6 +36,7 @@ def get_topology_coefficients(model):
     swin_unet = module.swin_unet
     guided_head = swin_unet.guided_head
     coefficients = {
+        "surface_only": bool(getattr(swin_unet, "surface_only", False)),
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
         "highres_structure_stream": {
@@ -49,6 +50,9 @@ def get_topology_coefficients(model):
     }
 
     for stage in (2, 3):
+        if getattr(swin_unet, "surface_only", False):
+            coefficients[f"decoder_stage{stage}"] = {"gamma1": 0.0, "structure_enabled": False}
+            continue
         structure_block = swin_unet.decoder_structure_blocks[str(stage)]
         coefficients[f"decoder_stage{stage}"] = {
             "gamma1": float(structure_block.gamma1.detach().cpu()),
@@ -81,6 +85,8 @@ def apply_structure_profile_runtime(model):
     module = model.module if hasattr(model, "module") else model
     swin_unet = module.swin_unet
     guided_head = swin_unet.guided_head
+    if getattr(swin_unet, "surface_only", False):
+        return
     if guided_head.enable_final_structure:
         return
 
@@ -156,6 +162,8 @@ def load_topology_checkpoint_state(
     checkpoint_version,
     strict=True,
 ):
+    if getattr(_core_swin_unet(model), "surface_only", False):
+        return model.load_state_dict(state_dict, strict=strict)
     model_state = model.state_dict()
     highres_structure_missing_prefixes = (
         "swin_unet.highres_structure_encoder.",
@@ -555,7 +563,7 @@ class SwinUnet(nn.Module):
                  enable_e128_stage_fusion=False,
                   stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False):
+                 remove_stage2_pre_topology_source=False, surface_only=False):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -605,6 +613,9 @@ class SwinUnet(nn.Module):
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
+        if surface_only:
+            from .surface_only import configure_surface_only
+            configure_surface_only(self.swin_unet)
     def forward(
         self,
         x,

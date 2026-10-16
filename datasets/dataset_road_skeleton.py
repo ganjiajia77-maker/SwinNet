@@ -30,6 +30,7 @@ class RoadSkeletonDataset(Dataset):
         random_crops_per_image=1,
         random_crop_seed=1234,
         crop_list_path="",
+        surface_only=False,
     ):
         super().__init__()
 
@@ -38,6 +39,7 @@ class RoadSkeletonDataset(Dataset):
         self.image_size = image_size
         self.source_patch_size = source_patch_size
         self.transform = transform
+        self.surface_only = bool(surface_only)
         self.tile_size = tile_size
         self.tile_stride = tile_stride if tile_stride is not None else tile_size
         self.augment = bool(augment and split == "train")
@@ -380,8 +382,12 @@ class RoadSkeletonDataset(Dataset):
             image = self._augment_color_degrade(image, rng=rng)
 
         mask = (mask > 127).astype(np.float32)
-        skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
-        skeleton_dilate = (self._dilate_skeleton(skeleton_hard * 255, iterations=1) > 127).astype(np.float32)
+        if self.surface_only:
+            skeleton_hard = np.zeros_like(mask)
+            skeleton_dilate = np.zeros_like(mask)
+        else:
+            skeleton_hard = (self._skeletonize_binary(mask) > 127).astype(np.float32)
+            skeleton_dilate = (self._dilate_skeleton(skeleton_hard * 255, iterations=1) > 127).astype(np.float32)
 
         if self.random_crop_train:
             crop_size = self.tile_size or self.image_size

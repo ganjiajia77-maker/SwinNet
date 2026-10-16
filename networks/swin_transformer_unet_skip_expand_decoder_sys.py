@@ -2100,6 +2100,10 @@ class SwinTransformerSys(nn.Module):
                 x = torch.cat([x, skip_refined], -1)
                 x = self.concat_back_dim[inx](x)
 
+            if getattr(self, "surface_only", False):
+                x = layer_up(x)
+                continue
+
             decoder_structure_gate_enabled = (
                 self._decoder_structure_enabled(inx)
                 and isinstance(layer_up, BasicLayer_up)

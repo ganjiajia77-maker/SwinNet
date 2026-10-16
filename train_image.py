@@ -74,6 +74,7 @@ parser.add_argument('--tiny_overfit_samples', default=0, type=int, help='use the
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
 parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final skeleton threshold for validation')
+parser.add_argument('--surface_only', action='store_true', help='same backbone with only the original surface prediction and loss')
 parser.add_argument('--val_interval', type=int, default=1, help='run validation every N epochs; always validates on final epoch')
 parser.add_argument('--finetune_epochs', type=int, default=0, help='when resuming, stop after this many extra epochs while keeping the original LR schedule length')
 parser.add_argument('--trend_val_every_steps', type=int, default=0, help='run fixed-subset topology validation every N training batches; 0 disables it')
@@ -296,6 +297,8 @@ if args.enable_global_topology and not args.enable_highres_structure_stream:
 
 
 def get_final_loss_weights(args):
+    if args.surface_only:
+        return dict(skeleton_weight=0.0, connectivity_weight=0.0, boundary_weight=0.0)
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         weights = {
             "skeleton_weight": 0.0,
@@ -343,8 +346,8 @@ def get_graph_outputs_from_model(model):
 
 
 def build_criterion(args, loss_weights, device):
-    stage2_weight = args.stage2_skeleton_weight
-    stage3_weight = args.stage3_skeleton_weight
+    stage2_weight = 0.0 if args.surface_only else args.stage2_skeleton_weight
+    stage3_weight = 0.0 if args.surface_only else args.stage3_skeleton_weight
     boundary_weight = 0.0
 
     return SurfaceStructureLoss(
@@ -361,11 +364,11 @@ def build_criterion(args, loss_weights, device):
             stage2_weight,
             stage3_weight,
         ),
-        road_attention_weight=args.road_attention_weight,
+        road_attention_weight=0.0 if args.surface_only else args.road_attention_weight,
         stage_connectivity_factor=args.stage_connectivity_factor,
         stage_direction_factor=args.stage_direction_factor,
         highres_structure_skeleton_weight=(
-            args.highres_structure_skeleton_weight
+            0.0 if args.surface_only else args.highres_structure_skeleton_weight
         ),
         use_legacy_stage_connectivity_loss=(
             args.structure_profile in {
@@ -373,7 +376,7 @@ def build_criterion(args, loss_weights, device):
                 STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
             }
         ),
-        use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
+        use_masked_connectivity_center_experiment=(args.masked_connectivity_center_experiment and not args.surface_only),
         connectivity_pos_weight=args.connectivity_pos_weight,
         skeleton_pos_weight=args.skeleton_pos_weight,
         directional_pos_weight_cardinal=args.directional_pos_weight_cardinal,
@@ -407,6 +410,17 @@ def build_criterion(args, loss_weights, device):
 
 
 def format_training_config_lines(args, loss_weights):
+    if args.surface_only:
+        return [
+            "  Ablation: same e2020d9 backbone, surface prediction only",
+            "  Encoder/decoder Swin depths, PatchEmbed, PatchMerging, bottleneck and DCA skips: unchanged",
+            "  A1/A2, S/C/D heads, structure feedback, high-res/E128, H3 fusion, boundary and global topology: removed",
+            f"  Only loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
+            f"  Crop: native {args.source_patch_size} -> random {args.img_size}; crops/image={args.random_crops_per_image}",
+            f"  Batch={args.batch_size}, accumulation={args.accumulation_steps}, epochs={args.max_epochs}, EMA={args.use_ema}, AMP={args.amp_dtype}",
+            f"  Seed={args.seed}; pretrain={args.pretrain_ckpt}",
+            f"  Pretrained LR={args.pretrained_lr:g}->{args.pretrained_min_lr:g}; new LR={args.new_lr:g}->{args.new_min_lr:g}",
+        ]
     lines = [
         f"  结构配置: {args.structure_profile}",
         f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
@@ -572,6 +586,7 @@ def inherit_resume_architecture_args(args):
 
     saved_args = checkpoint["args"]
     for name, cast in (
+        ("surface_only", bool),
         ("surface_focal_gamma", float),
         ("amp_dtype", str),
         ("stage3_gate_topology_gradient_ratio", float),
@@ -1258,7 +1273,8 @@ if __name__ == "__main__":
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
-                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
+                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+                    surface_only=args.surface_only).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
@@ -1415,6 +1431,7 @@ if __name__ == "__main__":
         random_crop_train=args.random_crop_train,
         random_crops_per_image=args.random_crops_per_image,
         random_crop_seed=args.seed,
+        surface_only=args.surface_only,
     )
     if args.tiny_overfit_samples > 0:
         tiny_count = min(int(args.tiny_overfit_samples), len(train_dataset))
@@ -1455,6 +1472,7 @@ if __name__ == "__main__":
         source_patch_size=args.source_patch_size,
         return_full_image=not args.direct_resize_train and not args.val_crop_list,
         crop_list_path=args.val_crop_list,
+        surface_only=args.surface_only,
     )
     val_loader = DataLoader(
         val_dataset,
