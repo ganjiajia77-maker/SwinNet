@@ -1,0 +1,53 @@
+{
+  "surface_baseline": "eb2da24d768b7f643e4fb288e3736693862c1fe8",
+  "shared_initial_state_exact": true,
+  "constructor_rng_state_exact": true,
+  "loaded_imagenet_tensors": 225,
+  "baseline_parameters": 74354667,
+  "auxiliary_parameters": 74985581,
+  "encoder_swin_depths": [
+    2,
+    2,
+    6,
+    2
+  ],
+  "decoder_swin_depths": [
+    6,
+    2,
+    2
+  ],
+  "surface_logits_exact_eval_and_train": true,
+  "head_output_shapes": {
+    "S2": [
+      2,
+      1,
+      128,
+      128
+    ],
+    "S3": [
+      2,
+      1,
+      128,
+      128
+    ]
+  },
+  "changing_auxiliary_predictions_cannot_change_surface": true,
+  "exact_loss_decomposition": {
+    "surface": 5.191985130310059,
+    "S2_raw": 1.6354525089263916,
+    "S3_raw": 1.6354525089263916,
+    "S2_weighted": 0.013083620928227901,
+    "S3_weighted": 0.019625430926680565,
+    "total": 5.22469425201416
+  },
+  "S_only_shared_gradient_abs_sum_after_readout_update": {
+    "encoder_stage1": 9.197408096531245e-05,
+    "decoder_stage2": 0.0006606360509044951,
+    "decoder_stage3": 0.00039613337709387686
+  },
+  "S_only_loss_has_no_surface_head_gradient": true,
+  "input_gradient_ratio_exact_half_both_heads": true,
+  "trained_surface_baseline_resume_rejected": true,
+  "strict_cross_variant_state_load_rejected": true,
+  "checkpoint_roundtrip_exact": true
+}

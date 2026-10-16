@@ -2102,6 +2102,16 @@ class SwinTransformerSys(nn.Module):
 
             if getattr(self, "surface_only", False):
                 x = layer_up(x)
+                if getattr(self, "skeleton_aux_only", False) and inx in (2, 3):
+                    height, width = self.patches_resolution
+                    feature = token_to_map(x, height, width)
+                    skeleton_logits = self.skeleton_aux_heads[str(inx)](feature)
+                    structure_outputs.append({
+                        "stage": inx,
+                        "skeleton": skeleton_logits,
+                        "refinement_step": 1,
+                        "stage_loss_scale": 1.0,
+                    })
                 continue
 
             decoder_structure_gate_enabled = (

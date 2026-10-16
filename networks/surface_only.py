@@ -2,6 +2,50 @@
 
 import torch.nn as nn
 
+from .skeleton_guided_head import scale_gradient
+
+
+SKELETON_AUX_ARCHITECTURE = "e202_surface_skeleton_aux_v1"
+
+
+def skeleton_aux_metadata(core, args):
+    if not getattr(core, "skeleton_aux_only", False):
+        return None
+    return dict(
+        architecture=SKELETON_AUX_ARCHITECTURE,
+        surface_baseline_commit="eb2da24d768b7f643e4fb288e3736693862c1fe8",
+        stages=[2, 3], feature_hw=[args.img_size // 4] * 2, feature_channels=96,
+        inputs="layer_up output, before any structure processing",
+        head="original independent structure_branch + skeleton_head",
+        feedback=False, stage_transfer=False, surface_fusion=False,
+        gradient_ratios={str(i): core.skeleton_aux_heads[str(i)].gradient_ratio for i in (2, 3)},
+        weights={"S2": args.stage2_skeleton_weight, "S3": args.stage3_skeleton_weight},
+        target="original Gaussian soft stage skeleton target, BCE+Dice, pos_weight2",
+    )
+
+
+def require_skeleton_aux_checkpoint(checkpoint):
+    saved = checkpoint.get("args", {})
+    metadata = checkpoint.get("skeleton_aux_protocol") or {}
+    if (not saved.get("surface_only") or not saved.get("skeleton_aux_only")
+            or metadata.get("architecture") != SKELETON_AUX_ARCHITECTURE):
+        raise ValueError("Expected the independent S2/S3 auxiliary experiment checkpoint; "
+                         "do not resume from the trained surface-only baseline")
+    return metadata
+
+
+class SkeletonAuxiliaryHead(nn.Module):
+    """The original structure/skeleton submodules, with no feedback outputs."""
+    def __init__(self, original):
+        super().__init__()
+        self.structure_branch = original.structure_branch
+        self.skeleton_head = original.skeleton_head
+        self.gradient_ratio = original.skeleton_gradient_ratio
+
+    def forward(self, feature):
+        feature = scale_gradient(feature, self.gradient_ratio)
+        return self.skeleton_head(self.structure_branch(feature))
+
 
 class SurfaceOnlyHead(nn.Module):
     def __init__(self, original):
@@ -22,9 +66,17 @@ class SurfaceOnlyHead(nn.Module):
         return logits, None, None, None
 
 
-def configure_surface_only(core):
+def configure_surface_only(core, skeleton_aux_only=False):
     # Prune after the original constructor consumes RNG, preserving shared tensors.
+    # Reuse the already initialized heads before their parent blocks are removed.
+    # The wrappers allocate no random tensors and preserve the baseline RNG state.
+    if skeleton_aux_only:
+        core.skeleton_aux_heads = nn.ModuleDict({
+            str(stage): SkeletonAuxiliaryHead(core.decoder_structure_blocks[str(stage)])
+            for stage in (2, 3)
+        })
     core.surface_only = True
+    core.skeleton_aux_only = bool(skeleton_aux_only)
     for name in ("enable_highres_structure_stream", "enable_e128_stage_fusion",
                  "enable_h3_surface_fusion", "enable_global_topology",
                  "enable_post_refine_structure_interaction", "use_stage3_global_context"):
@@ -53,3 +105,6 @@ def configure_surface_only(core):
     core.guided_head = SurfaceOnlyHead(core.guided_head)
     print("[ABLATION] surface_only: A1/A2, S/C/D, structure feedback, high-res/E128, "
           "H3 fusion, boundary residual and global topology removed", flush=True)
+    if skeleton_aux_only:
+        print("[ABLATION] independent S2/S3 auxiliary heads after layer_up; "
+              "no feedback/transfer; shared decoder gradient ratios=0.5/0.5", flush=True)

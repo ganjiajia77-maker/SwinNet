@@ -30,6 +30,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset, set_dataset_epoc
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
+from networks.surface_only import skeleton_aux_metadata, require_skeleton_aux_checkpoint
 
 
 def seed_worker(worker_id):
@@ -75,6 +76,7 @@ parser.add_argument('--print_freq', default=10, type=int, help='print loss every
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
 parser.add_argument('--skeleton_threshold', default=0.5, type=float, help='final skeleton threshold for validation')
 parser.add_argument('--surface_only', action='store_true', help='same backbone with only the original surface prediction and loss')
+parser.add_argument('--skeleton_aux_only', action='store_true', help='add independent S2/S3 supervision to the surface-only baseline; no feedback')
 parser.add_argument('--val_interval', type=int, default=1, help='run validation every N epochs; always validates on final epoch')
 parser.add_argument('--finetune_epochs', type=int, default=0, help='when resuming, stop after this many extra epochs while keeping the original LR schedule length')
 parser.add_argument('--trend_val_every_steps', type=int, default=0, help='run fixed-subset topology validation every N training batches; 0 disables it')
@@ -346,8 +348,8 @@ def get_graph_outputs_from_model(model):
 
 
 def build_criterion(args, loss_weights, device):
-    stage2_weight = 0.0 if args.surface_only else args.stage2_skeleton_weight
-    stage3_weight = 0.0 if args.surface_only else args.stage3_skeleton_weight
+    stage2_weight = 0.0 if args.surface_only and not args.skeleton_aux_only else args.stage2_skeleton_weight
+    stage3_weight = 0.0 if args.surface_only and not args.skeleton_aux_only else args.stage3_skeleton_weight
     boundary_weight = 0.0
 
     return SurfaceStructureLoss(
@@ -410,6 +412,18 @@ def build_criterion(args, loss_weights, device):
 
 
 def format_training_config_lines(args, loss_weights):
+    if args.skeleton_aux_only:
+        return [
+            "  Ablation: eb2da24 surface-only backbone + independent post-layer_up S2/S3 auxiliary heads",
+            "  Surface forward and initialization: identical to the same-seed surface-only baseline",
+            "  C/D, gates, stage transfer, structure feedback, high-res and global topology: absent",
+            "  Loss: original surface + 0.008*original soft skeleton S2 + 0.012*original soft skeleton S3",
+            "  Skeleton BCE pos_weight=2; input gradient ratios=0.5/0.5; no detached head inputs",
+            f"  Crop: native {args.source_patch_size} -> random {args.img_size}; crops/image={args.random_crops_per_image}",
+            f"  Batch={args.batch_size}, accumulation={args.accumulation_steps}, epochs={args.max_epochs}, EMA={args.use_ema}, AMP={args.amp_dtype}",
+            f"  Seed={args.seed}; pretrain={args.pretrain_ckpt}",
+            f"  Pretrained LR={args.pretrained_lr:g}->{args.pretrained_min_lr:g}; new LR={args.new_lr:g}->{args.new_min_lr:g}",
+        ]
     if args.surface_only:
         return [
             "  Ablation: same e2020d9 backbone, surface prediction only",
@@ -574,7 +588,7 @@ def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -585,8 +599,11 @@ def inherit_resume_architecture_args(args):
         return
 
     saved_args = checkpoint["args"]
+    if args.skeleton_aux_only or saved_args.get("skeleton_aux_only"):
+        require_skeleton_aux_checkpoint(checkpoint)
     for name, cast in (
         ("surface_only", bool),
+        ("skeleton_aux_only", bool),
         ("surface_focal_gamma", float),
         ("amp_dtype", str),
         ("stage3_gate_topology_gradient_ratio", float),
@@ -1223,6 +1240,18 @@ if __name__ == "__main__":
         if args.img_size > args.source_patch_size:
             parser.error("random native crops require --img_size <= --source_patch_size")
     apply_structure_profile_defaults(args)
+    if args.skeleton_aux_only:
+        required = dict(surface_only=True, stage2_skeleton_weight=.008, stage3_skeleton_weight=.012,
+                        stage_skeleton_loss_factor=1., stage_skeleton_only_loss_factor=1.,
+                        skeleton_pos_weight=2., stage2_skeleton_gradient_ratio=.5,
+                        stage3_skeleton_gradient_ratio=.5)
+        mismatch = {key: [getattr(args, key), value] for key, value in required.items()
+                    if getattr(args, key) != value}
+        if mismatch:
+            raise ValueError(f"Independent skeleton auxiliary protocol mismatch: {mismatch}")
+        if args.warm_start_ckpt or args.no_pretrain:
+            raise ValueError("This comparison starts from the same ImageNet initialization; "
+                             "warm_start_ckpt and no_pretrain are not allowed")
 
     # 加载配置
     config = get_config(args)
@@ -1274,7 +1303,8 @@ if __name__ == "__main__":
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
-                    surface_only=args.surface_only).to(device)
+                    surface_only=args.surface_only,
+                    skeleton_aux_only=args.skeleton_aux_only).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
@@ -1365,7 +1395,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1431,7 +1461,7 @@ if __name__ == "__main__":
         random_crop_train=args.random_crop_train,
         random_crops_per_image=args.random_crops_per_image,
         random_crop_seed=args.seed,
-        surface_only=args.surface_only,
+        surface_only=args.surface_only and not args.skeleton_aux_only,
     )
     if args.tiny_overfit_samples > 0:
         tiny_count = min(int(args.tiny_overfit_samples), len(train_dataset))
@@ -1472,7 +1502,7 @@ if __name__ == "__main__":
         source_patch_size=args.source_patch_size,
         return_full_image=not args.direct_resize_train and not args.val_crop_list,
         crop_list_path=args.val_crop_list,
-        surface_only=args.surface_only,
+        surface_only=args.surface_only and not args.skeleton_aux_only,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -1497,7 +1527,7 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             checkpoint_state = checkpoint["model_state_dict"]
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -1778,7 +1808,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -2251,6 +2281,7 @@ if __name__ == "__main__":
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
                 'epoch': epoch + 1,
+                'skeleton_aux_protocol': skeleton_aux_metadata(model.swin_unet, args),
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),
                 'ema_state_dict': ema.ema.state_dict() if ema is not None else None,
@@ -2292,7 +2323,7 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location='cuda', weights_only=False)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(

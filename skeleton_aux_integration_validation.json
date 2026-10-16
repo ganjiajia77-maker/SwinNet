@@ -1,0 +1,13 @@
+{
+  "checkpoint_manifest_verified": true,
+  "actual_val_and_test_sliding_inference_passed": true,
+  "native_mask_hw": [
+    1500,
+    1500
+  ],
+  "tile": 512,
+  "stride": 256,
+  "val_selection_only": true,
+  "test_selected_threshold_topology_passed": true,
+  "note": "One synthetic image per split; freshly initialized model, not a performance evaluation; no formal training."
+}

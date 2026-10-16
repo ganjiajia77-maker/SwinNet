@@ -25,6 +25,7 @@ from networks.vision_transformer import (
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
+from networks.surface_only import require_skeleton_aux_checkpoint
 from networks.checkpoint_compat import adapt_connectivity_modules_for_checkpoint
 
 
@@ -100,6 +101,7 @@ parser.add_argument(
 )
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
 parser.add_argument('--surface_only', action='store_true')
+parser.add_argument('--skeleton_aux_only', action='store_true')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
 parser.add_argument(
     '--highres_structure_fuse_stages',
@@ -271,6 +273,7 @@ if __name__ == "__main__":
                 )
             for name in (
                 "surface_only",
+                "skeleton_aux_only",
                 "stage_topology_stages",
                 "stage_topology_alpha_max",
                 "stage_topology_alpha_init",
@@ -313,6 +316,8 @@ if __name__ == "__main__":
         if getattr(args, name) is None:
             setattr(args, name, default)
 
+    if args.skeleton_aux_only:
+        require_skeleton_aux_checkpoint(checkpoint)
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes,
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
@@ -338,7 +343,8 @@ if __name__ == "__main__":
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     enable_e128_stage_fusion=args.enable_e128_stage_fusion,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
-                    surface_only=args.surface_only).cuda()
+                    surface_only=args.surface_only,
+                    skeleton_aux_only=args.skeleton_aux_only).cuda()
     device = next(model.parameters()).device
     
     # 加载模型

@@ -37,6 +37,7 @@ def get_topology_coefficients(model):
     guided_head = swin_unet.guided_head
     coefficients = {
         "surface_only": bool(getattr(swin_unet, "surface_only", False)),
+        "skeleton_aux_only": bool(getattr(swin_unet, "skeleton_aux_only", False)),
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
         "highres_structure_stream": {
@@ -109,6 +110,8 @@ def format_topology_coefficients(model):
         f"profile={coefficients['structure_profile']}",
         f"final_structure={'on' if coefficients['final_structure_enabled'] else 'off'}",
     ]
+    if coefficients["skeleton_aux_only"]:
+        fields.append("S2/S3=auxiliary_only,input_gradient=0.5")
     highres_values = coefficients["highres_structure_stream"]
     fields.append(
         "highres_structure={} source={} channels={} fuse_stages={} fusion_mode={}".format(
@@ -563,8 +566,13 @@ class SwinUnet(nn.Module):
                  enable_e128_stage_fusion=False,
                   stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False, surface_only=False):
+                 remove_stage2_pre_topology_source=False, surface_only=False,
+                 skeleton_aux_only=False):
         super(SwinUnet, self).__init__()
+        if skeleton_aux_only and (not surface_only or not return_skeleton):
+            raise ValueError("skeleton_aux_only requires surface_only and return_skeleton")
+        if skeleton_aux_only and (stage2_skeleton_gradient_ratio != 0.5 or stage3_skeleton_gradient_ratio != 0.5):
+            raise ValueError("The skeleton auxiliary comparison requires gradient ratios 0.5/0.5")
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.config = config
@@ -615,7 +623,7 @@ class SwinUnet(nn.Module):
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
         if surface_only:
             from .surface_only import configure_surface_only
-            configure_surface_only(self.swin_unet)
+            configure_surface_only(self.swin_unet, skeleton_aux_only=skeleton_aux_only)
     def forward(
         self,
         x,
