@@ -10,10 +10,12 @@ from .dca_fpn_lite import DCAFPNLite
 from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
 from .keypoint_global_topology import KeypointGuidedGlobalTopology
+from .directional_diffusion import ARCHITECTURE_ID
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
 from .skeleton_guided_head import (
     DecoderStructureRefinement,
+    H0SkeletonDiffusionStage,
     GlobalContextHead,
     STAGE3_GLOBAL_CONTEXT_CHANNELS,
     SkeletonGuidedHead,
@@ -1275,8 +1277,22 @@ class SwinTransformerSys(nn.Module):
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False,
+                 architecture_id='h0_original', diffusion_mode='semantic_directional',
+                 diffusion_steps=8, diffusion_eta=0.1, diffusion_beta=0.5, diffusion_latent_channels=32,
                   **kwargs):
         super().__init__()
+
+        self.architecture_id = architecture_id
+        self.is_s2s3_diffusion = architecture_id == ARCHITECTURE_ID
+        if architecture_id not in ('h0_original', ARCHITECTURE_ID):
+            raise ValueError('Unknown H0 architecture')
+        if self.is_s2s3_diffusion and not (
+            return_skeleton and structure_profile == 'stage23_boundary_0626' and
+            enable_highres_structure_stream and enable_h3_surface_fusion and
+            not enable_global_topology and remove_stage2_pre_topology_source and
+            stage_skeleton_mode == 'direct' and highres_structure_fusion_mode == 'stage23'
+        ):
+            raise ValueError('Incompatible flags for Stage2-skeleton/Stage3-diffusion H0')
 
         print(
             "SwinTransformerSys expand initial----depths:{};drop_path_rate:{};num_classes:{}".format(
@@ -1308,7 +1324,7 @@ class SwinTransformerSys(nn.Module):
                 "stage23_boundary_0626_final_ske"
             )
         self.use_stage3_global_context = (
-            self.structure_profile in {
+            not self.is_s2s3_diffusion and self.structure_profile in {
                 "stage23_boundary_0626",
                 "stage23_boundary_0626_final_ske",
             }
@@ -1538,10 +1554,11 @@ class SwinTransformerSys(nn.Module):
         else:
             self.global_context_head = None
 
+        refinement_class = H0SkeletonDiffusionStage if self.is_s2s3_diffusion else DecoderStructureRefinement
         self.decoder_structure_blocks = nn.ModuleDict(
             {
                 str(stage_index):
-                DecoderStructureRefinement(
+                refinement_class(
                     channels=channels,
                     context_channels=(
                         STAGE3_GLOBAL_CONTEXT_CHANNELS
@@ -1573,6 +1590,10 @@ class SwinTransformerSys(nn.Module):
                         else None
                     ),
                     use_structure_residual=(stage_index in (2, 3)),
+                    **(dict(stage_index=stage_index, diffusion_mode=diffusion_mode,
+                            diffusion_steps=diffusion_steps, diffusion_eta=diffusion_eta,
+                            diffusion_beta=diffusion_beta, diffusion_latent_channels=diffusion_latent_channels)
+                       if self.is_s2s3_diffusion else {}),
                 )
                 for stage_index, channels in decoder_structure_channels.items()
             }
@@ -1593,7 +1614,8 @@ class SwinTransformerSys(nn.Module):
         )
         self.highres_structure_fusion = nn.ModuleDict(
             {
-                "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
+                **({} if self.is_s2s3_diffusion else {
+                    "2": HighResStructureFusion(embed_dim, self.highres_structure_channels)}),
                 "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
             }
         )
@@ -1608,7 +1630,10 @@ class SwinTransformerSys(nn.Module):
                 self.highres_structure_fusion_mode,
             )
         )
-        if self.structure_profile in {
+        if self.is_s2s3_diffusion:
+            print('[INFO] New H0: Stage2=S2+H/G exchange, semantic identity, direct H->decoder off; '
+                  'Stage3=S3/D3+diffusion, C2/D2/C3/old gates/global nodes disabled')
+        elif self.structure_profile in {
             "stage23_boundary_0626",
             "stage23_boundary_0626_final_ske",
         }:
@@ -1660,7 +1685,7 @@ class SwinTransformerSys(nn.Module):
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
             if self.return_skeleton:
-                self.global_topology = KeypointGuidedGlobalTopology(
+                self.global_topology = None if self.is_s2s3_diffusion else KeypointGuidedGlobalTopology(
                     channels=embed_dim,
                     struct_channels=self.highres_structure_channels,
                     max_nodes=global_topology_max_nodes,
@@ -1812,6 +1837,8 @@ class SwinTransformerSys(nn.Module):
         return x, x_downsample, road_attentions
 
     def _highres_structure_stage_enabled(self, stage):
+        if self.is_s2s3_diffusion and stage == 2:
+            return False
         if not self.enable_highres_structure_stream:
             return False
         if self.highres_structure_fusion_mode not in {"stage23", "stage23_final_correction"}:
@@ -2223,12 +2250,10 @@ class SwinTransformerSys(nn.Module):
                 output_scale = 2 ** max(2 - inx, 0)
                 output_height = self.patches_resolution[0] // output_scale
                 output_width = self.patches_resolution[1] // output_scale
-                x = self._apply_highres_structure_fusion(
-                    x,
-                    highres_skeleton_feat,
-                    inx,
-                    (output_height, output_width),
-                )
+                if not (self.is_s2s3_diffusion and inx == 2):
+                    x = self._apply_highres_structure_fusion(
+                        x, highres_skeleton_feat, inx, (output_height, output_width),
+                    )
                 if skeleton_0 is not None or connectivity_0 is not None or direction_0 is not None:
                     self._append_structure_output(
                         structure_outputs,

@@ -51,7 +51,8 @@ def get_topology_coefficients(model):
     for stage in (2, 3):
         structure_block = swin_unet.decoder_structure_blocks[str(stage)]
         coefficients[f"decoder_stage{stage}"] = {
-            "gamma1": float(structure_block.gamma1.detach().cpu()),
+            "gamma1": (float(structure_block.gamma1.detach().cpu())
+                       if hasattr(structure_block, 'gamma1') else None),
             "structure_enabled": bool(swin_unet._decoder_structure_enabled(stage)),
         }
 
@@ -120,12 +121,15 @@ def format_topology_coefficients(model):
     )
     for stage in ("decoder_stage2", "decoder_stage3"):
         values = coefficients[stage]
+        if values['gamma1'] is None:
+            fields.append(f'{stage} old_gate=disabled')
+            continue
         enabled = "active" if values.get("structure_enabled") else "bypass"
         fields.append(
             "{}[{}] gamma1={:.6f}".format(
                 stage,
                 enabled,
-                values["gamma1"],
+                values["gamma1"] if values["gamma1"] is not None else 0.0,
             )
         )
     final_values = coefficients["final_topology"]
@@ -557,7 +561,9 @@ class SwinUnet(nn.Module):
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False):
+                 remove_stage2_pre_topology_source=False,
+                 architecture_id='h0_original', diffusion_mode='semantic_directional',
+                 diffusion_steps=8, diffusion_eta=0.1, diffusion_beta=0.5, diffusion_latent_channels=32):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -605,7 +611,10 @@ class SwinUnet(nn.Module):
                                  stage_skeleton_mode=stage_skeleton_mode,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
-                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
+                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source,
+                                 architecture_id=architecture_id, diffusion_mode=diffusion_mode,
+                                 diffusion_steps=diffusion_steps, diffusion_eta=diffusion_eta,
+                                 diffusion_beta=diffusion_beta, diffusion_latent_channels=diffusion_latent_channels)
     def forward(
         self,
         x,

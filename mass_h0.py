@@ -104,6 +104,8 @@ def manifest(args, checkpoint_info, selection=None):
                     'evaluation/road_comparison/compare_predictions.py',
                     'evaluation/road_comparison/road_metrics.py']
     source_files += list(json.loads((ROOT / 'BASE_MODEL_SHA256.json').read_text(encoding='utf-8')))
+    source_files += ['networks/vision_transformer.py', 'networks/skeleton_guided_head.py',
+                     'networks/swin_transformer_unet_skip_expand_decoder_sys.py']
     data = {'data_root': str(args.root_path),
             'protocol': {'image_size': 1500, 'short_area_threshold': 20,
                          'apls_max_nodes': 64, 'apls_snap_radius': 5.0},

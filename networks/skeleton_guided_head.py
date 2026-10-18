@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .directional_diffusion import SemanticDirectionalDiffusion
 
 from topology_direction_constants import (
     CONNECTIVITY_DIRECTIONS,
@@ -932,6 +933,55 @@ class DecoderStructureRefinement(nn.Module):
             structure_gate,
             diagnostics,
         )
+
+
+class H0SkeletonDiffusionStage(nn.Module):
+    """Original H<->G exchange, S2 only / S3+D3 with diffusion; no C or gate."""
+    def __init__(self, channels, stage_index, highres_structure_channels,
+                 skeleton_gradient_ratio=0.5, previous_structure_channels=None,
+                 diffusion_mode='semantic_directional', diffusion_steps=8,
+                 diffusion_eta=0.1, diffusion_beta=0.5, diffusion_latent_channels=32,
+                 **unused_original_gate_options):
+        super().__init__()
+        self.stage_index = int(stage_index)
+        self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
+        self.structure_branch = nn.Sequential(ConvBNReLU(channels, channels), ConvBNReLU(channels, channels))
+        self.highres_skeleton_fusion = BidirectionalSkeletonFeatureFusion(highres_structure_channels, channels)
+        self.previous_structure_fusion = (ConvBNReLU(channels+previous_structure_channels, channels, kernel_size=1, padding=0)
+                                          if previous_structure_channels is not None else None)
+        self.skeleton_head = SkeletonSpatialHead(channels)
+        self.direction_head = (nn.Sequential(ConvBNReLU(channels, channels), nn.Conv2d(channels, 2, 1))
+                               if self.stage_index == 3 else None)
+        self.diffusion = (SemanticDirectionalDiffusion(channels, channels, highres_structure_channels,
+                          diffusion_latent_channels, diffusion_steps, diffusion_eta, diffusion_beta, diffusion_mode)
+                          if self.stage_index == 3 else None)
+        self.capture_diagnostics = False
+        self.last_diagnostics = None
+
+    def forward(self, x, global_context=None, apply_feature_refinement=True,
+                disable_skeleton_prediction=False, skeleton_prior=None,
+                previous_structure_feat=None, highres_skeleton_feat=None):
+        if disable_skeleton_prediction or skeleton_prior is not None or highres_skeleton_feat is None:
+            raise ValueError('New H0 architecture requires direct skeletons and real H features')
+        g = self.structure_branch(scale_gradient(x, self.skeleton_gradient_ratio))
+        if self.previous_structure_fusion is not None:
+            if previous_structure_feat is None:
+                raise ValueError('Stage 3 requires the actual G2')
+            previous = previous_structure_feat
+            if previous.shape[-2:] != g.shape[-2:]:
+                previous = F.interpolate(previous, size=g.shape[-2:], mode='bilinear', align_corners=False)
+            g = self.previous_structure_fusion(torch.cat((g, previous), 1))
+        g, h = self.highres_skeleton_fusion(highres_skeleton_feat, g)
+        skeleton = self.skeleton_head(g)
+        direction = self.direction_head(g) if self.direction_head is not None else None
+        out = self.diffusion(x, g, h, direction) if self.diffusion is not None else x
+        diagnostics = {'structure_feat': g, 'highres_skeleton_feat': h,
+                       'structure_gate_old': None, 'structure_gate_final': None,
+                       'gate_residual': None, 'stage2_semantic_identity': self.stage_index == 2}
+        if self.capture_diagnostics:
+            self.last_diagnostics = {'X': x, 'G': g, 'H': h, 'S': skeleton, 'D': direction, 'out': out,
+                                     'previous_G2': previous_structure_feat}
+        return out, skeleton, None, direction, None, diagnostics
 
 
 class SkeletonGuidedHead(nn.Module):

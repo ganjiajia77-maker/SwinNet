@@ -1,9 +1,16 @@
 # Original H0 on Massachusetts Roads
 
+This branch also implements `h0_s2_skeleton_s3_directional_diffusion_v1`.
+See [README_DIFFUSION.md](README_DIFFUSION.md) for the new architecture,
+verification evidence, and `diffusion_experiment.py` commands. The original
+H0 model path and the commands below remain available independently.
+
 Base architecture: `599a410de8d341850e1810417307e4b3bbdfc82d`.
-The 14 model, loss, and direction-target files in `BASE_MODEL_SHA256.json` are
-byte-for-byte identical to that commit. This package changes data handling,
-training/evaluation entry points, and the unified metric adapter.
+The unchanged model and loss files listed in `BASE_MODEL_SHA256.json` are
+byte-for-byte identical to that commit. The three modified network files add
+the new architecture behind an explicit selector; the original H0 selector
+remains available. This package also includes Massachusetts data handling and
+the unified metric adapter.
 
 ## Fixed experiment
 
