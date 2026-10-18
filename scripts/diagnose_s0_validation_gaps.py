@@ -157,10 +157,55 @@ def local_gap_components(gt_center, surface, tolerance, margin, min_pixels):
         records.append(dict(component_id=component_id, x=left, y=top, width=width,
                             height=height, pixels=area, anchor_groups=len(anchors),
                             status=status))
-    return verified, missing, records
+    return verified, missing, components, records
 
 
-def measure_case(name, aligned, gt, archived, threshold, tolerance, margin, min_pixels,
+def save_gap_examples(name, rgb, gt_center, surface, sh, s3, component_labels,
+                      gaps, maps_dir):
+    touched = sorted((g for g in gaps if g["status"] == "verified_break"
+                      and g.get("difference_detected")),
+                     key=lambda g: g["pixels"], reverse=True)[:3]
+    missed = sorted((g for g in gaps if g["status"] == "verified_break"
+                     and g.get("jointly_missed")),
+                    key=lambda g: g["pixels"], reverse=True)[:2]
+    examples = {g["component_id"]: g for g in touched + missed}
+    directory = maps_dir / "gap_examples"
+    directory.mkdir(parents=True, exist_ok=True)
+    for gap in examples.values():
+        size = 256
+        center_x = gap["x"] + gap["width"]//2
+        center_y = gap["y"] + gap["height"]//2
+        x0 = max(0, min(rgb.shape[1]-size, center_x-size//2))
+        y0 = max(0, min(rgb.shape[0]-size, center_y-size//2))
+        sl = np.s_[y0:y0+size, x0:x0+size]
+        current = component_labels[sl] == gap["component_id"]
+        line = gt_center[sl]
+        image = cv2.cvtColor(rgb[sl], cv2.COLOR_RGB2BGR).copy()
+        image[line] = (255, 255, 0)
+        image[current] = (0, 0, 255)
+        surface_panel = cv2.cvtColor(surface[sl].astype(np.uint8)*255,
+                                     cv2.COLOR_GRAY2BGR)
+        surface_panel[line] = (255, 255, 0)
+        surface_panel[current] = (0, 0, 255)
+        sh_panel = cv2.applyColorMap(np.round(sh[sl]*255).astype(np.uint8),
+                                     cv2.COLORMAP_TURBO)
+        s3_panel = cv2.applyColorMap(np.round(s3[sl]*255).astype(np.uint8),
+                                     cv2.COLORMAP_TURBO)
+        sh_panel[current] = (255, 255, 255)
+        s3_panel[current] = (255, 255, 255)
+        panels = [image, surface_panel, sh_panel, s3_panel]
+        for panel, label in zip(panels, ("IMAGE + GT", "SURFACE + GT", "S_H", "S3")):
+            cv2.putText(panel, label, (8, 23), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.58, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(panel, label, (8, 23), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.58, (255, 255, 255), 1, cv2.LINE_AA)
+        path = directory / f"{name}_gap_{gap['component_id']}.png"
+        if not cv2.imwrite(str(path), np.concatenate(panels, axis=1)):
+            raise OSError(path)
+        gap["example_png"] = str(path)
+
+
+def measure_case(name, rgb, aligned, gt, archived, threshold, tolerance, margin, min_pixels,
                  maps_dir):
     surface = aligned["surface"] >= threshold
     if not np.array_equal(surface, archived):
@@ -171,8 +216,8 @@ def measure_case(name, aligned, gt, archived, threshold, tolerance, margin, min_
     disagreement = sh_binary ^ s3_binary
     proposal = disagreement & ~surface
     gt_center = skeletonize(gt)
-    verified, missing, gaps = local_gap_components(gt_center, surface, tolerance,
-                                                     margin, min_pixels)
+    verified, missing, missing_components, gaps = local_gap_components(
+        gt_center, surface, tolerance, margin, min_pixels)
     distance, nearest = ndimage.distance_transform_edt(~gt_center, return_indices=True)
     near_center = distance <= tolerance
     nearest_gap = verified[nearest[0], nearest[1]]
@@ -205,27 +250,59 @@ def measure_case(name, aligned, gt, archived, threshold, tolerance, margin, min_
             & (component_sizes[1:] > 0))),
     }
     tol_kernel = np.ones((2*tolerance+1, 2*tolerance+1), np.uint8)
-    near_proposal = cv2.dilate(proposal.astype(np.uint8), tol_kernel).astype(bool)
-    near_sh = cv2.dilate(sh_binary.astype(np.uint8), tol_kernel).astype(bool)
-    near_s3 = cv2.dilate(s3_binary.astype(np.uint8), tol_kernel).astype(bool)
+    covered_gt_center = gt_center & cv2.dilate(
+        surface.astype(np.uint8), tol_kernel).astype(bool)
+    missing_distance, missing_nearest = ndimage.distance_transform_edt(
+        ~missing, return_indices=True)
+    nearest_missing_id = missing_components[missing_nearest[0], missing_nearest[1]]
+    if sum(g["pixels"] for g in gaps if g["status"] == "verified_break") != int(verified.sum()):
+        raise AssertionError("Verified gap components must partition the verified pixel map")
     verified_count = 0
     for gap in gaps:
         if gap["status"] != "verified_break":
             continue
         verified_count += 1
         x, y, w, h = gap["x"], gap["y"], gap["width"], gap["height"]
-        region = verified[y:y+h, x:x+w]
-        active = region & (near_proposal[y:y+h, x:x+w])
-        sh_active = region & near_sh[y:y+h, x:x+w]
-        s3_active = region & near_s3[y:y+h, x:x+w]
+        x0, x1 = max(0, x-tolerance), min(gt.shape[1], x+w+tolerance)
+        y0, y1 = max(0, y-tolerance), min(gt.shape[0], y+h+tolerance)
+        region = missing_components[y0:y1, x0:x1] == gap["component_id"]
+        if int(region.sum()) != gap["pixels"]:
+            raise AssertionError("A verified gap must contain only its own component pixels")
+        owned = ((nearest_missing_id[y0:y1, x0:x1] == gap["component_id"])
+                 & (missing_distance[y0:y1, x0:x1] <= tolerance))
+        def aligned_response(binary):
+            source = binary[y0:y1, x0:x1] & owned
+            return region & cv2.dilate(source.astype(np.uint8), tol_kernel).astype(bool)
+        active = aligned_response(proposal)
+        sh_active = aligned_response(sh_binary)
+        s3_active = aligned_response(s3_binary)
+        boundary = (cv2.dilate(region.astype(np.uint8),
+                               np.ones((3, 3), np.uint8)).astype(bool)
+                    & covered_gt_center[y0:y1, x0:x1])
+        if not boundary.any():
+            raise AssertionError("A verified break must have GT centerline on both sides")
+        edge = region & (ndimage.distance_transform_edt(~boundary) <= 4.0)
+        interior = region & ~edge
+        own_sh = sh[y0:y1, x0:x1][region]
+        own_s3 = s3[y0:y1, x0:x1][region]
         gap.update(case=name, difference_detected=bool(active.any()),
                    jointly_missed=not sh_active.any() and not s3_active.any(),
                    sh_detected=bool(sh_active.any()), s3_detected=bool(s3_active.any()),
                    difference_covered_pixels=int(active.sum()),
-                   jointly_missed_pixels=int((region & ~near_sh[y:y+h, x:x+w]
-                                               & ~near_s3[y:y+h, x:x+w]).sum()),
-                   sh_prob_mean=float(sh[y:y+h, x:x+w][region].mean()),
-                   s3_prob_mean=float(s3[y:y+h, x:x+w][region].mean()))
+                   jointly_missed_pixels=int((region & ~sh_active & ~s3_active).sum()),
+                   edge_pixels=int(edge.sum()), interior_pixels=int(interior.sum()),
+                   difference_edge_pixels=int((active & edge).sum()),
+                   difference_interior_pixels=int((active & interior).sum()),
+                   sh_edge_pixels=int((sh_active & edge).sum()),
+                   sh_interior_pixels=int((sh_active & interior).sum()),
+                   s3_edge_pixels=int((s3_active & edge).sum()),
+                   s3_interior_pixels=int((s3_active & interior).sum()),
+                   sh_direct_centerline_pixels=int((region & sh_binary[y0:y1, x0:x1]).sum()),
+                   sh_nearby_only_pixels=int((sh_active & ~sh_binary[y0:y1, x0:x1]).sum()),
+                   s3_direct_centerline_pixels=int((region & s3_binary[y0:y1, x0:x1]).sum()),
+                   s3_nearby_only_pixels=int((s3_active & ~s3_binary[y0:y1, x0:x1]).sum()),
+                   sh_prob_mean=float(own_sh.mean()),
+                   s3_prob_mean=float(own_s3.mean()))
     row = dict(case=name, proposals=int(proposal.sum()),
                **component_metrics,
                sh_only_proposals=int((sh_binary & ~s3_binary & ~surface).sum()),
@@ -256,6 +333,8 @@ def measure_case(name, aligned, gt, archived, threshold, tolerance, margin, min_
     for key, mask in labels.items():
         visual[mask] = colors[key]
     cv2.imwrite(str(maps_dir / f"{name}_proposal_classes.png"), visual)
+    save_gap_examples(name, rgb, gt_center, surface, sh, s3,
+                      missing_components, gaps, maps_dir)
     return row, gaps
 
 
@@ -272,9 +351,12 @@ def write_csv(path, rows):
 def aggregate(rows, gaps, threshold, tolerance, margin, checkpoint, epoch, audit):
     def total(key):
         return sum(int(row.get(key, 0)) for row in rows)
+    def gap_total(key):
+        return sum(int(gap.get(key, 0)) for gap in gaps)
     proposals, breaks = total("proposals"), total("verified_breaks")
     proposal_components = total("proposal_components")
     verified_pixels = total("verified_break_pixels")
+    edge_pixels, interior_pixels = gap_total("edge_pixels"), gap_total("interior_pixels")
     return dict(cases=len(rows), checkpoint=str(checkpoint), checkpoint_sha256=sha256(checkpoint),
                 checkpoint_epoch=epoch, audit=str(audit), surface_threshold=threshold,
                 skeleton_threshold=0.5, centerline_tolerance_px=tolerance,
@@ -311,6 +393,21 @@ def aggregate(rows, gaps, threshold, tolerance, margin, checkpoint, epoch, audit
                 jointly_missed_break_pixel_fraction=(
                     total("jointly_missed_break_pixels")/verified_pixels
                     if verified_pixels else None),
+                edge_break_pixels=edge_pixels, interior_break_pixels=interior_pixels,
+                sh_edge_coverage=(gap_total("sh_edge_pixels")/edge_pixels if edge_pixels else None),
+                sh_interior_coverage=(gap_total("sh_interior_pixels")/interior_pixels
+                                      if interior_pixels else None),
+                s3_edge_coverage=(gap_total("s3_edge_pixels")/edge_pixels if edge_pixels else None),
+                s3_interior_coverage=(gap_total("s3_interior_pixels")/interior_pixels
+                                      if interior_pixels else None),
+                difference_edge_coverage=(gap_total("difference_edge_pixels")/edge_pixels
+                                          if edge_pixels else None),
+                difference_interior_coverage=(gap_total("difference_interior_pixels")/interior_pixels
+                                              if interior_pixels else None),
+                sh_direct_centerline_pixels=gap_total("sh_direct_centerline_pixels"),
+                sh_nearby_only_pixels=gap_total("sh_nearby_only_pixels"),
+                s3_direct_centerline_pixels=gap_total("s3_direct_centerline_pixels"),
+                s3_nearby_only_pixels=gap_total("s3_nearby_only_pixels"),
                 unverified_missing_components=total("unverified_missing_components"),
                 gap_status_counts={status: sum(g["status"] == status for g in gaps)
                                    for status in sorted({g["status"] for g in gaps})})
@@ -345,7 +442,8 @@ def main():
         reference = read_binary(archived[name], 1500)
         aligned = infer_aligned(model, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
                                 torch.device(args.device))
-        row, image_gaps = measure_case(name, aligned, gt, reference, threshold,
+        row, image_gaps = measure_case(name, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                                       aligned, gt, reference, threshold,
                                        args.centerline_tolerance, args.local_margin,
                                        args.min_missing_pixels, args.output_dir / "maps")
         rows.append(row)
