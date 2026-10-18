@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "evaluation" / "road_comparison"))
 
 from config import get_config
+from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from evaluation.road_comparison.compare_predictions import case_id, index_files, read_binary
 from evaluation.road_comparison.road_metrics import skeletonize
 from networks.skeleton_feature_architecture import (
@@ -82,10 +83,10 @@ def load_audit(audit, expected_cases):
     if len(pred) != expected_cases:
         raise ValueError(f"Expected {expected_cases} archived masks, found {len(pred)}")
     data_root = Path(manifest["data_root"])
-    images = index_images(data_root / "test" / "image")
-    labels_dir = data_root / "test" / "mask"
-    if not labels_dir.is_dir():
-        labels_dir = data_root / "test" / "label"
+    image_dir = Path(RoadSkeletonDataset._resolve_image_dir(str(data_root), "test"))
+    labels_dir = Path(RoadSkeletonDataset._resolve_label_dir(
+        str(data_root), "test", ("mask", "label")))
+    images = index_images(image_dir)
     labels = index_files(labels_dir)
     if set(pred) != set(images) or set(pred) != set(labels):
         raise ValueError("The 49 archived predictions, input images, and GT labels are not paired")
