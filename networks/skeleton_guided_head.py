@@ -31,8 +31,9 @@ class ConvBNReLU(nn.Module):
 
 
 class BidirectionalSkeletonFeatureFusion(nn.Module):
-    def __init__(self, highres_channels, stage_channels):
+    def __init__(self, highres_channels, stage_channels, preserve_native_highres=False):
         super().__init__()
+        self.preserve_native_highres = bool(preserve_native_highres)
         self.highres_refine = ConvBNReLU(highres_channels, highres_channels)
         self.stage_refine = ConvBNReLU(stage_channels, stage_channels)
         self.stage_to_highres = nn.Sequential(
@@ -46,6 +47,13 @@ class BidirectionalSkeletonFeatureFusion(nn.Module):
         self.activation = nn.GELU()
 
     def forward(self, highres_feature, stage_feature):
+        if self.preserve_native_highres:
+            hr = self.highres_refine(highres_feature)
+            gr = self.stage_refine(stage_feature)
+            to_h = F.interpolate(self.stage_to_highres(gr), size=hr.shape[-2:],
+                                 mode='bilinear', align_corners=False)
+            to_g = self.highres_to_stage(F.adaptive_avg_pool2d(hr, gr.shape[-2:]))
+            return self.activation(gr + to_g), self.activation(hr + to_h)
         if highres_feature.shape[-2:] != stage_feature.shape[-2:]:
             highres_feature = F.interpolate(
                 highres_feature,
@@ -941,12 +949,15 @@ class H0SkeletonDiffusionStage(nn.Module):
                  skeleton_gradient_ratio=0.5, previous_structure_channels=None,
                  diffusion_mode='semantic_directional', diffusion_steps=8,
                  diffusion_eta=0.1, diffusion_beta=0.5, diffusion_latent_channels=32,
+                 preserve_native_highres=False,
                  **unused_original_gate_options):
         super().__init__()
         self.stage_index = int(stage_index)
         self.skeleton_gradient_ratio = float(skeleton_gradient_ratio)
         self.structure_branch = nn.Sequential(ConvBNReLU(channels, channels), ConvBNReLU(channels, channels))
-        self.highres_skeleton_fusion = BidirectionalSkeletonFeatureFusion(highres_structure_channels, channels)
+        self.preserve_native_highres = bool(preserve_native_highres)
+        self.highres_skeleton_fusion = BidirectionalSkeletonFeatureFusion(
+            highres_structure_channels, channels, preserve_native_highres)
         self.previous_structure_fusion = (ConvBNReLU(channels+previous_structure_channels, channels, kernel_size=1, padding=0)
                                           if previous_structure_channels is not None else None)
         self.skeleton_head = SkeletonSpatialHead(channels)
@@ -974,13 +985,14 @@ class H0SkeletonDiffusionStage(nn.Module):
         g, h = self.highres_skeleton_fusion(highres_skeleton_feat, g)
         skeleton = self.skeleton_head(g)
         direction = self.direction_head(g) if self.direction_head is not None else None
-        out = self.diffusion(x, g, h, direction) if self.diffusion is not None else x
+        h_diff = F.adaptive_avg_pool2d(h, x.shape[-2:]) if self.preserve_native_highres else h
+        out = self.diffusion(x, g, h_diff, direction) if self.diffusion is not None else x
         diagnostics = {'structure_feat': g, 'highres_skeleton_feat': h,
                        'structure_gate_old': None, 'structure_gate_final': None,
                        'gate_residual': None, 'stage2_semantic_identity': self.stage_index == 2}
         if self.capture_diagnostics:
             self.last_diagnostics = {'X': x, 'G': g, 'H': h, 'S': skeleton, 'D': direction, 'out': out,
-                                     'previous_G2': previous_structure_feat}
+                                     'previous_G2': previous_structure_feat, 'H_diff': h_diff}
         return out, skeleton, None, direction, None, diagnostics
 
 

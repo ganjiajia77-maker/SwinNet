@@ -1,0 +1,6 @@
+{
+  "synthetic_native_size": 1500,
+  "selected_val_threshold": 0.05,
+  "sweep_test_topology": "passed",
+  "checkpoint_strict_restore": "passed"
+}

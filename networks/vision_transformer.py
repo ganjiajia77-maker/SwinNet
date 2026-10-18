@@ -563,7 +563,8 @@ class SwinUnet(nn.Module):
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False,
                  architecture_id='h0_original', diffusion_mode='semantic_directional',
-                 diffusion_steps=8, diffusion_eta=0.1, diffusion_beta=0.5, diffusion_latent_channels=32):
+                 diffusion_steps=8, diffusion_eta=0.1, diffusion_beta=0.5, diffusion_latent_channels=32,
+                 encoder_h_exchange=True, enable_h_surface_residual=True):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -614,7 +615,9 @@ class SwinUnet(nn.Module):
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source,
                                  architecture_id=architecture_id, diffusion_mode=diffusion_mode,
                                  diffusion_steps=diffusion_steps, diffusion_eta=diffusion_eta,
-                                 diffusion_beta=diffusion_beta, diffusion_latent_channels=diffusion_latent_channels)
+                                 diffusion_beta=diffusion_beta, diffusion_latent_channels=diffusion_latent_channels,
+                                 encoder_h_exchange=encoder_h_exchange,
+                                 enable_h_surface_residual=enable_h_surface_residual)
     def forward(
         self,
         x,

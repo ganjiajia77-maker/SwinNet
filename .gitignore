@@ -8,3 +8,5 @@ reports/
 tests/
 mass_run_name.txt
 diffusion_run_*.txt
+.validation/
+SOURCE_COMMIT

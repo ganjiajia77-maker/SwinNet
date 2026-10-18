@@ -11,6 +11,7 @@ from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
 from .keypoint_global_topology import KeypointGuidedGlobalTopology
 from .directional_diffusion import ARCHITECTURE_ID
+from .encoder_h256 import ARCHITECTURE_ID as H256_ID, EncoderHExchange, HSurfaceResidual
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
 from .skeleton_guided_head import (
@@ -255,7 +256,7 @@ def _largest_group_divisor(channels, candidates=(8, 4, 2, 1)):
 
 
 class PrePatchStructureEncoder(nn.Module):
-    def __init__(self, struct_channels):
+    def __init__(self, struct_channels, output_stride=4):
         super().__init__()
         self.down1 = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1, bias=False),
@@ -270,7 +271,7 @@ class PrePatchStructureEncoder(nn.Module):
                 16,
                 32,
                 kernel_size=3,
-                stride=2,
+                stride=1 if output_stride == 2 else 2,
                 padding=1,
                 bias=False,
             ),
@@ -798,6 +799,7 @@ class PatchMerging(nn.Module):
         norm_layer=nn.LayerNorm,
         road_alpha_init=0.1,
         road_attention_merge_mode="residual",
+        enable_road_prior=True,
     ):
         super().__init__()
         self.input_resolution = input_resolution
@@ -809,7 +811,7 @@ class PatchMerging(nn.Module):
             nn.Linear(2 * dim, 2 * dim, bias=False),
         )
         self.alpha = nn.Parameter(torch.tensor(0.1))
-        self.road_alpha = nn.Parameter(torch.tensor(float(road_alpha_init)))
+        self.road_alpha = nn.Parameter(torch.tensor(float(road_alpha_init))) if enable_road_prior else None
         self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
         if self.road_attention_merge_mode not in {"residual", "merge_attention"}:
             raise ValueError(
@@ -842,6 +844,8 @@ class PatchMerging(nn.Module):
 
         x = x.view(B, H, W, C)
         if road_attention is not None:
+            if self.road_alpha is None:
+                raise ValueError('A1/A2 modulation is absent in this PatchMerging')
             if road_attention.dim() == 3:
                 road_attention = road_attention.unsqueeze(1)
             assert road_attention.shape[-2:] == (H, W), (
@@ -966,7 +970,7 @@ class BasicLayer(nn.Module):
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
                  road_attention_head=None, road_alpha_init=0.1, use_road_bias=False,
                  road_attention_modulates_downsample=True,
-                 road_attention_merge_mode="residual"):
+                 road_attention_merge_mode="residual", enable_road_prior=True):
 
         super().__init__()
         self.dim = dim
@@ -1002,16 +1006,21 @@ class BasicLayer(nn.Module):
                 norm_layer=norm_layer,
                 road_alpha_init=self.road_alpha_init,
                 road_attention_merge_mode=self.road_attention_merge_mode,
+                enable_road_prior=enable_road_prior,
             )
         else:
             self.downsample = None
 
-    def forward(self, x, road_prior=None):
+    def forward(self, x, road_prior=None, h_feature=None, h_exchange=None):
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, None, None, None, None, road_prior)
             else:
                 x = blk(x, road_prior=road_prior)
+        if h_feature is not None and h_exchange is not None:
+            height, width = self.input_resolution
+            e, h_feature = h_exchange(token_to_map(x, height, width), h_feature)
+            x = map_to_token(e)
         self.last_road_attention = None
         self.last_pre_downsample = x
         if self.downsample is not None:
@@ -1029,7 +1038,7 @@ class BasicLayer(nn.Module):
                     else None
                 ),
             )
-        return x
+        return (x, h_feature) if h_feature is not None else x
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
@@ -1279,12 +1288,17 @@ class SwinTransformerSys(nn.Module):
                  remove_stage2_pre_topology_source=False,
                  architecture_id='h0_original', diffusion_mode='semantic_directional',
                  diffusion_steps=8, diffusion_eta=0.1, diffusion_beta=0.5, diffusion_latent_channels=32,
+                 encoder_h_exchange=True, enable_h_surface_residual=True,
                   **kwargs):
         super().__init__()
 
         self.architecture_id = architecture_id
-        self.is_s2s3_diffusion = architecture_id == ARCHITECTURE_ID
-        if architecture_id not in ('h0_original', ARCHITECTURE_ID):
+        self.is_h256 = architecture_id == H256_ID
+        self.is_s2s3_diffusion = architecture_id in (ARCHITECTURE_ID, H256_ID)
+        self.encoder_h_exchange = bool(encoder_h_exchange)
+        self.enable_h_surface_residual = bool(enable_h_surface_residual)
+        self.last_encoder_h_features = {}
+        if architecture_id not in ('h0_original', ARCHITECTURE_ID, H256_ID):
             raise ValueError('Unknown H0 architecture')
         if self.is_s2s3_diffusion and not (
             return_skeleton and structure_profile == 'stage23_boundary_0626' and
@@ -1395,15 +1409,18 @@ class SwinTransformerSys(nn.Module):
 
         # build encoder and bottleneck layers
         self.layers = nn.ModuleList()
-        self.encoder_stage1_road_attention_head = RoadAttentionHead(embed_dim)
-        self.encoder_stage2_road_attention_head = RoadAttentionHead(embed_dim * 2)
-        print(
+        self.encoder_stage1_road_attention_head = None if self.is_h256 else RoadAttentionHead(embed_dim)
+        self.encoder_stage2_road_attention_head = None if self.is_h256 else RoadAttentionHead(embed_dim * 2)
+        if not self.is_h256:
+            print(
             "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
             "Stage3 attention bias; A1/A2 -> residual PatchMerging priors".format(
                 embed_dim,
                 embed_dim * 2,
             )
-        )
+            )
+        else:
+            print('[INFO] H256: A1/A2 heads, PatchMerging road modulation and E3 road bias are absent')
         for i_layer in range(self.num_layers):
             layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
@@ -1428,7 +1445,8 @@ class SwinTransformerSys(nn.Module):
                                road_alpha_init=(
                                    0.1
                                ),
-                               use_road_bias=(i_layer == 2),
+                               use_road_bias=(i_layer == 2 and not self.is_h256),
+                               enable_road_prior=not self.is_h256,
                                road_attention_modulates_downsample=(i_layer in (0, 1)),
                                road_attention_merge_mode=(
                                    "residual"
@@ -1592,7 +1610,8 @@ class SwinTransformerSys(nn.Module):
                     use_structure_residual=(stage_index in (2, 3)),
                     **(dict(stage_index=stage_index, diffusion_mode=diffusion_mode,
                             diffusion_steps=diffusion_steps, diffusion_eta=diffusion_eta,
-                            diffusion_beta=diffusion_beta, diffusion_latent_channels=diffusion_latent_channels)
+                            diffusion_beta=diffusion_beta, diffusion_latent_channels=diffusion_latent_channels,
+                            preserve_native_highres=self.is_h256)
                        if self.is_s2s3_diffusion else {}),
                 )
                 for stage_index, channels in decoder_structure_channels.items()
@@ -1600,6 +1619,7 @@ class SwinTransformerSys(nn.Module):
         )
         self.prepatch_structure_encoder = PrePatchStructureEncoder(
             struct_channels=self.highres_structure_channels,
+            output_stride=2 if self.is_h256 else 4,
         )
         self.highres_skeleton_adapter = (
             HighResSkeletonAdapter(self.highres_structure_channels)
@@ -1759,7 +1779,12 @@ class SwinTransformerSys(nn.Module):
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
+        if self.is_h256:
+            self.encoder_h_exchanges = nn.ModuleList([EncoderHExchange(embed_dim*2**i) for i in range(3)])
+            self.h_surface_residual = HSurfaceResidual(embed_dim)
         self.apply(self._init_weights)
+        if self.is_h256:
+            self.h_surface_residual.reset_output()
         if self.enable_highres_structure_stream:
             skeleton_bias = 0.0
             if self.stage_skeleton_bias_init == "prior":
@@ -1793,7 +1818,7 @@ class SwinTransformerSys(nn.Module):
         return {'relative_position_bias_table'}
 
     # Encoder and Bottleneck
-    def forward_features(self, x):
+    def forward_features(self, x, h_enc=None):
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -1805,6 +1830,11 @@ class SwinTransformerSys(nn.Module):
 
         for i_layer, layer in enumerate(self.layers):
             x_downsample.append(x)
+            if self.is_h256 and i_layer < 3:
+                x, h_enc = layer(x, h_feature=h_enc, h_exchange=(
+                    self.encoder_h_exchanges[i_layer] if self.encoder_h_exchange else None))
+                self.last_encoder_h_features[f'H_E{i_layer+1}'] = h_enc
+                continue
             x = layer(
                 x,
                 road_prior=(
@@ -1834,6 +1864,8 @@ class SwinTransformerSys(nn.Module):
         x = self.bottleneck_swin_block(x)
         x = self.norm(x)  # B L C
 
+        if self.is_h256:
+            return x, x_downsample, road_attentions, h_enc
         return x, x_downsample, road_attentions
 
     def _highres_structure_stage_enabled(self, stage):
@@ -1859,8 +1891,8 @@ class SwinTransformerSys(nn.Module):
             expected_stage1_shape = (
                 structure_input.shape[0],
                 self.highres_structure_channels,
-                self.patches_resolution[0],
-                self.patches_resolution[1],
+                self.patches_resolution[0] * (2 if self.is_h256 else 1),
+                self.patches_resolution[1] * (2 if self.is_h256 else 1),
             )
             print(
                 "[HighRes Structure] source=prepatch expected_z_struct={} z_struct={}".format(
@@ -1883,9 +1915,11 @@ class SwinTransformerSys(nn.Module):
         ):
             return x
         feature_map = token_to_map(x, target_hw[0], target_hw[1])
+        fusion_h = (F.adaptive_avg_pool2d(highres_skeleton_feat, target_hw)
+                    if self.is_h256 else highres_skeleton_feat)
         feature_map = self.highres_structure_fusion[str(stage)](
             feature_map,
-            highres_skeleton_feat,
+            fusion_h,
         )
         return map_to_token(feature_map)
 
@@ -2089,6 +2123,7 @@ class SwinTransformerSys(nn.Module):
         x_downsample,
         bottleneck_tokens=None,
         z_struct=None,
+        h_enc=None,
     ):
         """
         Decoder with DCA-FPN-Lite refinement on stage 2 and stage 3 skips.
@@ -2103,13 +2138,16 @@ class SwinTransformerSys(nn.Module):
         structure_outputs = []
         stage2_structure_feat = None
         self.last_stage_features = {}
-        highres_skeleton_feat = (
+        highres_skeleton_feat = h_enc if self.is_h256 else (
             self.highres_skeleton_adapter(z_struct)
             if z_struct is not None and self.highres_skeleton_adapter is not None
             else None
         )
         if highres_skeleton_feat is not None:
-            self.last_stage_features["H0"] = highres_skeleton_feat
+            self.last_stage_features["H0"] = (self.last_encoder_h_features['H0']
+                                               if self.is_h256 else highres_skeleton_feat)
+            if self.is_h256:
+                self.last_stage_features['H_enc'] = highres_skeleton_feat
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
             if highres_skeleton_feat is not None
@@ -2429,6 +2467,8 @@ class SwinTransformerSys(nn.Module):
                         x = self.surface_h3_fusion(
                             torch.cat([x, h3_surface], dim=1)
                         )
+                if self.is_h256 and self.enable_h_surface_residual:
+                    x = self.h_surface_residual(x, highres_skeleton_feat)
                 x = self.guided_head(x, z_struct=highres_skeleton_feat)
             else:
                 x = self.output(x)
@@ -2440,13 +2480,21 @@ class SwinTransformerSys(nn.Module):
         x,
     ):
         structure_input = x
-        x, x_downsample, road_attentions = self.forward_features(x)
-        z_struct = self._build_highres_structure_outputs(structure_input)
+        if self.is_h256:
+            z_struct = self._build_highres_structure_outputs(structure_input)
+            h0 = self.highres_skeleton_adapter(z_struct)
+            self.last_encoder_h_features = {'H0': h0}
+            x, x_downsample, road_attentions, h_enc = self.forward_features(x, h0)
+        else:
+            x, x_downsample, road_attentions = self.forward_features(x)
+            z_struct = self._build_highres_structure_outputs(structure_input)
+            h_enc = None
         x, structure_outputs, highres_skeleton_feat = self.forward_up_features(
             x,
             x_downsample,
             bottleneck_tokens=x,
             z_struct=z_struct,
+            h_enc=h_enc,
         )
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)

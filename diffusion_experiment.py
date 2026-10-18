@@ -16,7 +16,8 @@ import torch
 from torch.utils.data import DataLoader
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from diffusion_protocol import (ARCHITECTURE_ID, BASE_COMMIT, ROOT, architecture, build_model,
-                                initialize_from_h0, load_checkpoint, save_atomic, write_json)
+                                initialize_from_h0, load_checkpoint, save_atomic, write_json,
+                                H256_ID, EXPERIMENT_BASE)
 from losses.h0_diffusion_loss import H0DiffusionLoss
 from mass_protocol import stitch_logits
 from networks.directional_diffusion import MODES
@@ -112,16 +113,19 @@ def train(args, arc, device):
         generator.set_state(restored['loader_generator_state'])
     else:
         model = build_model(arc)
-        loaded, migration = initialize_from_h0(model, arc, args.seed, args.pretrain_ckpt, args.h0_init_ckpt)
+        loaded, migration = initialize_from_h0(model, arc, args.seed, args.pretrain_ckpt,
+                                              args.h0_init_ckpt, args.base_init_ckpt)
         start_epoch, best_f1 = 0, -1.
     write_json(run_dir/'initialization_manifest.json', migration)
     parsed = fixed_args(args)
-    write_json(run_dir/'resolved_config.json', dict(args=parsed, architecture=arc, base_h0_commit=BASE_COMMIT))
+    write_json(run_dir/'resolved_config.json', dict(args=parsed, architecture=arc, base_h0_commit=BASE_COMMIT,
+        base_experiment_commit=EXPERIMENT_BASE if arc['architecture_id'] == H256_ID else None,
+        implementation=implementation_revision(), model_config=model.config.dump()))
     model = model.to(device)
     inspection = benchmark(model, device)
     write_json(run_dir/'pretrain_inspection.json', inspection)
     print(json.dumps(inspection, ensure_ascii=False), flush=True)
-    print(f'Architecture={ARCHITECTURE_ID}; mode={args.diffusion_mode}; C2/D2/C3=disabled/null; '
+    print(f'Architecture={arc["architecture_id"]}; mode={args.diffusion_mode}; C2/D2/C3=disabled/null; '
           'old gates=disabled; Stage2 H->decoder=disabled; global nodes=disabled; '
           'loss=surface+0.008*S2+0.012*S3+0.0024*D3; EMA=off; batch2/acc1', flush=True)
     groups = []
@@ -173,7 +177,10 @@ def train(args, arc, device):
                 C2='disabled',D2='disabled',C3='disabled',val_iou=metrics['iou'] if metrics else None,
                 val_f1=metrics['f1'] if metrics else None))
             handle.flush()
-            checkpoint = dict(architecture_id=ARCHITECTURE_ID, architecture_config=arc, base_h0_commit=BASE_COMMIT,
+            checkpoint = dict(architecture_id=arc['architecture_id'], architecture_config=arc, base_h0_commit=BASE_COMMIT,
+                base_experiment_commit=EXPERIMENT_BASE if arc['architecture_id'] == H256_ID else None,
+                implementation=implementation_revision(),
+                model_config=model.config.dump(),
                 model_state_dict=model.state_dict(), optimizer_state_dict=optimizer.state_dict(),
                 args=parsed, epoch=epoch+1, best_f1=best_f1, val_metrics=metrics,
                 initialization_manifest=migration, loaded_pretrained_names=sorted(loaded),
@@ -184,7 +191,24 @@ def train(args, arc, device):
 
 
 def model_name(checkpoint):
-    return 'h0_s2skel_s3diff_'+checkpoint['architecture_config']['diffusion_mode']
+    architecture_id = checkpoint.get('architecture_id', checkpoint['architecture_config']['architecture_id'])
+    prefix = 'h0_encoder_h256_s2skel_s3diff_' if architecture_id == H256_ID else 'h0_s2skel_s3diff_'
+    return prefix+checkpoint['architecture_config']['diffusion_mode']
+
+
+def implementation_revision():
+    marker = ROOT/'SOURCE_COMMIT'
+    if marker.is_file():
+        return marker.read_text().strip()
+    try:
+        top = subprocess.check_output(['git','rev-parse','--show-toplevel'], cwd=ROOT, text=True).strip()
+        if Path(top).resolve() == ROOT.resolve():
+            revision = subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip()
+            dirty = subprocess.check_output(['git','status','--porcelain','--untracked-files=no'], cwd=ROOT, text=True).strip()
+            return revision+('+uncommitted' if dirty else '')
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return 'unavailable; see source_sha256'
 
 
 @torch.inference_mode()
@@ -214,9 +238,10 @@ def manifest(args, checkpoint, threshold=None):
     provenance = dict(checkpoint=str(Path(args.model_path).resolve()), epoch=checkpoint['epoch'],
         architecture=checkpoint['architecture_config'], seed=checkpoint['args']['seed'], base_h0_commit=BASE_COMMIT,
         initialization=checkpoint['initialization_manifest']['shared_tensor_sha256'], weights='raw; no EMA',
-        inference='512 windows / stride256; weighted logits; native1500; no TTA/postprocessing')
+        inference='512 windows / stride256; weighted logits floor0.1; native1500; no TTA/postprocessing',
+        implementation=checkpoint.get('implementation'),base_experiment_commit=checkpoint.get('base_experiment_commit'))
     provenance['source_sha256'] = {name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in (
-        'diffusion_experiment.py','diffusion_protocol.py','networks/directional_diffusion.py',
+        'diffusion_experiment.py','diffusion_protocol.py','networks/directional_diffusion.py','networks/encoder_h256.py',
         'networks/skeleton_guided_head.py','networks/swin_transformer_unet_skip_expand_decoder_sys.py',
         'networks/vision_transformer.py','losses/h0_diffusion_loss.py','losses/road_losses.py',
         'datasets/dataset_road_skeleton.py','mass_protocol.py',
@@ -239,7 +264,7 @@ def compare(args, checkpoint, split, selection=None):
     subprocess.run(command, check=True)
 
 
-def main():
+def main(architecture_id=ARCHITECTURE_ID):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('action', choices=['inspect','train','sweep','test','topology'])
     p.add_argument('--root_path', default='/home/gjj/Swin-Unet-main/Massachusetts/tiff')
@@ -247,6 +272,7 @@ def main():
     p.add_argument('--run_name', default='')
     p.add_argument('--pretrain_ckpt')
     p.add_argument('--h0_init_ckpt', help='explicit original H0 weight migration; never resume optimizer')
+    p.add_argument('--base_init_ckpt', help='explicit a668711 weight migration for H256; no optimizer migration')
     p.add_argument('--model_path')
     p.add_argument('--resume')
     p.add_argument('--gpu', default='2')
@@ -257,18 +283,21 @@ def main():
     p.add_argument('--diffusion_eta',type=float,default=.1)
     p.add_argument('--diffusion_beta',type=float,default=.5)
     p.add_argument('--diffusion_latent_channels',type=int,default=32)
+    p.add_argument('--encoder_h_exchange', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--enable_h_surface_residual', action=argparse.BooleanOptionalAction, default=True)
     args=p.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES']=args.gpu
     os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF','expandable_segments:True')
     os.environ['OPENCV_LOG_LEVEL']='ERROR'
     torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
     device=torch.device('cpu' if args.gpu=='cpu' else 'cuda')
-    arc=architecture(args.diffusion_mode,args.diffusion_steps,args.diffusion_eta,args.diffusion_beta,args.diffusion_latent_channels)
+    arc=architecture(args.diffusion_mode,args.diffusion_steps,args.diffusion_eta,args.diffusion_beta,
+                     args.diffusion_latent_channels,architecture_id,args.encoder_h_exchange,args.enable_h_surface_residual)
     if args.action in ('train','inspect'):
         if not args.pretrain_ckpt or not Path(args.pretrain_ckpt).is_file(): p.error('Provide original SwinV2 pretraining')
         if args.action=='inspect':
             model=build_model(arc)
-            _,migration=initialize_from_h0(model,arc,args.seed,args.pretrain_ckpt,args.h0_init_ckpt)
+            _,migration=initialize_from_h0(model,arc,args.seed,args.pretrain_ckpt,args.h0_init_ckpt,args.base_init_ckpt)
             output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True)
             report=benchmark(model.to(device),device)
             write_json(output/'inspection.json',report); write_json(output/'initialization_manifest.json',migration)
@@ -277,11 +306,14 @@ def main():
             if args.resume:
                 resume_dir=Path(args.resume).resolve().parent
                 args.output_dir=str(resume_dir.parent); args.run_name=resume_dir.name
-            args.run_name=args.run_name or f'mass_s2skel_s3diff_{args.diffusion_mode}_s{args.seed}_'+datetime.now().strftime('%Y%m%d_%H%M%S')
+            prefix = 'mass_h256_s2skel_s3diff' if architecture_id == H256_ID else 'mass_s2skel_s3diff'
+            args.run_name=args.run_name or f'{prefix}_{args.diffusion_mode}_s{args.seed}_'+datetime.now().strftime('%Y%m%d_%H%M%S')
             train(args,arc,device)
         return
     if not args.model_path: p.error('Provide a new architecture checkpoint')
     model,checkpoint=load_checkpoint(args.model_path)
+    if checkpoint['architecture_id'] != architecture_id:
+        raise ValueError('Use the entry matching this checkpoint architecture; no cross-architecture resume/inference')
     model=model.to(device).eval()
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True)
     if args.action=='sweep':
