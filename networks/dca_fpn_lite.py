@@ -32,6 +32,10 @@ class DCAFPNLite(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(channels // 2, num_points, kernel_size=1)
         )
+        # Uniform weights preserve the original concatenation scale at startup.
+        nn.init.zeros_(self.weight_conv[-1].weight)
+        nn.init.zeros_(self.weight_conv[-1].bias)
+        self.register_buffer('weighted_fusion_version', torch.tensor(1, dtype=torch.int64))
         
         # 融合采样结果
         self.fusion_conv = nn.Sequential(
@@ -95,14 +99,14 @@ class DCAFPNLite(nn.Module):
             sampled_features.append(feat_k)
         
         # 按权重融合
-        fused = torch.zeros_like(V)  # [B, C, H, W]
-        for k in range(self.num_points):
-            weight_k = weights[:, k:k+1, :, :]  # [B, 1, H, W]
-            fused = fused + weight_k * sampled_features[k]  # [B, C, H, W]
+        weighted_features = [
+            self.num_points * weights[:, k:k+1] * sampled_features[k]
+            for k in range(self.num_points)
+        ]
         
         # 融合输出
         fused = self.fusion_conv(
-            torch.cat(sampled_features, dim=1)  # [B, C*K, H, W]
+            torch.cat(weighted_features, dim=1)  # [B, C*K, H, W]
         )  # [B, C, H, W]
         
         # 最终输出

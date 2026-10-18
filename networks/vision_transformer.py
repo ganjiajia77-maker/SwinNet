@@ -37,6 +37,7 @@ def get_topology_coefficients(model):
     guided_head = swin_unet.guided_head
     coefficients = {
         "surface_only": bool(getattr(swin_unet, "surface_only", False)),
+        "dca_fusion": "scaled_softmax_weighted_concat_v1",
         "structure_profile": getattr(swin_unet, "structure_profile", "full"),
         "final_structure_enabled": bool(guided_head.enable_final_structure),
         "highres_structure_stream": {

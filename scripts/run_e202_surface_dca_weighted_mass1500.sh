@@ -13,15 +13,15 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 
 MODE=${1:-}
 if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != sweep && "$MODE" != test && "$MODE" != topology ]]; then
-  echo "Usage: bash scripts/run_e202_surface_only_mass1500.sh train|resume|sweep|test|topology" >&2
+  echo "Usage: bash scripts/run_e202_surface_dca_weighted_mass1500.sh train|resume|sweep|test|topology" >&2
   exit 2
 fi
 cd "$REPO"
 mkdir -p "$RESULTS"
-LATEST="$RESULTS/latest_e202_surface_only_mass1500_run.txt"
+LATEST="$RESULTS/latest_e202_surface_dca_weighted_mass1500_run.txt"
 if [[ "$MODE" == train ]]; then
   test -s "$PRETRAIN" || { echo "Missing pretrained checkpoint: $PRETRAIN" >&2; exit 1; }
-  RUN=${RUN:-e202_surface_only_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)}
+  RUN=${RUN:-e202_surface_dca_weighted_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)}
   test ! -e "$RESULTS/$RUN" || { echo "Existing run: $RUN; use resume or a new RUN" >&2; exit 1; }
   python -u scripts/check_mass_layout.py --root_path "$DATA" --source_size 1500
   printf '%s\n' "$RUN" > "$LATEST"
@@ -31,20 +31,21 @@ else
     RUN=$(<"$LATEST")
   fi
 fi
-if [[ "$RUN" != e202_surface_only_mass1500_* ]]; then
-  echo "RUN=$RUN is not a surface-only experiment. Run 'unset RUN' to use this script's own run name." >&2
+if [[ "$RUN" != e202_surface_dca_weighted_mass1500_* ]]; then
+  echo "RUN=$RUN is not a weighted-DCA experiment. Run 'unset RUN' to use this script's own run name." >&2
   exit 2
 fi
 RUN_DIR="$RESULTS/$RUN"
 CFG="$REPO/configs/swin_tiny_patch4_window7_224_lite.yaml"
 EVAL="$REPO/evaluation/road_comparison"
 echo "RUN_DIR=$RUN_DIR; GPU=$CUDA_VISIBLE_DEVICES; FP32; no EMA; physical batch 2; accumulation 1"
+echo "DCA=scaled softmax weighted concatenation v1; fresh training against surface-only baseline"
 
 if [[ "$MODE" == train || "$MODE" == resume ]]; then
   resume_args=()
   if [[ "$MODE" == resume ]]; then
     test -s "$RUN_DIR/last.pth" || { echo "Missing $RUN_DIR/last.pth" >&2; exit 1; }
-    python "$EVAL/build_surface_only_mass_manifest.py" --checkpoint "$RUN_DIR/last.pth" \
+    python "$EVAL/build_surface_dca_weighted_mass_manifest.py" --checkpoint "$RUN_DIR/last.pth" \
       --data_root "$DATA" --predictions_root "$RUN_DIR" --output "$RUN_DIR/resume_check.json" --check_only
     resume_args+=(--resume "$RUN_DIR/last.pth")
   fi
@@ -83,7 +84,7 @@ AUDIT_POINTER="$RUN_DIR/latest_unified_eval.txt"
 if [[ "$MODE" == sweep ]]; then
   AUDIT="$RUN_DIR/unified_eval_$(date +%Y%m%d_%H%M%S)"
   test ! -e "$AUDIT" || { echo "Existing audit: $AUDIT" >&2; exit 1; }
-  python "$EVAL/build_surface_only_mass_manifest.py" --checkpoint "$CKPT" \
+  python "$EVAL/build_surface_dca_weighted_mass_manifest.py" --checkpoint "$CKPT" \
     --data_root "$DATA" --predictions_root "$AUDIT/predictions" --output "$AUDIT/comparison.json" --check_only
   mkdir -p "$AUDIT"
   python -u test_image.py --root_path "$DATA" --model_path "$CKPT" --cfg "$CFG" \
@@ -92,7 +93,7 @@ if [[ "$MODE" == sweep ]]; then
     --export_thresholds 0.05 0.10 0.15 0.20 0.25 0.30 0.35 0.40 0.45 0.50 \
                         0.55 0.60 0.65 0.70 0.75 0.80 0.85 0.90 0.95 \
     2>&1 | tee "$AUDIT/val_inference.log"
-  python "$EVAL/build_surface_only_mass_manifest.py" --checkpoint "$CKPT" \
+  python "$EVAL/build_surface_dca_weighted_mass_manifest.py" --checkpoint "$CKPT" \
     --data_root "$DATA" --predictions_root "$AUDIT/predictions" --output "$AUDIT/comparison.json"
   python -u "$EVAL/compare_predictions.py" --manifest "$AUDIT/comparison.json" \
     --split val --select_threshold_only --output_dir "$AUDIT/val" --progress_every 1 \
@@ -123,13 +124,13 @@ if [[ "$MODE" == topology ]]; then
   exit 0
 fi
 if [[ "$MODE" == test ]]; then
-  python "$EVAL/build_surface_only_mass_manifest.py" --checkpoint "$CKPT" \
+  python "$EVAL/build_surface_dca_weighted_mass_manifest.py" --checkpoint "$CKPT" \
     --data_root "$DATA" --predictions_root "$AUDIT/predictions" --output "$MANIFEST"
   python -u test_image.py --root_path "$DATA" --model_path "$CKPT" --cfg "$CFG" \
     --split test --img_size 512 --source_patch_size 1500 --overlap_infer --overlap_stride 256 \
     --output_dir "$AUDIT/predictions/test" --threshold "$THRESHOLD" --export_thresholds "$THRESHOLD" \
     2>&1 | tee "$AUDIT/test_inference.log"
-  python "$EVAL/build_surface_only_mass_manifest.py" --checkpoint "$CKPT" \
+  python "$EVAL/build_surface_dca_weighted_mass_manifest.py" --checkpoint "$CKPT" \
     --data_root "$DATA" --predictions_root "$AUDIT/predictions" --output "$MANIFEST" --selection "$SELECTION"
 fi
 python -u "$EVAL/compare_predictions.py" --manifest "$MANIFEST" --split test \

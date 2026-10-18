@@ -1,7 +1,25 @@
-# e2020d9 surface-only Massachusetts ablation
+# e2020d9 surface-only weighted-DCA Massachusetts experiment
 
 Base: `e2020d9a8df311f9f680cd3637466a674d76688e`.
-Compare with the full e202 Mass protocol, not the H0 or Conv-C variants.
+Parent: `eb2da24d768b7f643e4fb288e3736693862c1fe8`, the surface-only Mass run.
+Compare this experiment with that surface-only baseline.
+
+## DCA change
+
+Both DCA skip modules now compute
+`fusion_conv(cat(K * softmax(weight_conv(Q))[k] * sampled[k]))`.
+The old weighted sum that was overwritten is removed. The weight predictor's
+last convolution starts at zero, so every initial multiplier is one. All other
+parameters and random-number consumption retain the original initialization;
+the initial function equals the original unweighted concatenation. On the first
+step the final weight-prediction layer receives gradients; its preceding layer
+receives nonzero gradients after the final layer starts learning.
+
+Parameter count stays 74,354,667; the existing weight predictor becomes active.
+This is a new from-scratch experiment with the original ImageNet pretraining.
+Do not resume the completed unweighted run as this experiment. Both DCA blocks
+save `weighted_fusion_version=1`; strict loading and manifest validation reject
+old checkpoints. Measured server epoch/forward timing is needed for any speed claim.
 
 ## Effective architecture
 
@@ -22,8 +40,8 @@ modules after initialization, before moving to GPU or creating the optimizer.
 The runner retains the full-model constructor options only to preserve the RNG
 sequence. They do not enable the pruned runtime branches. Checkpoint
 `topology_coefficients` records the effective disabled state.
-All surviving state tensors are exactly equal to the same-seed full model
-before training. The original ImageNet loading rule and loaded/new LR groups
+All shared parameters except the last DCA weight-prediction layers keep the
+same-seed baseline values. The original ImageNet loading rule and loaded/new LR groups
 are retained. Both load 225 compatible ImageNet tensors at 512 input.
 
 Only focal BCE (`gamma=1`) plus `0.5 * Dice` supervises the final surface.
@@ -35,8 +53,7 @@ coordinates remain identical to the full-model dataset for each seed/epoch.
 The common surface head has 124,945 parameters in both variants. At 512 input,
 the full model has 77,013,094 parameters and this ablation has 74,354,667
 (2,658,427 fewer). No unused layers are added to match total parameter count.
-The unchanged reference DCA contains a weight predictor whose intermediate
-result is overwritten in its original forward; it is retained in both arms.
+Both DCA weight predictors now participate in the loss and output.
 
 ## Protocol
 
@@ -60,29 +77,27 @@ the shared raster approximation, not official SpaceNet APLS. Evaluation uses
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate swinunet
-cd /home/gjj/SwinNet-e202-surface-only-mass1500
+cd /home/gjj/SwinNet-e202-surface-dca-weighted-mass1500
 export CUDA_VISIBLE_DEVICES=1
 export SEED=1234
-export RUN=e202_surface_only_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)
-bash scripts/run_e202_surface_only_mass1500.sh train
-bash scripts/run_e202_surface_only_mass1500.sh sweep
-bash scripts/run_e202_surface_only_mass1500.sh test
-bash scripts/run_e202_surface_only_mass1500.sh topology
+export RUN=e202_surface_dca_weighted_mass1500_random512_fp32_noema80_b2_acc1_s${SEED}_$(date +%Y%m%d_%H%M%S)
+bash scripts/run_e202_surface_dca_weighted_mass1500.sh train
+bash scripts/run_e202_surface_dca_weighted_mass1500.sh sweep
+bash scripts/run_e202_surface_dca_weighted_mass1500.sh test
+bash scripts/run_e202_surface_dca_weighted_mass1500.sh topology
 ```
 
 `test` already computes topology and writes `test/test_comparison.csv`.
 `topology` reuses the completed report. Set RUN to the existing run when
-resuming, then use `bash scripts/run_e202_surface_only_mass1500.sh resume`.
-Independent seeds should also be run for the full reference arm.
+resuming, then use `bash scripts/run_e202_surface_dca_weighted_mass1500.sh resume`.
+Independent seeds should also be run for the surface-only reference arm.
 
 ```bash
-python -u scripts/benchmark_surface_only.py \
-  --pretrain_ckpt /home/gjj/Swin-Unet-main/pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth \
-  --output_json /home/gjj/SwinNet-roadbias/model_out/$RUN/full_vs_surface_compute.json
+RESULTS=/home/gjj/SwinNet-roadbias/model_out
+RUN=$(cat "$RESULTS/latest_e202_surface_dca_weighted_mass1500_run.txt")
+AUDIT=$(cat "$RESULTS/$RUN/latest_unified_eval.txt")
+cat "$AUDIT/test/test_comparison.csv"
 ```
 
-The benchmark measures full forward, including every enabled model branch,
-on the same GPU with batch2/512/FP32. It reports parameter counts, shared-head
-counts, synchronized batch/per-tile time and peak allocated GPU memory.
-It excludes H2D, sliding fusion and metrics; it does not measure full-image
-inference or training epoch time. Report measured server results for speed.
+The runtime package includes training, inference and unified evaluation only.
+The original surface-only latest-run pointer and results are separate.

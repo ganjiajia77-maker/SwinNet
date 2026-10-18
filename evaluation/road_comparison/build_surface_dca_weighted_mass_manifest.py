@@ -10,7 +10,7 @@ import torch
 
 
 BASE = "e2020d9a8df311f9f680cd3637466a674d76688e"
-NAME = "e2020d9_surface_only_mass1500_random512_fp32_noema80_b2_acc1"
+NAME = "e2020d9_surface_dca_weighted_mass1500_random512_fp32_noema80_b2_acc1"
 EXPECTED = dict(
     surface_only=True,
     img_size=512, source_patch_size=1500, random_crop_train=True,
@@ -51,6 +51,11 @@ def verify_checkpoint(path):
         raise ValueError("Checkpoint must record the training seed")
     if not checkpoint.get("model_state_dict"):
         raise ValueError("Checkpoint has no model weights")
+    for index in (0, 1):
+        key = f"swin_unet.dca_blocks.{index}.weighted_fusion_version"
+        version = checkpoint["model_state_dict"].get(key)
+        if not isinstance(version, torch.Tensor) or version.numel() != 1 or version.item() != 1:
+            raise ValueError("Expected a newly trained weighted-DCA checkpoint, not the old surface-only run")
     return saved, checkpoint.get("epoch")
 
 
@@ -76,7 +81,7 @@ def build_manifest(checkpoint, data_root, predictions_root, selection=None):
     root = Path(__file__).resolve().parents[2]
     files = ["train_image.py", "test_image.py", "datasets/dataset_road_skeleton.py",
              "config.py", "configs/swin_tiny_patch4_window7_224_lite.yaml",
-             "networks/vision_transformer.py", "networks/surface_only.py",
+             "networks/vision_transformer.py", "networks/surface_only.py", "networks/dca_fpn_lite.py",
              "networks/swin_transformer_unet_skip_expand_decoder_sys.py",
              "networks/skeleton_guided_head.py", "networks/keypoint_global_topology.py",
              "losses/road_losses.py", "losses/cldice_loss.py", "direction_target_utils.py",
@@ -89,6 +94,9 @@ def build_manifest(checkpoint, data_root, predictions_root, selection=None):
         models=[dict(name=NAME, provenance=dict(
             checkpoint=str(checkpoint), checkpoint_epoch=epoch,
             base_model_commit=BASE, checkpoint_args_verified=True,
+            surface_only_base_commit="eb2da24d768b7f643e4fb288e3736693862c1fe8",
+            dca_fusion="scaled_softmax_weighted_concat_v1",
+            dca_weight_initialization="zero final weight predictor; K * softmax = 1 at initialization",
             seed=saved["seed"], pretrained_checkpoint=saved.get("pretrain_ckpt"),
             loaded_pretrained_names_record="checkpoint.loaded_pretrained_names",
             training_crop="one random512 crop per native1500 image each epoch",

@@ -106,10 +106,9 @@ class SurfaceOnlyTests(unittest.TestCase):
                         unused.add(name)
                         continue
                     self.assertTrue(torch.isfinite(parameter.grad).all(), name)
-            # The unchanged e202 DCA overwrites its weighted fusion result.
-            self.assertEqual(unused, {f"swin_unet.dca_blocks.{stage}.weight_conv.{layer}.{part}"
-                                      for stage in (0, 1) for layer in (0, 2)
-                                      for part in ("weight", "bias")})
+            self.assertEqual(unused, set())
+            for block in model.swin_unet.dca_blocks:
+                self.assertGreater(float(block.weight_conv[-1].weight.grad.abs().sum()), 0.0)
         finally:
             model.zero_grad(set_to_none=True)
             model.cpu()
