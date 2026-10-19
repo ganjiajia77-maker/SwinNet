@@ -76,6 +76,35 @@ class ConvConnectivityAblationTests(unittest.TestCase):
         self.assertIsInstance(conv.decoder_structure_blocks["2"].connectivity_head, torch.nn.Conv2d)
         self.assertIsInstance(conv.decoder_structure_blocks["3"].connectivity_head, torch.nn.Conv2d)
 
+    def test_actual_block_c_ignores_s_and_d_but_trains_shared_features(self):
+        block = DecoderStructureRefinement(channels=96).eval()
+        block.connectivity_head = torch.nn.Conv2d(96, 8, 1)
+        feature = torch.randn(2, 96, 8, 8, requires_grad=True)
+        original = block(feature)
+        # Perturb the actual S/D outputs, rather than just calling an isolated C head.
+        hooks = [
+            block.skeleton_head.register_forward_hook(lambda module, args, out: out + 20.),
+            block.direction_head.register_forward_hook(lambda module, args, out: out - 30.),
+        ]
+        try:
+            block.runtime_connectivity_skeleton_override = torch.ones(2, 1, 8, 8)
+            with torch.no_grad(), patch.object(
+                PairwiseConnectivityHead, "direction_alignment",
+                side_effect=AssertionError("Conv-C must not compute direction matching"),
+            ):
+                changed = block(feature)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        torch.testing.assert_close(original[2], changed[2], rtol=0, atol=0)
+        self.assertFalse(torch.equal(original[1], changed[1]))
+        self.assertFalse(torch.equal(original[3], changed[3]))
+        original[2].square().mean().backward()
+        self.assertGreater(float(feature.grad.abs().sum()), 0.)
+        self.assertGreater(float(block.structure_branch[0].block[0].weight.grad.abs().sum()), 0.)
+        self.assertTrue(all(p.grad is None for p in block.skeleton_head.parameters()))
+        self.assertTrue(all(p.grad is None for p in block.direction_head.parameters()))
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_real_model_fp32_forward_backward(self):
         root = Path(__file__).resolve().parents[1]
