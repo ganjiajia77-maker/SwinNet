@@ -109,3 +109,8 @@ Zhang–Suen、8邻域、短块面积<20、APLS64节点/匹配<=5保持一致；
 
 更换MODE为identity/semantic重复；种子可选1234/2026/3407并做相同种子的配对比较。
 恢复训练使用同一MODE/SEED和 `--resume "$OUT/$RUN/last.pth"`；保持80轮原学习率进度。
+
+已训练的 `semantic_directional` checkpoint 可先用新增的
+`diagnose_direction.py` 做同权重开/关方向推理诊断，查看边权、回写和最终预测变化，
+并通过统一工具比较固定阈值与各自验证阈值的测试指标。完整指令及解释见
+[DIRECTION_DIAGNOSIS.md](DIRECTION_DIAGNOSIS.md)。该诊断不重训、不覆盖 checkpoint。
