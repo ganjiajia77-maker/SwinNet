@@ -1,0 +1,14 @@
+{
+  "mass_h0.py": "2d02acb3d4307d3002df5e7429bfa1a62746c443a04dc0187e3c572a094c084a",
+  "mass_protocol.py": "1cfdc7cf14ddf498970ce61dea86cc6ea268a4222993ed1f6141ab147e386128",
+  "train_image.py": "e86c233d2a59eacf90441e6381ceb7bb25aa65f4c8c4b7295a7143d16f7e5e73",
+  "test_image.py": "df07ea92e2cc7a2f2ea6a62e8fb32457504734b28fa88a3014b8f223004a0ca0",
+  "datasets/dataset_road_skeleton.py": "de5d5e836157d6b39ba529c94d557782cdb333dddf756a05d80ea031daef6a89",
+  "config.py": "36212583e71dc7458c016672dabf327dce2b754dffb1ccbe34fa36664770de25",
+  "configs/swin_tiny_patch4_window7_224_lite.yaml": "5baa9c6b66f0e3568e4e29c38285ab7ca7abe9cea8e1e3119ed9ab5a74234b2f",
+  "evaluation/road_comparison/compare_predictions.py": "a5117b06bdddf0c085e1e1657c3794f21b4624035d7d28692c9cc074640b6d6b",
+  "evaluation/road_comparison/road_metrics.py": "09e56e4e5140eace41b53e977f23195f0b457082e7a6a765ef490026407815e5",
+  "evaluation/road_comparison/requirements.txt": "9b38163412b35736a67582f2f08dd2c515ad152023fee28aaafec3052a5edaf6",
+  "requirements-mass.txt": "c533094b9a7ba61d75e82a6b4c6cd7fa9b820253ed0f1bb33aafbb1c6a402c25",
+  "BASE_MODEL_SHA256.json": "083fdde3c71ffd16ec207835280e1176c405098077419ba6c3129029c2ccb1ff"
+}

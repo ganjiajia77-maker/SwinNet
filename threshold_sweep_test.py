@@ -112,6 +112,8 @@ def main():
     
     print('\nLoading model from: {}'.format(args.model_path))
     checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
+    if checkpoint.get('architecture_contract') is not None:
+        raise ValueError('Use h0_location.py sweep for the location experiment: native1500, 512/256 sliding')
     saved_args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
     if isinstance(saved_args, dict):
         for name in (

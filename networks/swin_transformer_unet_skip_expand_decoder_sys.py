@@ -1004,12 +1004,14 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, road_prior=None):
+    def forward(self, x, road_prior=None, post_swin_transform=None):
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, None, None, None, None, road_prior)
             else:
                 x = blk(x, road_prior=road_prior)
+        if post_swin_transform is not None:
+            x = post_swin_transform(x)
         self.last_road_attention = None
         self.last_pre_downsample = x
         if self.downsample is not None:
@@ -1275,6 +1277,7 @@ class SwinTransformerSys(nn.Module):
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False,
+                 stage2_structure_location="decoder",
                   **kwargs):
         super().__init__()
 
@@ -1331,6 +1334,9 @@ class SwinTransformerSys(nn.Module):
             remove_stage2_pre_topology_source
         )
         self.last_stage_features = {}
+        self.stage2_structure_location = stage2_structure_location
+        if stage2_structure_location not in {"decoder", "encoder_e1"}:
+            raise ValueError("stage2_structure_location must be decoder or encoder_e1")
         self.last_z_struct = None
         self.highres_structure_fuse_stages = str(highres_structure_fuse_stages).lower()
         self._highres_structure_shape_logged = False
@@ -1768,7 +1774,7 @@ class SwinTransformerSys(nn.Module):
         return {'relative_position_bias_table'}
 
     # Encoder and Bottleneck
-    def forward_features(self, x):
+    def forward_features(self, x, encoder_structure=None):
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -1787,6 +1793,9 @@ class SwinTransformerSys(nn.Module):
                     if i_layer == 2
                     else None
                 ),
+                post_swin_transform=(
+                    lambda tokens: self._run_encoder_e1_structure(tokens, encoder_structure)
+                ) if i_layer == 0 and encoder_structure is not None else None,
             )
             if i_layer == 0 and layer.last_road_attention is not None:
                 stage1_road_attention = layer.last_road_attention
@@ -1810,6 +1819,29 @@ class SwinTransformerSys(nn.Module):
         x = self.norm(x)  # B L C
 
         return x, x_downsample, road_attentions
+
+    def _run_encoder_e1_structure(self, x, state):
+        """Run the existing Stage 2 chain before A1 and PatchMerging once."""
+        height, width = self.patches_resolution
+        x = self._apply_highres_structure_fusion(
+            x, state["H0"], 2, (height, width))
+        feature_map = token_to_map(x, height, width)
+        feature_map, skeleton, connectivity, direction, gate, diagnostics = (
+            self._run_decoder_structure_block(
+                feature_map, 2, bottleneck_tokens=None,
+                highres_skeleton_feat=state["H0"]))
+        if not isinstance(diagnostics, dict):
+            raise RuntimeError("E1 structure block did not return G_E and H1")
+        state["G_E"] = diagnostics.pop("structure_feat")
+        state["H1"] = diagnostics.pop("highres_skeleton_feat")
+        state["features"].update(G2=state["G_E"], G_E=state["G_E"], H1=state["H1"])
+        self._append_structure_output(
+            state["structure_outputs"], stage=2, skeleton=skeleton,
+            connectivity=connectivity, direction=direction,
+            structure_gate=gate, roadness=diagnostics,
+            refinement_step=1, stage_loss_scale=1.0)
+        state["structure_outputs"][-1]["source_location"] = "encoder_e1"
+        return map_to_token(feature_map)
 
     def _highres_structure_stage_enabled(self, stage):
         if not self.enable_highres_structure_stream:
@@ -2062,6 +2094,7 @@ class SwinTransformerSys(nn.Module):
         x_downsample,
         bottleneck_tokens=None,
         z_struct=None,
+        encoder_structure=None,
     ):
         """
         Decoder with DCA-FPN-Lite refinement on stage 2 and stage 3 skips.
@@ -2073,16 +2106,22 @@ class SwinTransformerSys(nn.Module):
         Returns:
             decoder output [B, L, C]
         """
-        structure_outputs = []
-        stage2_structure_feat = None
-        self.last_stage_features = {}
-        highres_skeleton_feat = (
-            self.highres_skeleton_adapter(z_struct)
-            if z_struct is not None and self.highres_skeleton_adapter is not None
-            else None
-        )
-        if highres_skeleton_feat is not None:
-            self.last_stage_features["H0"] = highres_skeleton_feat
+        if encoder_structure is None:
+            structure_outputs = []
+            stage2_structure_feat = None
+            self.last_stage_features = {}
+            highres_skeleton_feat = (
+                self.highres_skeleton_adapter(z_struct)
+                if z_struct is not None and self.highres_skeleton_adapter is not None
+                else None
+            )
+            if highres_skeleton_feat is not None:
+                self.last_stage_features["H0"] = highres_skeleton_feat
+        else:
+            structure_outputs = list(encoder_structure["structure_outputs"])
+            stage2_structure_feat = encoder_structure["G_E"]
+            highres_skeleton_feat = encoder_structure["H1"]
+            self.last_stage_features = dict(encoder_structure["features"])
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
             if highres_skeleton_feat is not None
@@ -2120,6 +2159,10 @@ class SwinTransformerSys(nn.Module):
                 # 5. Skip concatenation
                 x = torch.cat([x, skip_refined], -1)
                 x = self.concat_back_dim[inx](x)
+
+            if inx == 2 and self.stage2_structure_location == "encoder_e1":
+                x = layer_up(x)
+                continue
 
             decoder_structure_gate_enabled = (
                 self._decoder_structure_enabled(inx)
@@ -2415,13 +2458,21 @@ class SwinTransformerSys(nn.Module):
         x,
     ):
         structure_input = x
-        x, x_downsample, road_attentions = self.forward_features(x)
-        z_struct = self._build_highres_structure_outputs(structure_input)
+        encoder_structure = None
+        if self.stage2_structure_location == "encoder_e1":
+            z_struct = self._build_highres_structure_outputs(structure_input)
+            h0 = self.highres_skeleton_adapter(z_struct)
+            encoder_structure = dict(H0=h0, features={"H0": h0}, structure_outputs=[])
+            x, x_downsample, road_attentions = self.forward_features(x, encoder_structure)
+        else:
+            x, x_downsample, road_attentions = self.forward_features(x)
+            z_struct = self._build_highres_structure_outputs(structure_input)
         x, structure_outputs, highres_skeleton_feat = self.forward_up_features(
             x,
             x_downsample,
             bottleneck_tokens=x,
             z_struct=z_struct,
+            encoder_structure=encoder_structure,
         )
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)

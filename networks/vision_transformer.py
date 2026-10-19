@@ -47,6 +47,9 @@ def get_topology_coefficients(model):
         },
         "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
     }
+    if getattr(module, "architecture_contract", None) is not None:
+        coefficients["architecture_id"] = module.architecture_contract["architecture_id"]
+        coefficients["stage2_structure_location"] = swin_unet.stage2_structure_location
 
     for stage in (2, 3):
         structure_block = swin_unet.decoder_structure_blocks[str(stage)]
@@ -103,6 +106,9 @@ def format_topology_coefficients(model):
         f"profile={coefficients['structure_profile']}",
         f"final_structure={'on' if coefficients['final_structure_enabled'] else 'off'}",
     ]
+    if "architecture_id" in coefficients:
+        fields.append("architecture={} stage2_location={}".format(
+            coefficients["architecture_id"], coefficients["stage2_structure_location"]))
     highres_values = coefficients["highres_structure_stream"]
     fields.append(
         "highres_structure={} source={} channels={} fuse_stages={} fusion_mode={}".format(
@@ -155,7 +161,12 @@ def load_topology_checkpoint_state(
     state_dict,
     checkpoint_version,
     strict=True,
+    checkpoint_contract=None,
 ):
+    if getattr(model, "architecture_contract", None) is not None or checkpoint_contract is not None:
+        from .h0_location_contract import validate_checkpoint_contract
+        validate_checkpoint_contract(model, {"architecture_contract": checkpoint_contract})
+        return model.load_state_dict(state_dict, strict=True)
     model_state = model.state_dict()
     highres_structure_missing_prefixes = (
         "swin_unet.highres_structure_encoder.",
@@ -557,13 +568,23 @@ class SwinUnet(nn.Module):
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False):
+                 remove_stage2_pre_topology_source=False,
+                 architecture_id=None, stage2_structure_location=None):
+        constructor = dict(locals())
+        stage2_structure_location = stage2_structure_location or "decoder"
+        constructor["stage2_structure_location"] = stage2_structure_location
+        from .h0_location_contract import ARCHITECTURE_ID, make_contract
+        if architecture_id not in {None, ARCHITECTURE_ID}:
+            raise ValueError(f"Unknown architecture_id: {architecture_id}")
+        if architecture_id is None and stage2_structure_location != "decoder":
+            raise ValueError("encoder_e1 requires architecture_id=h0_stage2_location_v1")
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.config = config
         self.return_skeleton = return_skeleton
         self.bottleneck_type = bottleneck_type
+        self.architecture_contract = make_contract(config, constructor) if architecture_id else None
 
         self.swin_unet = SwinTransformerSys(img_size=config.DATA.IMG_SIZE,
                                 patch_size=config.MODEL.SWIN.PATCH_SIZE,
@@ -605,7 +626,8 @@ class SwinUnet(nn.Module):
                                  stage_skeleton_mode=stage_skeleton_mode,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
-                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
+                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source,
+                                 stage2_structure_location=stage2_structure_location)
     def forward(
         self,
         x,

@@ -30,6 +30,10 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
+from mass_protocol import BASE_COMMIT, stitch_logits, validate_training_args
+from networks.h0_location_contract import (
+    ARCHITECTURE_ID, inherit_location_args, load_checkpoint_strict, validate_checkpoint_contract,
+)
 
 
 def seed_worker(worker_id):
@@ -39,6 +43,8 @@ def seed_worker(worker_id):
 
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--architecture_id', choices=[ARCHITECTURE_ID], default=None)
+parser.add_argument('--stage2_structure_location', choices=['decoder', 'encoder_e1'], default=None)
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--list_dir', type=str, default='./lists/lists_Synapse', help='list dir')
@@ -562,7 +568,7 @@ def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -573,6 +579,7 @@ def inherit_resume_architecture_args(args):
         return
 
     saved_args = checkpoint["args"]
+    inherit_location_args(args, checkpoint, lambda name: _cli_has("--" + name))
     for name, cast in (
         ("surface_focal_gamma", float),
         ("amp_dtype", str),
@@ -940,10 +947,6 @@ def evaluate_overlap_full_images(
     surface_tp = surface_fp = surface_fn = 0
     skeleton_tp = skeleton_fp = skeleton_fn = 0
     image_count = 0
-    positions = RoadSkeletonDataset.sliding_positions
-    weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
-    weight_1d = (1.0 - weight_1d).clamp_min(0.1)
-    tile_weight = (weight_1d[:, None] * weight_1d[None, :]).view(1, 1, tile_size, tile_size)
 
     with torch.no_grad():
         for batch in loader:
@@ -956,35 +959,14 @@ def evaluate_overlap_full_images(
                 mask = full_masks[image_index:image_index + 1]
                 skeleton = full_skeletons[image_index:image_index + 1]
                 skeleton_dilate = full_skeletons_dilate[image_index:image_index + 1]
-                height, width = image.shape[-2:]
-                logit_canvas = torch.zeros((1, 1, height, width), device=device)
-                skeleton_logit_canvas = torch.zeros_like(logit_canvas)
-                weight_canvas = torch.zeros_like(logit_canvas)
-
-                for top in positions(height, tile_size, stride):
-                    for left in positions(width, tile_size, stride):
-                        tile = image[:, :, top:top + tile_size, left:left + tile_size]
-                        outputs = model(tile)
-                        surface_logits = outputs[0]
-                        skeleton_logits = outputs[2]
-                        tile_height, tile_width = surface_logits.shape[-2:]
-                        weight = tile_weight[:, :, :tile_height, :tile_width]
-                        logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += surface_logits * weight
-                        if skeleton_logits is not None:
-                            skeleton_logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += skeleton_logits * weight
-                        weight_canvas[:, :, top:top + tile_height, left:left + tile_width] += weight
-
-                if weight_canvas.min().item() <= 0:
-                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
-                full_logits = logit_canvas / weight_canvas.clamp_min(1e-8)
+                full_logits, full_skeleton_logits = stitch_logits(model, image, tile_size, stride)
                 surface_pred = (torch.sigmoid(full_logits) >= threshold).float()
                 mask_bin = (mask > 0.5).float()
                 surface_tp += int((surface_pred * mask_bin).sum().item())
                 surface_fp += int((surface_pred * (1.0 - mask_bin)).sum().item())
                 surface_fn += int(((1.0 - surface_pred) * mask_bin).sum().item())
 
-                if skeleton_logits is not None:
-                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas.clamp_min(1e-8)
+                if full_skeleton_logits is not None:
                     if criterion is not None:
                         loss, _ = criterion(
                             full_logits,
@@ -1188,6 +1170,14 @@ if __name__ == "__main__":
     
     inherit_resume_architecture_args(args)
     apply_structure_profile_defaults(args)
+    if args.architecture_id:
+        from h0_location import validate_reference_args
+        validate_reference_args(vars(args))
+        if args.resume and not os.path.isfile(args.resume):
+            raise FileNotFoundError(args.resume)
+    validate_training_args(args)
+    print('[MASS PROTOCOL] native1500 -> one random512 crop/image/epoch; '
+          'val=512/256 sliding; 80 epochs; batch2; accumulation1; FP32; no EMA', flush=True)
 
     # 加载配置
     config = get_config(args)
@@ -1237,7 +1227,9 @@ if __name__ == "__main__":
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
-                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
+                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+                    architecture_id=args.architecture_id,
+                    stage2_structure_location=args.stage2_structure_location).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
@@ -1328,7 +1320,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1450,7 +1442,10 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            validate_checkpoint_contract(model, checkpoint)
+            if args.architecture_id:
+                load_checkpoint_strict(model, checkpoint)
             checkpoint_state = checkpoint["model_state_dict"]
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -1656,6 +1651,8 @@ if __name__ == "__main__":
                     optimizer = build_layerwise_optimizer()
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 except (ValueError, RuntimeError) as exc:
+                    if args.architecture_id:
+                        raise RuntimeError("Location experiment requires exact optimizer resume") from exc
                     print(
                         "[WARN] Optimizer state not restored; "
                         "continuing with a fresh optimizer for current parameters.",
@@ -1732,7 +1729,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -2205,6 +2202,10 @@ if __name__ == "__main__":
 
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
+                'architecture_contract': model.architecture_contract,
+                'experiment_base_commit': BASE_COMMIT if not args.architecture_id else None,
+                'model_base_commit': BASE_COMMIT,
+                'experiment_protocol': 'h0-mass-native1500-random512-fp32-80e-bs2-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),
@@ -2247,7 +2248,8 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location='cuda', weights_only=False)
+        validate_checkpoint_contract(model, best_checkpoint)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(
