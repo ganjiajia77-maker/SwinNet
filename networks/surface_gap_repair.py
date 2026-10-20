@@ -424,7 +424,8 @@ class SurfaceGapRepair(nn.Module):
         self.fuse=nn.Sequential(nn.Conv2d(64,64,1,bias=False),nn.GroupNorm(8,64),nn.GELU())
         self.context=nn.Sequential(_ResidualDilated(64,1),_ResidualDilated(64,2),_ResidualDilated(64,4))
         self.geometry=nn.Sequential(nn.Linear(8,token_dim),nn.GELU(),nn.Linear(token_dim,token_dim))
-        self.classifier=nn.Sequential(nn.Linear(96+token_dim,64),nn.GELU(),nn.Linear(64,1))
+        # Global context (64), two anchor descriptors (2 x 64), geometry token.
+        self.classifier=nn.Sequential(nn.Linear(64*3+token_dim,64),nn.GELU(),nn.Linear(64,1))
         self.delta256=nn.Sequential(nn.Conv2d(64+32,48,3,padding=1,bias=False),nn.GroupNorm(8,48),nn.GELU())
         self.delta512=nn.Sequential(nn.Conv2d(48+10,16,1,bias=False),nn.GroupNorm(4,16),nn.GELU(),nn.Conv2d(16,1,3,padding=1))
         nn.init.zeros_(self.delta512[-1].weight); nn.init.zeros_(self.delta512[-1].bias)
@@ -468,7 +469,13 @@ class SurfaceGapRepair(nn.Module):
         geo=self.geometry(geom_vec)
         pooled=F.adaptive_avg_pool2d(context,1).flatten(1)
         anchor=self._anchor_pool(context,prompts)
-        cls=self.classifier(torch.cat([pooled,anchor,geo],dim=1)).squeeze(1)
+        classifier_input=torch.cat([pooled,anchor,geo],dim=1)
+        if classifier_input.shape[1] != self.classifier[0].in_features:
+            raise RuntimeError(
+                "repair classifier feature width mismatch: "
+                f"got {classifier_input.shape[1]}, expected {self.classifier[0].in_features}"
+            )
+        cls=self.classifier(classifier_input).squeeze(1)
         up=F.interpolate(context,size=(256,256),mode="bilinear",align_corners=False)
         detail_up=F.interpolate(detail,size=(256,256),mode="bilinear",align_corners=False)
         d=self.delta256(torch.cat([up,detail_up],dim=1))
