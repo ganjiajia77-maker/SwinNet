@@ -39,8 +39,13 @@ class SurfaceGapRepairTests(unittest.TestCase):
 
         gt[:]=False
         # A curved, local GT route can be positive even when the straight corridor is empty.
-        for x,y in [(80,120),(100,115),(120,105),(140,95),(160,95),(180,105),(200,115)]:
-            gt[y-2:y+3,x-2:x+3]=True
+        curve=[(80,120),(100,115),(120,105),(140,95),(160,95),(180,105),(200,115)]
+        for (x0,y0),(x1,y1) in zip(curve,curve[1:]):
+            steps=max(abs(x1-x0),abs(y1-y0))
+            for step in range(steps+1):
+                t=step/steps
+                x=round(x0+(x1-x0)*t); y=round(y0+(y1-y0)*t)
+                gt[y-2:y+3,x-2:x+3]=True
         curved=label_candidate(self.candidate((120,80),(115,200)),gt,pred)
         self.assertEqual(curved.label,1)
 
@@ -77,7 +82,7 @@ class SurfaceGapRepairTests(unittest.TestCase):
         cls,delta=repair(rgb,p0,prompts,geometry,shallow,decoder)
         self.assertEqual(tuple(cls.shape),(1,))
         self.assertEqual(tuple(delta.shape),(1,1,512,512))
-        self.assertEqual(float(delta.abs().max()),0.0)
+        self.assertEqual(float(delta.detach().abs().max()),0.0)
         # Connection BCE updates its classifier; pixel loss reaches the zero-initialized delta head.
         loss=torch.nn.functional.binary_cross_entropy_with_logits(cls,torch.ones_like(cls))+delta.square().mean()
         loss.backward()
