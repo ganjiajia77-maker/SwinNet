@@ -21,7 +21,11 @@ INFO=$(python -c 'import sys,torch; c=torch.load(sys.argv[1],map_location="cpu",
 read -r IMAGE_SIZE SOURCE_SIZE USE_EMA <<< "$INFO"
 EMA_ARGS=()
 if [[ "$USE_EMA" == 1 ]]; then EMA_ARGS+=(--require_ema); fi
+MODEL_ARGS=(--enable_global_topology --ablate_h0_stream
+            --global_topology_max_nodes 32 --global_topology_heads 4
+            --global_topology_alpha_max 0.05)
 echo "checkpoint=$CKPT data=$DATA split=$SPLIT tile=$IMAGE_SIZE native=$SOURCE_SIZE threshold=$THRESHOLD EMA=$USE_EMA GPU=$GPU output=$OUT"
+echo "H0 variant=A (no_highres); global topology enabled with Stage 3 projected structure"
 
 for FLOOR in 0 0.2; do
   NAME=original
@@ -32,7 +36,7 @@ for FLOOR in 0 0.2; do
     --split "$SPLIT" --img_size "$IMAGE_SIZE" --source_patch_size "$SOURCE_SIZE" \
     --overlap_infer --threshold "$THRESHOLD" \
     --writeback_gate_floor "$FLOOR" --save_overlap_logits \
-    --output_dir "$OUT/$NAME" "${EMA_ARGS[@]}" \
+    --output_dir "$OUT/$NAME" "${EMA_ARGS[@]}" "${MODEL_ARGS[@]}" \
     2>&1 | tee "$OUT/${NAME}_inference.log"
 done
 
