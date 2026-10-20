@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${CKPT:?Set CKPT to the trained H0 best.pth used by the original evaluation}"
-: "${DATA:?Set DATA to that checkpoint's validation dataset root}"
+: "${DATA:?Set DATA to the checkpoint validation dataset root}"
 : "${THRESHOLD:?Set THRESHOLD to the original validation-selected threshold}"
 GPU=${GPU:-0}
 SPLIT=${SPLIT:-val}
