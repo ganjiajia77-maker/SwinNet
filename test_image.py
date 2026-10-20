@@ -138,7 +138,7 @@ parser.add_argument('--model_path', type=str, required=True, help='path to model
 parser.add_argument('--writeback_gate_floor', type=float, default=0.0,
                     help='diagnostic floor for global topology feature writeback only')
 parser.add_argument('--save_overlap_logits', action='store_true',
-                    help='save stitched full-resolution surface logits as float32 NPY')
+                    help='save stitched full-resolution surface logits as float16 NPY')
 parser.add_argument('--num_workers', default=4, type=int)
 # Options expected by config.update_config
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
