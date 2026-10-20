@@ -18,7 +18,8 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset, set_dataset_epoc
 from losses.cldice_loss import SoftCLDiceLoss
 from networks.vision_transformer import SwinUnet, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
 from networks.surface_gap_repair import (GapCandidate, SurfaceGapRepair, candidate_tensors,
-    generate_candidates, label_candidate, sliding_positions, stitch_logits, taper_weight, zhang_suen)
+    generate_candidates, label_candidate, sliding_positions, stitch_logits, taper_weight, zhang_suen,
+    PROPOSAL_SEARCH_BUDGET)
 
 
 BASE_COMMIT="eb2da24d768b7f643e4fb288e3736693862c1fe8"
@@ -141,8 +142,11 @@ def _candidate_windows(rgb,mask,model,device,split,name,threshold=.45,progress_p
     started=time.perf_counter()
     candidate_progress=(lambda message: print(f"{progress_prefix} {message}",flush=True)) if progress_prefix else None
     candidates,stats=generate_candidates(prob,threshold=threshold,tile=512,stride=256,
-        progress=candidate_progress)
+        progress=candidate_progress,**PROPOSAL_SEARCH_BUDGET)
     if progress_prefix: print(f"{progress_prefix} generated {len(candidates)} candidates; labeling against train GT",flush=True)
+    if not candidates:
+        timing["candidate_generation_and_label_seconds"]=time.perf_counter()-started
+        return base,pos,tile_logits,[],{**stats,**timing}
     labeled=[]
     gt=mask[0].numpy().astype(bool)
     gt_skeleton=zhang_suen(gt)
@@ -182,7 +186,8 @@ def repair_image(model,repair,rgb,device,candidate_threshold=.45,accept_threshol
     base,pos,tile_logits,timing=tile_inference(model,rgb,device)
     prob=torch.sigmoid(base)[0,0].cpu().numpy()
     started=time.perf_counter()
-    candidates,stats=generate_candidates(prob,threshold=candidate_threshold,tile=512,stride=256)
+    candidates,stats=generate_candidates(prob,threshold=candidate_threshold,tile=512,stride=256,
+        **PROPOSAL_SEARCH_BUDGET)
     stats["candidate_generation_seconds"]=time.perf_counter()-started
     bytile=defaultdict(list)
     for c in candidates: bytile[(c.tile_top,c.tile_left)].append(c)
@@ -251,6 +256,8 @@ def masked_soft_cldice(logits,target,mask,loss_fn=None):
 
 def load_repair_checkpoint(args,device):
     ckpt=torch.load(args.checkpoint,map_location="cpu",weights_only=False)
+    if ckpt.get("protocol",{}).get("proposal",{}).get("search_budget")!=PROPOSAL_SEARCH_BUDGET:
+        raise ValueError("Checkpoint uses a different candidate search budget; evaluate with its original code version")
     model,_=build_base(args,device,load_imagenet=False)
     model.load_state_dict(ckpt["model_state_dict"],strict=True)
     repair=None
@@ -396,6 +403,8 @@ def train(args,device,resume=False,baseline_only=False):
         path=args.checkpoint or str(run_dir/"last.pth")
         ckpt=torch.load(path,map_location="cpu",weights_only=False)
         if ckpt.get("base_commit")!=BASE_COMMIT: raise ValueError("Resume checkpoint has wrong base commit")
+        if ckpt.get("protocol",{}).get("proposal",{}).get("search_budget")!=PROPOSAL_SEARCH_BUDGET:
+            raise ValueError("Resume checkpoint uses a different candidate search budget; use its original code version")
         model.load_state_dict(ckpt["model_state_dict"],strict=True)
         if repair is not None: repair.load_state_dict(ckpt["repair_state_dict"],strict=True)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"]); start=int(ckpt["epoch"]); best=float(ckpt.get("best_val_iou",-1))
@@ -413,7 +422,8 @@ def train(args,device,resume=False,baseline_only=False):
         "candidate_protocol":{"threshold":args.candidate_threshold,"threshold_source":args.candidate_threshold_source,
           "8_connectivity":8,"tangent_native_px":16,
           "distance_native_px":[8,128],"angle_max_degrees":75,"boundary_margin_px":8,
-          "max_per_endpoint":8,"max_candidates_image":256,"prompt_sigma_native_px":3},
+          "max_per_endpoint":8,"max_candidates_image":256,"prompt_sigma_native_px":3,
+          "proposal_search_budget":PROPOSAL_SEARCH_BUDGET},
         "training":{"epochs":args.max_epochs,"batch_size":2,"accumulation":1,"seed":args.seed,
           "precision":"FP32","ema":False,"train_mode":"joint","ordinary_crop_per_image_epoch":1,
           "candidate_tiles_per_step":2,"lambda_repair":args.lambda_repair,"lambda_cldice":args.lambda_cldice,
@@ -489,7 +499,8 @@ def train(args,device,resume=False,baseline_only=False):
             model.train(prior)
             candidate_manifest={"epoch":epoch+1,"split":"train","weights_sha256":state_hash(model),
               "protocol":{"threshold":args.candidate_threshold,"max_per_endpoint":8,"max_candidates_image":256,
-                "distance_px":[8,128],"tangent_px":16,"boundary_px":8},
+                "distance_px":[8,128],"tangent_px":16,"boundary_px":8,
+                "proposal_search_budget":PROPOSAL_SEARCH_BUDGET},
               "images":candidate_counts,"exposed_tiles":len(candidate_groups),"candidates":candidate_records}
         (run_dir/f"train_candidates_epoch_{epoch+1:03d}.json").write_text(json.dumps(candidate_manifest,indent=2),encoding="utf-8")
         candidate_pool=list(candidate_groups.items())
@@ -569,7 +580,8 @@ def train(args,device,resume=False,baseline_only=False):
                 "proposal":{"connectivity":8,"skeleton":"Zhang-Suen","tangent_length_px":16,
                     "min_distance_px":8,"max_distance_px":128,"angle_max_degrees":75,
                     "boundary_margin_px":8,"max_per_endpoint":8,"max_candidates_image":256,
-                    "tile_size":512,"tile_stride":256,"anchor_context_px":16,"prompt_sigma_px":3},
+                    "tile_size":512,"tile_stride":256,"anchor_context_px":16,"prompt_sigma_px":3,
+                    "search_budget":PROPOSAL_SEARCH_BUDGET},
                 "candidate_refresh":"once at each epoch start, current eval/no_grad weights",
                 "candidate_cache_file":f"train_candidates_epoch_{epoch+1:03d}.json",
                 "split":"train","features":["encoder_stage1_before_patch_merging","decoder_final_before_surface_head"],
@@ -606,6 +618,7 @@ def write_manifest(args,checkpoint,split,thresholds,output):
     provenance={"checkpoint":str(Path(checkpoint).resolve()),"base_commit":BASE_COMMIT,
         "epoch":ckpt.get("epoch"),"candidate_threshold":args.candidate_threshold,
         "candidate_threshold_source":args.candidate_threshold_source,
+        "proposal_search_budget":PROPOSAL_SEARCH_BUDGET,
         "accept_threshold":ckpt.get("protocol",{}).get("accept_threshold",.5),
         "inference":"native1500;512/256 tiles; taper0.1 weighted logits; single candidate pass",
         "prediction_generation":"all candidates from unrepaired P0; tile repair merged by weighted mean",

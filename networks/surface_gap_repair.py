@@ -14,6 +14,15 @@ from torch.nn import functional as F
 from scipy.spatial import cKDTree
 
 
+PROPOSAL_SEARCH_BUDGET={
+    "max_thinning_radius":64,
+    "max_endpoint_sources":512,
+    "max_endpoint_pair_checks":16,
+    "max_road_samples":1024,
+    "max_road_bins_checked":32,
+}
+
+
 @dataclass(frozen=True)
 class GapCandidate:
     kind: str                    # endpoint_endpoint | endpoint_road
@@ -196,31 +205,68 @@ def _local_gt_path_length(gt_band, anchor_a, anchor_b, source, target, max_detou
 def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
                         max_distance=128, max_per_endpoint=8, max_total=256,
                         tangent_length=16, boundary_margin=8, tile=512, stride=256,
-                        progress=None):
+                        progress=None,
+                        max_thinning_radius=PROPOSAL_SEARCH_BUDGET["max_thinning_radius"],
+                        max_endpoint_sources=PROPOSAL_SEARCH_BUDGET["max_endpoint_sources"],
+                        max_endpoint_pair_checks=PROPOSAL_SEARCH_BUDGET["max_endpoint_pair_checks"],
+                        max_road_samples=PROPOSAL_SEARCH_BUDGET["max_road_samples"],
+                        max_road_bins_checked=PROPOSAL_SEARCH_BUDGET["max_road_bins_checked"]):
     """Generate deterministic candidates from prediction only (no GT argument)."""
     binary = (probability >= threshold).astype(np.uint8)
+    road_fraction=float(binary.mean())
+    if binary.any():
+        max_radius=float(cv2.distanceTransform(binary,cv2.DIST_L2,3).max())
+    else:
+        max_radius=0.0
+    if max_radius>max_thinning_radius:
+        if progress: progress(f"candidate mask too thick for bounded thinning (radius={max_radius:.1f}); skip this image")
+        return [],{"endpoint_count":0,"endpoint_count_raw":0,"endpoint_budget_skipped":0,
+                   "proposed":0,"kept":0,"boundary_filtered":0,"tile_skipped":0,
+                   "road_fraction":road_fraction,"max_mask_radius":max_radius,
+                   "skip_reason":"thick_initial_candidate_mask"}
     if progress: progress("skeletonizing native prediction")
     skel = zhang_suen(binary)
     points = np.argwhere(skel)
     if not len(points):
-        return [], {"endpoint_count": 0, "proposed": 0, "kept": 0,
-                    "boundary_filtered": 0, "tile_skipped": 0}
+        return [], {"endpoint_count":0,"endpoint_count_raw":0,"endpoint_budget_skipped":0,
+                    "proposed":0,"kept":0,"boundary_filtered":0,"tile_skipped":0,
+                    "road_fraction":road_fraction,"max_mask_radius":max_radius,
+                    "skip_reason":"empty_candidate_skeleton"}
     kernel=np.ones((3,3),np.uint8); kernel[1,1]=0
     neighbor_counts=cv2.filter2D(skel.astype(np.uint8),-1,kernel,borderType=cv2.BORDER_CONSTANT)
     endpoints=[tuple(map(int,p)) for p in np.argwhere(skel & (neighbor_counts==1))]
     h,w = probability.shape
     boundary = [p for p in endpoints if min(p[0],p[1],h-1-p[0],w-1-p[1]) < boundary_margin]
-    endpoints = [p for p in endpoints if p not in set(boundary)]
-    if progress: progress(f"skeleton endpoints={len(endpoints)}")
+    boundary_set=set(boundary)
+    endpoints = [p for p in endpoints if p not in boundary_set]
+    all_endpoint_set=set(endpoints)
+    raw_endpoint_count=len(endpoints)
+    if len(endpoints)>max_endpoint_sources:
+        ranked=sorted(endpoints,key=lambda p:(-float(probability[p]),p[0],p[1]))
+        selected=[]; selected_set=set(); cells=set()
+        for p in ranked:
+            cell=(p[0]//64,p[1]//64)
+            if cell not in cells:
+                cells.add(cell); selected.append(p); selected_set.add(p)
+                if len(selected)>=max_endpoint_sources: break
+        if len(selected)<max_endpoint_sources:
+            for p in ranked:
+                if p not in selected_set:
+                    selected.append(p); selected_set.add(p)
+                    if len(selected)>=max_endpoint_sources: break
+        endpoints=sorted(selected)
+    if progress: progress(f"skeleton endpoints={raw_endpoint_count}; searched={len(endpoints)}")
     tangents = {p: _trace_tangent(skel,p,tangent_length) for p in endpoints}
     positions = tile_grid(h,w,tile,stride)
     proposals = []
+    pair_search_truncated=0
     if endpoints:
         endpoint_xy=np.asarray(endpoints,dtype=np.float64)
         endpoint_tree=cKDTree(endpoint_xy)
         for i,a in enumerate(endpoints):
-            # Query only nearby endpoints instead of enumerating every pair in the image.
-            for j in sorted(endpoint_tree.query_ball_point(endpoint_xy[i],max_distance)):
+            # Rank nearby pairs before expensive local connectivity and tile checks.
+            nearby_pairs=[]
+            for j in endpoint_tree.query_ball_point(endpoint_xy[i],max_distance):
                 if j<=i: continue
                 b=endpoints[j]
                 dy,dx=b[0]-a[0],b[1]-a[1]; distance=math.hypot(dy,dx)
@@ -229,6 +275,12 @@ def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
                 align_a=_alignment(ta,va,(dy,dx)); align_b=_alignment(tb,vb,(-dy,-dx))
                 if (va and align_a < math.cos(math.radians(75))) or (vb and align_b < math.cos(math.radians(75))):
                     continue
+                compatibility=min([v for v,valid in ((align_a,va),(align_b,vb)) if valid],default=0.0)
+                nearby_pairs.append(((-compatibility,distance,j),j,distance,align_a,align_b))
+            nearby_pairs.sort(key=lambda item:item[0])
+            pair_search_truncated+=max(0,len(nearby_pairs)-max_endpoint_pair_checks)
+            for _,j,distance,align_a,align_b in nearby_pairs[:max_endpoint_pair_checks]:
+                b=endpoints[j]; ta,va=tangents[a]; tb,vb=tangents[b]
                 if _locally_connected(binary,a,b): continue
                 tile_pos=_candidate_tile(a,b,positions,tile)
                 if tile_pos is None: continue
@@ -236,35 +288,49 @@ def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
                                               align_a,align_b,*tile_pos))
     if progress: progress(f"endpoint pairs proposed={len(proposals)}")
     tree=cKDTree(points.astype(np.float32))
-    endpoint_set=set(endpoints)
+    endpoint_set=all_endpoint_set
     used_counts={}
     for candidate in proposals:
         used_counts[candidate.anchor_a]=used_counts.get(candidate.anchor_a,0)+1
-    tile_skipped=0; road_proposals=0
+    tile_skipped=0; road_proposals=0; road_samples_truncated=0; road_bins_truncated=0
     for endpoint_index,a in enumerate(endpoints,1):
         ta,va=tangents[a]
         options={}
-        nearby=tree.query_ball_point(np.asarray(a),max_distance)
+        nearby=np.asarray(tree.query_ball_point(np.asarray(a),max_distance),dtype=np.int64)
+        if len(nearby)>max_road_samples:
+            nearby_points=points[nearby]
+            vectors=nearby_points-np.asarray(a)
+            distances=np.hypot(vectors[:,0],vectors[:,1])
+            alignments=(vectors[:,0]*ta[0]+vectors[:,1]*ta[1])/np.maximum(distances,1.0) if va else np.zeros_like(distances)
+            order=np.lexsort((nearby_points[:,1],nearby_points[:,0],distances,-alignments))
+            road_samples_truncated+=len(nearby)-max_road_samples
+            nearby=nearby[order[:max_road_samples]]
         for ix in nearby:
             b=tuple(map(int,points[ix])); distance=math.dist(a,b)
             if b==a or distance < min_distance or distance > max_distance or b in endpoint_set:
                 continue
             align_a=_alignment(ta,va,(b[0]-a[0],b[1]-a[1]))
             if va and align_a < math.cos(math.radians(75)): continue
-            tile_pos=_candidate_tile(a,b,positions,tile)
-            if tile_pos is None:
-                tile_skipped+=1; continue
-            road_proposals+=1
             key=(b[0]//8,b[1]//8)
-            candidate=GapCandidate("endpoint_road",a,b,ta,va,(0.0,0.0),False,
-                                   distance,align_a,0.0,*tile_pos)
             rank=(-align_a,distance,b)
-            if key not in options or rank < options[key][0]: options[key]=(rank,candidate)
-        for _,candidate in sorted(options.values(),key=lambda item:item[0]):
+            choices=options.setdefault(key,[])
+            choices.append((rank,b,distance,align_a))
+            choices.sort(key=lambda item:item[0])
+            del choices[2:]
+        ordered_bins=sorted(options.values(),key=lambda choices:choices[0][0])
+        road_bins_truncated+=max(0,len(ordered_bins)-max_road_bins_checked)
+        for choices in ordered_bins[:max_road_bins_checked]:
             if used_counts.get(a,0)>=max_per_endpoint: break
-            if _locally_connected(binary,a,candidate.anchor_b): continue
-            proposals.append(candidate)
-            used_counts[a]=used_counts.get(a,0)+1
+            for _,b,distance,align_a in choices:
+                tile_pos=_candidate_tile(a,b,positions,tile)
+                if tile_pos is None:
+                    tile_skipped+=1; continue
+                road_proposals+=1
+                if _locally_connected(binary,a,b): continue
+                proposals.append(GapCandidate("endpoint_road",a,b,ta,va,(0.0,0.0),False,
+                                              distance,align_a,0.0,*tile_pos))
+                used_counts[a]=used_counts.get(a,0)+1
+                break
         if progress and (endpoint_index%32==0 or endpoint_index==len(endpoints)):
             progress(f"endpoint-road search {endpoint_index}/{len(endpoints)}")
     def proposal_rank(c):
@@ -294,7 +360,13 @@ def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
     return kept,{"endpoint_count":len(endpoints),"proposed":len(proposals),"deduplicated":len(dedup),
                  "road_geometric_proposals":road_proposals,"kept":len(kept),
                  "truncated_by_image_cap":max(0,pre_cap-len(kept)),
-                 "boundary_filtered":len(boundary),"tile_skipped":tile_skipped}
+                 "boundary_filtered":len(boundary),"tile_skipped":tile_skipped,
+                 "endpoint_count_raw":raw_endpoint_count,
+                 "endpoint_budget_skipped":raw_endpoint_count-len(endpoints),
+                 "pair_checks_truncated":pair_search_truncated,
+                 "road_samples_truncated":road_samples_truncated,
+                 "road_bins_truncated":road_bins_truncated,
+                 "road_fraction":road_fraction,"max_mask_radius":max_radius}
 
 
 def label_candidate(candidate: GapCandidate, gt_mask: np.ndarray, base_probability: np.ndarray,
