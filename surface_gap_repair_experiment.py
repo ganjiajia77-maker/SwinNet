@@ -612,12 +612,16 @@ def validate_small(model,repair,args,device,limit=0):
         augment=False,return_full_image=True,surface_only=True)
     names=_read_case_ids(ds,limit); tp=fp=fn=0
     model.eval(); repair.eval() if repair else None
+    print(f"[validation] native 1500 sliding inference on {len(names)} images (25 tiles each)",flush=True)
+    started=time.perf_counter()
     with torch.no_grad():
-        for name in names:
+        for image_index,name in enumerate(names,1):
             rgb,gt=read_native(Path(args.root_path),"val",name)
             _,logits,_,_=repair_image(model,repair,rgb,device)
             pred=torch.sigmoid(logits)>=.45; truth=gt[None].to(device)>0.5
             tp+=int((pred&truth).sum()); fp+=int((pred&~truth).sum()); fn+=int((~pred&truth).sum())
+            if image_index==1 or image_index%5==0 or image_index==len(names):
+                print(f"[validation] {image_index}/{len(names)} images, elapsed={(time.perf_counter()-started)/60:.1f} min",flush=True)
     return tp/max(tp+fp+fn,1)
 
 def write_manifest(args,checkpoint,split,thresholds,output):
