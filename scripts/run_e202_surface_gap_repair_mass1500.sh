@@ -18,7 +18,7 @@ if [[ -z "$MODE" ]]; then
 fi
 mkdir -p "$OUT"
 if [[ "$MODE" == train || "$MODE" == baseline-only ]]; then
-  RUN=${RUN:-e202_gap_online512_mass1500_fp32_joint80_s${SEED}_$(date +%Y%m%d_%H%M%S)}
+  RUN=${RUN:-e202_gap_online512_v2_mass1500_fp32_joint80_s${SEED}_$(date +%Y%m%d_%H%M%S)}
   if [[ "$MODE" == baseline-only ]]; then RUN=${RUN}_baseline_only; fi
   test ! -e "$OUT/$RUN" || { echo "Run exists: $OUT/$RUN" >&2; exit 2; }
   printf '%s\n' "$RUN" > "$OUT/latest_e202_surface_gap_repair_run.txt"
