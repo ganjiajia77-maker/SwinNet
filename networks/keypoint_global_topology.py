@@ -54,6 +54,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.raw_alpha = nn.Parameter(torch.tensor(0.0))
         self.capture_diagnostics = False
         self.last_diagnostics = None
+        # Runtime-only diagnostic switch; absent from checkpoint state_dict.
+        self.writeback_gate_floor = 0.0
 
     @property
     def alpha_global(self):
@@ -400,7 +402,13 @@ class KeypointGuidedGlobalTopology(nn.Module):
             valid,
         )
         delta = self.grid_projection(context)
-        delta = delta * surface_gate.clamp(0.0, 1.0)
+        gate = surface_gate.clamp(0.0, 1.0)
+        floor = self.writeback_gate_floor
+        if not 0.0 <= floor <= 1.0:
+            raise ValueError("writeback_gate_floor must be in [0, 1]")
+        if floor:
+            gate = floor + (1.0 - floor) * gate
+        delta = delta * gate
         output = feature + self.alpha_global * delta
 
         if self.capture_diagnostics:

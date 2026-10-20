@@ -135,6 +135,10 @@ parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_windo
                     help='path to config file')
 parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--model_path', type=str, required=True, help='path to model checkpoint')
+parser.add_argument('--writeback_gate_floor', type=float, default=0.0,
+                    help='diagnostic floor for global topology feature writeback only')
+parser.add_argument('--save_overlap_logits', action='store_true',
+                    help='save stitched full-resolution surface logits as float32 NPY')
 parser.add_argument('--num_workers', default=4, type=int)
 # Options expected by config.update_config
 parser.add_argument('--opts', nargs=argparse.REMAINDER, default=None, help='modify config options using the command-line')
@@ -149,6 +153,10 @@ parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
 args = parser.parse_args()
+if not 0 <= args.writeback_gate_floor <= 1:
+    parser.error('--writeback_gate_floor must be in [0,1]')
+if args.save_overlap_logits and not args.overlap_infer:
+    parser.error('--save_overlap_logits requires --overlap_infer')
 if args.export_thresholds:
     if args.test_crop_list:
         parser.error('--export_thresholds requires full images, not a fixed crop list')
@@ -338,6 +346,13 @@ if __name__ == "__main__":
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device
+    topology = getattr(model.swin_unet, 'global_topology', None)
+    if args.writeback_gate_floor or args.save_overlap_logits:
+        if topology is None or not topology.enable_global_topology:
+            raise ValueError('Checkpoint configuration has no active global topology writeback')
+    if args.writeback_gate_floor:
+        topology.writeback_gate_floor = args.writeback_gate_floor
+    print(f'[GATE-DIAG] writeback_gate_floor={args.writeback_gate_floor:.3f}', flush=True)
     
     # Load EMA explicitly only when the checkpoint protocol requests it.
     if args.require_ema:
@@ -377,6 +392,8 @@ if __name__ == "__main__":
     else:
         print(f"错误: 模型文件不存在 {args.model_path}")
         exit(1)
+    if topology is not None:
+        print(f'[GATE-DIAG] trained_alpha_global={topology.alpha_global.item():.8f}', flush=True)
     test_image_dir = os.path.join(args.root_path, args.split, 'image')
     if not os.path.exists(test_image_dir):
         test_image_dir = os.path.join(args.root_path, args.split)
@@ -409,6 +426,9 @@ if __name__ == "__main__":
         os.makedirs(pred_dir, exist_ok=True)
         surface_dir = os.path.join(pred_dir, 'surface')
         os.makedirs(surface_dir, exist_ok=True)
+        logits_dir = os.path.join(pred_dir, 'logits')
+        if args.save_overlap_logits:
+            os.makedirs(logits_dir, exist_ok=True)
 
         threshold_dirs = {}
         for value in args.export_thresholds:
@@ -488,7 +508,11 @@ if __name__ == "__main__":
 
                 if weight_canvas.min().item() <= 0:
                     raise RuntimeError("Overlap test left uncovered pixels in the full-image canvas.")
-                avg_prob = torch.sigmoid(logit_canvas / weight_canvas.clamp_min(1e-8))[0, 0].cpu().numpy()
+                stitched_logit = (logit_canvas / weight_canvas.clamp_min(1e-8))[0, 0]
+                avg_prob = torch.sigmoid(stitched_logit).cpu().numpy()
+                if args.save_overlap_logits:
+                    np.save(os.path.join(logits_dir, f'{os.path.splitext(image_name)[0]}_logit.npy'),
+                            stitched_logit.cpu().numpy())
                 pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
                 label_name = find_label_name(image_name)
                 if label_name is not None:
