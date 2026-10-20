@@ -15,7 +15,6 @@ from scipy.spatial import cKDTree
 
 from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset, set_dataset_epoch
-from losses.cldice_loss import SoftCLDiceLoss
 from networks.vision_transformer import SwinUnet, STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626
 from networks.surface_gap_repair import (GapCandidate, SurfaceGapRepair, candidate_tensors,
     generate_candidates, label_candidate, sliding_positions, stitch_logits, taper_weight, zhang_suen,
@@ -23,7 +22,9 @@ from networks.surface_gap_repair import (GapCandidate, SurfaceGapRepair, candida
 
 
 BASE_COMMIT="eb2da24d768b7f643e4fb288e3736693862c1fe8"
-MODEL_NAME="e202_surface_gap_repair_mass1500_random512_fp32_joint80"
+MODEL_NAME="e202_surface_gap_repair_online512_fp32_joint80"
+TRAIN_PROTOCOL="online_decoder_crop512_v1"
+MAX_CANDIDATES_PER_TILE=4
 MEAN=np.array([0.485,0.456,0.406],np.float32)
 STD=np.array([0.229,0.224,0.225],np.float32)
 
@@ -47,7 +48,7 @@ def parser():
     p.add_argument("--candidate_threshold_source",default="unverified historical source; configured at 0.45")
     p.add_argument("--baseline_only",action="store_true")
     p.add_argument("--candidate_replay_dir",default="",
-        help="Replay train_candidates_epoch_*.json from a joint run (baseline-only control only)")
+        help="Unsupported in online-candidate mode; retained only to reject old commands explicitly")
     p.add_argument("--limit_train_images",type=int,default=0,help="smoke-check only; 0 means all")
     return p
 
@@ -162,6 +163,32 @@ def _candidate_windows(rgb,mask,model,device,split,name,threshold=.45,progress_p
     timing["candidate_generation_and_label_seconds"]=time.perf_counter()-started
     return base,pos,tile_logits,labeled,{**stats,**timing}
 
+def online_candidates_for_batch(logits,targets,threshold):
+    """Mine detached crop coordinates from the live decoder output; label with train GT only."""
+    selected=[]; records=[]; counts=[]
+    for image_index in range(logits.shape[0]):
+        probability=torch.sigmoid(logits[image_index,0].detach()).cpu().numpy()
+        candidates,stats=generate_candidates(probability,threshold=threshold,tile=512,stride=256,
+            max_total=MAX_CANDIDATES_PER_TILE,**PROPOSAL_SEARCH_BUDGET)
+        labeled=[]
+        if candidates:
+            gt=targets[image_index,0].detach().cpu().numpy().astype(bool)
+            gt_skeleton=zhang_suen(gt)
+            ys,xs=np.nonzero(gt_skeleton)
+            gt_tree=cKDTree(np.stack([ys,xs],axis=1)) if len(ys) else None
+            gt_band=cv2.dilate(gt.astype(np.uint8),np.ones((9,9),np.uint8))>0
+            base_corr=cv2.dilate((probability>=threshold).astype(np.uint8),np.ones((3,3),np.uint8))
+            labeled=[label_candidate(c,gt,probability,gt_skeleton=gt_skeleton,gt_tree=gt_tree,
+                gt_band=gt_band,base_corridor=base_corr) for c in candidates]
+            if any(c.label>=0 for c in labeled):
+                selected.append((image_index,labeled))
+        counts.append({"batch_index":image_index,**stats,"labeled":sum(c.label>=0 for c in labeled),
+            "positive":sum(c.label==1 for c in labeled),"negative":sum(c.label==0 for c in labeled),
+            "ignored":sum(c.label<0 for c in labeled)})
+        records.extend({"batch_index":image_index,**c.to_dict()} for c in labeled)
+    return selected,counts,records
+
+
 def _make_candidate_input(candidate,rgb,base_logit,features,device):
     top,left=candidate.tile_top,candidate.tile_left
     tile_rgb=rgb[:,top:top+512,left:left+512][None].to(device)
@@ -191,6 +218,9 @@ def repair_image(model,repair,rgb,device,candidate_threshold=.45,accept_threshol
     stats["candidate_generation_seconds"]=time.perf_counter()-started
     bytile=defaultdict(list)
     for c in candidates: bytile[(c.tile_top,c.tile_left)].append(c)
+    assigned_count=sum(len(items) for items in bytile.values())
+    bytile={key:items[:MAX_CANDIDATES_PER_TILE] for key,items in bytile.items()}
+    stats["truncated_by_tile_cap"]=assigned_count-sum(len(items) for items in bytile.values())
     repaired_tiles=[x.clone() for x in tile_logits]
     base_index={p:i for i,p in enumerate(pos)}
     cand_rows=[]
@@ -220,7 +250,7 @@ def repair_image(model,repair,rgb,device,candidate_threshold=.45,accept_threshol
         stats["feature_and_local_repair_seconds"]=0.0
     repaired=stitch_logits(repaired_tiles,pos,rgb.shape[-2:])
     stats.update(timing)
-    stats["candidate_count_after_tile_assignment"]=len(candidates)
+    stats["candidate_count_after_tile_assignment"]=assigned_count-stats["truncated_by_tile_cap"]
     stats["peak_allocated_bytes"]=max(stats.get("peak_allocated_bytes",0),
         int(torch.cuda.max_memory_allocated(device)) if device.type=="cuda" else 0)
     if emit_dir:
@@ -254,8 +284,54 @@ def masked_soft_cldice(logits,target,mask,loss_fn=None):
         cl=2*precision*recall/(precision+recall+1e-8)
         return (1-cl).mean()
 
+def online_repair_loss(repair,images,targets,logits,features,threshold,lambda_repair,lambda_cldice):
+    selected,counts,records=online_candidates_for_batch(logits,targets,threshold)
+    zero=logits.sum()*0.0
+    if not selected:
+        return zero,counts,records,0,0
+    valid_labels=[c.label for _,items in selected for c in items if c.label>=0]
+    npos=sum(x==1 for x in valid_labels); nneg=sum(x==0 for x in valid_labels)
+    connection_terms=[]; pixel_terms=[]; cldice_terms=[]; cldice_skips=0
+    window=_window_map(device=logits.device)
+    region=(window>0).float()
+    safe=region.clone()
+    safe[:,:,:32,:]=0; safe[:,:,-32:,:]=0; safe[:,:,:,:32]=0; safe[:,:,:,-32:]=0
+    for image_index,items in selected:
+        base_tile=logits[image_index:image_index+1]
+        gt_tile=targets[image_index:image_index+1]
+        if repair is not None:
+            live_features={key:value[image_index:image_index+1] for key,value in features.items()}
+            numerator=torch.zeros_like(base_tile); denominator=torch.zeros_like(base_tile)
+            for candidate in items:
+                inputs=_make_candidate_input(candidate,images[image_index],base_tile,live_features,logits.device)
+                cls,delta=repair(*inputs)
+                probability=torch.sigmoid(cls)
+                numerator=numerator+window*prob.reshape(1,1,1,1)*delta
+                denominator=denominator+window
+                if candidate.label>=0:
+                    weight=(0.5/npos if candidate.label==1 else 0.5/nneg) if npos and nneg else 1.0/len(valid_labels)
+                    label=torch.tensor([float(candidate.label)],device=logits.device)
+                    connection_terms.append(F.binary_cross_entropy_with_logits(cls,label)*weight)
+            repaired=base_tile+numerator/denominator.clamp_min(1.0)
+        else:
+            repaired=base_tile
+        pixel_terms.append(focal_dice(repaired,gt_tile,region))
+        if safe.any():
+            cldice_terms.append(masked_soft_cldice(repaired,gt_tile,safe))
+        else:
+            cldice_skips+=1
+    connection=torch.stack(connection_terms).sum() if connection_terms else zero
+    pixel=torch.stack(pixel_terms).mean()
+    cldice=torch.stack(cldice_terms).mean() if cldice_terms else zero
+    return connection+lambda_repair*(pixel+lambda_cldice*cldice),counts,records,sum(len(x) for _,x in selected),cldice_skips
+
+
 def load_repair_checkpoint(args,device):
     ckpt=torch.load(args.checkpoint,map_location="cpu",weights_only=False)
+    if ckpt.get("protocol",{}).get("train_candidate_protocol")!=TRAIN_PROTOCOL:
+        raise ValueError("Checkpoint belongs to another candidate-training protocol; use its original code version")
+    if ckpt.get("protocol",{}).get("max_candidates_per_tile")!=MAX_CANDIDATES_PER_TILE:
+        raise ValueError("Checkpoint uses a different candidate-per-tile cap")
     if ckpt.get("protocol",{}).get("proposal",{}).get("search_budget")!=PROPOSAL_SEARCH_BUDGET:
         raise ValueError("Checkpoint uses a different candidate search budget; evaluate with its original code version")
     model,_=build_base(args,device,load_imagenet=False)
@@ -381,8 +457,10 @@ def evaluate_export(args,device,split,thresholds,selection_threshold=None):
     return outroot
 
 def train(args,device,resume=False,baseline_only=False):
+    if args.candidate_replay_dir:
+        raise ValueError("Candidate replay is not supported when candidates are generated online from the current crop")
     seed_all(args.seed)
-    run=args.run_name or f"e202_surface_gap_repair_mass1500_random512_fp32_joint80_s{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run=args.run_name or f"e202_gap_online512_mass1500_fp32_joint80_s{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir=Path(args.output_dir)/run; run_dir.mkdir(parents=True,exist_ok=True)
     free_bytes=shutil.disk_usage(run_dir).free
     if free_bytes < 5*(1024**3):
@@ -403,6 +481,10 @@ def train(args,device,resume=False,baseline_only=False):
         path=args.checkpoint or str(run_dir/"last.pth")
         ckpt=torch.load(path,map_location="cpu",weights_only=False)
         if ckpt.get("base_commit")!=BASE_COMMIT: raise ValueError("Resume checkpoint has wrong base commit")
+        if ckpt.get("protocol",{}).get("train_candidate_protocol")!=TRAIN_PROTOCOL:
+            raise ValueError("Resume checkpoint belongs to another candidate-training protocol")
+        if ckpt.get("protocol",{}).get("max_candidates_per_tile")!=MAX_CANDIDATES_PER_TILE:
+            raise ValueError("Resume checkpoint uses a different candidate-per-tile cap")
         if ckpt.get("protocol",{}).get("proposal",{}).get("search_budget")!=PROPOSAL_SEARCH_BUDGET:
             raise ValueError("Resume checkpoint uses a different candidate search budget; use its original code version")
         model.load_state_dict(ckpt["model_state_dict"],strict=True)
@@ -422,14 +504,17 @@ def train(args,device,resume=False,baseline_only=False):
         "candidate_protocol":{"threshold":args.candidate_threshold,"threshold_source":args.candidate_threshold_source,
           "8_connectivity":8,"tangent_native_px":16,
           "distance_native_px":[8,128],"angle_max_degrees":75,"boundary_margin_px":8,
-          "max_per_endpoint":8,"max_candidates_image":256,"prompt_sigma_native_px":3,
+          "max_per_endpoint":8,"max_candidates_image":256,
+          "max_candidates_per_tile":MAX_CANDIDATES_PER_TILE,
+          "train_candidate_protocol":TRAIN_PROTOCOL,"prompt_sigma_native_px":3,
           "proposal_search_budget":PROPOSAL_SEARCH_BUDGET},
         "training":{"epochs":args.max_epochs,"batch_size":2,"accumulation":1,"seed":args.seed,
           "precision":"FP32","ema":False,"train_mode":"joint","ordinary_crop_per_image_epoch":1,
-          "candidate_tiles_per_step":2,"lambda_repair":args.lambda_repair,"lambda_cldice":args.lambda_cldice,
+          "candidate_tiles_per_step":"current batch crops with valid candidates",
+          "candidate_generation":"same train-mode decoder forward; coordinates detached; no full-image pre-scan",
+          "lambda_repair":args.lambda_repair,"lambda_cldice":args.lambda_cldice,
           "softcldice":{"iterations":10,"smooth":1e-6,"mask_safe_border":32}},
         "repair_parameters":sum(p.numel() for p in repair.parameters()) if repair else 0},indent=2),encoding="utf-8")
-    cldice_fn=SoftCLDiceLoss(iter_num=10,smooth=1e-6)
     for epoch in range(start,args.max_epochs):
         for group in optimizer.param_groups:
             initial=group["initial_lr"]; minimum=5e-6 if group["name"]=="imagenet_loaded" else 1e-5
@@ -441,127 +526,50 @@ def train(args,device,resume=False,baseline_only=False):
         model.train()
         if repair: repair.train()
         set_dataset_epoch(train_ds,epoch)
-        # Refresh candidates once per epoch using current base weights, eval/no-grad only.
-        candidate_groups=defaultdict(list); candidate_counts=[]; candidate_records=[]
-        if baseline_only and args.candidate_replay_dir:
-            replay_path=Path(args.candidate_replay_dir)/f"train_candidates_epoch_{epoch+1:03d}.json"
-            if not replay_path.is_file():
-                raise FileNotFoundError(f"Missing joint-run train candidate manifest: {replay_path}")
-            replay=json.loads(replay_path.read_text(encoding="utf-8"))
-            if replay.get("split")!="train" or int(replay.get("epoch",-1))!=epoch+1:
-                raise ValueError(f"Candidate replay has mismatched split/epoch: {replay_path}")
-            train_name_set=set(names)
-            for row in replay.get("candidates",[]):
-                image_name=row["image"]
-                if image_name not in train_name_set:
-                    raise ValueError(f"Replay manifest contains non-train image {image_name!r}")
-                fields={k:row[k] for k in GapCandidate.__dataclass_fields__}
-                for key in ("anchor_a","anchor_b","tangent_a","tangent_b"):
-                    fields[key]=tuple(fields[key])
-                c=GapCandidate(**fields); candidate_records.append({"image":image_name,**c.to_dict()})
-                candidate_groups[(image_name,c.tile_top,c.tile_left)].append(c)
-            # Match the joint run's tile exposure: a tile is sampled only when
-            # at least one candidate in that tile has a non-ignored label.
-            candidate_groups={key:items for key,items in candidate_groups.items()
-                              if any(c.label>=0 for c in items)}
-            candidate_manifest={"epoch":epoch+1,"split":"train","source":"replayed_joint_train_manifest",
-                "source_manifest":str(replay_path.resolve()),"source_weights_sha256":replay.get("weights_sha256"),
-                "weights_sha256":state_hash(model),"exposed_tiles":len(candidate_groups),
-                "candidates":candidate_records}
-        else:
-            prior=model.training; model.eval()
-            print(f"[epoch {epoch+1}] refreshing train candidates from {len(names)} native images (25 sliding tiles per image)",flush=True)
-            refresh_started=time.perf_counter()
-            with torch.no_grad():
-                for image_index,image_name in enumerate(names,1):
-                    image_started=time.perf_counter()
-                    rgb,gt=read_native(Path(args.root_path),"train",image_name)
-                    prefix=f"[epoch {epoch+1} image {image_index}/{len(names)} {image_name}]" if image_index==1 else None
-                    _,_,_,items,stats=_candidate_windows(rgb,gt,model,device,"train",image_name,
-                        args.candidate_threshold,progress_prefix=prefix)
-                    for c in items:
-                        candidate_records.append({"image":image_name,**c.to_dict()})
-                    valid_tiles={(image_name,c.tile_top,c.tile_left) for c in items if c.label>=0}
-                    for c in items:
-                        key=(image_name,c.tile_top,c.tile_left)
-                        # Keep every generated proposal in any tile that has a supervised candidate.
-                        if key in valid_tiles: candidate_groups[key].append(c)
-                    candidate_counts.append({"image":image_name,**stats,"labeled":sum(c.label>=0 for c in items),
-                        "positive":sum(c.label==1 for c in items),"negative":sum(c.label==0 for c in items),
-                        "ignored":sum(c.label<0 for c in items)})
-                    image_seconds=time.perf_counter()-image_started
-                    if image_index==1 or image_index%5==0 or image_seconds>=30 or image_index==len(names):
-                        elapsed=time.perf_counter()-refresh_started
-                        eta=elapsed/image_index*(len(names)-image_index)
-                        print(f"[epoch {epoch+1}] candidates {image_index}/{len(names)} "
-                              f"last={image_seconds:.1f}s elapsed={elapsed/60:.1f}m "
-                              f"ETA={eta/60:.1f}m kept={len(items)}",flush=True)
-            model.train(prior)
-            candidate_manifest={"epoch":epoch+1,"split":"train","weights_sha256":state_hash(model),
-              "protocol":{"threshold":args.candidate_threshold,"max_per_endpoint":8,"max_candidates_image":256,
-                "distance_px":[8,128],"tangent_px":16,"boundary_px":8,
+        # One decoder forward per ordinary 512 crop. Candidate coordinates are detached;
+        # repair inputs and losses use the same live forward and retain gradients.
+        candidate_manifest={"epoch":epoch+1,"split":"train",
+            "source":"online_train_mode_decoder_crop512",
+            "train_candidate_protocol":TRAIN_PROTOCOL,
+            "start_weights_sha256":state_hash(model),
+            "protocol":{"threshold":args.candidate_threshold,
+                "max_candidates_per_tile":MAX_CANDIDATES_PER_TILE,
                 "proposal_search_budget":PROPOSAL_SEARCH_BUDGET},
-              "images":candidate_counts,"exposed_tiles":len(candidate_groups),"candidates":candidate_records}
-        (run_dir/f"train_candidates_epoch_{epoch+1:03d}.json").write_text(json.dumps(candidate_manifest,indent=2),encoding="utf-8")
-        candidate_pool=list(candidate_groups.items())
-        random.Random(args.seed+epoch).shuffle(candidate_pool); candidate_cursor=0
+            "images":[],"candidates":[],"exposed_tiles":0}
         epoch_loss=0.; nstep=0; cldice_skips=0; seen_candidates=0
+        print(f"[epoch {epoch+1}] online candidate mining in {len(loader)} training batches; no full-image pre-scan",flush=True)
         for batch in loader:
-            images=batch["image"].to(device,non_blocking=True); targets=batch["mask"].to(device,non_blocking=True)
+            images=batch["image"].to(device,non_blocking=True)
+            targets=batch["mask"].to(device,non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            logits,_=base_forward(model,images,False)
+            logits,features=base_forward(model,images,repair is not None)
             base_loss=focal_dice(logits,targets)
-            repair_loss=logits.sum()*0.0
-            # Candidate patches are additional, normalized inputs; each unique tile is used once per step.
-            selected=[]
-            target_tiles=min(2,len(candidate_pool))
-            while candidate_pool and len(selected)<target_tiles:
-                if candidate_cursor>=len(candidate_pool): candidate_cursor=0; random.shuffle(candidate_pool)
-                key,items=candidate_pool[candidate_cursor]; candidate_cursor+=1
-                if key not in [k for k,_ in selected]: selected.append((key,items))
-            if selected:
-                conn_terms=[]; pixel_terms=[]; cl_terms=[]
-                selected_labels=[c.label for _,items in selected for c in items if c.label>=0]
-                npos=sum(x==1 for x in selected_labels); nneg=sum(x==0 for x in selected_labels)
-                for (image_name,top,left),items in selected:
-                    rgb,gt=read_native(Path(args.root_path),"train",image_name)
-                    tile,base_tile,features=_load_current_tile(model,rgb,items[0],device)
-                    gt_tile=gt[:,top:top+512,left:left+512][None].to(device)
-                    if repair is not None:
-                        numerator=torch.zeros_like(base_tile); denominator=torch.zeros_like(base_tile)
-                        region=torch.zeros_like(base_tile); local_conn=[]
-                        for c in items:
-                            inp=_make_candidate_input(c,rgb,base_tile,features,device)
-                            cls,delta=repair(*inp); p=torch.sigmoid(cls); win=_window_map(device=device)
-                            numerator += win*p.reshape(1,1,1,1)*delta
-                            denominator += win
-                            region=torch.maximum(region,(win>0).float())
-                            if c.label>=0:
-                                class_weight=(0.5/npos if c.label==1 else 0.5/nneg) if npos and nneg else 1.0/max(len(selected_labels),1)
-                                local_conn.append(F.binary_cross_entropy_with_logits(cls,torch.tensor([float(c.label)],device=device),reduction="none").mean()*class_weight)
-                        seen_candidates+=len(items)
-                        repaired=base_tile+numerator/denominator.clamp_min(1.0)
-                        pix=focal_dice(repaired,gt_tile,region)
-                        safe=region.clone(); safe[:,:,:32,:]=0; safe[:,:,-32:,:]=0; safe[:,:,:,:32]=0; safe[:,:,:,-32:]=0
-                        if safe.any(): cl=masked_soft_cldice(repaired,gt_tile,safe,cldice_fn)
-                        else: cl=repaired.sum()*0; cldice_skips+=1
-                        conn_terms.extend(local_conn); pixel_terms.append(pix); cl_terms.append(cl)
-                    else:
-                        region=torch.zeros_like(base_tile)
-                        for c in items:
-                            region=torch.maximum(region,(_window_map(device=device)>0).float())
-                        safe=region.clone(); safe[:,:,:32,:]=0; safe[:,:,-32:,:]=0; safe[:,:,:,:32]=0; safe[:,:,:,-32:]=0
-                        pixel_terms.append(focal_dice(base_tile,gt_tile,region)); cl_terms.append(masked_soft_cldice(base_tile,gt_tile,safe,cldice_fn))
-                        seen_candidates+=len(items)
-                conn_loss=torch.stack(conn_terms).sum() if conn_terms else logits.sum()*0
-                pixel_loss=torch.stack(pixel_terms).mean() if pixel_terms else logits.sum()*0
-                cl_loss=torch.stack(cl_terms).mean() if cl_terms else logits.sum()*0
-                repair_loss=conn_loss+args.lambda_repair*(pixel_loss+args.lambda_cldice*cl_loss)
+            repair_loss,counts,records,seen,skips=online_repair_loss(
+                repair,images,targets,logits,features,args.candidate_threshold,
+                args.lambda_repair,args.lambda_cldice)
+            for row in counts:
+                idx=row["batch_index"]
+                row.update({"step":nstep+1,"image":batch["image_name"][idx],
+                    "crop_top_augmented":int(batch["tile_top"][idx]),
+                    "crop_left_augmented":int(batch["tile_left"][idx])})
+            for row in records:
+                idx=row["batch_index"]
+                row.update({"step":nstep+1,"image":batch["image_name"][idx],
+                    "crop_top_augmented":int(batch["tile_top"][idx]),
+                    "crop_left_augmented":int(batch["tile_left"][idx])})
+            candidate_manifest["images"].extend(counts)
+            candidate_manifest["candidates"].extend(records)
+            candidate_manifest["exposed_tiles"]+=sum(row["labeled"]>0 for row in counts)
+            seen_candidates+=seen; cldice_skips+=skips
             loss=base_loss+repair_loss
             loss.backward(); torch.nn.utils.clip_grad_norm_(list(model.parameters())+(list(repair.parameters()) if repair else []),1.0)
             # Epoch-wise warmup and cosine, independently for ImageNet-loaded and new groups.
             optimizer.step(); epoch_loss+=float(loss.detach()); nstep+=1
-            if nstep%10==0: print(f"epoch={epoch+1} step={nstep}/{len(loader)} loss={float(loss.detach()):.4f} base={float(base_loss.detach()):.4f} repair={float(repair_loss.detach()):.4f}",flush=True)
+            if nstep==1 or nstep%10==0:
+                print(f"epoch={epoch+1} step={nstep}/{len(loader)} loss={float(loss.detach()):.4f} base={float(base_loss.detach()):.4f} repair={float(repair_loss.detach()):.4f} candidates={sum(row['kept'] for row in counts)}",flush=True)
+        candidate_manifest["end_weights_sha256"]=state_hash(model)
+        (run_dir/f"train_candidates_epoch_{epoch+1:03d}.json").write_text(
+            json.dumps(candidate_manifest,indent=2),encoding="utf-8")
         val_iou=validate_small(model,repair,args,device,limit=0)
         ckpt={"base_commit":BASE_COMMIT,"epoch":epoch+1,"best_val_iou":max(best,val_iou),
             "model_state_dict":model.state_dict(),"repair_state_dict":repair.state_dict() if repair else None,
@@ -569,12 +577,15 @@ def train(args,device,resume=False,baseline_only=False):
             "pretrain_ckpt":args.pretrain_ckpt,"pretrain_sha256":pre_sha,
             "repair_parameter_count":sum(p.numel() for p in repair.parameters()) if repair else 0,
             "epoch_train_steps":nstep,"candidate_tiles_seen":seen_candidates,
-            "candidate_mining_weights_sha256":candidate_manifest["weights_sha256"],
+            "candidate_start_weights_sha256":candidate_manifest["start_weights_sha256"],
+            "candidate_end_weights_sha256":candidate_manifest["end_weights_sha256"],
             "scheduler_state_dict":{"name":"warmup_cosine","epoch_completed":epoch+1,
                 "max_epochs":args.max_epochs,"warmup_epochs":10,"pretrained_lr":5e-5,
                 "pretrained_min_lr":5e-6,"new_lr":2e-4,"new_min_lr":1e-5},
             "repair_weight_sha256":state_hash(repair) if repair else None,
-            "protocol":{"candidate_threshold":args.candidate_threshold,"candidate_threshold_source":args.candidate_threshold_source,
+            "protocol":{"train_candidate_protocol":TRAIN_PROTOCOL,
+                "max_candidates_per_tile":MAX_CANDIDATES_PER_TILE,
+                "candidate_threshold":args.candidate_threshold,"candidate_threshold_source":args.candidate_threshold_source,
                 "accept_threshold":args.accept_threshold,
                 "lambda_repair":args.lambda_repair,"lambda_cldice":args.lambda_cldice,
                 "proposal":{"connectivity":8,"skeleton":"Zhang-Suen","tangent_length_px":16,
@@ -582,7 +593,7 @@ def train(args,device,resume=False,baseline_only=False):
                     "boundary_margin_px":8,"max_per_endpoint":8,"max_candidates_image":256,
                     "tile_size":512,"tile_stride":256,"anchor_context_px":16,"prompt_sigma_px":3,
                     "search_budget":PROPOSAL_SEARCH_BUDGET},
-                "candidate_refresh":"once at each epoch start, current eval/no_grad weights",
+                "candidate_refresh":"each optimizer step, detached proposal coordinates from current train-mode crop logits",
                 "candidate_cache_file":f"train_candidates_epoch_{epoch+1:03d}.json",
                 "split":"train","features":["encoder_stage1_before_patch_merging","decoder_final_before_surface_head"],
                 "tile_merge":"sum(W*p*delta)/max(1,sum(W)); taper0.1 weighted logit stitch",
@@ -618,6 +629,7 @@ def write_manifest(args,checkpoint,split,thresholds,output):
     provenance={"checkpoint":str(Path(checkpoint).resolve()),"base_commit":BASE_COMMIT,
         "epoch":ckpt.get("epoch"),"candidate_threshold":args.candidate_threshold,
         "candidate_threshold_source":args.candidate_threshold_source,
+        "train_candidate_protocol":TRAIN_PROTOCOL,"max_candidates_per_tile":MAX_CANDIDATES_PER_TILE,
         "proposal_search_budget":PROPOSAL_SEARCH_BUDGET,
         "accept_threshold":ckpt.get("protocol",{}).get("accept_threshold",.5),
         "inference":"native1500;512/256 tiles; taper0.1 weighted logits; single candidate pass",

@@ -18,19 +18,15 @@ if [[ -z "$MODE" ]]; then
 fi
 mkdir -p "$OUT"
 if [[ "$MODE" == train || "$MODE" == baseline-only ]]; then
-  RUN=${RUN:-e202_surface_gap_repair_mass1500_random512_fp32_joint80_s${SEED}_$(date +%Y%m%d_%H%M%S)}
+  RUN=${RUN:-e202_gap_online512_mass1500_fp32_joint80_s${SEED}_$(date +%Y%m%d_%H%M%S)}
   if [[ "$MODE" == baseline-only ]]; then RUN=${RUN}_baseline_only; fi
   test ! -e "$OUT/$RUN" || { echo "Run exists: $OUT/$RUN" >&2; exit 2; }
   printf '%s\n' "$RUN" > "$OUT/latest_e202_surface_gap_repair_run.txt"
   ARGS=(train)
   [[ "$MODE" == baseline-only ]] && ARGS=(baseline-only)
-  EXTRA=()
-  if [[ "$MODE" == baseline-only && -n "${CANDIDATE_REPLAY_DIR:-}" ]]; then
-    EXTRA+=(--candidate_replay_dir "$CANDIDATE_REPLAY_DIR")
-  fi
   python -u surface_gap_repair_experiment.py "${ARGS[@]}" --gpu 0 --seed "$SEED" \
     --root_path "$DATA" --output_dir "$OUT" --run_name "$RUN" --pretrain_ckpt "$PRETRAIN" \
-    --max_epochs 80 --lambda_repair 1.0 --lambda_cldice 0.1 "${EXTRA[@]}"
+    --max_epochs 80 --lambda_repair 1.0 --lambda_cldice 0.1
   exit 0
 fi
 if [[ -z "$RUN" ]]; then
