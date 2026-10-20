@@ -438,6 +438,21 @@ class SurfaceGapRepair(nn.Module):
         return torch.cat(pooled,dim=1)
 
     def forward(self,rgb,p0,prompts,geometry,shallow,decoder):
+        if geometry.ndim != 2 or geometry.shape[1] != 8:
+            raise ValueError(
+                "geometry must have shape [batch, 8]; "
+                f"received {tuple(geometry.shape)}"
+            )
+        if rgb.ndim != 4 or p0.ndim != 4 or prompts.ndim != 4:
+            raise ValueError("rgb, p0, and prompts must be four-dimensional NCHW tensors")
+        if not (
+            geometry.shape[0] == rgb.shape[0]
+            and p0.shape[0] == rgb.shape[0]
+            and prompts.shape[0] == rgb.shape[0]
+        ):
+            raise ValueError("rgb, p0, prompts, and geometry batch sizes must match")
+        if p0.shape[-2:] != rgb.shape[-2:] or prompts.shape[-2:] != rgb.shape[-2:]:
+            raise ValueError("p0 and prompts must have the same spatial size as rgb")
         # RGB + P0 + two independent Gaussian anchor maps + four geometry planes.
         gmap=geometry[:,:,None,None].expand(-1,-1,rgb.shape[-2],rgb.shape[-1])
         full=torch.cat([rgb,p0,prompts,gmap[:,:4]],dim=1)
@@ -478,7 +493,7 @@ def candidate_tensors(candidate, device, size=512):
     dx=(candidate.anchor_b[1]-candidate.anchor_a[1])/128.0
     geom=torch.tensor([dy,dx,candidate.distance/128.0,candidate.tangent_a_valid,
                        candidate.tangent_b_valid,candidate.line_alignment_a,
-                       candidate.line_alignment_b,kind],device=device,dtype=torch.float32)[None,:,None,None]
+                       candidate.line_alignment_b,kind],device=device,dtype=torch.float32)[None]
     return prompts,geom
 
 
