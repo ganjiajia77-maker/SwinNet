@@ -218,7 +218,9 @@ def focal_dice(logits,target,mask=None,gamma=1.0):
     if mask is None: mask=torch.ones_like(target)
     denom=mask.sum().clamp_min(1)
     focal=(focal*mask).sum()/denom
-    dice=1-(2*(prob*target*mask).sum()+1.0)/((prob*mask).sum()+(target*mask).sum()+1.0)
+    intersection=(prob*target*mask).sum((1,2,3))
+    union=(prob*mask).sum((1,2,3))+(target*mask).sum((1,2,3))
+    dice=1-((2*intersection+1.0)/(union+1.0)).mean()
     return focal+0.5*dice
 
 def masked_soft_cldice(logits,target,mask,loss_fn=None):
@@ -556,11 +558,17 @@ def write_manifest(args,checkpoint,split,thresholds,output):
         models.append({"name":MODEL_NAME+"_base_same_checkpoint","provenance":{**provenance,
             "prediction_generation":"repair module bypassed; same trained joint checkpoint"},
             "predictions":{"val":baseline_masks}})
+        models.append({"name":MODEL_NAME+"_fixed045","provenance":{**provenance,
+            "prediction_generation":"repaired logits at fixed 0.45 for equal-threshold comparison"},
+            "predictions":{"val":[{"threshold":.45,"path":str(predroot/"threshold_0.45"/"surface")}]}})
     elif split=="test" and ckpt.get("repair_state_dict") is not None:
         baseline_masks=[{"threshold":.45,"path":str(predroot/"base_threshold_0.45"/"surface")}]
         models.append({"name":MODEL_NAME+"_base_same_checkpoint","provenance":{**provenance,
             "prediction_generation":"repair module bypassed; same trained joint checkpoint"},
             "predictions":{"test":baseline_masks}})
+        models.append({"name":MODEL_NAME+"_fixed045","provenance":{**provenance,
+            "prediction_generation":"repaired logits at fixed 0.45 for equal-threshold comparison"},
+            "predictions":{"test":[{"threshold":.45,"path":str(predroot/"threshold_0.45"/"surface")}]}})
     manifest={"data_root":str(Path(args.root_path).resolve()),
       "protocol":{"image_size":1500,"short_area_threshold":20,"apls_max_nodes":64,"apls_snap_radius":5.0},
       "models":models}
@@ -600,7 +608,7 @@ def main():
         ckpt=torch.load(args.checkpoint,map_location="cpu",weights_only=False)
         selected_name=MODEL_NAME if ckpt.get("repair_state_dict") is not None else MODEL_NAME+"_baseline_only"
         threshold=json.loads(sel.read_text())["models"][selected_name]["threshold"]
-        root=evaluate_export(args,device,"test",[threshold],threshold)
+        root=evaluate_export(args,device,"test",sorted(set([threshold,.45])),threshold)
         run_unified(args,"test",[threshold],sel)
         print(f"TEST_MASKS={root}"); return
     if args.mode=="topology":
