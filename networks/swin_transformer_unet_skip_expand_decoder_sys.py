@@ -1778,8 +1778,10 @@ class SwinTransformerSys(nn.Module):
                     }
                 )
             if i_layer == 0 and return_surface_features:
-                # Stage-1 output, after its Swin blocks and before PatchMerging.
-                stage1_surface_tokens = x
+                # Save Stage-1 tokens before PatchMerging. ``x`` has already
+                # been downsampled by the BasicLayer call above, so it is only
+                # 1/8 resolution and cannot be reshaped using patches_resolution.
+                stage1_surface_tokens = layer.last_pre_downsample
             if i_layer == 1 and layer.last_road_attention is not None:
                 stage2_road_attention = layer.last_road_attention
                 road_attentions.append(
