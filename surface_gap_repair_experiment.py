@@ -78,7 +78,9 @@ def read_native(root,split,name):
     lp=Path(ds.mask_dir)/ds._find_label_name(name,ds.mask_dir)
     image=cv2.cvtColor(cv2.imread(str(ip),cv2.IMREAD_COLOR),cv2.COLOR_BGR2RGB)
     mask=cv2.imread(str(lp),cv2.IMREAD_GRAYSCALE)
-    image=ds._center_crop_or_pad(image,1500); mask=ds._center_crop_or_pad(mask,1500)
+    source_size=(1500,1500)
+    image=ds._center_crop_or_pad(image,source_size)
+    mask=ds._center_crop_or_pad(mask,source_size)
     rgb=(image.astype(np.float32)/255.0-MEAN)/STD
     rgb=torch.from_numpy(rgb.transpose(2,0,1).copy()).float()
     mask=torch.from_numpy((mask>127).astype(np.float32))[None]
@@ -141,7 +143,7 @@ def _candidate_windows(rgb,mask,model,device,split,name,threshold=.45):
     ys,xs=np.nonzero(gt_skeleton)
     gt_tree=cKDTree(np.stack([ys,xs],axis=1)) if len(ys) else None
     gt_band=cv2.dilate(gt.astype(np.uint8),np.ones((9,9),np.uint8))>0
-    base_corr=cv2.dilate((prob>=.45).astype(np.uint8),np.ones((3,3),np.uint8))
+    base_corr=cv2.dilate((prob>=threshold).astype(np.uint8),np.ones((3,3),np.uint8))
     for cand in candidates:
         labeled.append(label_candidate(cand,gt,prob,gt_skeleton=gt_skeleton,gt_tree=gt_tree,
                                        gt_band=gt_band,base_corridor=base_corr))
