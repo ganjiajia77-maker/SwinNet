@@ -512,7 +512,7 @@ if __name__ == "__main__":
                 avg_prob = torch.sigmoid(stitched_logit).cpu().numpy()
                 if args.save_overlap_logits:
                     np.save(os.path.join(logits_dir, f'{os.path.splitext(image_name)[0]}_logit.npy'),
-                            stitched_logit.cpu().numpy())
+                            stitched_logit.cpu().numpy().astype(np.float16))
                 pred = (avg_prob >= args.threshold).astype(np.uint8) * 255
                 label_name = find_label_name(image_name)
                 if label_name is not None:

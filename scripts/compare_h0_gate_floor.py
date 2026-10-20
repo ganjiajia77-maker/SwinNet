@@ -221,8 +221,8 @@ def main():
     metric_baseline, metric_floor, cases, all_gaps = [], [], [], []
     total_new_joins = total_resolved_joins = 0
     for index, key in enumerate(keys, 1):
-        base_logit = np.load(baseline[key], allow_pickle=False)
-        floor_logit = np.load(floor[key], allow_pickle=False)
+        base_logit = np.load(baseline[key], allow_pickle=False).astype(np.float32, copy=False)
+        floor_logit = np.load(floor[key], allow_pickle=False).astype(np.float32, copy=False)
         size = args.source_patch_size
         if base_logit.shape != (size, size) or floor_logit.shape != (size, size):
             raise ValueError(f"Mismatched logit shape for {key}")
