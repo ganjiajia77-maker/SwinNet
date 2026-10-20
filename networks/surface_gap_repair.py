@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from itertools import combinations
 import math
 from collections import deque
 
@@ -196,46 +195,53 @@ def _local_gt_path_length(gt_band, anchor_a, anchor_b, source, target, max_detou
 
 def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
                         max_distance=128, max_per_endpoint=8, max_total=256,
-                        tangent_length=16, boundary_margin=8, tile=512, stride=256):
+                        tangent_length=16, boundary_margin=8, tile=512, stride=256,
+                        progress=None):
     """Generate deterministic candidates from prediction only (no GT argument)."""
     binary = (probability >= threshold).astype(np.uint8)
+    if progress: progress("skeletonizing native prediction")
     skel = zhang_suen(binary)
     points = np.argwhere(skel)
     if not len(points):
         return [], {"endpoint_count": 0, "proposed": 0, "kept": 0,
                     "boundary_filtered": 0, "tile_skipped": 0}
-    neighbor_counts = np.zeros(len(points), np.uint8)
-    lookup = {tuple(p): i for i,p in enumerate(points)}
-    for i, point in enumerate(points):
-        neighbor_counts[i] = len(_neighbors(skel, tuple(point)))
-    endpoints = [tuple(map(int, points[i])) for i in range(len(points)) if neighbor_counts[i] == 1]
+    kernel=np.ones((3,3),np.uint8); kernel[1,1]=0
+    neighbor_counts=cv2.filter2D(skel.astype(np.uint8),-1,kernel,borderType=cv2.BORDER_CONSTANT)
+    endpoints=[tuple(map(int,p)) for p in np.argwhere(skel & (neighbor_counts==1))]
     h,w = probability.shape
     boundary = [p for p in endpoints if min(p[0],p[1],h-1-p[0],w-1-p[1]) < boundary_margin]
     endpoints = [p for p in endpoints if p not in set(boundary)]
+    if progress: progress(f"skeleton endpoints={len(endpoints)}")
     tangents = {p: _trace_tangent(skel,p,tangent_length) for p in endpoints}
     positions = tile_grid(h,w,tile,stride)
     proposals = []
-    for a,b in combinations(endpoints,2):
-        dy,dx=b[0]-a[0],b[1]-a[1]; distance=math.hypot(dy,dx)
-        if not min_distance <= distance <= max_distance:
-            continue
-        ta,va=tangents[a]; tb,vb=tangents[b]
-        align_a=_alignment(ta,va,(dy,dx)); align_b=_alignment(tb,vb,(-dy,-dx))
-        if (va and align_a < math.cos(math.radians(75))) or (vb and align_b < math.cos(math.radians(75))):
-            continue
-        if _locally_connected(binary,a,b):
-            continue
-        tile_pos=_candidate_tile(a,b,positions,tile)
-        if tile_pos is None: continue
-        proposals.append(GapCandidate("endpoint_endpoint",a,b,ta,va,tb,vb,distance,
-                                      align_a,align_b,*tile_pos))
+    if endpoints:
+        endpoint_xy=np.asarray(endpoints,dtype=np.float64)
+        endpoint_tree=cKDTree(endpoint_xy)
+        for i,a in enumerate(endpoints):
+            # Query only nearby endpoints instead of enumerating every pair in the image.
+            for j in sorted(endpoint_tree.query_ball_point(endpoint_xy[i],max_distance)):
+                if j<=i: continue
+                b=endpoints[j]
+                dy,dx=b[0]-a[0],b[1]-a[1]; distance=math.hypot(dy,dx)
+                if not min_distance <= distance <= max_distance: continue
+                ta,va=tangents[a]; tb,vb=tangents[b]
+                align_a=_alignment(ta,va,(dy,dx)); align_b=_alignment(tb,vb,(-dy,-dx))
+                if (va and align_a < math.cos(math.radians(75))) or (vb and align_b < math.cos(math.radians(75))):
+                    continue
+                if _locally_connected(binary,a,b): continue
+                tile_pos=_candidate_tile(a,b,positions,tile)
+                if tile_pos is None: continue
+                proposals.append(GapCandidate("endpoint_endpoint",a,b,ta,va,tb,vb,distance,
+                                              align_a,align_b,*tile_pos))
+    if progress: progress(f"endpoint pairs proposed={len(proposals)}")
     tree=cKDTree(points.astype(np.float32))
     endpoint_set=set(endpoints)
     used_counts={}
     for candidate in proposals:
         used_counts[candidate.anchor_a]=used_counts.get(candidate.anchor_a,0)+1
     tile_skipped=0; road_proposals=0
-    for a in endpoints:
+    for endpoint_index,a in enumerate(endpoints,1):
         ta,va=tangents[a]
         options={}
         nearby=tree.query_ball_point(np.asarray(a),max_distance)
@@ -259,6 +265,8 @@ def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
             if _locally_connected(binary,a,candidate.anchor_b): continue
             proposals.append(candidate)
             used_counts[a]=used_counts.get(a,0)+1
+        if progress and (endpoint_index%32==0 or endpoint_index==len(endpoints)):
+            progress(f"endpoint-road search {endpoint_index}/{len(endpoints)}")
     def proposal_rank(c):
         alignments=[]
         if c.tangent_a_valid: alignments.append(c.line_alignment_a)

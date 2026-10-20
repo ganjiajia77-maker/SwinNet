@@ -112,16 +112,18 @@ def base_forward(model,image,features=False):
     if isinstance(out,tuple): out=out[0]
     return out,feat
 
-def tile_inference(model,rgb,device,need_features=False):
+def tile_inference(model,rgb,device,need_features=False,progress_prefix=None):
     h,w=rgb.shape[-2:]; pos=[(y,x) for y in sliding_positions(h,512,256) for x in sliding_positions(w,512,256)]
     logits=[]
     if device.type=="cuda": torch.cuda.reset_peak_memory_stats(device)
     if device.type=="cuda": torch.cuda.synchronize(device)
     started=time.perf_counter()
-    for top,left in pos:
+    for tile_index,(top,left) in enumerate(pos,1):
         tile=rgb[:,top:top+512,left:left+512][None].to(device)
         with torch.no_grad(): out,_=base_forward(model,tile,False)
         logits.append(out.detach())
+        if progress_prefix and (tile_index%5==0 or tile_index==len(pos)):
+            print(f"{progress_prefix} sliding tiles {tile_index}/{len(pos)}",flush=True)
     stitched=stitch_logits(logits,pos,(h,w))
     if device.type=="cuda": torch.cuda.synchronize(device)
     timing={"base_sliding_inference_seconds":time.perf_counter()-started,
@@ -132,11 +134,15 @@ def _read_case_ids(dataset,limit=0):
     names=list(dataset.image_files)
     return names[:limit] if limit else names
 
-def _candidate_windows(rgb,mask,model,device,split,name,threshold=.45):
-    base,pos,tile_logits,timing=tile_inference(model,rgb,device)
+def _candidate_windows(rgb,mask,model,device,split,name,threshold=.45,progress_prefix=None):
+    base,pos,tile_logits,timing=tile_inference(model,rgb,device,progress_prefix=progress_prefix)
+    if progress_prefix: print(f"{progress_prefix} extracting prediction skeleton and proposals",flush=True)
     prob=torch.sigmoid(base)[0,0].cpu().numpy()
     started=time.perf_counter()
-    candidates,stats=generate_candidates(prob,threshold=threshold,tile=512,stride=256)
+    candidate_progress=(lambda message: print(f"{progress_prefix} {message}",flush=True)) if progress_prefix else None
+    candidates,stats=generate_candidates(prob,threshold=threshold,tile=512,stride=256,
+        progress=candidate_progress)
+    if progress_prefix: print(f"{progress_prefix} generated {len(candidates)} candidates; labeling against train GT",flush=True)
     labeled=[]
     gt=mask[0].numpy().astype(bool)
     gt_skeleton=zhang_suen(gt)
@@ -144,9 +150,11 @@ def _candidate_windows(rgb,mask,model,device,split,name,threshold=.45):
     gt_tree=cKDTree(np.stack([ys,xs],axis=1)) if len(ys) else None
     gt_band=cv2.dilate(gt.astype(np.uint8),np.ones((9,9),np.uint8))>0
     base_corr=cv2.dilate((prob>=threshold).astype(np.uint8),np.ones((3,3),np.uint8))
-    for cand in candidates:
+    for candidate_index,cand in enumerate(candidates,1):
         labeled.append(label_candidate(cand,gt,prob,gt_skeleton=gt_skeleton,gt_tree=gt_tree,
                                        gt_band=gt_band,base_corridor=base_corr))
+        if progress_prefix and (candidate_index%32==0 or candidate_index==len(candidates)):
+            print(f"{progress_prefix} labeled {candidate_index}/{len(candidates)} candidates",flush=True)
     timing["candidate_generation_and_label_seconds"]=time.perf_counter()-started
     return base,pos,tile_logits,labeled,{**stats,**timing}
 
@@ -452,10 +460,15 @@ def train(args,device,resume=False,baseline_only=False):
                 "candidates":candidate_records}
         else:
             prior=model.training; model.eval()
+            print(f"[epoch {epoch+1}] refreshing train candidates from {len(names)} native images (25 sliding tiles per image)",flush=True)
+            refresh_started=time.perf_counter()
             with torch.no_grad():
-                for image_name in names:
+                for image_index,image_name in enumerate(names,1):
+                    image_started=time.perf_counter()
                     rgb,gt=read_native(Path(args.root_path),"train",image_name)
-                    _,_,_,items,stats=_candidate_windows(rgb,gt,model,device,"train",image_name,args.candidate_threshold)
+                    prefix=f"[epoch {epoch+1} image {image_index}/{len(names)} {image_name}]" if image_index==1 else None
+                    _,_,_,items,stats=_candidate_windows(rgb,gt,model,device,"train",image_name,
+                        args.candidate_threshold,progress_prefix=prefix)
                     for c in items:
                         candidate_records.append({"image":image_name,**c.to_dict()})
                     valid_tiles={(image_name,c.tile_top,c.tile_left) for c in items if c.label>=0}
@@ -466,6 +479,13 @@ def train(args,device,resume=False,baseline_only=False):
                     candidate_counts.append({"image":image_name,**stats,"labeled":sum(c.label>=0 for c in items),
                         "positive":sum(c.label==1 for c in items),"negative":sum(c.label==0 for c in items),
                         "ignored":sum(c.label<0 for c in items)})
+                    image_seconds=time.perf_counter()-image_started
+                    if image_index==1 or image_index%5==0 or image_seconds>=30 or image_index==len(names):
+                        elapsed=time.perf_counter()-refresh_started
+                        eta=elapsed/image_index*(len(names)-image_index)
+                        print(f"[epoch {epoch+1}] candidates {image_index}/{len(names)} "
+                              f"last={image_seconds:.1f}s elapsed={elapsed/60:.1f}m "
+                              f"ETA={eta/60:.1f}m kept={len(items)}",flush=True)
             model.train(prior)
             candidate_manifest={"epoch":epoch+1,"split":"train","weights_sha256":state_hash(model),
               "protocol":{"threshold":args.candidate_threshold,"max_per_endpoint":8,"max_candidates_image":256,
