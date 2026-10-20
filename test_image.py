@@ -243,6 +243,61 @@ def dice_loss(pred, target, threshold=0.5):
     return 1 - dice_score
 
 
+def adapt_shared_road_attention_for_checkpoint(model, state_dict):
+    """Match saved road heads without introducing untrained inference modules."""
+    swin = model.swin_unet
+    for layer_index, stage_index in ((0, 1), (1, 2)):
+        head_name = f'encoder_stage{stage_index}_road_attention_head'
+        head = getattr(swin, head_name)
+        layer_head = swin.layers[layer_index].road_attention_head
+        if head is not layer_head:
+            raise RuntimeError(f'Road attention stage {stage_index} is not shared')
+
+        canonical_prefix = f'swin_unet.{head_name}.'
+        layer_prefix = f'swin_unet.layers.{layer_index}.road_attention_head.'
+        suffixes = tuple(head.state_dict())
+        required = {suffix for suffix in suffixes
+                    if not suffix.endswith('num_batches_tracked')}
+        canonical = {key[len(canonical_prefix):] for key in state_dict
+                     if key.startswith(canonical_prefix)}
+        layer = {key[len(layer_prefix):] for key in state_dict
+                 if key.startswith(layer_prefix)}
+
+        if not canonical and not layer:
+            swin.layers[layer_index].road_attention_head = None
+            setattr(swin, head_name, None)
+            print(f'[GATE-DIAG] Stage {stage_index} road attention is absent in checkpoint; '
+                  'disabled in inference', flush=True)
+            continue
+
+        canonical_complete = required <= canonical
+        layer_complete = required <= layer
+        if (canonical and not canonical_complete) or (layer and not layer_complete):
+            raise RuntimeError(
+                f'Incomplete Stage {stage_index} road attention weights: '
+                f'canonical_missing={sorted(required - canonical)}, '
+                f'layer_missing={sorted(required - layer)}'
+            )
+        if canonical_complete and layer_complete:
+            for suffix in required:
+                if not torch.equal(state_dict[canonical_prefix + suffix],
+                                   state_dict[layer_prefix + suffix]):
+                    raise RuntimeError(
+                        f'Conflicting shared Stage {stage_index} road attention weight: '
+                        f'{suffix}'
+                    )
+            continue
+
+        present_prefix = canonical_prefix if canonical_complete else layer_prefix
+        missing_prefix = layer_prefix if canonical_complete else canonical_prefix
+        for suffix in suffixes:
+            source = present_prefix + suffix
+            if source in state_dict:
+                state_dict[missing_prefix + suffix] = state_dict[source]
+        print(f'[GATE-DIAG] Stage {stage_index} road attention loaded from '
+              'shared checkpoint weights', flush=True)
+
+
 if __name__ == "__main__":
     if not args.deterministic:
         cudnn.benchmark = True
@@ -363,6 +418,10 @@ if __name__ == "__main__":
     # 加载模型
     if checkpoint is not None:
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            adapt_shared_road_attention_for_checkpoint(
+                model,
+                checkpoint['model_state_dict'],
+            )
             adapt_connectivity_modules_for_checkpoint(
                 model,
                 checkpoint['model_state_dict'],
