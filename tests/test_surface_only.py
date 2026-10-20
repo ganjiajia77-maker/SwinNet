@@ -54,6 +54,19 @@ class SurfaceOnlyTests(unittest.TestCase):
         self.assertFalse(get_topology_coefficients(self.surface)["global_topology_enabled"])
         load_topology_checkpoint_state(self.surface, self.surface.state_dict(), "test", strict=True)
 
+    def test_explicit_surface_feature_export_preserves_logits_and_state(self):
+        model=self.surface.eval()
+        image=torch.randn(1,3,128,128)
+        state={key:value.clone() for key,value in model.state_dict().items()}
+        with torch.no_grad():
+            normal=model(image)
+            featured,features=model(image,return_surface_features=True)
+        torch.testing.assert_close(normal[0],featured[0],rtol=0,atol=0)
+        self.assertEqual(tuple(features["encoder_stage1"].shape),(1,96,32,32))
+        self.assertEqual(tuple(features["decoder_final"].shape),(1,96,128,128))
+        for key,value in model.state_dict().items():
+            self.assertTrue(torch.equal(value,state[key]),key)
+
     def test_same_crop_without_building_skeleton_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

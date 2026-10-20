@@ -619,10 +619,15 @@ class SwinUnet(nn.Module):
     def forward(
         self,
         x,
+        return_surface_features=False,
     ):
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)
-        outputs = self.swin_unet(x)
+        outputs = self.swin_unet(x, return_surface_features=return_surface_features)
+
+        surface_features = None
+        if return_surface_features:
+            outputs, surface_features = outputs
 
         if isinstance(outputs, tuple):
             logits = outputs[0]
@@ -632,7 +637,10 @@ class SwinUnet(nn.Module):
             aux_outputs = ()
 
         if self.return_skeleton:
-            return (logits, *aux_outputs)
+            result = (logits, *aux_outputs)
+            return (result, surface_features) if return_surface_features else result
+        if return_surface_features:
+            return logits, surface_features
         return logits
 
     def load_from(self, config):

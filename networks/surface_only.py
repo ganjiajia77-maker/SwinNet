@@ -15,10 +15,13 @@ class SurfaceOnlyHead(nn.Module):
         self.last_delta_logit = None
         self.last_graph_delta = None
 
-    def forward(self, x, z_struct=None):
+    def forward(self, x, z_struct=None, return_feature=False):
+        decoder_feature = x
         feature = self.surface_refine(self.surface_branch(self.surface_proj(x)))
         logits = self.surface_head(feature)
         self.last_surface_pre_logits = logits
+        if return_feature:
+            return (logits, None, None, None), decoder_feature
         return logits, None, None, None
 
 

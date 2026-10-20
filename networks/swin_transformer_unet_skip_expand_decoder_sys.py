@@ -1748,7 +1748,7 @@ class SwinTransformerSys(nn.Module):
         return {'relative_position_bias_table'}
 
     # Encoder and Bottleneck
-    def forward_features(self, x):
+    def forward_features(self, x, return_surface_features=False):
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -1757,6 +1757,7 @@ class SwinTransformerSys(nn.Module):
         road_attentions = []
         stage1_road_attention = None
         stage2_road_attention = None
+        stage1_surface_tokens = None
 
         for i_layer, layer in enumerate(self.layers):
             x_downsample.append(x)
@@ -1776,6 +1777,9 @@ class SwinTransformerSys(nn.Module):
                         "road_attention": stage1_road_attention,
                     }
                 )
+            if i_layer == 0 and return_surface_features:
+                # Stage-1 output, after its Swin blocks and before PatchMerging.
+                stage1_surface_tokens = x
             if i_layer == 1 and layer.last_road_attention is not None:
                 stage2_road_attention = layer.last_road_attention
                 road_attentions.append(
@@ -1789,6 +1793,8 @@ class SwinTransformerSys(nn.Module):
         x = self.bottleneck_swin_block(x)
         x = self.norm(x)  # B L C
 
+        if return_surface_features:
+            return x, x_downsample, road_attentions, stage1_surface_tokens
         return x, x_downsample, road_attentions
 
     def _highres_structure_stage_enabled(self, stage):
@@ -2343,10 +2349,11 @@ class SwinTransformerSys(nn.Module):
             for module, was_training in zip(prior_modules, prior_training):
                 module.train(was_training)
 
-    def up_x4(self, x, structure_outputs=None, z_struct=None):
+    def up_x4(self, x, structure_outputs=None, z_struct=None, return_surface_features=False):
         H, W = self.patches_resolution
         B, L, C = x.shape
         assert L == H * W, "input features has wrong size"
+        decoder_surface_feature = None
 
         if self.final_upsample == "expand_first":
             x = self.up(x)
@@ -2386,18 +2393,44 @@ class SwinTransformerSys(nn.Module):
                         x = self.surface_h3_fusion(
                             torch.cat([x, h3_surface], dim=1)
                         )
-                x = self.guided_head(x, z_struct=z_struct)
+                if return_surface_features and self.surface_only:
+                    x, decoder_surface_feature = self.guided_head(
+                        x, z_struct=z_struct, return_feature=True
+                    )
+                else:
+                    x = self.guided_head(x, z_struct=z_struct)
+                    decoder_surface_feature = None
             else:
                 x = self.output(x)
+                decoder_surface_feature = None
 
+        if return_surface_features:
+            return x, decoder_surface_feature
         return x
 
     def forward(
         self,
         x,
+        return_surface_features=False,
     ):
         structure_input = x
-        x, x_downsample, road_attentions = self.forward_features(x)
+        if return_surface_features:
+            x, x_downsample, road_attentions, shallow_tokens = self.forward_features(
+                x, return_surface_features=True
+            )
+        else:
+            x, x_downsample, road_attentions = self.forward_features(x)
+        shallow_surface_feature = None
+        if return_surface_features:
+            batch, length, channels = shallow_tokens.shape
+            height, width = self.patches_resolution
+            if length != height * width:
+                raise RuntimeError(
+                    f"Stage-1 feature token count {length} != {height}x{width}"
+                )
+            shallow_surface_feature = shallow_tokens.transpose(1, 2).reshape(
+                batch, channels, height, width
+            )
         z_struct, e128, highres_structure_skeleton = (
             self._build_highres_structure_outputs(structure_input)
         )
@@ -2418,11 +2451,16 @@ class SwinTransformerSys(nn.Module):
             )
         if self.return_skeleton and road_attentions:
             structure_outputs.extend(road_attentions)
-        x = self.up_x4(
+        upsampled = self.up_x4(
             x,
             structure_outputs=structure_outputs if self.return_skeleton else None,
             z_struct=z_struct,
+            return_surface_features=return_surface_features,
         )
+        if return_surface_features:
+            x, decoder_surface_feature = upsampled
+        else:
+            x = upsampled
         if self.return_skeleton and isinstance(x, tuple):
             x = self._apply_structure_surface_correction(
                 x,
@@ -2431,6 +2469,11 @@ class SwinTransformerSys(nn.Module):
             )
             x = (*x, structure_outputs)
 
+        if return_surface_features:
+            return x, {
+                "encoder_stage1": shallow_surface_feature,
+                "decoder_final": decoder_surface_feature,
+            }
         return x
 
     def flops(self):
