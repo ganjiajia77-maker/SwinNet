@@ -56,9 +56,9 @@ class SurfaceGapRepairTests(unittest.TestCase):
         self.assertEqual(dead_end.label,0)
 
         gt[:]=False
-        gt[90,30:480]=True; gt[110,30:480]=True
-        gt[90:111,470]=True  # real connection, well outside the proposed local gap ROI
-        parallel=label_candidate(self.candidate((90,200),(110,200)),gt,pred)
+        gt[80,30:480]=True; gt[120,30:480]=True
+        gt[80:121,470]=True  # real connection, well outside the proposed local gap ROI
+        parallel=label_candidate(self.candidate((80,200),(120,200)),gt,pred)
         self.assertEqual(parallel.label,0)
 
     def test_repair_zero_delta_and_joint_gradient(self):
@@ -69,8 +69,11 @@ class SurfaceGapRepairTests(unittest.TestCase):
         candidate=GapCandidate("endpoint_endpoint",(256,200),(256,240),(0,1),True,(0,-1),True,
                                40.,1.,1.,0,0,1)
         prompts,geometry=candidate_tensors(candidate,"cpu")
+        self.assertEqual(tuple(prompts.shape),(1,2,512,512))
+        self.assertEqual(tuple(geometry.shape),(1,8))
         shallow=torch.randn(1,96,128,128,requires_grad=True)
         decoder=torch.randn(1,96,512,512,requires_grad=True)
+        self.assertEqual(repair.classifier[0].in_features,256)
         cls,delta=repair(rgb,p0,prompts,geometry,shallow,decoder)
         self.assertEqual(tuple(cls.shape),(1,))
         self.assertEqual(tuple(delta.shape),(1,1,512,512))
