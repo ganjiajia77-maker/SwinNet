@@ -17,15 +17,7 @@ test -d "$DATA/$SPLIT" || { echo "Missing split data: $DATA/$SPLIT" >&2; exit 1;
 test ! -e "$OUT" || { echo "Output already exists: $OUT" >&2; exit 1; }
 mkdir -p "$OUT"
 
-INFO=$(python - "$CKPT" <<'PY'
-import sys
-import torch
-c = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
-a = c.get("args", {})
-print(a.get("img_size", 512), a.get("source_patch_size", 1024),
-      int(bool(a.get("use_ema", False))))
-PY
-)
+INFO=$(python -c 'import sys,torch; c=torch.load(sys.argv[1],map_location="cpu",weights_only=False); a=c.get("args",{}); print(a.get("img_size",512),a.get("source_patch_size",1024),int(bool(a.get("use_ema",False))))' "$CKPT")
 read -r IMAGE_SIZE SOURCE_SIZE USE_EMA <<< "$INFO"
 EMA_ARGS=()
 if [[ "$USE_EMA" == 1 ]]; then EMA_ARGS+=(--require_ema); fi
