@@ -15,14 +15,13 @@ cd "$REPO"
 test -s "$CKPT" || { echo "Missing checkpoint: $CKPT" >&2; exit 1; }
 test -d "$DATA/$SPLIT" || { echo "Missing split data: $DATA/$SPLIT" >&2; exit 1; }
 test ! -e "$OUT" || { echo "Output already exists: $OUT" >&2; exit 1; }
-mkdir -p "$OUT"
 
-INFO=$(python -c 'import sys,torch; c=torch.load(sys.argv[1],map_location="cpu",weights_only=False); a=c.get("args",{}); print(a.get("img_size",512),a.get("source_patch_size",1024),int(bool(a.get("use_ema",False))))' "$CKPT")
-read -r IMAGE_SIZE SOURCE_SIZE USE_EMA <<< "$INFO"
+INFO=$(python -c 'import sys,torch; c=torch.load(sys.argv[1],map_location="cpu",weights_only=False); a=c.get("args",{}); enabled=bool(a.get("enable_global_topology",False)); enabled or sys.exit("Checkpoint has no active global topology writeback"); variant="a" if a.get("ablate_h0_stream",False) else ("b" if a.get("static_h0_stage_fusion",False) else "full"); print(a.get("img_size",512),a.get("source_patch_size",1024),int(bool(a.get("use_ema",False))),variant)' "$CKPT")
+read -r IMAGE_SIZE SOURCE_SIZE USE_EMA H0_VARIANT <<< "$INFO"
 EMA_OPTION=
 if [ "$USE_EMA" = 1 ]; then EMA_OPTION=--require_ema; fi
-echo "checkpoint=$CKPT data=$DATA split=$SPLIT tile=$IMAGE_SIZE native=$SOURCE_SIZE threshold=$THRESHOLD EMA=$USE_EMA GPU=$GPU output=$OUT"
-echo "H0 variant A: no high-resolution stream; global topology uses Stage 3 projected structure"
+echo "checkpoint=$CKPT data=$DATA split=$SPLIT tile=$IMAGE_SIZE native=$SOURCE_SIZE threshold=$THRESHOLD EMA=$USE_EMA H0_variant=$H0_VARIANT GPU=$GPU output=$OUT"
+mkdir -p "$OUT"
 
 for FLOOR in 0 0.2; do
   NAME=original
@@ -34,9 +33,6 @@ for FLOOR in 0 0.2; do
     --overlap_infer --threshold "$THRESHOLD" \
     --writeback_gate_floor "$FLOOR" --save_overlap_logits \
     --output_dir "$OUT/$NAME" $EMA_OPTION \
-    --enable_global_topology --ablate_h0_stream \
-    --global_topology_max_nodes 32 --global_topology_heads 4 \
-    --global_topology_alpha_max 0.05 \
     2>&1 | tee "$OUT/${NAME}_inference.log"
 done
 
