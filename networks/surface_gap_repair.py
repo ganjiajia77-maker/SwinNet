@@ -259,8 +259,14 @@ def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
             if _locally_connected(binary,a,candidate.anchor_b): continue
             proposals.append(candidate)
             used_counts[a]=used_counts.get(a,0)+1
-    proposals.sort(key=lambda c:(c.anchor_a,c.kind,-min(c.line_alignment_a if c.tangent_a_valid else 0.0,
-        c.line_alignment_b if c.tangent_b_valid else c.line_alignment_a),c.distance,c.anchor_b))
+    def proposal_rank(c):
+        alignments=[]
+        if c.tangent_a_valid: alignments.append(c.line_alignment_a)
+        if c.kind=="endpoint_endpoint" and c.tangent_b_valid: alignments.append(c.line_alignment_b)
+        # Prefer geometrically compatible, nearby proposals before applying the image cap.
+        compatibility=min(alignments) if alignments else 0.0
+        return (-compatibility,c.distance,c.kind,c.anchor_a,c.anchor_b)
+    proposals.sort(key=proposal_rank)
     # Nearby samples along the same target road are grouped deterministically.
     dedup=[]; seen=set()
     for c in proposals:
@@ -275,9 +281,11 @@ def generate_candidates(probability: np.ndarray, threshold=0.45, min_distance=8,
         if c.kind=="endpoint_endpoint":
             per_endpoint[c.anchor_b]=per_endpoint.get(c.anchor_b,0)+1
         kept.append(c)
+    pre_cap=len(kept)
     kept=kept[:max_total]
     return kept,{"endpoint_count":len(endpoints),"proposed":len(proposals),"deduplicated":len(dedup),
                  "road_geometric_proposals":road_proposals,"kept":len(kept),
+                 "truncated_by_image_cap":max(0,pre_cap-len(kept)),
                  "boundary_filtered":len(boundary),"tile_skipped":tile_skipped}
 
 

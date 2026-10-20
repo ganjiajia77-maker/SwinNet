@@ -24,9 +24,13 @@ if [[ "$MODE" == train || "$MODE" == baseline-only ]]; then
   printf '%s\n' "$RUN" > "$OUT/latest_e202_surface_gap_repair_run.txt"
   ARGS=(train)
   [[ "$MODE" == baseline-only ]] && ARGS=(baseline-only)
+  EXTRA=()
+  if [[ "$MODE" == baseline-only && -n "${CANDIDATE_REPLAY_DIR:-}" ]]; then
+    EXTRA+=(--candidate_replay_dir "$CANDIDATE_REPLAY_DIR")
+  fi
   python -u surface_gap_repair_experiment.py "${ARGS[@]}" --gpu 0 --seed "$SEED" \
     --root_path "$DATA" --output_dir "$OUT" --run_name "$RUN" --pretrain_ckpt "$PRETRAIN" \
-    --max_epochs 80 --lambda_repair 1.0 --lambda_cldice 0.1
+    --max_epochs 80 --lambda_repair 1.0 --lambda_cldice 0.1 "${EXTRA[@]}"
   exit 0
 fi
 if [[ -z "$RUN" ]]; then

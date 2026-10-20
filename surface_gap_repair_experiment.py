@@ -43,7 +43,10 @@ def parser():
     p.add_argument("--lambda_cldice",type=float,default=0.1)
     p.add_argument("--accept_threshold",type=float,default=0.5)
     p.add_argument("--candidate_threshold",type=float,default=0.45)
+    p.add_argument("--candidate_threshold_source",default="unverified historical source; configured at 0.45")
     p.add_argument("--baseline_only",action="store_true")
+    p.add_argument("--candidate_replay_dir",default="",
+        help="Replay train_candidates_epoch_*.json from a joint run (baseline-only control only)")
     p.add_argument("--limit_train_images",type=int,default=0,help="smoke-check only; 0 means all")
     return p
 
@@ -397,7 +400,8 @@ def train(args,device,resume=False,baseline_only=False):
     loaded_names=sorted(loaded)
     (run_dir/"provenance.json").write_text(json.dumps({"model":MODEL_NAME,"base_commit":BASE_COMMIT,
         "pretrain_path":args.pretrain_ckpt,"pretrain_sha256":pre_sha,"loaded_pretrained_names":loaded_names,
-        "candidate_protocol":{"threshold":.45,"8_connectivity":8,"tangent_native_px":16,
+        "candidate_protocol":{"threshold":args.candidate_threshold,"threshold_source":args.candidate_threshold_source,
+          "8_connectivity":8,"tangent_native_px":16,
           "distance_native_px":[8,128],"angle_max_degrees":75,"boundary_margin_px":8,
           "max_per_endpoint":8,"max_candidates_image":256,"prompt_sigma_native_px":3},
         "training":{"epochs":args.max_epochs,"batch_size":2,"accumulation":1,"seed":args.seed,
@@ -419,22 +423,52 @@ def train(args,device,resume=False,baseline_only=False):
         set_dataset_epoch(train_ds,epoch)
         # Refresh candidates once per epoch using current base weights, eval/no-grad only.
         candidate_groups=defaultdict(list); candidate_counts=[]; candidate_records=[]
-        prior=model.training; model.eval()
-        with torch.no_grad():
-            for image_name in names:
-                rgb,gt=read_native(Path(args.root_path),"train",image_name)
-                _,_,_,items,stats=_candidate_windows(rgb,gt,model,device,"train",image_name,.45)
-                for c in items:
-                    candidate_records.append({"image":image_name,**c.to_dict()})
-                    if c.label>=0:
-                        candidate_groups[(image_name,c.tile_top,c.tile_left)].append(c)
-                candidate_counts.append({"image":image_name,**stats,"labeled":sum(c.label>=0 for c in items),
-                    "positive":sum(c.label==1 for c in items),"negative":sum(c.label==0 for c in items)})
-        model.train(prior)
-        candidate_manifest={"epoch":epoch+1,"split":"train","weights_sha256":state_hash(model),
-          "protocol":{"threshold":.45,"max_per_endpoint":8,"max_candidates_image":256,
-            "distance_px":[8,128],"tangent_px":16,"boundary_px":8},
-          "images":candidate_counts,"candidates":candidate_records}
+        if baseline_only and args.candidate_replay_dir:
+            replay_path=Path(args.candidate_replay_dir)/f"train_candidates_epoch_{epoch+1:03d}.json"
+            if not replay_path.is_file():
+                raise FileNotFoundError(f"Missing joint-run train candidate manifest: {replay_path}")
+            replay=json.loads(replay_path.read_text(encoding="utf-8"))
+            if replay.get("split")!="train" or int(replay.get("epoch",-1))!=epoch+1:
+                raise ValueError(f"Candidate replay has mismatched split/epoch: {replay_path}")
+            train_name_set=set(names)
+            for row in replay.get("candidates",[]):
+                image_name=row["image"]
+                if image_name not in train_name_set:
+                    raise ValueError(f"Replay manifest contains non-train image {image_name!r}")
+                fields={k:row[k] for k in GapCandidate.__dataclass_fields__}
+                for key in ("anchor_a","anchor_b","tangent_a","tangent_b"):
+                    fields[key]=tuple(fields[key])
+                c=GapCandidate(**fields); candidate_records.append({"image":image_name,**c.to_dict()})
+                candidate_groups[(image_name,c.tile_top,c.tile_left)].append(c)
+            # Match the joint run's tile exposure: a tile is sampled only when
+            # at least one candidate in that tile has a non-ignored label.
+            candidate_groups={key:items for key,items in candidate_groups.items()
+                              if any(c.label>=0 for c in items)}
+            candidate_manifest={"epoch":epoch+1,"split":"train","source":"replayed_joint_train_manifest",
+                "source_manifest":str(replay_path.resolve()),"source_weights_sha256":replay.get("weights_sha256"),
+                "weights_sha256":state_hash(model),"exposed_tiles":len(candidate_groups),
+                "candidates":candidate_records}
+        else:
+            prior=model.training; model.eval()
+            with torch.no_grad():
+                for image_name in names:
+                    rgb,gt=read_native(Path(args.root_path),"train",image_name)
+                    _,_,_,items,stats=_candidate_windows(rgb,gt,model,device,"train",image_name,args.candidate_threshold)
+                    for c in items:
+                        candidate_records.append({"image":image_name,**c.to_dict()})
+                    valid_tiles={(image_name,c.tile_top,c.tile_left) for c in items if c.label>=0}
+                    for c in items:
+                        key=(image_name,c.tile_top,c.tile_left)
+                        # Keep every generated proposal in any tile that has a supervised candidate.
+                        if key in valid_tiles: candidate_groups[key].append(c)
+                    candidate_counts.append({"image":image_name,**stats,"labeled":sum(c.label>=0 for c in items),
+                        "positive":sum(c.label==1 for c in items),"negative":sum(c.label==0 for c in items),
+                        "ignored":sum(c.label<0 for c in items)})
+            model.train(prior)
+            candidate_manifest={"epoch":epoch+1,"split":"train","weights_sha256":state_hash(model),
+              "protocol":{"threshold":args.candidate_threshold,"max_per_endpoint":8,"max_candidates_image":256,
+                "distance_px":[8,128],"tangent_px":16,"boundary_px":8},
+              "images":candidate_counts,"exposed_tiles":len(candidate_groups),"candidates":candidate_records}
         (run_dir/f"train_candidates_epoch_{epoch+1:03d}.json").write_text(json.dumps(candidate_manifest,indent=2),encoding="utf-8")
         candidate_pool=list(candidate_groups.items())
         random.Random(args.seed+epoch).shuffle(candidate_pool); candidate_cursor=0
@@ -454,7 +488,7 @@ def train(args,device,resume=False,baseline_only=False):
                 if key not in [k for k,_ in selected]: selected.append((key,items))
             if selected:
                 conn_terms=[]; pixel_terms=[]; cl_terms=[]
-                selected_labels=[c.label for _,items in selected for c in items]
+                selected_labels=[c.label for _,items in selected for c in items if c.label>=0]
                 npos=sum(x==1 for x in selected_labels); nneg=sum(x==0 for x in selected_labels)
                 for (image_name,top,left),items in selected:
                     rgb,gt=read_native(Path(args.root_path),"train",image_name)
@@ -469,8 +503,9 @@ def train(args,device,resume=False,baseline_only=False):
                             numerator += win*p.reshape(1,1,1,1)*delta
                             denominator += win
                             region=torch.maximum(region,(win>0).float())
-                            class_weight=(0.5/npos if c.label==1 else 0.5/nneg) if npos and nneg else 1.0/max(len(selected_labels),1)
-                            local_conn.append(F.binary_cross_entropy_with_logits(cls,torch.tensor([float(c.label)],device=device),reduction="none").mean()*class_weight)
+                            if c.label>=0:
+                                class_weight=(0.5/npos if c.label==1 else 0.5/nneg) if npos and nneg else 1.0/max(len(selected_labels),1)
+                                local_conn.append(F.binary_cross_entropy_with_logits(cls,torch.tensor([float(c.label)],device=device),reduction="none").mean()*class_weight)
                         seen_candidates+=len(items)
                         repaired=base_tile+numerator/denominator.clamp_min(1.0)
                         pix=focal_dice(repaired,gt_tile,region)
@@ -506,7 +541,8 @@ def train(args,device,resume=False,baseline_only=False):
                 "max_epochs":args.max_epochs,"warmup_epochs":10,"pretrained_lr":5e-5,
                 "pretrained_min_lr":5e-6,"new_lr":2e-4,"new_min_lr":1e-5},
             "repair_weight_sha256":state_hash(repair) if repair else None,
-            "protocol":{"candidate_threshold":.45,"accept_threshold":args.accept_threshold,
+            "protocol":{"candidate_threshold":args.candidate_threshold,"candidate_threshold_source":args.candidate_threshold_source,
+                "accept_threshold":args.accept_threshold,
                 "lambda_repair":args.lambda_repair,"lambda_cldice":args.lambda_cldice,
                 "proposal":{"connectivity":8,"skeleton":"Zhang-Suen","tangent_length_px":16,
                     "min_distance_px":8,"max_distance_px":128,"angle_max_degrees":75,
@@ -546,7 +582,8 @@ def write_manifest(args,checkpoint,split,thresholds,output):
     ckpt=torch.load(checkpoint,map_location="cpu",weights_only=False)
     model_name=MODEL_NAME if ckpt.get("repair_state_dict") is not None else MODEL_NAME+"_baseline_only"
     provenance={"checkpoint":str(Path(checkpoint).resolve()),"base_commit":BASE_COMMIT,
-        "epoch":ckpt.get("epoch"),"candidate_threshold":.45,
+        "epoch":ckpt.get("epoch"),"candidate_threshold":args.candidate_threshold,
+        "candidate_threshold_source":args.candidate_threshold_source,
         "accept_threshold":ckpt.get("protocol",{}).get("accept_threshold",.5),
         "inference":"native1500;512/256 tiles; taper0.1 weighted logits; single candidate pass",
         "prediction_generation":"all candidates from unrepaired P0; tile repair merged by weighted mean",
