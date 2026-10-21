@@ -83,6 +83,7 @@ def main():
     parser.add_argument('--global_topology_max_nodes', type=int, default=32)
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
+    parser.add_argument('--encoder_structure_exchange', action='store_true')
     parser.add_argument('--stage_skeleton_mode', type=str, default='prior_residual', choices=['direct', 'prior_residual'])
     parser.add_argument('--enable_h3_surface_fusion', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=False)
@@ -126,6 +127,7 @@ def main():
             'stage3_skeleton_gradient_ratio', 'stage3_gate_topology_gradient_ratio',
             'final_skeleton_gradient_ratio', 'final_topology_eta_init',
             'final_gap_rho_init',
+            'encoder_structure_exchange',
         ):
             if name in saved_args:
                 setattr(args, name, saved_args[name])
@@ -154,13 +156,20 @@ def main():
         stage_skeleton_mode=args.stage_skeleton_mode,
         enable_h3_surface_fusion=args.enable_h3_surface_fusion,
         remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+        encoder_structure_exchange=args.encoder_structure_exchange,
     )
-    load_topology_checkpoint_state(
-        model,
-        checkpoint['model_state_dict'],
-        checkpoint.get('topology_attention_version', 'legacy-unrecorded'),
-        strict=(args.bottleneck_type == 'global_local'),
-    )
+    if checkpoint.get('architecture_id') == 'h0_encoder_road_skeleton_v1':
+        if not args.encoder_structure_exchange:
+            raise RuntimeError('Encoder checkpoint requires encoder exchange')
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    else:
+        if args.encoder_structure_exchange:
+            raise RuntimeError('Encoder exchange cannot load an original H0 checkpoint')
+        load_topology_checkpoint_state(
+            model, checkpoint['model_state_dict'],
+            checkpoint.get('topology_attention_version', 'legacy-unrecorded'),
+            strict=(args.bottleneck_type == 'global_local'),
+        )
     model = model.to(device)
     model.eval()
     print('Model loaded')

@@ -557,13 +557,18 @@ class SwinUnet(nn.Module):
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False):
+                 remove_stage2_pre_topology_source=False,
+                 encoder_structure_exchange=False):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
         self.config = config
         self.return_skeleton = return_skeleton
         self.bottleneck_type = bottleneck_type
+        self.architecture_id = (
+            "h0_encoder_road_skeleton_v1"
+            if encoder_structure_exchange else "h0_599a410_control"
+        )
 
         self.swin_unet = SwinTransformerSys(img_size=config.DATA.IMG_SIZE,
                                 patch_size=config.MODEL.SWIN.PATCH_SIZE,
@@ -605,7 +610,8 @@ class SwinUnet(nn.Module):
                                  stage_skeleton_mode=stage_skeleton_mode,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
-                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
+                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source,
+                                 encoder_structure_exchange=encoder_structure_exchange)
     def forward(
         self,
         x,

@@ -179,6 +179,7 @@ def main():
     parser.add_argument('--global_topology_max_nodes', type=int, default=32)
     parser.add_argument('--global_topology_heads', type=int, default=4)
     parser.add_argument('--global_topology_alpha_max', type=float, default=0.05)
+    parser.add_argument('--encoder_structure_exchange', action='store_true')
     parser.add_argument('--stage_skeleton_mode', type=str, default=None, choices=['direct', 'prior_residual'])
     parser.add_argument('--remove_stage2_pre_topology_source', action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
@@ -220,6 +221,7 @@ def main():
                     "bottleneck_type",
                     "stage_skeleton_mode",
                     "remove_stage2_pre_topology_source",
+                    "encoder_structure_exchange",
                 ):
                     if name in saved_args and not _cli_has(name):
                         setattr(args, name, saved_args[name])
@@ -274,20 +276,25 @@ def main():
             global_topology_alpha_max=args.global_topology_alpha_max,
             stage_skeleton_mode=args.stage_skeleton_mode,
             remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+            encoder_structure_exchange=args.encoder_structure_exchange,
         )
     model = vit_cls(**model_kwargs)
     if checkpoint is None:
         checkpoint = torch.load(args.model_path, map_location=device)
-    adapt_connectivity_modules_for_checkpoint(
-        model,
-        checkpoint['model_state_dict'],
-        args.model_impl,
-    )
-    loader(
-        model,
-        checkpoint['model_state_dict'],
-        checkpoint.get("topology_attention_version", "legacy-unrecorded"),
-    )
+    if checkpoint.get('architecture_id') == 'h0_encoder_road_skeleton_v1':
+        if args.model_impl != 'standard' or not args.encoder_structure_exchange:
+            raise RuntimeError('Encoder checkpoint requires the standard encoder-exchange model')
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    else:
+        if args.encoder_structure_exchange:
+            raise RuntimeError('Encoder exchange cannot load an original H0 checkpoint')
+        adapt_connectivity_modules_for_checkpoint(
+            model, checkpoint['model_state_dict'], args.model_impl,
+        )
+        loader(
+            model, checkpoint['model_state_dict'],
+            checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+        )
     model = model.to(device)
     model.eval()
     print('Model loaded')

@@ -41,6 +41,12 @@ def _cli_has(flag_name):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
+parser.add_argument('--split', choices=['val', 'test'], default='test')
+parser.add_argument('--export_thresholds', type=float, nargs='*', default=None,
+                    help='native-size mask thresholds for overlap inference')
+parser.add_argument('--encoder_structure_exchange', action='store_true')
+parser.add_argument('--save_encoder_diagnostics', action='store_true',
+                    help='save first-window E1/E2/E3 road and H skeleton logits per image')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--num_classes', type=int, default=1, help='output channel of network')
 parser.add_argument('--output_dir', type=str, default='./predictions', help='output dir')
@@ -277,6 +283,7 @@ if __name__ == "__main__":
                 "global_topology_alpha_max",
                 "stage_skeleton_mode",
                 "remove_stage2_pre_topology_source",
+                "encoder_structure_exchange",
             ):
                 if name in saved_args and not _cli_has(name):
                     setattr(args, name, saved_args[name])
@@ -318,23 +325,28 @@ if __name__ == "__main__":
                     global_topology_heads=args.global_topology_heads,
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
-                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
+                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+                    encoder_structure_exchange=args.encoder_structure_exchange).cuda()
     device = next(model.parameters()).device
     
     # 加载模型
     if checkpoint is not None:
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            adapt_connectivity_modules_for_checkpoint(
-                model,
-                checkpoint['model_state_dict'],
-                "standard",
-            )
-            load_topology_checkpoint_state(
-                model,
-                checkpoint['model_state_dict'],
-                checkpoint.get("topology_attention_version", "legacy-unrecorded"),
-                strict=(args.bottleneck_type == 'global_local'),
-            )
+            if checkpoint.get('architecture_id') == 'h0_encoder_road_skeleton_v1':
+                if not args.encoder_structure_exchange:
+                    raise RuntimeError('Checkpoint requires encoder structure exchange')
+                model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+            else:
+                if args.encoder_structure_exchange:
+                    raise RuntimeError('Encoder exchange cannot load an original H0 checkpoint')
+                adapt_connectivity_modules_for_checkpoint(
+                    model, checkpoint['model_state_dict'], "standard",
+                )
+                load_topology_checkpoint_state(
+                    model, checkpoint['model_state_dict'],
+                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
+                    strict=(args.bottleneck_type == 'global_local'),
+                )
         else:
             model.load_state_dict(checkpoint, strict=(args.bottleneck_type == 'global_local'))
         print(f"已加载模型: {args.model_path}")
@@ -353,14 +365,14 @@ if __name__ == "__main__":
     else:
         print(f"错误: 模型文件不存在 {args.model_path}")
         exit(1)
-    test_image_dir = os.path.join(args.root_path, 'test', 'image')
+    test_image_dir = os.path.join(args.root_path, args.split, 'image')
     if not os.path.exists(test_image_dir):
-        test_image_dir = os.path.join(args.root_path, 'test')
-    test_label_dir = os.path.join(args.root_path, 'test', 'mask')
+        test_image_dir = os.path.join(args.root_path, args.split)
+    test_label_dir = os.path.join(args.root_path, args.split, 'mask')
     if not os.path.exists(test_label_dir):
-        test_label_dir = os.path.join(args.root_path, 'test', 'label')
+        test_label_dir = os.path.join(args.root_path, args.split, 'label')
     if not os.path.exists(test_label_dir):
-        test_label_dir = os.path.join(args.root_path, 'test_labels')
+        test_label_dir = os.path.join(args.root_path, args.split + '_labels')
     
     print(f"加载测试数据...")
     print(f"  Image目录: {test_image_dir}")
@@ -385,12 +397,23 @@ if __name__ == "__main__":
         os.makedirs(pred_dir, exist_ok=True)
         surface_dir = os.path.join(pred_dir, 'surface')
         os.makedirs(surface_dir, exist_ok=True)
+        export_thresholds = args.export_thresholds or [args.threshold]
+        if args.save_encoder_diagnostics:
+            if not args.encoder_structure_exchange:
+                raise ValueError('Encoder diagnostics require encoder exchange')
+            os.makedirs(os.path.join(args.output_dir, 'encoder_diagnostics'), exist_ok=True)
+        if any(not 0.0 < threshold < 1.0 for threshold in export_thresholds):
+            raise ValueError('All export thresholds must be in (0, 1)')
+        if args.export_thresholds is not None:
+            for threshold in export_thresholds:
+                os.makedirs(os.path.join(args.output_dir,
+                            f'threshold_{threshold:.2f}', 'surface'), exist_ok=True)
 
         stride = args.img_size // 2
         tile_size = args.img_size
         positions = RoadSkeletonDataset.sliding_positions
         weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
-        tile_weight = (1.0 - weight_1d).clamp_min(0.05)
+        tile_weight = (1.0 - weight_1d).clamp_min(0.1)
         tile_weight = torch.outer(tile_weight, tile_weight).view(1, 1, tile_size, tile_size)
         image_list = sorted([f for f in os.listdir(test_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'))])
         def find_label_name(image_name):
@@ -419,6 +442,7 @@ if __name__ == "__main__":
 
                 logit_canvas = torch.zeros((1, 1, h, w), device=device)
                 weight_canvas = torch.zeros_like(logit_canvas)
+                diagnostic_saved = False
 
                 # sliding: include the final border tile, matching validation.
                 for y in positions(h, tile_size, stride):
@@ -444,6 +468,21 @@ if __name__ == "__main__":
                         inp = torch.from_numpy(crop_f).unsqueeze(0).cuda()
 
                         outputs = model(inp)
+                        if args.save_encoder_diagnostics and not diagnostic_saved:
+                            aux = outputs[5]
+                            diagnostic = {}
+                            for stage_index, item in enumerate(aux, start=1):
+                                diagnostic[f'E{stage_index}_road_logits'] = (
+                                    item['encoder_road_logits'][0, 0].float().cpu().numpy())
+                                diagnostic[f'H_E{stage_index}_skeleton_logits'] = (
+                                    item['encoder_skeleton_logits'][0, 0].float().cpu().numpy())
+                            diagnostic['tile_top_left'] = np.array([y1, x1], dtype=np.int32)
+                            np.savez_compressed(
+                                os.path.join(args.output_dir, 'encoder_diagnostics',
+                                             os.path.splitext(image_name)[0] + '.npz'),
+                                **diagnostic,
+                            )
+                            diagnostic_saved = True
                         surface_logits = outputs[0] if isinstance(outputs, tuple) else outputs
                         tile_h = y2 - y1
                         tile_w = x2 - x1
@@ -472,6 +511,12 @@ if __name__ == "__main__":
                 case_name = os.path.splitext(image_name)[0]
                 png_save_path = os.path.join(surface_dir, f'{case_name}_pred.png')
                 cv2.imwrite(png_save_path, pred)
+                if args.export_thresholds is not None:
+                    for threshold in export_thresholds:
+                        threshold_dir = os.path.join(
+                            args.output_dir, f'threshold_{threshold:.2f}', 'surface')
+                        cv2.imwrite(os.path.join(threshold_dir, f'{case_name}_pred.png'),
+                                    (avg_prob >= threshold).astype(np.uint8) * 255)
 
                 total_samples += 1
 

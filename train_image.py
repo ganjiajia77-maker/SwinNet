@@ -1,6 +1,7 @@
 import argparse
 import copy
 import csv
+import json
 import math
 import os
 import random
@@ -91,6 +92,10 @@ parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
+parser.add_argument('--encoder_structure_exchange', action='store_true',
+                    help='enable three encoder E/H exchanges and encoder auxiliary heads')
+parser.add_argument('--encoder_road_aux_weight', type=float, default=0.10)
+parser.add_argument('--encoder_skeleton_aux_weight', type=float, default=0.004)
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
 parser.add_argument(
@@ -286,6 +291,39 @@ def apply_structure_profile_defaults(args):
 
 apply_structure_profile_defaults(args)
 
+
+def configure_encoder_budget(args):
+    if not args.encoder_structure_exchange:
+        if _cli_has('--encoder_road_aux_weight') and args.encoder_road_aux_weight != 0:
+            parser.error('Encoder road auxiliary weight requires --encoder_structure_exchange')
+        if _cli_has('--encoder_skeleton_aux_weight') and args.encoder_skeleton_aux_weight != 0:
+            parser.error('Encoder skeleton auxiliary weight requires --encoder_structure_exchange')
+        args.encoder_road_aux_weight = 0.0
+        args.encoder_skeleton_aux_weight = 0.0
+        args.stage_skeleton_only_loss_factor = 1.0
+        return
+    if not args.enable_highres_structure_stream or args.highres_structure_channels != 64:
+        parser.error('Encoder exchange requires 64-channel high-resolution structure stream')
+    if args.stage2_skeleton_weight != 0.008 or args.stage3_skeleton_weight != 0.012:
+        parser.error('Encoder S budget requires stage weights 0.008 and 0.012')
+    if args.stage_skeleton_loss_factor != 1.0:
+        parser.error('Encoder S budget requires --stage_skeleton_loss_factor 1.0')
+    budget = args.encoder_skeleton_aux_weight
+    if not 0.0 <= budget <= 0.020 or args.encoder_road_aux_weight < 0:
+        parser.error('Encoder auxiliary weights are outside the allowed budget')
+    factor = (0.020 - budget) / 0.020
+    if (_cli_has('--stage_skeleton_only_loss_factor') and
+            not math.isclose(args.stage_skeleton_only_loss_factor, factor, abs_tol=1e-8)):
+        parser.error('Decoder S factor must match the remaining 0.020 budget')
+    args.stage_skeleton_only_loss_factor = factor
+    print('[ENCODER] road={:.4f}, skeleton={:.4f}, decoder_S_factor={:.4f}; '
+          'effective S2={:.4f}, S3={:.4f}, total_S={:.4f}'.format(
+              args.encoder_road_aux_weight, budget, factor,
+              .008*factor, .012*factor, .020), flush=True)
+
+
+configure_encoder_budget(args)
+
 if args.freeze_post_refine_interaction_only:
     if not args.enable_highres_structure_stream:
         parser.error("--freeze_post_refine_interaction_only requires --enable_highres_structure_stream")
@@ -402,6 +440,8 @@ def build_criterion(args, loss_weights, device):
         ),
         stage_skeleton_loss_factor=args.stage_skeleton_loss_factor,
         stage_skeleton_only_loss_factor=args.stage_skeleton_only_loss_factor,
+        encoder_road_aux_weight=args.encoder_road_aux_weight,
+        encoder_skeleton_aux_weight=args.encoder_skeleton_aux_weight,
     ).to(device)
 
 
@@ -421,8 +461,24 @@ def format_training_config_lines(args, loss_weights):
     ]
     if args.enable_highres_structure_stream:
         lines.append(
-            "  Skeleton feature flow: z_struct -> H0 <-> G2 -> H1 <-> G3 -> H2"
+            "  Skeleton feature flow: " + (
+                "H0 -> H_E1 -> H_E2 -> H_E3 -> H_D2 -> H_D3"
+                if args.encoder_structure_exchange
+                else "z_struct -> H0 <-> G2 -> H1 <-> G3 -> H2"
+            )
         )
+    lines.append(
+        "  Encoder exchange: {}; road_aux={:.4f}, skeleton_aux={:.4f}, "
+        "decoder_S_factor={:.4f}; S2={:.4f}, S3={:.4f}, S_total={:.4f}".format(
+            args.encoder_structure_exchange, args.encoder_road_aux_weight,
+            args.encoder_skeleton_aux_weight, args.stage_skeleton_only_loss_factor,
+            args.stage2_skeleton_weight * args.stage_skeleton_only_loss_factor,
+            args.stage3_skeleton_weight * args.stage_skeleton_only_loss_factor,
+            args.stage2_skeleton_weight * args.stage_skeleton_only_loss_factor
+            + args.stage3_skeleton_weight * args.stage_skeleton_only_loss_factor
+            + args.encoder_skeleton_aux_weight,
+        )
+    )
     if args.structure_profile in {
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
@@ -574,6 +630,12 @@ def inherit_resume_architecture_args(args):
 
     saved_args = checkpoint["args"]
     for name, cast in (
+        ("encoder_structure_exchange", bool),
+        ("encoder_road_aux_weight", float),
+        ("encoder_skeleton_aux_weight", float),
+        ("stage2_skeleton_weight", float),
+        ("stage3_skeleton_weight", float),
+        ("stage_skeleton_loss_factor", float),
         ("surface_focal_gamma", float),
         ("amp_dtype", str),
         ("stage3_gate_topology_gradient_ratio", float),
@@ -1188,6 +1250,20 @@ if __name__ == "__main__":
     
     inherit_resume_architecture_args(args)
     apply_structure_profile_defaults(args)
+    configure_encoder_budget(args)
+    args.num_classes = 1
+    with open(os.path.join(args.output_dir, 'resolved_config.json'), 'w', encoding='utf-8') as config_file:
+        json.dump({
+            'architecture_id': ('h0_encoder_road_skeleton_v1'
+                                if args.encoder_structure_exchange else 'h0_599a410_control'),
+            'base_commit': '599a410de8d341850e1810417307e4b3bbdfc82d',
+            'args': vars(args),
+            'effective_skeleton_coefficients': {
+                'stage2': args.stage2_skeleton_weight * args.stage_skeleton_only_loss_factor,
+                'stage3': args.stage3_skeleton_weight * args.stage_skeleton_only_loss_factor,
+                'encoder': args.encoder_skeleton_aux_weight,
+            },
+        }, config_file, indent=2, ensure_ascii=False)
 
     # 加载配置
     config = get_config(args)
@@ -1208,7 +1284,6 @@ if __name__ == "__main__":
         args.img_size = aligned_img_size
     
     # 创建网络（启用 DilatedAsterisk 空间特征增强）
-    args.num_classes = 1
     loss_weights = get_final_loss_weights(args)
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes,
@@ -1237,7 +1312,8 @@ if __name__ == "__main__":
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
-                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
+                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source,
+                    encoder_structure_exchange=args.encoder_structure_exchange).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
@@ -1806,6 +1882,8 @@ if __name__ == "__main__":
                 'structure_delta_weak_skeleton_fn_mean',
                 'structure_delta_skeleton_tp_mean',
                 'structure_delta_background_mean',
+                'encoder_road_raw', 'encoder_road_weighted',
+                'encoder_skeleton_raw', 'encoder_skeleton_weighted',
             ])
             batch_loss_writer.writerow([
                 'epoch', 'batch', 'loss',
@@ -1815,6 +1893,8 @@ if __name__ == "__main__":
                 'structure_delta_skeleton_tp_mean',
                 'structure_delta_background_mean',
                 'ms_per_batch',
+                'encoder_road_raw', 'encoder_road_weighted',
+                'encoder_skeleton_raw', 'encoder_skeleton_weighted',
             ])
             loss_log_file.flush()
             batch_loss_log_file.flush()
@@ -1876,6 +1956,10 @@ if __name__ == "__main__":
                 "structure_delta_weak_skeleton_fn_mean": 0.0,
                 "structure_delta_skeleton_tp_mean": 0.0,
                 "structure_delta_background_mean": 0.0,
+                "encoder_road_raw": 0.0,
+                "encoder_road_weighted": 0.0,
+                "encoder_skeleton_raw": 0.0,
+                "encoder_skeleton_weighted": 0.0,
             }
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
@@ -1913,6 +1997,11 @@ if __name__ == "__main__":
                 else:
                     raise RuntimeError("Structure-guided training requires auxiliary model outputs.")
                 surface_logits = surface_logits.float()
+                encoder_aux_outputs = outputs[5] if len(outputs) > 5 else None
+                if args.encoder_structure_exchange and (
+                    encoder_aux_outputs is None or len(encoder_aux_outputs) != 3
+                ):
+                    raise RuntimeError("Encoder exchange requires three differentiable auxiliary predictions")
                 boundary_logits = boundary_logits.float() if boundary_logits is not None else None
                 skeleton_logits = skeleton_logits.float() if skeleton_logits is not None else None
                 connectivity_logits = connectivity_logits.float() if connectivity_logits is not None else None
@@ -1942,6 +2031,7 @@ if __name__ == "__main__":
                     skeleton_gt=skeletons_padded,
                     skeleton_dilate_gt=skeletons_dilate_padded,
                     stage_outputs=stage_outputs,
+                    encoder_aux_outputs=encoder_aux_outputs,
                     boundary_logits=boundary_logits,
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
@@ -2007,6 +2097,10 @@ if __name__ == "__main__":
                     f"{loss_dict['structure_delta_skeleton_tp_mean'].item():.6f}",
                     f"{loss_dict['structure_delta_background_mean'].item():.6f}",
                     f"{ms_per_batch:.3f}",
+                    f"{loss_dict['encoder_road_raw'].item():.6f}",
+                    f"{loss_dict['encoder_road_weighted'].item():.6f}",
+                    f"{loss_dict['encoder_skeleton_raw'].item():.6f}",
+                    f"{loss_dict['encoder_skeleton_weighted'].item():.6f}",
                 ])
                 batch_loss_log_file.flush()
 
@@ -2170,6 +2264,10 @@ if __name__ == "__main__":
                 f"{highres_epoch_stats['structure_delta_weak_skeleton_fn_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_skeleton_tp_mean']:.6f}",
                 f"{highres_epoch_stats['structure_delta_background_mean']:.6f}",
+                f"{highres_epoch_stats['encoder_road_raw']:.6f}",
+                f"{highres_epoch_stats['encoder_road_weighted']:.6f}",
+                f"{highres_epoch_stats['encoder_skeleton_raw']:.6f}",
+                f"{highres_epoch_stats['encoder_skeleton_weighted']:.6f}",
             ])
             loss_log_file.flush()
             
@@ -2222,6 +2320,19 @@ if __name__ == "__main__":
                 'skeleton_recall': skeleton_recall,
                 'topology_attention_version': TOPOLOGY_ATTENTION_VERSION,
                 'structure_profile': args.structure_profile,
+                'architecture_id': model.architecture_id,
+                'base_commit': '599a410de8d341850e1810417307e4b3bbdfc82d',
+                'source_manifest': [
+                    'networks/swin_transformer_unet_skip_expand_decoder_sys.py',
+                    'networks/vision_transformer.py',
+                    'losses/road_losses.py', 'train_image.py',
+                    'test_image.py', 'threshold_sweep_val_fixed.py',
+                    'threshold_sweep_test.py', 'h0_encoder_experiment.py',
+                    'h0_encoder_protocol.py',
+                    'evaluation/road_comparison/compare_predictions.py',
+                    'evaluation/road_comparison/road_metrics.py',
+                    'docs/H0_ENCODER_ROAD_SKELETON_PRESERVATION_SPEC.md',
+                ],
                 'topology_coefficients': get_topology_coefficients(model),
                 'loaded_pretrained_names': sorted(loaded_pretrained_names),
                 'args': vars(args),

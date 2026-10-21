@@ -358,6 +358,8 @@ class SurfaceStructureLoss(nn.Module):
         stage_direction_factors=None,
         stage_skeleton_loss_factor=1.0,
         stage_skeleton_only_loss_factor=1.0,
+        encoder_road_aux_weight=0.0,
+        encoder_skeleton_aux_weight=0.0,
     ):
         super().__init__()
 
@@ -404,6 +406,8 @@ class SurfaceStructureLoss(nn.Module):
         self.stage_skeleton_only_loss_factor = float(
             stage_skeleton_only_loss_factor
         )
+        self.encoder_road_aux_weight = float(encoder_road_aux_weight)
+        self.encoder_skeleton_aux_weight = float(encoder_skeleton_aux_weight)
 
     @staticmethod
     def _match_spatial_size(target, reference, mode="nearest"):
@@ -973,6 +977,7 @@ class SurfaceStructureLoss(nn.Module):
         direction_gt=None,
         boundary_gt=None,
         valid_mask=None,
+        encoder_aux_outputs=None,
     ):
         if surface_gt is None or skeleton_gt is None:
             raise ValueError("surface_gt and skeleton_gt are required.")
@@ -1089,6 +1094,31 @@ class SurfaceStructureLoss(nn.Module):
             skeleton_gt,
         )
 
+        encoder_road_raw = surface_logits.sum() * 0.0
+        encoder_skeleton_raw = surface_logits.sum() * 0.0
+        if encoder_aux_outputs:
+            if len(encoder_aux_outputs) != 3:
+                raise ValueError("Expected three encoder auxiliary stages")
+            road_terms = []
+            skeleton_terms = []
+            for item in encoder_aux_outputs:
+                road_logits = item["encoder_road_logits"]
+                road_full = F.interpolate(
+                    road_logits, size=surface_gt.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )
+                road_terms.append(self.surface_loss(road_full, surface_gt)[0])
+                skeleton_logits_enc = item["encoder_skeleton_logits"]
+                _, skeleton_soft = build_soft_stage_skeleton_target(
+                    skeleton_gt, skeleton_logits_enc.shape[-2:],
+                )
+                skeleton_terms.append(
+                    self.soft_stage_skeleton_loss(skeleton_logits_enc, skeleton_soft)
+                )
+            encoder_road_raw = torch.stack(road_terms).mean()
+            encoder_skeleton_raw = torch.stack(skeleton_terms).mean()
+        weighted_encoder_road = self.encoder_road_aux_weight * encoder_road_raw
+        weighted_encoder_skeleton = self.encoder_skeleton_aux_weight * encoder_skeleton_raw
         total_loss = (
             loss_surface
             + self.skeleton_weight * loss_skeleton
@@ -1097,6 +1127,8 @@ class SurfaceStructureLoss(nn.Module):
             + loss_stage_structure
             + loss_road_attention
             + loss_highres_structure_skeleton
+            + weighted_encoder_road
+            + weighted_encoder_skeleton
         )
 
         loss_dict = {
@@ -1108,6 +1140,10 @@ class SurfaceStructureLoss(nn.Module):
             "boundary_loss": loss_boundary.detach(),
             "skeleton_stage_loss": loss_skeleton_stage.detach(),
             "stage_structure_loss": loss_stage_structure.detach(),
+            "encoder_road_raw": encoder_road_raw.detach(),
+            "encoder_skeleton_raw": encoder_skeleton_raw.detach(),
+            "encoder_road_weighted": weighted_encoder_road.detach(),
+            "encoder_skeleton_weighted": weighted_encoder_skeleton.detach(),
             "road_attention_loss": loss_road_attention.detach(),
             "loss_highres_structure_skeleton": loss_highres_structure_skeleton.detach(),
             "highres_structure_skeleton_raw": highres_stats["highres_structure_skeleton_raw"],
