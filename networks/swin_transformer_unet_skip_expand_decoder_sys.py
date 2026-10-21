@@ -1528,7 +1528,7 @@ class SwinTransformerSys(nn.Module):
             layer_name = "Layer 2" if skip_idx == 2 else "Layer 1"
             print(f"[INFO] DCA-FPN-Lite {layer_name} (inx={skip_idx}): {skip_channels} channels")
 
-        decoder_structure_channels = {2: embed_dim, 3: embed_dim}
+        decoder_structure_channels = {3: embed_dim}
         if self.use_stage3_global_context:
             self.global_context_head = GlobalContextHead(
                 in_channels=self.num_features,
@@ -1564,15 +1564,13 @@ class SwinTransformerSys(nn.Module):
                         if stage_index == 3
                         else 0.0
                     ),
-                    previous_structure_channels=(
-                        channels if stage_index == 3 else None
-                    ),
+                    previous_structure_channels=None,
                     highres_structure_channels=(
                         self.highres_structure_channels
                         if self.enable_highres_structure_stream
                         else None
                     ),
-                    use_structure_residual=(stage_index in (2, 3)),
+                    use_structure_residual=(stage_index == 3),
                 )
                 for stage_index, channels in decoder_structure_channels.items()
             }
@@ -1592,10 +1590,7 @@ class SwinTransformerSys(nn.Module):
             bias=True,
         )
         self.highres_structure_fusion = nn.ModuleDict(
-            {
-                "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-                "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-            }
+            {"3": HighResStructureFusion(embed_dim, self.highres_structure_channels)}
         )
         self.structure_surface_correction_head = StructureSurfaceCorrectionHead(
             self.highres_structure_channels,
@@ -1613,18 +1608,17 @@ class SwinTransformerSys(nn.Module):
             "stage23_boundary_0626_final_ske",
         }:
             print(
-                "[INFO] Decoder structure gates: stage2/stage3 only "
+                "[INFO] Decoder structure gate: stage3 only "
                 "(0626 profile), channels={}".format(
                     decoder_structure_channels
                 )
             )
             print(
-                "[INFO] Stage2 direct topology feature residual enabled; "
-                "stage2 structure gate can refine decoder features"
+                "[INFO] Stage2 structure removed; Swin, PatchExpand, skip and DCA remain"
             )
             print(
-                "[INFO] Stage2/3 skeleton prediction mode: {}".format(
-                    "direct H2/H3 predictions"
+                "[INFO] Stage3 skeleton prediction mode: {}".format(
+                    "direct H3 prediction"
                     if self.stage_skeleton_mode == "direct"
                     else "high-res prior plus decoder residual"
                 )
@@ -1646,15 +1640,7 @@ class SwinTransformerSys(nn.Module):
                     decoder_structure_channels
                 )
             )
-        self.stage2_topology_source = (
-            None
-            if self.remove_stage2_pre_topology_source
-            else DecoderStructureRefinement(
-                channels=embed_dim * 2,
-                enable_direct_feature_refinement=False,
-                skeleton_gradient_ratio=self.stage2_skeleton_gradient_ratio,
-            )
-        )
+        self.stage2_topology_source = None
         if self.final_upsample == "expand_first":
             print("---final upsample expand_first---")
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
@@ -1727,8 +1713,8 @@ class SwinTransformerSys(nn.Module):
                     )
                 if self.enable_global_topology:
                     print(
-                        "[INFO] Global topology residual: anchors=H2*surface, "
-                        "tokens=[H2,decoder_feature,connectivity], "
+                        "[INFO] Global topology residual: anchors=H1*surface, "
+                        "tokens=[H1,decoder_feature,connectivity], "
                         "relation_bias=relative_xy_distance+connectivity"
                     )
             else:
@@ -1740,7 +1726,7 @@ class SwinTransformerSys(nn.Module):
             if self.stage_skeleton_bias_init == "prior":
                 prior = min(max(self.stage_skeleton_positive_prior, 1e-5), 1.0 - 1e-5)
                 skeleton_bias = math.log(prior / (1.0 - prior))
-            for stage_index in (2, 3):
+            for stage_index in (3,):
                 nn.init.zeros_(self.decoder_structure_blocks[str(stage_index)].skeleton_head.out.weight)
                 nn.init.constant_(
                     self.decoder_structure_blocks[str(stage_index)].skeleton_head.out.bias,
@@ -1812,6 +1798,8 @@ class SwinTransformerSys(nn.Module):
         return x, x_downsample, road_attentions
 
     def _highres_structure_stage_enabled(self, stage):
+        if stage != 3:
+            return False
         if not self.enable_highres_structure_stream:
             return False
         if self.highres_structure_fusion_mode not in {"stage23", "stage23_final_correction"}:
@@ -1891,7 +1879,7 @@ class SwinTransformerSys(nn.Module):
         return (final_surface_logits, *outputs[1:])
 
     def _decoder_structure_enabled(self, stage):
-        return stage in (2, 3)
+        return stage == 3
 
     @staticmethod
     def _placeholder_structure_outputs(feature_map):
@@ -2074,7 +2062,6 @@ class SwinTransformerSys(nn.Module):
             decoder output [B, L, C]
         """
         structure_outputs = []
-        stage2_structure_feat = None
         self.last_stage_features = {}
         highres_skeleton_feat = (
             self.highres_skeleton_adapter(z_struct)
@@ -2121,209 +2108,46 @@ class SwinTransformerSys(nn.Module):
                 x = torch.cat([x, skip_refined], -1)
                 x = self.concat_back_dim[inx](x)
 
-            decoder_structure_gate_enabled = (
-                self._decoder_structure_enabled(inx)
-                and isinstance(layer_up, BasicLayer_up)
-                and inx in (2, 3)
-            )
-            if decoder_structure_gate_enabled:
-                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
-                if inx == 3:
-                    x = layer_up(x)
-                    output_scale = 2 ** max(2 - inx, 0)
-                    output_height = self.patches_resolution[0] // output_scale
-                    output_width = self.patches_resolution[1] // output_scale
-                    x = self._apply_highres_structure_fusion(
-                        x,
-                        highres_skeleton_feat,
-                        inx,
-                        (output_height, output_width),
-                    )
-                    x_map = token_to_map(x, output_height, output_width)
-                    (
-                        x_map,
-                        skeleton_i,
-                        connectivity_i,
-                        direction_i,
-                        structure_gate_i,
-                        roadness_i,
-                    ) = self._run_decoder_structure_block(
-                        x_map,
-                        inx,
-                        bottleneck_tokens,
-                        apply_feature_refinement=True,
-                        disable_skeleton_prediction=decoder_skeleton_disabled,
-                        skeleton_prior=(
-                            highres_structure_skeleton
-                            if self.stage_skeleton_mode == "prior_residual"
-                            else None
-                        ),
-                        previous_structure_feat=stage2_structure_feat,
-                        highres_skeleton_feat=highres_skeleton_feat,
-                    )
-                    if isinstance(roadness_i, dict):
-                        stage3_structure_feat = roadness_i.pop("structure_feat", None)
-                        highres_skeleton_feat = roadness_i.pop(
-                            "highres_skeleton_feat", highres_skeleton_feat
-                        )
-                        self.last_stage_features["G3"] = stage3_structure_feat
-                        self.last_stage_features["H2"] = highres_skeleton_feat
-                    else:
-                        stage3_structure_feat = None
-                    x = map_to_token(x_map)
-                    self._append_structure_output(
-                        structure_outputs,
-                        stage=inx,
-                        skeleton=skeleton_i,
-                        connectivity=connectivity_i,
-                        direction=direction_i,
-                        structure_gate=structure_gate_i,
-                        roadness=roadness_i,
-                        refinement_step=1,
-                        stage_loss_scale=1.0,
-                    )
-                    stage2_structure_feat = None
-                    continue
-                if inx == 2 and self.remove_stage2_pre_topology_source:
-                    x = layer_up(x)
-                    skeleton_0 = connectivity_0 = direction_0 = structure_gate_0 = roadness_0 = None
-                else:
-                    input_height, input_width = layer_up.input_resolution
-                    x_map = token_to_map(x, input_height, input_width)
-                    (
-                        _,
-                        skeleton_0,
-                        connectivity_0,
-                        direction_0,
-                        structure_gate_0,
-                        roadness_0,
-                    ) = self._run_decoder_structure_block(
-                        x_map,
-                        inx,
-                        bottleneck_tokens,
-                        block_stage="stage2_topology_source" if inx == 2 else inx,
-                        apply_feature_refinement=False,
-                        disable_skeleton_prediction=decoder_skeleton_disabled,
-                        skeleton_prior=highres_structure_skeleton,
-                    )
-                    if isinstance(roadness_0, dict):
-                        roadness_0.pop("structure_feat", None)
-                    if decoder_skeleton_disabled:
-                        skeleton_used = None
-                        connectivity_used = self._decoder_connectivity_used(connectivity_0)
-                    else:
-                        skeleton_used = torch.sigmoid(skeleton_0).detach()
-                        connectivity_used = torch.sigmoid(connectivity_0).detach()
-                    x = layer_up(
-                        x,
-                        decoder_skeleton_prob=skeleton_used,
-                        decoder_connectivity_prob=connectivity_used,
-                        decoder_direction_prob=direction_0,
-                    )
-                output_scale = 2 ** max(2 - inx, 0)
-                output_height = self.patches_resolution[0] // output_scale
-                output_width = self.patches_resolution[1] // output_scale
-                x = self._apply_highres_structure_fusion(
-                    x,
-                    highres_skeleton_feat,
-                    inx,
-                    (output_height, output_width),
-                )
-                if skeleton_0 is not None or connectivity_0 is not None or direction_0 is not None:
-                    self._append_structure_output(
-                        structure_outputs,
-                        stage=inx,
-                        skeleton=skeleton_0,
-                        connectivity=connectivity_0,
-                        direction=direction_0,
-                        structure_gate=structure_gate_0,
-                        roadness=roadness_0,
-                        refinement_step=0,
-                        stage_loss_scale=0.5,
-                    )
-
-                x_map = token_to_map(x, output_height, output_width)
-                (
-                    x_map,
-                    skeleton_i,
-                    connectivity_i,
-                    direction_i,
-                    structure_gate_i,
-                    roadness_i,
-                ) = self._run_decoder_structure_block(
-                    x_map,
-                    inx,
-                    bottleneck_tokens,
-                    apply_feature_refinement=True,
-                    disable_skeleton_prediction=decoder_skeleton_disabled,
-                    skeleton_prior=(
-                        highres_structure_skeleton
-                        if self.stage_skeleton_mode == "prior_residual"
-                        else None
-                    ),
-                    highres_skeleton_feat=highres_skeleton_feat,
-                )
-                if inx == 2 and isinstance(roadness_i, dict):
-                    stage2_structure_feat = roadness_i.pop("structure_feat", None)
-                    highres_skeleton_feat = roadness_i.pop(
-                        "highres_skeleton_feat", highres_skeleton_feat
-                    )
-                    self.last_stage_features["G2"] = stage2_structure_feat
-                    self.last_stage_features["H1"] = highres_skeleton_feat
-                x = map_to_token(x_map)
-                self._append_structure_output(
-                    structure_outputs,
-                    stage=inx,
-                    skeleton=skeleton_i,
-                    connectivity=connectivity_i,
-                    direction=direction_i,
-                    structure_gate=structure_gate_i,
-                    roadness=roadness_i,
-                    refinement_step=1,
-                    stage_loss_scale=1.0,
-                )
+            x = layer_up(x)
+            if inx != 3:
                 continue
-            else:
-                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
-                if isinstance(layer_up, BasicLayer_up):
-                    x = layer_up(x)
-                else:
-                    x = layer_up(x)
-                output_scale = 2 ** max(2 - inx, 0)
-                output_height = self.patches_resolution[0] // output_scale
-                output_width = self.patches_resolution[1] // output_scale
-                x = self._apply_highres_structure_fusion(
-                    x,
-                    highres_skeleton_feat,
-                    inx,
-                    (output_height, output_width),
+
+            output_height, output_width = self.patches_resolution
+            x = self._apply_highres_structure_fusion(
+                x, highres_skeleton_feat, inx, (output_height, output_width)
+            )
+            x_map = token_to_map(x, output_height, output_width)
+            (x_map, skeleton_i, connectivity_i, direction_i,
+             structure_gate_i, roadness_i) = self._run_decoder_structure_block(
+                x_map,
+                inx,
+                bottleneck_tokens,
+                apply_feature_refinement=True,
+                disable_skeleton_prediction=self._decoder_skeleton_disabled(inx),
+                skeleton_prior=(
+                    highres_structure_skeleton
+                    if self.stage_skeleton_mode == "prior_residual" else None
+                ),
+                highres_skeleton_feat=highres_skeleton_feat,
+            )
+            if isinstance(roadness_i, dict):
+                self.last_stage_features["G3"] = roadness_i.pop("structure_feat", None)
+                highres_skeleton_feat = roadness_i.pop(
+                    "highres_skeleton_feat", highres_skeleton_feat
                 )
-                x_map = token_to_map(x, output_height, output_width)
-                (
-                    x_map,
-                    skeleton_i,
-                    connectivity_i,
-                    direction_i,
-                    structure_gate_i,
-                    roadness_i,
-                ) = self._run_decoder_structure_block(
-                    x_map,
-                    inx,
-                    bottleneck_tokens,
-                    disable_skeleton_prediction=decoder_skeleton_disabled,
-                    skeleton_prior=highres_structure_skeleton,
-                )
-                x = map_to_token(x_map)
-            if self._decoder_structure_enabled(inx):
-                self._append_structure_output(
-                    structure_outputs,
-                    stage=inx,
-                    skeleton=skeleton_i,
-                    connectivity=connectivity_i,
-                    direction=direction_i,
-                    structure_gate=structure_gate_i,
-                    roadness=roadness_i,
-                )
+                self.last_stage_features["H1"] = highres_skeleton_feat
+            x = map_to_token(x_map)
+            self._append_structure_output(
+                structure_outputs,
+                stage=3,
+                skeleton=skeleton_i,
+                connectivity=connectivity_i,
+                direction=direction_i,
+                structure_gate=structure_gate_i,
+                roadness=roadness_i,
+                refinement_step=1,
+                stage_loss_scale=1.0,
+            )
 
         x = self.norm_up(x)  # B L C
 

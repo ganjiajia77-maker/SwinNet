@@ -48,7 +48,7 @@ def get_topology_coefficients(model):
         "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
     }
 
-    for stage in (2, 3):
+    for stage in (3,):
         structure_block = swin_unet.decoder_structure_blocks[str(stage)]
         coefficients[f"decoder_stage{stage}"] = {
             "gamma1": float(structure_block.gamma1.detach().cpu()),
@@ -118,7 +118,7 @@ def format_topology_coefficients(model):
             "on" if coefficients["global_topology_enabled"] else "off"
         )
     )
-    for stage in ("decoder_stage2", "decoder_stage3"):
+    for stage in ("decoder_stage3",):
         values = coefficients[stage]
         enabled = "active" if values.get("structure_enabled") else "bypass"
         fields.append(
