@@ -35,7 +35,7 @@ def index_ground_truth(root, split, keys):
         raise FileNotFoundError(f"No {split} labels under {root}")
     result = {}
     for key in keys:
-        candidates = [key, key.replace("_sat", "_mask")]
+        candidates = dict.fromkeys((key, key.replace("_sat", "_mask")))
         paths = [directory / f"{stem}{ext}" for stem in candidates
                  for ext in (".png", ".tif", ".tiff", ".bmp", ".jpg")]
         found = [p for p in paths if p.is_file()]
