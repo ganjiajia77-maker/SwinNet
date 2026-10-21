@@ -137,6 +137,8 @@ parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--model_path', type=str, required=True, help='path to model checkpoint')
 parser.add_argument('--writeback_gate_floor', type=float, default=0.0,
                     help='diagnostic floor for global topology feature writeback only')
+parser.add_argument('--diagnostic_zero_global_writeback', action='store_true',
+                    help='set loaded global writeback alpha to zero for a frozen-checkpoint diagnosis')
 parser.add_argument('--save_overlap_logits', action='store_true',
                     help='save stitched full-resolution surface logits as float16 NPY')
 parser.add_argument('--num_workers', default=4, type=int)
@@ -155,6 +157,8 @@ parser.add_argument('--throughput', action='store_true', help='test throughput o
 args = parser.parse_args()
 if not 0 <= args.writeback_gate_floor <= 1:
     parser.error('--writeback_gate_floor must be in [0,1]')
+if args.diagnostic_zero_global_writeback and args.writeback_gate_floor:
+    parser.error('zero-writeback diagnosis requires --writeback_gate_floor 0')
 if args.save_overlap_logits and not args.overlap_infer:
     parser.error('--save_overlap_logits requires --overlap_infer')
 if args.export_thresholds:
@@ -402,7 +406,7 @@ if __name__ == "__main__":
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
     device = next(model.parameters()).device
     topology = getattr(model.swin_unet, 'global_topology', None)
-    if args.writeback_gate_floor or args.save_overlap_logits:
+    if args.writeback_gate_floor or args.save_overlap_logits or args.diagnostic_zero_global_writeback:
         if topology is None or not topology.enable_global_topology:
             raise ValueError('Checkpoint configuration has no active global topology writeback')
     if args.writeback_gate_floor:
@@ -453,6 +457,11 @@ if __name__ == "__main__":
         exit(1)
     if topology is not None:
         print(f'[GATE-DIAG] trained_alpha_global={topology.alpha_global.item():.8f}', flush=True)
+    if args.diagnostic_zero_global_writeback:
+        with torch.no_grad():
+            topology.raw_alpha.zero_()
+        print(f'[GATE-DIAG] active_alpha_global={topology.alpha_global.item():.8f} '
+              '(zero-writeback diagnosis)', flush=True)
     test_image_dir = os.path.join(args.root_path, args.split, 'image')
     if not os.path.exists(test_image_dir):
         test_image_dir = os.path.join(args.root_path, args.split)
