@@ -2,6 +2,7 @@
 import argparse
 import io
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,41 @@ import torch
 from config import get_config
 from networks.vision_transformer import SwinUnet
 from losses.road_losses import SurfaceStructureLoss, build_soft_stage_skeleton_target
+
+
+def verify_persistent_worker_epoch_sync():
+    import cv2
+    import numpy as np
+    from torch.utils.data import DataLoader
+    from datasets.dataset_road_skeleton import RoadSkeletonDataset
+
+    with tempfile.TemporaryDirectory(prefix='h0_epoch_sync_') as temp_dir:
+        root = Path(temp_dir)
+        image_dir = root / 'train' / 'image'
+        mask_dir = root / 'train' / 'mask'
+        image_dir.mkdir(parents=True)
+        mask_dir.mkdir(parents=True)
+        y, x = np.mgrid[:100, :100]
+        rgb = np.stack((x, y, (x + y) % 256), axis=-1).astype(np.uint8)
+        cv2.imwrite(str(image_dir / 'sample.png'), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(mask_dir / 'sample.png'), np.zeros((100, 100), dtype=np.uint8))
+        dataset = RoadSkeletonDataset(
+            root, split='train', image_size=32, source_patch_size=100,
+            random_crop_train=True, random_crops_per_image=1,
+            random_crop_seed=1234,
+        )
+        loader = DataLoader(dataset, batch_size=1, num_workers=1,
+                            persistent_workers=True, shuffle=False)
+        dataset.set_epoch(0)
+        first = next(iter(loader))
+        first_position = (int(first['tile_top'][0]), int(first['tile_left'][0]))
+        dataset.set_epoch(1)
+        second = next(iter(loader))
+        second_position = (int(second['tile_top'][0]), int(second['tile_left'][0]))
+        del loader
+        assert first_position != second_position, (first_position, second_position)
+        print('PERSISTENT_WORKER_EPOCH_SYNC_OK', first_position, '->',
+              second_position, flush=True)
 
 
 def make_model(exchange):
@@ -41,6 +77,7 @@ def main():
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--batch_sizes', type=int, nargs='+', default=[1, 2])
     args = parser.parse_args()
+    verify_persistent_worker_epoch_sync()
     device = torch.device(args.device)
     torch.manual_seed(1234)
     model = make_model(True).to(device).eval()
