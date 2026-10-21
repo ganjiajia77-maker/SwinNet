@@ -59,13 +59,21 @@ def run(command, env):
     subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
+def source_hash_matches(path, expected_digest):
+    data = path.read_bytes()
+    lf = data.replace(b'\r\n', b'\n')
+    # The baseline manifest contains Windows hashes; Git archives may use LF.
+    variants = (data, lf, lf.replace(b'\n', b'\r\n'))
+    return any(hashlib.sha256(content).hexdigest() == expected_digest for content in variants)
+
+
 def verify_base_model():
     expected = json.loads((ROOT / 'BASE_MODEL_SHA256.json').read_text(encoding='utf-8'))
     modified = {'networks/vision_transformer.py',
                 'networks/swin_transformer_unet_skip_expand_decoder_sys.py'}
     changed = [name for name, digest in expected.items()
                if name not in modified and
-               hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest]
+               not source_hash_matches(ROOT / name, digest)]
     if changed:
         raise ValueError(f'Model/loss differs from original {BASE_COMMIT}: {changed}')
 
