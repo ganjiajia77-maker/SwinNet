@@ -1,4 +1,4 @@
-"""Run H0 encoder road/skeleton exchange and its original-H0 control on Massachusetts."""
+"""Run E2 symmetric direction aggregation without decoder D on Massachusetts."""
 import argparse
 from datetime import datetime
 import hashlib
@@ -11,7 +11,8 @@ import sys
 
 import torch
 
-from h0_encoder_protocol import BASE_COMMIT, MODEL_NAME, validate_training_args
+from h0_encoder_protocol import BASE_COMMIT, DIRECT_BASE_COMMIT, MODEL_NAME, validate_training_args
+from h0_e2_config import add_direction_arguments, direction_config, validate_checkpoint
 
 
 ROOT = Path(__file__).resolve().parent
@@ -44,18 +45,19 @@ def train_command(args):
             '--new_lr', '2e-4', '--new_min_lr', '1e-5', '--warmup_epochs', '10',
             '--stage2_skeleton_weight', '0.008', '--stage3_skeleton_weight', '0.012',
             '--stage_skeleton_loss_factor', '1.0', '--stage_skeleton_only_loss_factor',
-            '1.0' if args.control else '0.8',
+            '0.8',
             '--stage2_skeleton_gradient_ratio', '0.5', '--stage3_skeleton_gradient_ratio', '0.5',
             '--stage3_gate_topology_gradient_ratio', '0.0', '--skeleton_pos_weight', '2.0',
-            '--highres_structure_skeleton_weight', '0.0', '--stage_direction_factor', '0.2',
+            '--highres_structure_skeleton_weight', '0.0', '--stage_direction_factor', '0.0',
             '--stage_connectivity_factor', '3.0', '--road_attention_weight', '0.0',
             '--masked_connectivity_center_experiment', '--connectivity_pos_weight', '2.0',
             '--connectivity_focal_gamma', '1.5', '--edge_contrastive_margin', '0.1',
             '--directional_pos_weight_cardinal', '1.0', '--directional_pos_weight_diagonal', '2.5',
             '--surface_focal_gamma', '1.0',
-            '--encoder_road_aux_weight', '0' if args.control else '0.10',
-            '--encoder_skeleton_aux_weight', '0' if args.control else '0.004',
-            ] + ([] if args.control else ['--encoder_structure_exchange']) + architecture_flags()
+            '--encoder_road_aux_weight', '0.10',
+            '--encoder_skeleton_aux_weight', '0.004',
+            ] + ['--encoder_structure_exchange'] + architecture_flags() + [str(item)
+                for key, value in direction_config(args).items() for item in ('--' + key, value)]
 
 
 def run(command, env):
@@ -75,14 +77,8 @@ def verify_checkpoint(path):
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
         raise ValueError('Expected a checkpoint produced by this Massachusetts H0 training entry')
-    if checkpoint.get('base_commit') != BASE_COMMIT:
-        raise ValueError('Checkpoint does not record the 599a410 H0 base commit')
-    architecture_id = checkpoint.get('architecture_id')
-    if architecture_id not in (MODEL_NAME, 'h0_599a410_control'):
-        raise ValueError(f'Unexpected architecture_id: {architecture_id}')
-    validate_training_args(checkpoint.get('args', {}))
-    if checkpoint.get('ema_state_dict') is not None:
-        raise ValueError('This experiment requires raw weights without EMA')
+    validate_checkpoint(checkpoint)
+    architecture_id = checkpoint['architecture_id']
     result = {'epoch': checkpoint.get('epoch'), 'args': checkpoint['args'],
               'name': architecture_id}
     del checkpoint
@@ -113,15 +109,18 @@ def manifest(args, checkpoint_info, selection=None):
                     'evaluation/road_comparison/compare_predictions.py',
                     'evaluation/road_comparison/road_metrics.py',
                     'docs/H0_ENCODER_ROAD_SKELETON_PRESERVATION_SPEC.md',
-                    'scripts/verify_h0_encoder.py']
-    source_files += ['networks/vision_transformer.py', 'networks/skeleton_guided_head.py',
+                    'scripts/verify_h0_e2_direction.py']
+    source_files += ['h0_e2_config.py', 'networks/encoder_direction.py',
+                     'losses/encoder_direction_loss.py', 'networks/vision_transformer.py', 'networks/skeleton_guided_head.py',
                      'networks/swin_transformer_unet_skip_expand_decoder_sys.py']
     data = {'data_root': str(args.root_path),
             'protocol': {'image_size': 1500, 'short_area_threshold': 20,
                          'apls_max_nodes': 64, 'apls_snap_radius': 5.0},
             'models': [{'name': checkpoint_info['name'], 'provenance': {
                 'checkpoint': str(args.model_path), 'checkpoint_epoch': checkpoint_info['epoch'],
-                'base_model_commit': BASE_COMMIT, 'checkpoint_args_verified': True,
+                'base_model_commit': BASE_COMMIT, 'direct_base_commit': DIRECT_BASE_COMMIT,
+                'encoder_direction_config': {key: checkpoint_info['args'][key] for key in direction_config(args)},
+                'checkpoint_args_verified': True,
                 'training_crop': 'one random512 crop per native1500 image per epoch; shared epoch',
                 'training_precision': 'FP32', 'training_max_epochs': 80,
                 'micro_batch_size': 2, 'accumulation_steps': 1, 'weights': 'raw; no EMA',
@@ -167,8 +166,7 @@ def main():
     parser.add_argument('--gpu', default='2')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--control', action='store_true',
-                        help='train the original H0 control with encoder exchange and auxiliary heads off')
+    add_direction_arguments(parser)
     parser.add_argument('--thresholds', type=float, nargs='+',
                         default=[round(i / 100, 2) for i in range(5, 100, 5)])
     parser.add_argument('--recompute', action='store_true', help='recompute cached test topology metrics')
@@ -180,15 +178,14 @@ def main():
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.gpu, OPENCV_LOG_LEVEL='ERROR',
                PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True', PYTHONUNBUFFERED='1')
     if args.mode == 'inspect':
-        run([sys.executable, str(ROOT / 'scripts' / 'verify_h0_encoder.py'),
+        run([sys.executable, str(ROOT / 'scripts' / 'verify_h0_e2_direction.py'),
              '--device', 'cuda', '--batch_sizes', '1', '2'], env)
         return
     if args.mode == 'train':
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or (('mass_h0_control_' if args.control else 'mass_h0_encoder_')
-                                         + datetime.now().strftime('%Y%m%d_%H%M%S'))
+        args.run_name = args.run_name or ('mass_h0_e2dir_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
             parser.error(f'Fresh run directory already exists: {run_dir}')
@@ -201,7 +198,9 @@ def main():
     args.model_path = args.model_path.resolve()
     checkpoint_info = verify_checkpoint(args.model_path)
     if args.mode == 'resume':
-        args.control = checkpoint_info['name'] == 'h0_599a410_control'
+        for key in direction_config(args):
+            setattr(args, key, checkpoint_info['args'][key])
+        args.seed = checkpoint_info['args']['seed']
         args.run_name = args.model_path.parent.name
         args.pretrain_ckpt = Path(checkpoint_info['args']['pretrain_ckpt'])
         run(train_command(args) + ['--resume', str(args.model_path)], env)

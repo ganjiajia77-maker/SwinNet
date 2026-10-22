@@ -9,7 +9,8 @@ SOURCE_SIZE = 1500
 TILE_SIZE = 512
 STRIDE = 256
 BASE_COMMIT = '599a410de8d341850e1810417307e4b3bbdfc82d'
-MODEL_NAME = 'h0_encoder_road_skeleton_v1'
+MODEL_NAME = 'h0_encoder_e2_direction_no_decoder_d_v1'
+DIRECT_BASE_COMMIT = '1af958056f5953f0eb6edbffcdb9f1a9db77ba63'
 
 
 def blend_weight(size, device):
@@ -76,11 +77,13 @@ def crop_position(seed, image_index, crop_ordinal, epoch, height, width, size):
 
 
 def validate_training_args(args):
-    expected = dict(img_size=TILE_SIZE, source_patch_size=SOURCE_SIZE,
+    expected = dict(num_classes=1, img_size=TILE_SIZE, source_patch_size=SOURCE_SIZE,
                     overlap_stride=STRIDE, random_crop_train=True,
                     random_crops_per_image=1, direct_resize_train=False,
                     max_epochs=80, batch_size=2, accumulation_steps=1,
                     amp_dtype='none', use_ema=False, trend_val_every_steps=0,
+                    no_pretrain=False, warm_start_ckpt='',
+                    freeze_post_refine_interaction_only=False,
                     val_crop_list='', structure_profile='stage23_boundary_0626',
                     enable_highres_structure_stream=True, enable_global_topology=True,
                     enable_h3_surface_fusion=True, remove_stage2_pre_topology_source=True,
@@ -88,6 +91,9 @@ def validate_training_args(args):
                     highres_structure_fusion_mode='stage23', stage_skeleton_mode='direct')
     actual = vars(args) if hasattr(args, '__dict__') else args
     enabled = bool(actual.get('encoder_structure_exchange', False))
+    if not enabled:
+        raise ValueError('This experiment requires encoder E/H exchange and E2 direction aggregation')
+    expected.update(stage_direction_factor=0.0)
     expected.update(
         encoder_structure_exchange=enabled,
         encoder_road_aux_weight=0.10 if enabled else 0.0,

@@ -1,3 +1,5 @@
+from h0_e2_config import AGGREGATION_CONFIG, add_direction_arguments, direction_config, inherit_checkpoint_args
+from h0_encoder_protocol import MODEL_NAME, DIRECT_BASE_COMMIT, validate_training_args
 import argparse
 import copy
 import csv
@@ -92,6 +94,7 @@ parser.add_argument('--final_topology_eta_init', default=0.005, type=float, help
 parser.add_argument('--final_gap_rho_init', default=0.005, type=float, help='initial localized gap-repair coefficient')
 parser.add_argument('--stage3_skeleton_weight', type=float, default=0.005)
 parser.add_argument('--stage2_skeleton_weight', type=float, default=0.0)
+add_direction_arguments(parser)
 parser.add_argument('--encoder_structure_exchange', action='store_true',
                     help='enable three encoder E/H exchanges and encoder auxiliary heads')
 parser.add_argument('--encoder_road_aux_weight', type=float, default=0.10)
@@ -442,6 +445,7 @@ def build_criterion(args, loss_weights, device):
         stage_skeleton_only_loss_factor=args.stage_skeleton_only_loss_factor,
         encoder_road_aux_weight=args.encoder_road_aux_weight,
         encoder_skeleton_aux_weight=args.encoder_skeleton_aux_weight,
+        encoder_direction_config=direction_config(args),
     ).to(device)
 
 
@@ -507,10 +511,11 @@ def format_training_config_lines(args, loss_weights):
                 args.stage3_gate_topology_gradient_ratio
             ),
             "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
-            "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
-            "{:.3f}*connectivity loss".format(
-                args.stage_direction_factor,
+            "soft skeleton loss + {:.3f}*connectivity loss; decoder D removed".format(
                 args.stage_connectivity_factor
+            ),
+            "  E2 symmetric direction aggregation: D auxiliary weight={}; q has no auxiliary loss".format(
+                args.lambda_encoder_direction
             ),
             "  Stage skeleton-connectivity consistency: disabled",
             "  Encoder road attention: A1/A2 priors active for residual PatchMerging and Stage3 road attention bias",
@@ -617,81 +622,9 @@ def save_checkpoint_safely(checkpoint, target_path):
 def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
-    try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
-    except Exception as exc:
-        print(
-            f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
-            flush=True,
-        )
-        return
-    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("args"), dict):
-        return
-
-    saved_args = checkpoint["args"]
-    for name, cast in (
-        ("encoder_structure_exchange", bool),
-        ("encoder_road_aux_weight", float),
-        ("encoder_skeleton_aux_weight", float),
-        ("stage2_skeleton_weight", float),
-        ("stage3_skeleton_weight", float),
-        ("stage_skeleton_loss_factor", float),
-        ("surface_focal_gamma", float),
-        ("amp_dtype", str),
-        ("stage3_gate_topology_gradient_ratio", float),
-        ("stage_skeleton_mode", str),
-        ("stage_skeleton_bias_init", str),
-        ("stage_skeleton_positive_prior", float),
-    ):
-        if name in saved_args and not _cli_has(f"--{name}"):
-            setattr(args, name, cast(saved_args[name]))
-    if "structure_profile" in saved_args and not _cli_has("--structure_profile"):
-        args.structure_profile = saved_args["structure_profile"]
-    if "direct_resize_train" in saved_args and not _cli_has("--direct_resize_train"):
-        args.direct_resize_train = bool(saved_args["direct_resize_train"])
-    if "img_size" in saved_args and not _cli_has("--img_size"):
-        args.img_size = int(saved_args["img_size"])
-    if "source_patch_size" in saved_args and not _cli_has("--source_patch_size"):
-        args.source_patch_size = int(saved_args["source_patch_size"])
-    if "overlap_stride" in saved_args and not _cli_has("--overlap_stride"):
-        args.overlap_stride = int(saved_args["overlap_stride"])
-    if "enable_highres_structure_stream" in saved_args and not _cli_has("--enable_highres_structure_stream"):
-        args.enable_highres_structure_stream = bool(saved_args["enable_highres_structure_stream"])
-    for name in ("remove_stage2_pre_topology_source",):
-        if name in saved_args and not _cli_has("--" + name):
-            setattr(args, name, bool(saved_args[name]))
-    if "highres_structure_channels" in saved_args and not _cli_has("--highres_structure_channels"):
-        args.highres_structure_channels = int(saved_args["highres_structure_channels"])
-    if "highres_structure_fuse_stages" in saved_args and not _cli_has("--highres_structure_fuse_stages"):
-        args.highres_structure_fuse_stages = str(saved_args["highres_structure_fuse_stages"])
-    if "highres_structure_fusion_mode" in saved_args and not _cli_has("--highres_structure_fusion_mode"):
-        args.highres_structure_fusion_mode = str(saved_args["highres_structure_fusion_mode"])
-    if (
-        "enable_post_refine_structure_interaction" in saved_args
-        and not _cli_has("--enable_post_refine_structure_interaction")
-    ):
-        args.enable_post_refine_structure_interaction = bool(
-            saved_args["enable_post_refine_structure_interaction"]
-        )
-    if "highres_structure_skeleton_weight" in saved_args and not _cli_has("--highres_structure_skeleton_weight"):
-        args.highres_structure_skeleton_weight = float(saved_args["highres_structure_skeleton_weight"])
-    if "enable_global_topology" in saved_args and not _cli_has("--enable_global_topology"):
-        args.enable_global_topology = bool(saved_args["enable_global_topology"])
-    if "global_topology_max_nodes" in saved_args and not _cli_has("--global_topology_max_nodes"):
-        args.global_topology_max_nodes = int(saved_args["global_topology_max_nodes"])
-    if "global_topology_heads" in saved_args and not _cli_has("--global_topology_heads"):
-        args.global_topology_heads = int(saved_args["global_topology_heads"])
-    if "global_topology_alpha_max" in saved_args and not _cli_has("--global_topology_alpha_max"):
-        args.global_topology_alpha_max = float(saved_args["global_topology_alpha_max"])
-    print(
-        "[INFO] Resume architecture args: "
-        f"profile={args.structure_profile}, "
-        f"direct_resize_train={args.direct_resize_train}, "
-        f"img_size={args.img_size}, source_patch_size={args.source_patch_size}, "
-        f"highres_structure={args.enable_highres_structure_stream}, "
-        f"global_topology={args.enable_global_topology}",
-        flush=True,
-    )
+    checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+    inherit_checkpoint_args(args, checkpoint, training=True)
+    print('[E2] Restored checkpoint architecture/loss/optimizer protocol', flush=True)
 
 
 def model_state_is_finite(model):
@@ -1252,10 +1185,14 @@ if __name__ == "__main__":
     apply_structure_profile_defaults(args)
     configure_encoder_budget(args)
     args.num_classes = 1
+    validate_training_args(args)
+    direction_config(args)
     with open(os.path.join(args.output_dir, 'resolved_config.json'), 'w', encoding='utf-8') as config_file:
         json.dump({
-            'architecture_id': ('h0_encoder_road_skeleton_v1'
-                                if args.encoder_structure_exchange else 'h0_599a410_control'),
+            'architecture_id': MODEL_NAME,
+            'direct_base_commit': DIRECT_BASE_COMMIT,
+            'encoder_direction_config': direction_config(args),
+            'encoder_aggregation_config': AGGREGATION_CONFIG,
             'base_commit': '599a410de8d341850e1810417307e4b3bbdfc82d',
             'args': vars(args),
             'effective_skeleton_coefficients': {
@@ -1526,218 +1463,13 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             checkpoint_state = checkpoint["model_state_dict"]
-            model_state = model.state_dict()
-            filtered_checkpoint_state = {}
-            skipped_gate_keys = []
-            skipped_removed_keys = []
-            skipped_shape_keys = []
-            removed_direction_embedding_prefixes = (
-                "swin_unet.decoder_structure_blocks.0.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.1.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.2.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.3.directional_embedding.",
-                "swin_unet.stage2_topology_source.directional_embedding.",
-            )
-            removed_surface_uncertainty_prefixes = (
-                "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
-                "swin_unet.stage2_topology_source.surface_uncertainty_head.",
-            )
-            for key, value in checkpoint_state.items():
-                if key not in model_state:
-                    skipped_removed_keys.append(key)
-                    continue
-                if value.shape != model_state[key].shape:
-                    if (
-                        key.endswith("connectivity_head.prior_embed.0.weight")
-                        and value.ndim == model_state[key].ndim == 4
-                        and value.shape[0] == model_state[key].shape[0]
-                        and value.shape[1] >= 2
-                        and model_state[key].shape[1] == 2
-                        and value.shape[2:] == model_state[key].shape[2:]
-                    ):
-                        adapted_weight = model_state[key].detach().clone()
-                        adapted_weight.copy_(
-                            value[:, :2].to(
-                                device=adapted_weight.device,
-                                dtype=adapted_weight.dtype,
-                            )
-                        )
-                        filtered_checkpoint_state[key] = adapted_weight
-                        skipped_shape_keys.append(
-                            key + " (dropped direction prior channel)"
-                        )
-                        continue
-                    skipped_shape_keys.append(key)
-                    continue
-                if (
-                    key in model_state
-                    and value.shape != model_state[key].shape
-                    and key.endswith("structure_gate.0.weight")
-                ):
-                    skipped_gate_keys.append(key)
-                    continue
-                filtered_checkpoint_state[key] = value
-            if skipped_gate_keys:
-                print(
-                    "[WARN] Reinitialized structure-gate input weights: "
-                    + ", ".join(skipped_gate_keys),
-                    flush=True,
-                )
-            if skipped_removed_keys:
-                print(
-                    "[WARN] Ignored removed checkpoint keys: "
-                    + ", ".join(skipped_removed_keys[:12])
-                    + (" ..." if len(skipped_removed_keys) > 12 else ""),
-                    flush=True,
-                )
-            if skipped_shape_keys:
-                print(
-                    "[WARN] Reinitialized shape-incompatible checkpoint keys: "
-                    + ", ".join(skipped_shape_keys[:12])
-                    + (" ..." if len(skipped_shape_keys) > 12 else ""),
-                    flush=True,
-                )
-            if skipped_gate_keys or skipped_removed_keys or skipped_shape_keys:
-                checkpoint_state = filtered_checkpoint_state
-            strict_load = args.bottleneck_type == 'global_local'
-            try:
-                model.load_state_dict(checkpoint_state, strict=strict_load)
-            except RuntimeError as exc:
-                allowed_missing_prefixes = (
-                        "swin_unet.stage2_topology_source.",
-                        "swin_unet.stage_topology_scales.",
-                        "swin_unet.global_topology.",
-                        "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
-                        "swin_unet.highres_structure_encoder.",
-                        "swin_unet.prepatch_structure_encoder.",
-                        "swin_unet.highres_skeleton_adapter.",
-                        "swin_unet.highres_structure_skeleton_head.",
-                        "swin_unet.highres_structure_fusion.",
-                        "swin_unet.decoder_structure_blocks.2.highres_skeleton_fusion.",
-                        "swin_unet.decoder_structure_blocks.3.highres_skeleton_fusion.",
-                        "swin_unet.decoder_structure_blocks.0.direction_head.",
-                        "swin_unet.decoder_structure_blocks.1.direction_head.",
-                        "swin_unet.decoder_structure_blocks.2.direction_head.",
-                        "swin_unet.decoder_structure_blocks.3.direction_head.",
-                        "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.1.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.2.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.3.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.0.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.1.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.2.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.3.gate_branch.",
-                        "swin_unet.stage2_topology_source.direction_head.",
-                        "swin_unet.stage2_topology_source.structure_gate.0.weight",
-                        "swin_unet.stage2_topology_source.reliability_correction.",
-                        "swin_unet.stage2_topology_source.reliability_local.",
-                        "swin_unet.stage2_topology_source.reliability_context.",
-                        "swin_unet.stage2_topology_source.reliability_direction.",
-                        "swin_unet.stage2_topology_source.reliability_fuse.",
-                        "swin_unet.stage2_topology_source.reliability_beta",
-                        "swin_unet.stage2_topology_source.gate_branch.",
-                        "swin_unet.guided_head.detached_skeleton_refine.",
-                        "swin_unet.guided_head.detached_skeleton_head.",
-                        "swin_unet.guided_head.final_skeleton_aux_head.",
-                        "swin_unet.guided_head.post_refine_structure_interaction.",
-                )
-                allowed_unexpected_prefixes = (
-                        "swin_unet.coarse_road_mask_head.",
-                        "swin_unet.bottleneck_coarse_road_mask_head.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
-                        "swin_unet.stage2_topology_source.reliability_correction.",
-                        "swin_unet.guided_head.skeleton_proj.",
-                        "swin_unet.guided_head.structure_branch.",
-                        "swin_unet.guided_head.skeleton_head.",
-                        "swin_unet.guided_head.detached_skeleton_refine.",
-                        "swin_unet.guided_head.detached_skeleton_head.",
-                        "swin_unet.guided_head.connectivity_context.",
-                        "swin_unet.guided_head.connectivity_head.",
-                        "swin_unet.guided_head.structure_to_surface.",
-                        "swin_unet.guided_head.structure_to_surface_gamma",
-                        "swin_unet.guided_head.final_topology_attention.",
-                        "swin_unet.guided_head.structure_fusion.",
-                        "swin_unet.guided_head.structure_residual.",
-                        "swin_unet.decoder_structure_blocks.0.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.1.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.2.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.3.directional_embedding.",
-                        "swin_unet.stage2_topology_source.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
-                        "swin_unet.stage2_topology_source.surface_uncertainty_head.",
-                )
-                result = model.load_state_dict(
-                    checkpoint_state,
-                    strict=False,
-                )
-                invalid_missing = [
-                    key
-                    for key in result.missing_keys
-                    if not key.startswith(allowed_missing_prefixes)
-                ]
-                invalid_unexpected = [
-                    key
-                    for key in result.unexpected_keys
-                    if not key.startswith(allowed_unexpected_prefixes)
-                ]
-                if invalid_missing or invalid_unexpected:
-                    raise RuntimeError(
-                        "Checkpoint mismatch on resume: "
-                        f"missing={invalid_missing}, unexpected={invalid_unexpected}"
-                    ) from exc
-                print(
-                    "[WARN] Loaded checkpoint with strict=False; "
-                    "some modules use fresh initialization.",
-                    flush=True,
-                )
+            model.load_state_dict(checkpoint_state, strict=True)
             start_epoch = checkpoint.get('epoch', 0)
-            if not args.freeze_post_refine_interaction_only:
-                try:
-                    loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
-                    optimizer = build_layerwise_optimizer()
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                except (ValueError, RuntimeError) as exc:
-                    print(
-                        "[WARN] Optimizer state not restored; "
-                        "continuing with a fresh optimizer for current parameters.",
-                        flush=True,
-                    )
-                    print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
+            loaded_pretrained_names = restore_loaded_pretrained_names_from_checkpoint(checkpoint)
+            optimizer = build_layerwise_optimizer()
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"从epoch {start_epoch} 继续训练...")
         else:
             print(f"Warning: checkpoint未找到 {args.resume}")
@@ -1808,7 +1540,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -2048,6 +1780,23 @@ if __name__ == "__main__":
                     continue
 
                 (loss / accumulation_steps).backward()
+                direction_module = model.swin_unet.e2_direction
+                def direction_grad(module):
+                    return sum(float(p.grad.detach().float().norm()) for p in module.parameters()
+                               if p.grad is not None)
+                direction_record = {
+                    'epoch': epoch + 1, 'batch': i + 1,
+                    **{k: float(loss_dict[k]) for k in ('encoder_direction_raw',
+                       'encoder_direction_weighted', 'encoder_direction_valid', 'encoder_direction_weight_sum')},
+                    **{k: float(v) for k, v in direction_module.last_stats.items()},
+                    'D_grad_norm_sum': direction_grad(direction_module.direction_head),
+                    'q_grad_norm_sum': direction_grad(direction_module.gate_head),
+                    'projection_grad_norm_sum': direction_grad(direction_module.projection),
+                }
+                with open(os.path.join(args.output_dir, 'e2_direction.jsonl'), 'a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(direction_record) + '\n')
+                if i == 0:
+                    print('[E2 Direction] ' + json.dumps(direction_record), flush=True)
                 accumulation_count += 1
                 should_step = (
                     accumulation_count >= accumulation_steps
@@ -2321,6 +2070,9 @@ if __name__ == "__main__":
                 'topology_attention_version': TOPOLOGY_ATTENTION_VERSION,
                 'structure_profile': args.structure_profile,
                 'architecture_id': model.architecture_id,
+                'direct_base_commit': DIRECT_BASE_COMMIT,
+                'encoder_direction_config': direction_config(args),
+                'encoder_aggregation_config': AGGREGATION_CONFIG,
                 'base_commit': '599a410de8d341850e1810417307e4b3bbdfc82d',
                 'source_manifest': [
                     'networks/swin_transformer_unet_skip_expand_decoder_sys.py',
@@ -2328,7 +2080,8 @@ if __name__ == "__main__":
                     'losses/road_losses.py', 'train_image.py',
                     'test_image.py', 'threshold_sweep_val_fixed.py',
                     'threshold_sweep_test.py', 'h0_encoder_experiment.py',
-                    'h0_encoder_protocol.py',
+                    'h0_encoder_protocol.py', 'h0_e2_config.py',
+                    'networks/encoder_direction.py', 'losses/encoder_direction_loss.py',
                     'evaluation/road_comparison/compare_predictions.py',
                     'evaluation/road_comparison/road_metrics.py',
                     'docs/H0_ENCODER_ROAD_SKELETON_PRESERVATION_SPEC.md',
@@ -2358,8 +2111,8 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
-        model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
+        best_checkpoint = torch.load(best_path, map_location='cuda', weights_only=False)
+        model.load_state_dict(best_checkpoint['model_state_dict'], strict=True)
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(
                 model,

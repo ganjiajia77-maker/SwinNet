@@ -1,3 +1,5 @@
+from h0_e2_config import add_direction_arguments, inherit_checkpoint_args
+from h0_encoder_protocol import MODEL_NAME
 import argparse
 import logging
 import os
@@ -25,7 +27,6 @@ from networks.vision_transformer import (
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
-from analyze_structure_supervision import adapt_connectivity_modules_for_checkpoint
 
 
 def _cli_has(flag_name):
@@ -44,6 +45,7 @@ parser.add_argument('--root_path', type=str, default='./data1', help='root dir f
 parser.add_argument('--split', choices=['val', 'test'], default='test')
 parser.add_argument('--export_thresholds', type=float, nargs='*', default=None,
                     help='native-size mask thresholds for overlap inference')
+add_direction_arguments(parser)
 parser.add_argument('--encoder_structure_exchange', action='store_true')
 parser.add_argument('--save_encoder_diagnostics', action='store_true',
                     help='save first-window E1/E2/E3 road and H skeleton logits per image')
@@ -243,13 +245,13 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 加载配置
-    config = get_config(args)
     
     # 创建网络
     args.num_classes = 1
     checkpoint = None
     if os.path.exists(args.model_path):
-        checkpoint = torch.load(args.model_path, map_location='cpu')
+        checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
+        inherit_checkpoint_args(args, checkpoint)
         if isinstance(checkpoint, dict):
             saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
             saved_profile = checkpoint.get("structure_profile")
@@ -302,6 +304,7 @@ if __name__ == "__main__":
         if getattr(args, name) is None:
             setattr(args, name, default)
 
+    config = get_config(args)
     model = ViT_seg(config=config, img_size=args.img_size,
                     num_classes=args.num_classes,
                     return_skeleton=True, bottleneck_type=args.bottleneck_type,
@@ -329,26 +332,11 @@ if __name__ == "__main__":
                     encoder_structure_exchange=args.encoder_structure_exchange).cuda()
     device = next(model.parameters()).device
     
-    # 加载模型
+    # Only this versioned architecture is accepted; no legacy partial loading.
+    if checkpoint is None:
+        raise FileNotFoundError(args.model_path)
     if checkpoint is not None:
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            if checkpoint.get('architecture_id') == 'h0_encoder_road_skeleton_v1':
-                if not args.encoder_structure_exchange:
-                    raise RuntimeError('Checkpoint requires encoder structure exchange')
-                model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-            else:
-                if args.encoder_structure_exchange:
-                    raise RuntimeError('Encoder exchange cannot load an original H0 checkpoint')
-                adapt_connectivity_modules_for_checkpoint(
-                    model, checkpoint['model_state_dict'], "standard",
-                )
-                load_topology_checkpoint_state(
-                    model, checkpoint['model_state_dict'],
-                    checkpoint.get("topology_attention_version", "legacy-unrecorded"),
-                    strict=(args.bottleneck_type == 'global_local'),
-                )
-        else:
-            model.load_state_dict(checkpoint, strict=(args.bottleneck_type == 'global_local'))
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
         print(f"已加载模型: {args.model_path}")
         print("Using topology attention constrained version", flush=True)
         print_topology_coefficients(model)

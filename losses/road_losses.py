@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from direction_target_utils import build_continuous_direction_target
+from losses.encoder_direction_loss import encoder_direction_loss, validate_direction_config
 from topology_direction_constants import CONNECTIVITY_DIRECTIONS, CONNECTIVITY_OPPOSITE
 
 
@@ -360,6 +360,7 @@ class SurfaceStructureLoss(nn.Module):
         stage_skeleton_only_loss_factor=1.0,
         encoder_road_aux_weight=0.0,
         encoder_skeleton_aux_weight=0.0,
+        encoder_direction_config=None,
     ):
         super().__init__()
 
@@ -408,6 +409,9 @@ class SurfaceStructureLoss(nn.Module):
         )
         self.encoder_road_aux_weight = float(encoder_road_aux_weight)
         self.encoder_skeleton_aux_weight = float(encoder_skeleton_aux_weight)
+        self.encoder_direction_config = validate_direction_config(encoder_direction_config)
+        if stage_direction_factor != 0 or any(stage_direction_factors or ()):
+            raise ValueError("Decoder D losses have been removed")
 
     @staticmethod
     def _match_spatial_size(target, reference, mode="nearest"):
@@ -772,69 +776,17 @@ class SurfaceStructureLoss(nn.Module):
                     use_skeleton_center_mask=self.use_masked_connectivity_center_experiment,
                     symmetry_weight=0.05 if self.use_masked_connectivity_center_experiment else 0.20,
                 )
-            if direction_logits is not None and self.stage_direction_factor > 0:
-                stage_direction_gt, direction_valid = self.build_direction_target(stage_skel)
-                stage_direction_gt = stage_direction_gt.to(
-                    device=direction_logits.device,
-                    dtype=direction_logits.dtype,
-                )
-                direction_valid = direction_valid.to(
-                    device=direction_logits.device,
-                    dtype=direction_logits.dtype,
-                )
-                direction_valid = direction_valid * self._spatial_boundary_mask(
-                    direction_logits,
-                    valid_mask,
-                )
-                direction_pred = F.normalize(direction_logits, dim=1, eps=1e-6)
-                direction_cosine = (
-                    direction_pred * stage_direction_gt
-                ).sum(dim=1, keepdim=True)
-                loss_direction_stage = (
-                    (1.0 - direction_cosine) * direction_valid
-                ).sum() / direction_valid.sum().clamp_min(1.0)
-            else:
-                loss_direction_stage = loss_skeleton_stage * 0.0
             connectivity_factor = (
                 self.stage_connectivity_factors[stage_index]
                 if stage_index < len(self.stage_connectivity_factors)
                 else self.stage_connectivity_factor
             )
-            direction_factor = (
-                self.stage_direction_factors[stage_index]
-                if stage_index < len(self.stage_direction_factors)
-                else self.stage_direction_factor
-            )
             total = total + stage_weight * self.stage_skeleton_loss_factor * (
                 self.stage_skeleton_only_loss_factor * loss_skeleton_stage
                 + connectivity_factor * loss_connectivity_stage
-                + direction_factor * loss_direction_stage
             )
 
         return total
-
-    def build_direction_target(self, skeleton):
-        skel = (skeleton > 0.5).to(dtype=skeleton.dtype)
-        target = build_continuous_direction_target(skel, radius=3)
-        direction_valid = skel * (target.norm(dim=1, keepdim=True) > 1e-6).to(
-            dtype=skel.dtype
-        )
-        return target, direction_valid
-
-    def direction_field_loss(self, direction_logits, skeleton_gt):
-        direction_target, skeleton_mask = self.build_direction_target(skeleton_gt)
-        direction_pred = F.normalize(direction_logits, dim=1, eps=1e-6)
-        direction_target = direction_target.to(
-            device=direction_pred.device,
-            dtype=direction_pred.dtype,
-        )
-        skeleton_mask = skeleton_mask.to(
-            device=direction_pred.device,
-            dtype=direction_pred.dtype,
-        )
-        cosine = (direction_pred * direction_target).sum(dim=1, keepdim=True)
-        loss_map = (1.0 - cosine) * skeleton_mask
-        return loss_map.sum() / skeleton_mask.sum().clamp_min(1.0)
 
     def road_attention_loss(self, stage_outputs, surface_gt):
         if not stage_outputs or self.road_attention_weight <= 0:
@@ -1117,6 +1069,17 @@ class SurfaceStructureLoss(nn.Module):
                 )
             encoder_road_raw = torch.stack(road_terms).mean()
             encoder_skeleton_raw = torch.stack(skeleton_terms).mean()
+        direction_raw = surface_logits.sum() * 0.0
+        direction_valid = surface_logits.new_zeros(())
+        direction_weight_sum = surface_logits.new_zeros(())
+        if encoder_aux_outputs:
+            entries = [item['encoder_direction_raw'] for item in encoder_aux_outputs
+                       if 'encoder_direction_raw' in item]
+            if len(entries) != 1:
+                raise ValueError('Expected exactly one E2 direction prediction')
+            direction_raw, direction_valid, direction_weight_sum = encoder_direction_loss(
+                entries[0], skeleton_gt, surface_gt, self.encoder_direction_config)
+        weighted_direction = self.encoder_direction_config['lambda_encoder_direction'] * direction_raw
         weighted_encoder_road = self.encoder_road_aux_weight * encoder_road_raw
         weighted_encoder_skeleton = self.encoder_skeleton_aux_weight * encoder_skeleton_raw
         total_loss = (
@@ -1129,6 +1092,7 @@ class SurfaceStructureLoss(nn.Module):
             + loss_highres_structure_skeleton
             + weighted_encoder_road
             + weighted_encoder_skeleton
+            + weighted_direction
         )
 
         loss_dict = {
@@ -1140,6 +1104,10 @@ class SurfaceStructureLoss(nn.Module):
             "boundary_loss": loss_boundary.detach(),
             "skeleton_stage_loss": loss_skeleton_stage.detach(),
             "stage_structure_loss": loss_stage_structure.detach(),
+            "encoder_direction_raw": direction_raw.detach(),
+            "encoder_direction_weighted": weighted_direction.detach(),
+            "encoder_direction_valid": direction_valid,
+            "encoder_direction_weight_sum": direction_weight_sum,
             "encoder_road_raw": encoder_road_raw.detach(),
             "encoder_skeleton_raw": encoder_skeleton_raw.detach(),
             "encoder_road_weighted": weighted_encoder_road.detach(),

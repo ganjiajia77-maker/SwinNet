@@ -10,6 +10,7 @@ from .dca_fpn_lite import DCAFPNLite
 from .bottleneck_context_fusion import GlobalLocalContextFusion
 from .g2l2_bottleneck import G2L2Bottleneck
 from .keypoint_global_topology import KeypointGuidedGlobalTopology
+from .encoder_direction import E2DirectionAggregation
 from .road_attention_head import RoadAttentionHead
 from losses.road_losses import build_connectivity_target
 from .skeleton_guided_head import (
@@ -1804,6 +1805,7 @@ class SwinTransformerSys(nn.Module):
                 self.encoder_skeleton_heads = nn.ModuleList(
                     nn.Conv2d(64, 1, 1) for _ in range(3)
                 )
+                self.e2_direction = E2DirectionAggregation(embed_dim * 2)
             finally:
                 torch.set_rng_state(rng_state)
 
@@ -1848,6 +1850,11 @@ class SwinTransformerSys(nn.Module):
 
                 def exchange(tokens, stage=i_layer, current_layer=layer):
                     nonlocal encoder_structure
+                    direction_raw = None
+                    if stage == 1:
+                        feature = token_to_map(tokens, *current_layer.input_resolution)
+                        feature, direction_raw = self.e2_direction(feature)
+                        tokens = feature.flatten(2).transpose(1, 2).contiguous()
                     tokens, encoder_structure = self.encoder_exchanges[stage](
                         tokens, encoder_structure, current_layer.input_resolution,
                     )
@@ -1857,6 +1864,8 @@ class SwinTransformerSys(nn.Module):
                         "encoder_road_logits": self.encoder_road_heads[stage](encoder_map),
                         "encoder_skeleton_logits": self.encoder_skeleton_heads[stage](encoder_structure),
                     })
+                    if direction_raw is not None:
+                        encoder_aux_outputs[-1]['encoder_direction_raw'] = direction_raw
                     self.last_encoder_features["E{}".format(stage + 1)] = encoder_map
                     self.last_encoder_features["H_E{}".format(stage + 1)] = encoder_structure
                     return tokens
@@ -1997,14 +2006,7 @@ class SwinTransformerSys(nn.Module):
             device=device,
             dtype=dtype,
         )
-        direction_logits = torch.zeros(
-            batch,
-            2,
-            height,
-            width,
-            device=device,
-            dtype=dtype,
-        )
+        direction_logits = None
         structure_gate = torch.zeros(
             batch,
             1,
@@ -2100,10 +2102,11 @@ class SwinTransformerSys(nn.Module):
         item = {
             "stage": stage,
             "connectivity": connectivity,
-            "direction": direction,
             "structure_gate": structure_gate,
             "roadness": roadness,
         }
+        if direction is not None:
+            raise RuntimeError("Decoder direction output is forbidden in this architecture")
         if diagnostics:
             item.update(diagnostics)
         if skeleton is not None:
