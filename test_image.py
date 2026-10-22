@@ -47,6 +47,8 @@ parser.add_argument('--export_thresholds', type=float, nargs='*', default=None,
 parser.add_argument('--encoder_structure_exchange', action='store_true')
 parser.add_argument('--save_encoder_diagnostics', action='store_true',
                     help='save first-window E1/E2/E3 road and H skeleton logits per image')
+parser.add_argument('--save_stage_diagnostics', action='store_true',
+                    help='stitch E1/E2/E3 road, H skeleton and decoder Stage 2/3 skeleton logits for native-size diagnosis')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')
 parser.add_argument('--num_classes', type=int, default=1, help='output channel of network')
 parser.add_argument('--output_dir', type=str, default='./predictions', help='output dir')
@@ -402,6 +404,18 @@ if __name__ == "__main__":
             if not args.encoder_structure_exchange:
                 raise ValueError('Encoder diagnostics require encoder exchange')
             os.makedirs(os.path.join(args.output_dir, 'encoder_diagnostics'), exist_ok=True)
+        if args.save_stage_diagnostics:
+            if not args.encoder_structure_exchange:
+                raise ValueError('Stage diagnostics require an encoder-exchange checkpoint')
+            import csv
+            import json
+            from evaluation.road_comparison.road_metrics import skeletonize
+            stage_dir = os.path.join(args.output_dir, 'stage_diagnostics')
+            os.makedirs(stage_dir, exist_ok=True)
+            os.makedirs(os.path.join(stage_dir, 'examples'), exist_ok=True)
+            stage_rows = []
+            expected_stages = {f'E{i}_road' for i in (1, 2, 3)} | {
+                f'H_E{i}_skeleton' for i in (1, 2, 3)} | {'D2_skeleton', 'D3_skeleton'}
         if any(not 0.0 < threshold < 1.0 for threshold in export_thresholds):
             raise ValueError('All export thresholds must be in (0, 1)')
         if args.export_thresholds is not None:
@@ -442,6 +456,7 @@ if __name__ == "__main__":
 
                 logit_canvas = torch.zeros((1, 1, h, w), device=device)
                 weight_canvas = torch.zeros_like(logit_canvas)
+                stage_canvases = {} if args.save_stage_diagnostics else None
                 diagnostic_saved = False
 
                 # sliding: include the final border tile, matching validation.
@@ -468,6 +483,26 @@ if __name__ == "__main__":
                         inp = torch.from_numpy(crop_f).unsqueeze(0).cuda()
 
                         outputs = model(inp)
+                        if args.save_stage_diagnostics:
+                            if not isinstance(outputs, tuple) or len(outputs) != 6:
+                                raise RuntimeError('Expected surface, decoder structure and encoder auxiliary outputs')
+                            stage_logits = {}
+                            for stage_index, item in enumerate(outputs[5], start=1):
+                                stage_logits[f'E{stage_index}_road'] = item['encoder_road_logits']
+                                stage_logits[f'H_E{stage_index}_skeleton'] = item['encoder_skeleton_logits']
+                            for item in outputs[4]:
+                                if item.get('stage') in (2, 3) and item.get('refinement_step') == 1:
+                                    stage_logits[f'D{item["stage"]}_skeleton'] = item['skeleton']
+                            if set(stage_logits) != expected_stages:
+                                raise RuntimeError(f'Unexpected stage outputs: {set(stage_logits)}')
+                            stage_region = (slice(None), slice(None), slice(y1, y2), slice(x1, x2))
+                            for stage_name, logits in stage_logits.items():
+                                resized = F.interpolate(logits.float(), size=(tile_size, tile_size),
+                                                        mode='bilinear', align_corners=False)
+                                if stage_name not in stage_canvases:
+                                    stage_canvases[stage_name] = torch.zeros_like(logit_canvas)
+                                stage_canvases[stage_name][stage_region] += (
+                                    resized[:, :, :y2-y1, :x2-x1] * tile_weight[:, :, :y2-y1, :x2-x1])
                         if args.save_encoder_diagnostics and not diagnostic_saved:
                             aux = outputs[5]
                             diagnostic = {}
@@ -500,12 +535,67 @@ if __name__ == "__main__":
                 if label_name is not None:
                     mask = cv2.imread(os.path.join(test_label_dir, label_name), cv2.IMREAD_GRAYSCALE)
                     if mask is not None:
+                        if args.save_stage_diagnostics and mask.shape != avg_prob.shape:
+                            raise ValueError(f'GT and image size differ for {image_name}: {mask.shape}, {avg_prob.shape}')
                         mask = mask[:avg_prob.shape[0], :avg_prob.shape[1]]
                         pred_bool = avg_prob >= args.threshold
                         mask_bool = mask > 127
                         tp += int((pred_bool & mask_bool).sum())
                         fp += int((pred_bool & ~mask_bool).sum())
                         fn += int((~pred_bool & mask_bool).sum())
+
+                if args.save_stage_diagnostics:
+                    if label_name is None or mask is None:
+                        raise FileNotFoundError(f'GT mask required for stage diagnosis: {image_name}')
+                    gt_skeleton = skeletonize(mask_bool)
+                    missing = gt_skeleton & (avg_prob < args.threshold)
+                    stage_probs = {'surface': avg_prob}
+                    for stage_name, canvas in stage_canvases.items():
+                        stage_probs[stage_name] = torch.sigmoid(
+                            canvas / weight_canvas.clamp_min(1e-8))[0, 0].cpu().numpy()
+                    case_id = os.path.splitext(image_name)[0]
+                    for stage_name, stage_prob in stage_probs.items():
+                        def mean_on(region):
+                            return float(stage_prob[region].mean()) if region.any() else None
+                        stage_rows.append({
+                            'case_id': case_id, 'stage': stage_name,
+                            'gt_road_pixels': int(mask_bool.sum()),
+                            'gt_skeleton_pixels': int(gt_skeleton.sum()),
+                            'final_missing_gt_skeleton_pixels': int(missing.sum()),
+                            'mean_probability_on_gt_road': mean_on(mask_bool),
+                            'mean_probability_on_gt_skeleton': mean_on(gt_skeleton),
+                            'mean_probability_on_final_missing_gt_skeleton': mean_on(missing),
+                            'mean_probability_on_background': mean_on(~mask_bool),
+                            'fraction_ge_05_on_gt_skeleton': (
+                                float((stage_prob[gt_skeleton] >= 0.5).mean()) if gt_skeleton.any() else None),
+                            'fraction_ge_05_on_final_missing_gt_skeleton': (
+                                float((stage_prob[missing] >= 0.5).mean()) if missing.any() else None),
+                        })
+                    if int(missing.sum()) >= 20 and len(os.listdir(os.path.join(stage_dir, 'examples'))) < 12:
+                        n_regions, labels, sizes, _ = cv2.connectedComponentsWithStats(
+                            missing.astype(np.uint8), connectivity=8)
+                        largest = 1 + np.argmax(sizes[1:, cv2.CC_STAT_AREA]) if n_regions > 1 else 0
+                        yy, xx = np.where(labels == largest)
+                        cy, cx = int(np.median(yy)), int(np.median(xx))
+                        top, bottom = max(0, cy-64), min(h, cy+64)
+                        left, right = max(0, cx-64), min(w, cx+64)
+                        crop_rgb = cv2.cvtColor(img[top:bottom, left:right], cv2.COLOR_RGB2BGR)
+                        panels = [('RGB', crop_rgb), ('GT', mask_bool[top:bottom, left:right]),
+                                  ('surface', stage_probs['surface'][top:bottom, left:right])]
+                        panels += [(name, stage_probs[name][top:bottom, left:right])
+                                   for name in sorted(expected_stages)]
+                        visual = []
+                        for name, panel in panels:
+                            if panel.ndim == 2:
+                                panel = cv2.applyColorMap((panel * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+                            cv2.putText(panel, name, (5, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                            visual.append(panel)
+                        blank = np.zeros_like(visual[0])
+                        visual += [blank] * (12 - len(visual))
+                        grid = np.concatenate([np.concatenate(visual[i:i+3], axis=1)
+                                               for i in range(0, 12, 3)], axis=0)
+                        cv2.imwrite(os.path.join(stage_dir, 'examples', case_id + '.png'), grid)
 
                 # save
                 case_name = os.path.splitext(image_name)[0]
@@ -519,6 +609,34 @@ if __name__ == "__main__":
                                     (avg_prob >= threshold).astype(np.uint8) * 255)
 
                 total_samples += 1
+
+        if args.save_stage_diagnostics:
+            if not stage_rows:
+                raise RuntimeError('No images were available for stage diagnosis')
+            csv_path = os.path.join(stage_dir, 'per_image_stage_scores.csv')
+            with open(csv_path, 'w', newline='', encoding='utf-8') as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(stage_rows[0]))
+                writer.writeheader()
+                writer.writerows(stage_rows)
+            summary = {'checkpoint': args.model_path, 'split': args.split,
+                       'surface_threshold': args.threshold, 'cases': len(image_list),
+                       'tile_size': tile_size, 'stride': stride,
+                       'interpretation': 'Auxiliary head scores indicate directly readable information, not causal information loss; stage logits are resized and overlap-stitched.',
+                       'stages': {}}
+            for stage_name in sorted(stage_probs):
+                rows = [row for row in stage_rows if row['stage'] == stage_name]
+                summary['stages'][stage_name] = {
+                    key: float(np.mean([row[key] for row in rows if row[key] is not None]))
+                    for key in ('mean_probability_on_gt_road',
+                                'mean_probability_on_gt_skeleton',
+                                'mean_probability_on_final_missing_gt_skeleton',
+                                'mean_probability_on_background',
+                                'fraction_ge_05_on_gt_skeleton',
+                                'fraction_ge_05_on_final_missing_gt_skeleton')
+                    if any(row[key] is not None for row in rows)}
+            with open(os.path.join(stage_dir, 'summary.json'), 'w', encoding='utf-8') as handle:
+                json.dump(summary, handle, ensure_ascii=False, indent=2)
+            print(f'Stage diagnosis: {csv_path}', flush=True)
 
         print(f"滑窗推理完成，结果保存在: {pred_dir}")
         iou = tp / (tp + fp + fn + 1e-8)
