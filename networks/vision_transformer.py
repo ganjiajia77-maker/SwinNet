@@ -20,7 +20,7 @@ from .swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys
 
 logger = logging.getLogger(__name__)
 
-TOPOLOGY_ATTENTION_VERSION = "stage-topology-roadness-gap-v1"
+TOPOLOGY_ATTENTION_VERSION = "h0-local-gap-native-edges-centered-dca-v1"
 STRUCTURE_PROFILE_FULL = "full"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 = "stage23_boundary_0626"
 STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE = "stage23_boundary_0626_final_ske"
@@ -48,6 +48,12 @@ def get_topology_coefficients(model):
         "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
     }
 
+    if hasattr(swin_unet, 'gap_connection'):
+        coefficients['gap_connection'] = {
+            'gamma': float(swin_unet.gap_connection.gamma.detach().cpu()),
+            'writeback_scale': float(swin_unet.gap_connection.writeback_scale.cpu()),
+            'config': swin_unet.local_gap_config.to_dict(),
+        }
     for stage in (2, 3):
         structure_block = swin_unet.decoder_structure_blocks[str(stage)]
         coefficients[f"decoder_stage{stage}"] = {
@@ -156,6 +162,12 @@ def load_topology_checkpoint_state(
     checkpoint_version,
     strict=True,
 ):
+    if hasattr(_core_swin_unet(model), 'gap_connection'):
+        if checkpoint_version != TOPOLOGY_ATTENTION_VERSION:
+            raise ValueError('Use a checkpoint trained by this Local/Gap C branch; legacy H0 is not compatible')
+        result = model.load_state_dict(state_dict, strict=True)
+        apply_structure_profile_runtime(model)
+        return result
     model_state = model.state_dict()
     highres_structure_missing_prefixes = (
         "swin_unet.highres_structure_encoder.",
@@ -557,7 +569,7 @@ class SwinUnet(nn.Module):
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False):
+                 remove_stage2_pre_topology_source=False, local_gap_config=None):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -605,7 +617,7 @@ class SwinUnet(nn.Module):
                                  stage_skeleton_mode=stage_skeleton_mode,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
-                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
+                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source, local_gap_config=local_gap_config)
     def forward(
         self,
         x,

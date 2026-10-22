@@ -1274,7 +1274,7 @@ class SwinTransformerSys(nn.Module):
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False,
+                 remove_stage2_pre_topology_source=False, local_gap_config=None,
                   **kwargs):
         super().__init__()
 
@@ -1612,16 +1612,22 @@ class SwinTransformerSys(nn.Module):
             "stage23_boundary_0626",
             "stage23_boundary_0626_final_ske",
         }:
-            print(
-                "[INFO] Decoder structure gates: stage2/stage3 only "
-                "(0626 profile), channels={}".format(
-                    decoder_structure_channels
+            if local_gap_config is None:
+                print(
+                    "[INFO] Decoder structure gates: stage2/stage3 only "
+                    "(0626 profile), channels={}".format(
+                        decoder_structure_channels
+                    )
                 )
-            )
-            print(
-                "[INFO] Stage2 direct topology feature residual enabled; "
-                "stage2 structure gate can refine decoder features"
-            )
+                print(
+                    "[INFO] Stage2 direct topology feature residual enabled; "
+                    "stage2 structure gate can refine decoder features"
+                )
+            else:
+                print(
+                    "[INFO] H0 Local C + Gap MLP selected; legacy gates are "
+                    "initialized for parameter-order compatibility, then removed"
+                )
             print(
                 "[INFO] Stage2/3 skeleton prediction mode: {}".format(
                     "direct H2/H3 predictions"
@@ -1636,10 +1642,11 @@ class SwinTransformerSys(nn.Module):
                     else "enabled"
                 )
             )
-            print(
-                "[INFO] Global context calibration: bottleneck GAP -> "
-                "stage3 structure gate only (strength=0.03)"
-            )
+            if local_gap_config is None:
+                print(
+                    "[INFO] Global context calibration: bottleneck GAP -> "
+                    "stage3 structure gate only (strength=0.03)"
+                )
         else:
             print(
                 "[INFO] Restored 0621 decoder structure gates: channels={}".format(
@@ -1749,6 +1756,26 @@ class SwinTransformerSys(nn.Module):
             if self.stage2_topology_source is not None:
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.weight)
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.bias)
+
+        # Initialize in the same order as full H0, then discard the ablated
+        # module. With the same seed, every retained layer starts identically.
+        if not self.enable_global_topology and self.return_skeleton:
+            self.global_topology = None
+        if self.enable_global_topology or self.structure_profile != "stage23_boundary_0626":
+            raise ValueError("Local/Gap C requires H0 stage23 with global topology disabled")
+        if not self.enable_highres_structure_stream or not self.remove_stage2_pre_topology_source:
+            raise ValueError("Local/Gap C requires the H0 stream and post-layer-up Stage 2 heads")
+        from local_gap_config import LocalGapConfig
+        from .local_gap_connectivity import GapConnectivity
+        self.local_gap_config = LocalGapConfig.parse(local_gap_config)
+        self.decoder_structure_blocks['2'].configure_connections('local')
+        self.decoder_structure_blocks['3'].configure_connections('gap')
+        self.gap_connection = GapConnectivity(embed_dim, self.highres_structure_channels, self.local_gap_config)
+        for block in self.dca_blocks:
+            block.weight_conv = None  # discard the original unused branch after matched initialization
+        self.use_stage3_global_context = False
+        self.global_context_head = None  # its only consumer was the removed Stage 3 gate
+        print('[LOCAL-GAP] installed sender Local C / ordered Gap MLP; old gates, C3 and anchor global module removed')
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -2170,6 +2197,12 @@ class SwinTransformerSys(nn.Module):
                         self.last_stage_features["H2"] = highres_skeleton_feat
                     else:
                         stage3_structure_feat = None
+                    local_output = next(item for item in structure_outputs if item.get('stage') == 2)
+                    x_map, gap_record = self.gap_connection(
+                        x_map, highres_skeleton_feat, local_output['p2_logits'],
+                        local_output['skeleton'].sigmoid(),
+                    )
+                    structure_outputs.append(gap_record)
                     x = map_to_token(x_map)
                     self._append_structure_output(
                         structure_outputs,

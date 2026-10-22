@@ -30,6 +30,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
+from mass_protocol import BASE_COMMIT, stitch_logits, validate_training_args
 
 
 def seed_worker(worker_id):
@@ -255,6 +256,7 @@ parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
+parser.add_argument('--local_gap_config', default='{}', help='JSON overrides for LocalGapConfig; saved in checkpoint')
 args = parser.parse_args()
 
 
@@ -428,7 +430,7 @@ def format_training_config_lines(args, loss_weights):
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
     }:
         lines.extend([
-            "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
+            "  Structure head: S2/C2 sender propagation; P2 proposals; Stage3 Gap MLP; old gates and C3 removed",
             (
                 "  Final head: surface branch + boundary residual + final skeleton auxiliary only; "
                 "final connectivity removed"
@@ -552,17 +554,23 @@ def make_unique_dir(base_dir, run_name):
 
 
 def save_checkpoint_safely(checkpoint, target_path):
-    """Save directly on Windows to avoid orphaned temporary checkpoint files."""
+    """Preserve the previous checkpoint if a write fails, including disk-full."""
     target_dir = os.path.dirname(target_path)
     os.makedirs(target_dir, exist_ok=True)
-    torch.save(checkpoint, target_path, _use_new_zipfile_serialization=False)
+    temporary_path = target_path + '.tmp'
+    try:
+        torch.save(checkpoint, temporary_path, _use_new_zipfile_serialization=False)
+        os.replace(temporary_path, target_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -572,6 +580,13 @@ def inherit_resume_architecture_args(args):
     if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("args"), dict):
         return
 
+    if checkpoint.get('experiment_protocol') != 'h0-local-gap-mass1500-fp32-noema80-v1':
+        raise ValueError('Resume requires this Local/Gap C experiment, not an old H0 checkpoint')
+    from local_gap_config import LocalGapConfig
+    expected_config = LocalGapConfig.parse(checkpoint['args'].get('local_gap_config'))
+    if _cli_has('--local_gap_config') and LocalGapConfig.parse(args.local_gap_config) != expected_config:
+        raise ValueError('Resume Local/Gap configuration differs from the checkpoint')
+    args.local_gap_config = checkpoint['args']['local_gap_config']
     saved_args = checkpoint["args"]
     for name, cast in (
         ("surface_focal_gamma", float),
@@ -940,10 +955,6 @@ def evaluate_overlap_full_images(
     surface_tp = surface_fp = surface_fn = 0
     skeleton_tp = skeleton_fp = skeleton_fn = 0
     image_count = 0
-    positions = RoadSkeletonDataset.sliding_positions
-    weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
-    weight_1d = (1.0 - weight_1d).clamp_min(0.1)
-    tile_weight = (weight_1d[:, None] * weight_1d[None, :]).view(1, 1, tile_size, tile_size)
 
     with torch.no_grad():
         for batch in loader:
@@ -956,35 +967,14 @@ def evaluate_overlap_full_images(
                 mask = full_masks[image_index:image_index + 1]
                 skeleton = full_skeletons[image_index:image_index + 1]
                 skeleton_dilate = full_skeletons_dilate[image_index:image_index + 1]
-                height, width = image.shape[-2:]
-                logit_canvas = torch.zeros((1, 1, height, width), device=device)
-                skeleton_logit_canvas = torch.zeros_like(logit_canvas)
-                weight_canvas = torch.zeros_like(logit_canvas)
-
-                for top in positions(height, tile_size, stride):
-                    for left in positions(width, tile_size, stride):
-                        tile = image[:, :, top:top + tile_size, left:left + tile_size]
-                        outputs = model(tile)
-                        surface_logits = outputs[0]
-                        skeleton_logits = outputs[2]
-                        tile_height, tile_width = surface_logits.shape[-2:]
-                        weight = tile_weight[:, :, :tile_height, :tile_width]
-                        logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += surface_logits * weight
-                        if skeleton_logits is not None:
-                            skeleton_logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += skeleton_logits * weight
-                        weight_canvas[:, :, top:top + tile_height, left:left + tile_width] += weight
-
-                if weight_canvas.min().item() <= 0:
-                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
-                full_logits = logit_canvas / weight_canvas.clamp_min(1e-8)
+                full_logits, full_skeleton_logits = stitch_logits(model, image, tile_size, stride)
                 surface_pred = (torch.sigmoid(full_logits) >= threshold).float()
                 mask_bin = (mask > 0.5).float()
                 surface_tp += int((surface_pred * mask_bin).sum().item())
                 surface_fp += int((surface_pred * (1.0 - mask_bin)).sum().item())
                 surface_fn += int(((1.0 - surface_pred) * mask_bin).sum().item())
 
-                if skeleton_logits is not None:
-                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas.clamp_min(1e-8)
+                if full_skeleton_logits is not None:
                     if criterion is not None:
                         loss, _ = criterion(
                             full_logits,
@@ -1188,6 +1178,9 @@ if __name__ == "__main__":
     
     inherit_resume_architecture_args(args)
     apply_structure_profile_defaults(args)
+    validate_training_args(args)
+    print('[MASS PROTOCOL] native1500 -> one random512 crop/image/epoch; '
+          'val=512/256 sliding; 80 epochs; batch2; accumulation1; FP32; no EMA', flush=True)
 
     # 加载配置
     config = get_config(args)
@@ -1237,7 +1230,7 @@ if __name__ == "__main__":
                     enable_h3_surface_fusion=args.enable_h3_surface_fusion,
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
-                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
+                    remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source, local_gap_config=args.local_gap_config).to(device)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
@@ -1328,7 +1321,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1439,6 +1432,7 @@ if __name__ == "__main__":
 
     # 优化器 / 损失（graph-only 模式在加载 checkpoint 后再建 optimizer）
     criterion = build_criterion(args, loss_weights, device)
+    criterion.local_gap_config = args.local_gap_config
     optimizer = None
 
     # 检查是否恢复训练
@@ -1446,209 +1440,13 @@ if __name__ == "__main__":
     if args.warm_start_ckpt and args.resume:
         raise ValueError("--warm_start_ckpt is for fresh runs; do not combine it with --resume")
     if args.warm_start_ckpt:
-        loaded_pretrained_names = load_warm_start_checkpoint(args.warm_start_ckpt)
+        raise ValueError('Train this architecture from ImageNet; warm-start H0 experiment weights are not supported')
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            checkpoint_state = checkpoint["model_state_dict"]
-            model_state = model.state_dict()
-            filtered_checkpoint_state = {}
-            skipped_gate_keys = []
-            skipped_removed_keys = []
-            skipped_shape_keys = []
-            removed_direction_embedding_prefixes = (
-                "swin_unet.decoder_structure_blocks.0.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.1.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.2.directional_embedding.",
-                "swin_unet.decoder_structure_blocks.3.directional_embedding.",
-                "swin_unet.stage2_topology_source.directional_embedding.",
-            )
-            removed_surface_uncertainty_prefixes = (
-                "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
-                "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
-                "swin_unet.stage2_topology_source.surface_uncertainty_head.",
-            )
-            for key, value in checkpoint_state.items():
-                if key not in model_state:
-                    skipped_removed_keys.append(key)
-                    continue
-                if value.shape != model_state[key].shape:
-                    if (
-                        key.endswith("connectivity_head.prior_embed.0.weight")
-                        and value.ndim == model_state[key].ndim == 4
-                        and value.shape[0] == model_state[key].shape[0]
-                        and value.shape[1] >= 2
-                        and model_state[key].shape[1] == 2
-                        and value.shape[2:] == model_state[key].shape[2:]
-                    ):
-                        adapted_weight = model_state[key].detach().clone()
-                        adapted_weight.copy_(
-                            value[:, :2].to(
-                                device=adapted_weight.device,
-                                dtype=adapted_weight.dtype,
-                            )
-                        )
-                        filtered_checkpoint_state[key] = adapted_weight
-                        skipped_shape_keys.append(
-                            key + " (dropped direction prior channel)"
-                        )
-                        continue
-                    skipped_shape_keys.append(key)
-                    continue
-                if (
-                    key in model_state
-                    and value.shape != model_state[key].shape
-                    and key.endswith("structure_gate.0.weight")
-                ):
-                    skipped_gate_keys.append(key)
-                    continue
-                filtered_checkpoint_state[key] = value
-            if skipped_gate_keys:
-                print(
-                    "[WARN] Reinitialized structure-gate input weights: "
-                    + ", ".join(skipped_gate_keys),
-                    flush=True,
-                )
-            if skipped_removed_keys:
-                print(
-                    "[WARN] Ignored removed checkpoint keys: "
-                    + ", ".join(skipped_removed_keys[:12])
-                    + (" ..." if len(skipped_removed_keys) > 12 else ""),
-                    flush=True,
-                )
-            if skipped_shape_keys:
-                print(
-                    "[WARN] Reinitialized shape-incompatible checkpoint keys: "
-                    + ", ".join(skipped_shape_keys[:12])
-                    + (" ..." if len(skipped_shape_keys) > 12 else ""),
-                    flush=True,
-                )
-            if skipped_gate_keys or skipped_removed_keys or skipped_shape_keys:
-                checkpoint_state = filtered_checkpoint_state
-            strict_load = args.bottleneck_type == 'global_local'
-            try:
-                model.load_state_dict(checkpoint_state, strict=strict_load)
-            except RuntimeError as exc:
-                allowed_missing_prefixes = (
-                        "swin_unet.stage2_topology_source.",
-                        "swin_unet.stage_topology_scales.",
-                        "swin_unet.global_topology.",
-                        "swin_unet.decoder_structure_blocks.3.stage_roadness_head.",
-                        "swin_unet.highres_structure_encoder.",
-                        "swin_unet.prepatch_structure_encoder.",
-                        "swin_unet.highres_skeleton_adapter.",
-                        "swin_unet.highres_structure_skeleton_head.",
-                        "swin_unet.highres_structure_fusion.",
-                        "swin_unet.decoder_structure_blocks.2.highres_skeleton_fusion.",
-                        "swin_unet.decoder_structure_blocks.3.highres_skeleton_fusion.",
-                        "swin_unet.decoder_structure_blocks.0.direction_head.",
-                        "swin_unet.decoder_structure_blocks.1.direction_head.",
-                        "swin_unet.decoder_structure_blocks.2.direction_head.",
-                        "swin_unet.decoder_structure_blocks.3.direction_head.",
-                        "swin_unet.decoder_structure_blocks.0.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.1.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.2.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.3.structure_gate.0.weight",
-                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_local.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_context.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_direction.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_fuse.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.1.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.2.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.3.reliability_beta",
-                        "swin_unet.decoder_structure_blocks.0.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.1.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.2.gate_branch.",
-                        "swin_unet.decoder_structure_blocks.3.gate_branch.",
-                        "swin_unet.stage2_topology_source.direction_head.",
-                        "swin_unet.stage2_topology_source.structure_gate.0.weight",
-                        "swin_unet.stage2_topology_source.reliability_correction.",
-                        "swin_unet.stage2_topology_source.reliability_local.",
-                        "swin_unet.stage2_topology_source.reliability_context.",
-                        "swin_unet.stage2_topology_source.reliability_direction.",
-                        "swin_unet.stage2_topology_source.reliability_fuse.",
-                        "swin_unet.stage2_topology_source.reliability_beta",
-                        "swin_unet.stage2_topology_source.gate_branch.",
-                        "swin_unet.guided_head.detached_skeleton_refine.",
-                        "swin_unet.guided_head.detached_skeleton_head.",
-                        "swin_unet.guided_head.final_skeleton_aux_head.",
-                        "swin_unet.guided_head.post_refine_structure_interaction.",
-                )
-                allowed_unexpected_prefixes = (
-                        "swin_unet.coarse_road_mask_head.",
-                        "swin_unet.bottleneck_coarse_road_mask_head.",
-                        "swin_unet.decoder_structure_blocks.0.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.1.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.2.reliability_correction.",
-                        "swin_unet.decoder_structure_blocks.3.reliability_correction.",
-                        "swin_unet.stage2_topology_source.reliability_correction.",
-                        "swin_unet.guided_head.skeleton_proj.",
-                        "swin_unet.guided_head.structure_branch.",
-                        "swin_unet.guided_head.skeleton_head.",
-                        "swin_unet.guided_head.detached_skeleton_refine.",
-                        "swin_unet.guided_head.detached_skeleton_head.",
-                        "swin_unet.guided_head.connectivity_context.",
-                        "swin_unet.guided_head.connectivity_head.",
-                        "swin_unet.guided_head.structure_to_surface.",
-                        "swin_unet.guided_head.structure_to_surface_gamma",
-                        "swin_unet.guided_head.final_topology_attention.",
-                        "swin_unet.guided_head.structure_fusion.",
-                        "swin_unet.guided_head.structure_residual.",
-                        "swin_unet.decoder_structure_blocks.0.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.1.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.2.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.3.directional_embedding.",
-                        "swin_unet.stage2_topology_source.directional_embedding.",
-                        "swin_unet.decoder_structure_blocks.0.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.1.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.2.surface_uncertainty_head.",
-                        "swin_unet.decoder_structure_blocks.3.surface_uncertainty_head.",
-                        "swin_unet.stage2_topology_source.surface_uncertainty_head.",
-                )
-                result = model.load_state_dict(
-                    checkpoint_state,
-                    strict=False,
-                )
-                invalid_missing = [
-                    key
-                    for key in result.missing_keys
-                    if not key.startswith(allowed_missing_prefixes)
-                ]
-                invalid_unexpected = [
-                    key
-                    for key in result.unexpected_keys
-                    if not key.startswith(allowed_unexpected_prefixes)
-                ]
-                if invalid_missing or invalid_unexpected:
-                    raise RuntimeError(
-                        "Checkpoint mismatch on resume: "
-                        f"missing={invalid_missing}, unexpected={invalid_unexpected}"
-                    ) from exc
-                print(
-                    "[WARN] Loaded checkpoint with strict=False; "
-                    "some modules use fresh initialization.",
-                    flush=True,
-                )
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            checkpoint_state = checkpoint.get('training_model_state_dict', checkpoint['model_state_dict'])
+            model.load_state_dict(checkpoint_state, strict=True)
             start_epoch = checkpoint.get('epoch', 0)
             if not args.freeze_post_refine_interaction_only:
                 try:
@@ -1656,12 +1454,7 @@ if __name__ == "__main__":
                     optimizer = build_layerwise_optimizer()
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 except (ValueError, RuntimeError) as exc:
-                    print(
-                        "[WARN] Optimizer state not restored; "
-                        "continuing with a fresh optimizer for current parameters.",
-                        flush=True,
-                    )
-                    print(f"[WARN] Optimizer resume detail: {exc}", flush=True)
+                    raise RuntimeError('Optimizer resume failed; refusing a silently changed training run') from exc
             print(f"从epoch {start_epoch} 继续训练...")
         else:
             print(f"Warning: checkpoint未找到 {args.resume}")
@@ -1732,7 +1525,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -1848,6 +1641,7 @@ if __name__ == "__main__":
 
         global_train_step = 0
         for epoch in range(start_epoch, end_epoch):
+            model.swin_unet.gap_connection.set_epoch(epoch)
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
             current_lr = get_cosine_warmup_lr(
@@ -1947,6 +1741,13 @@ if __name__ == "__main__":
                     connectivity_logits=connectivity_logits,
                 )
 
+                if loss_dict.get('gap_audit'):
+                    import json
+                    audit = {'epoch': epoch+1, 'batch': i+1, 'images': batch.get('image_name', [])}
+                    audit.update({key: float(value.detach().cpu()) if torch.is_tensor(value) else value
+                                  for key, value in loss_dict['gap_audit'].items()})
+                    with open(os.path.join(args.output_dir, 'local_gap_audit.jsonl'), 'a', encoding='utf-8') as handle:
+                        handle.write(json.dumps(audit, ensure_ascii=False) + '\n')
                 if not torch.isfinite(loss):
                     skipped_batches += 1
                     print(
@@ -2205,6 +2006,8 @@ if __name__ == "__main__":
 
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
+                'experiment_base_commit': BASE_COMMIT,
+                'experiment_protocol': 'h0-local-gap-mass1500-fp32-noema80-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),
@@ -2247,7 +2050,7 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location='cuda', weights_only=False)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(

@@ -65,14 +65,10 @@ class DCAFPNLite(nn.Module):
         offsets = self.offset_conv(Q)  # [B, K*2, H, W]
         offsets = offsets * self.max_offset  # 限制偏移范围
         
-        # 预测采样权重 [B, K, H, W] → 经 softmax 归一化
-        weights = self.weight_conv(Q)  # [B, K, H, W]
-        weights = torch.softmax(weights, dim=1)  # [B, K, H, W]
-        
         # 构造网格
         grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=device),
-            torch.linspace(-1, 1, W, device=device),
+            2 * (torch.arange(H, device=device, dtype=Q.dtype) + 0.5) / H - 1,
+            2 * (torch.arange(W, device=device, dtype=Q.dtype) + 0.5) / W - 1,
             indexing='ij'
         )
         grid = torch.stack([grid_x, grid_y], dim=-1)  # [H, W, 2]
@@ -93,12 +89,6 @@ class DCAFPNLite(nn.Module):
                 align_corners=False
             )  # [B, C, H, W]
             sampled_features.append(feat_k)
-        
-        # 按权重融合
-        fused = torch.zeros_like(V)  # [B, C, H, W]
-        for k in range(self.num_points):
-            weight_k = weights[:, k:k+1, :, :]  # [B, 1, H, W]
-            fused = fused + weight_k * sampled_features[k]  # [B, C, H, W]
         
         # 融合输出
         fused = self.fusion_conv(

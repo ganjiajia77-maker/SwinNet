@@ -737,9 +737,29 @@ class DecoderStructureRefinement(nn.Module):
 
     @property
     def gamma1(self):
+        if getattr(self, 'connection_mode', 'legacy') == 'local':
+            return self.local_propagation.beta
+        if getattr(self, 'connection_mode', 'legacy') == 'gap':
+            return self.connection_zero
         if self.gamma_limit is None:
             return self.raw_gamma1
         return float(self.gamma_limit) * torch.tanh(self.raw_gamma1)
+
+    def configure_connections(self, mode):
+        from .local_gap_connectivity import LocalConnectivityPropagation
+        if mode not in {'local', 'gap'}:
+            raise ValueError(mode)
+        self.connection_mode = mode
+        channels = self.structure_branch[0].block[0].in_channels
+        for name in ('gate_branch', 'structure_gate', 'feature_residual', 'context_to_gate', 'raw_gamma1'):
+            delattr(self, name)
+        self.register_buffer('connection_zero', torch.zeros(()))
+        if mode == 'local':
+            self.local_propagation = LocalConnectivityPropagation(channels)
+            self.p2_head = nn.Conv2d(channels, 1, 1)
+        else:
+            self.connectivity_context = None
+            self.connectivity_head = None
 
     @staticmethod
     def _shift_feature(x, dy, dx):
@@ -838,6 +858,24 @@ class DecoderStructureRefinement(nn.Module):
             runtime_connectivity_skeleton = connectivity_override
 
         direction_logits = self.direction_head(structure_feat)
+        if getattr(self, 'connection_mode', 'legacy') != 'legacy':
+            connectivity_logits = None
+            out = x
+            diagnostics = {'structure_feat': structure_feat}
+            if highres_skeleton_feat is not None:
+                diagnostics['highres_skeleton_feat'] = highres_skeleton_feat
+            if self.connection_mode == 'local':
+                connectivity_logits = self.connectivity_head(
+                    self.connectivity_context(structure_feat),
+                    skeleton_prob=runtime_connectivity_skeleton.detach(),
+                )
+                # Candidate generation uses the pre-propagation Stage 2 road map.
+                diagnostics['p2_logits'] = self.p2_head(
+                    scale_gradient(x, self.skeleton_gradient_ratio)
+                )
+                if apply_feature_refinement:
+                    out = self.local_propagation(x, skeleton_prob, connectivity_logits.sigmoid())
+            return out, skeleton_logits, connectivity_logits, direction_logits, None, diagnostics
         connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
             connectivity_feat,

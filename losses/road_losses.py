@@ -305,6 +305,35 @@ def build_stage_skeleton_target(skeleton_gt, target_size):
     return F.interpolate(skeleton, size=target_size, mode="nearest").clamp(0.0, 1.0)
 
 
+def build_stage_connectivity_target(skeleton_gt, target_size, mode='fine_edges'):
+    """Project native eight-neighbor edges, not just occupied coarse cells."""
+    if mode == 'pooled_adjacency':
+        return build_connectivity_target(build_stage_skeleton_target(skeleton_gt, target_size))
+    if mode != 'fine_edges':
+        raise ValueError(f'Unknown connectivity target mode: {mode}')
+    if skeleton_gt.ndim == 3:
+        skeleton_gt = skeleton_gt[:, None]
+    batch, _, height, width = skeleton_gt.shape
+    th, tw = target_size
+    if height % th or width % tw or th > height or tw > width:
+        raise ValueError('Fine-edge mapping requires exact integer spatial downsampling')
+    skeleton = skeleton_gt[:, 0] > .5
+    result = skeleton_gt.new_zeros(batch, 8, th, tw)
+    direction_lookup = torch.tensor([7, 0, 1, 6, -1, 2, 5, 4, 3], device=skeleton.device)
+    for dy, dx in CONNECTIVITY_DIRECTIONS:
+        y0, y1 = max(0, -dy), min(height, height-dy)
+        x0, x1 = max(0, -dx), min(width, width-dx)
+        source = skeleton[:, y0:y1, x0:x1]
+        neighbor = skeleton[:, y0+dy:y1+dy, x0+dx:x1+dx]
+        b, y, x = (source & neighbor).nonzero(as_tuple=True)
+        py, px = (y+y0)//(height//th), (x+x0)//(width//tw)
+        qy, qx = (y+y0+dy)//(height//th), (x+x0+dx)//(width//tw)
+        different = (py != qy) | (px != qx)
+        direction = direction_lookup[(qy-py+1)*3 + (qx-px+1)]
+        result[b[different], direction[different], py[different], px[different]] = 1
+    return result
+
+
 def build_soft_stage_skeleton_target(skeleton_gt, target_size, sigma=1.5):
     hard = build_stage_skeleton_target(skeleton_gt, target_size)
     soft = hard.clone()
@@ -756,7 +785,9 @@ class SurfaceStructureLoss(nn.Module):
                 loss_skeleton_stage = reference_logits.sum() * 0.0
             loss_connectivity_stage = reference_logits.sum() * 0.0
             if stage_connectivity_logits is not None:
-                stage_connectivity_gt = build_connectivity_target(stage_skel).to(
+                from local_gap_config import LocalGapConfig
+                cfg = LocalGapConfig.parse(getattr(self, 'local_gap_config', None))
+                stage_connectivity_gt = build_stage_connectivity_target(source_stage_skel, target_size, cfg.c_target).to(
                     device=stage_connectivity_logits.device,
                     dtype=stage_connectivity_logits.dtype,
                 )
@@ -1077,6 +1108,12 @@ class SurfaceStructureLoss(nn.Module):
             valid_mask=valid_mask,
         )
         loss_road_attention = self.road_attention_loss(stage_outputs, surface_gt)
+        from losses.gap_losses import gap_auxiliary_loss
+        self.local_gap_calls = getattr(self, 'local_gap_calls', 0) + 1
+        loss_gap_aux, gap_stats = gap_auxiliary_loss(
+            stage_outputs, surface_gt, skeleton_gt,
+            audit_coverage=(self.local_gap_calls % 50 == 1),
+        )
         loss_highres_structure_skeleton, highres_stats = self.highres_structure_skeleton_loss(
             stage_outputs,
             skeleton_gt,
@@ -1097,6 +1134,7 @@ class SurfaceStructureLoss(nn.Module):
             + loss_stage_structure
             + loss_road_attention
             + loss_highres_structure_skeleton
+            + loss_gap_aux
         )
 
         loss_dict = {
@@ -1128,6 +1166,7 @@ class SurfaceStructureLoss(nn.Module):
             "connectivity_gt_dir_positive_ratio": connectivity_gt_dir_positive_ratio.detach(),
         }
 
+        loss_dict['gap_audit'] = gap_stats
         return total_loss, loss_dict
 
 
