@@ -1,4 +1,8 @@
 # Swin-Unet
+
+本分支是直接基于 `1af958056f5953f0eb6edbffcdb9f1a9db77ba63` 的 A1/A2 删除消融。
+具体改动与核对方法见 [H0_NO_A1A2.md](docs/H0_NO_A1A2.md)。
+
 [ECCVW2022] The codes for the work "Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation"(https://arxiv.org/abs/2105.05537). Our paper has been accepted by ECCV 2022 MEDICAL COMPUTER VISION WORKSHOP (https://mcv-workshop.github.io/). We updated the Reproducibility. I hope this will help you to reproduce the results.
 
 ## 1. Download pre-trained swin transformer model (Swin-T)

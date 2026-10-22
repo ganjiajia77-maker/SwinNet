@@ -103,10 +103,12 @@ def main():
         hooks.append(layer.blocks[-1].register_forward_hook(named(f'swin{stage + 1}')))
         hooks.append(model.swin_unet.encoder_exchanges[stage].register_forward_hook(
             named(f'exchange{stage + 1}')))
-        if stage < 2:
-            hooks.append(layer.road_attention_head.register_forward_hook(
-                named(f'A{stage + 1}')))
         hooks.append(layer.downsample.register_forward_hook(named(f'merge{stage + 1}')))
+
+    assert not any('road_attention' in name or 'road_bias' in name or 'road_alpha' in name
+                   for name in model.state_dict()), 'A1/A2 parameters remain'
+    assert not any(type(module).__name__ == 'RoadAttentionHead'
+                   for module in model.modules()), 'A1/A2 heads remain'
 
     def count(which):
         def hook(*_):
@@ -151,8 +153,9 @@ def main():
         assert stem_calls == {'stem': 1, 'adapter': 1}, stem_calls
         assert len(decoder_h) == 1 and decoder_h[0] is model.swin_unet.last_encoder_features['H_E3']
         assert len(global_h) == 1 and global_h[0] is model.swin_unet.last_stage_features['H_D3']
-        expected = ['swin1', 'exchange1', 'A1', 'merge1',
-                    'swin2', 'exchange2', 'A2', 'merge2',
+        assert not any('road_attention' in item for item in result[4])
+        expected = ['swin1', 'exchange1', 'merge1',
+                    'swin2', 'exchange2', 'merge2',
                     'swin3', 'exchange3', 'merge3']
         assert sequence == expected, sequence
         assert torch.isfinite(result[0]).all()

@@ -566,8 +566,8 @@ class SwinUnet(nn.Module):
         self.return_skeleton = return_skeleton
         self.bottleneck_type = bottleneck_type
         self.architecture_id = (
-            "h0_encoder_road_skeleton_v1"
-            if encoder_structure_exchange else "h0_599a410_control"
+            "h0_encoder_road_skeleton_no_a1a2_v1"
+            if encoder_structure_exchange else "h0_599a410_no_a1a2_control"
         )
 
         self.swin_unet = SwinTransformerSys(img_size=config.DATA.IMG_SIZE,

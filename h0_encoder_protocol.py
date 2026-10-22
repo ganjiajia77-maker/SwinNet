@@ -9,7 +9,7 @@ SOURCE_SIZE = 1500
 TILE_SIZE = 512
 STRIDE = 256
 BASE_COMMIT = '599a410de8d341850e1810417307e4b3bbdfc82d'
-MODEL_NAME = 'h0_encoder_road_skeleton_v1'
+MODEL_NAME = 'h0_encoder_road_skeleton_no_a1a2_v1'
 
 
 def blend_weight(size, device):

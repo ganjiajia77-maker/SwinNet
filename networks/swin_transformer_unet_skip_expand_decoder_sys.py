@@ -142,7 +142,6 @@ class WindowAttention(nn.Module):
         self,
         x,
         mask=None,
-        road_attention_bias=None,
         structure_attention_bias=None,
     ):
         """
@@ -163,10 +162,6 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias_table[self.relative_position_index.view(-1)].view(N, N, -1)
         relative_position_bias = 16 * torch.sigmoid(relative_position_bias.permute(2, 0, 1).contiguous())
         attn = qk_logits + relative_position_bias.unsqueeze(0)
-        if road_attention_bias is not None:
-            if road_attention_bias.dim() == 3:
-                road_attention_bias = road_attention_bias.unsqueeze(1)
-            attn = attn + road_attention_bias
         if structure_attention_bias is not None:
             if structure_attention_bias.dim() == 3:
                 structure_attention_bias = structure_attention_bias.unsqueeze(1)
@@ -458,7 +453,7 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_road_bias=False,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
                  use_decoder_structure_bias=False):
         super().__init__()
         self.dim = dim
@@ -467,7 +462,6 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        self.use_road_bias = bool(use_road_bias)
         self.use_decoder_structure_bias = bool(use_decoder_structure_bias)
         if min(self.input_resolution) <= self.window_size:
             # if window size is larger than input resolution, we don't partition windows
@@ -479,12 +473,6 @@ class SwinTransformerBlock(nn.Module):
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-        if self.use_road_bias:
-            self.road_bias_scale_a1 = nn.Parameter(torch.tensor(0.0))
-            self.road_bias_scale_a2 = nn.Parameter(torch.tensor(0.0))
-        else:
-            self.register_parameter("road_bias_scale_a1", None)
-            self.register_parameter("road_bias_scale_a2", None)
         if self.use_decoder_structure_bias:
             self.decoder_connectivity_bias_scale = nn.Parameter(torch.tensor(0.1))
         else:
@@ -524,13 +512,6 @@ class SwinTransformerBlock(nn.Module):
             x = F.pad(x, (0, Wp - W, 0, Hp - H))
         return x
 
-    def _pad_road_prior(self, road_prior, H, W, Hp, Wp):
-        if road_prior is None:
-            return None
-        if isinstance(road_prior, (tuple, list)):
-            return tuple(self._pad_road_prior(item, H, W, Hp, Wp) for item in road_prior)
-        return self._pad_probability_map(road_prior, H, W, Hp, Wp)
-
     def _register_structure_bias_buffers(self):
         coords_h = torch.arange(self.window_size)
         coords_w = torch.arange(self.window_size)
@@ -559,48 +540,6 @@ class SwinTransformerBlock(nn.Module):
         self.register_buffer("topology_pair_distance", distance, persistent=False)
         self.register_buffer("topology_pair_unit_i_to_j", pair_axis, persistent=False)
         self.register_buffer("topology_pair_unit_j_to_i", pair_axis, persistent=False)
-
-    def _road_prior_to_pair_bias(self, road_prior):
-        H, W = road_prior.shape[-2:]
-        if road_prior.dim() == 3:
-            road_prior = road_prior.unsqueeze(1)
-        if road_prior.shape[-2:] != (H, W):
-            road_prior = F.interpolate(
-                road_prior,
-                size=(H, W),
-                mode="bilinear",
-                align_corners=False,
-            )
-        road_prior = road_prior.permute(0, 2, 3, 1).contiguous()
-        if self.shift_size > 0:
-            road_prior = torch.roll(
-                road_prior,
-                shifts=(-self.shift_size, -self.shift_size),
-                dims=(1, 2),
-            )
-        road_windows = window_partition(
-            road_prior,
-            self.window_size,
-        ).view(-1, self.window_size * self.window_size, 1)
-        road_windows = road_windows.clamp(0.0, 1.0)
-        return road_windows * road_windows.transpose(1, 2)
-
-    def _build_road_attention_bias(self, road_prior):
-        if road_prior is None or not self.use_road_bias:
-            return None
-        if isinstance(road_prior, (tuple, list)):
-            road_priors = list(road_prior)
-        else:
-            road_priors = [road_prior]
-
-        bias = None
-        scales = (self.road_bias_scale_a1, self.road_bias_scale_a2)
-        for prior, scale in zip(road_priors, scales):
-            if prior is None:
-                continue
-            pair_bias = scale * self._road_prior_to_pair_bias(prior)
-            bias = pair_bias if bias is None else bias + pair_bias
-        return bias
 
     @staticmethod
     def _row_normalize_attention_graph(graph):
@@ -705,7 +644,6 @@ class SwinTransformerBlock(nn.Module):
     def forward(
         self,
         x,
-        road_prior=None,
         decoder_skeleton_prob=None,
         decoder_connectivity_prob=None,
         decoder_direction_prob=None,
@@ -730,9 +668,6 @@ class SwinTransformerBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        road_attention_bias = self._build_road_attention_bias(
-            self._pad_road_prior(road_prior, H, W, Hp, Wp)
-        )
         structure_attention_bias = self._build_decoder_structure_attention_bias(
             self._pad_probability_map(decoder_skeleton_prob, H, W, Hp, Wp),
             self._pad_probability_map(decoder_connectivity_prob, H, W, Hp, Wp),
@@ -741,7 +676,6 @@ class SwinTransformerBlock(nn.Module):
         attn_windows = self.attn(
             x_windows,
             mask=attention_mask,
-            road_attention_bias=road_attention_bias,
             structure_attention_bias=structure_attention_bias,
         )
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -794,8 +728,6 @@ class PatchMerging(nn.Module):
         input_resolution,
         dim,
         norm_layer=nn.LayerNorm,
-        road_alpha_init=0.1,
-        road_attention_merge_mode="residual",
     ):
         super().__init__()
         self.input_resolution = input_resolution
@@ -807,29 +739,9 @@ class PatchMerging(nn.Module):
             nn.Linear(2 * dim, 2 * dim, bias=False),
         )
         self.alpha = nn.Parameter(torch.tensor(0.1))
-        self.road_alpha = nn.Parameter(torch.tensor(float(road_alpha_init)))
-        self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
-        if self.road_attention_merge_mode not in {"residual", "merge_attention"}:
-            raise ValueError(
-                "road_attention_merge_mode must be residual or merge_attention"
-            )
         self.norm = norm_layer(4 * dim)
 
-    def compute_merge_score(self, feature, road_prior):
-        feature_norm = F.normalize(feature, dim=-1, eps=1e-6)
-        feature_score = torch.matmul(
-            feature_norm,
-            feature_norm.transpose(-1, -2),
-        )
-        road_score = road_prior * road_prior.transpose(-1, -2)
-        return feature_score + self.road_alpha * road_score
-
-    def _apply_road_merge_attention(self, patch_tokens, patch_road_prior):
-        merge_score = self.compute_merge_score(patch_tokens, patch_road_prior)
-        merge_weight = torch.softmax(merge_score, dim=-1)
-        return torch.matmul(merge_weight, patch_tokens)
-
-    def forward(self, x, road_attention=None):
+    def forward(self, x):
         """
         x: B, H*W, C
         """
@@ -839,32 +751,10 @@ class PatchMerging(nn.Module):
         assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
 
         x = x.view(B, H, W, C)
-        if road_attention is not None:
-            if road_attention.dim() == 3:
-                road_attention = road_attention.unsqueeze(1)
-            assert road_attention.shape[-2:] == (H, W), (
-                "road attention size must match patch merge input resolution"
-            )
-            road_attention = road_attention.permute(0, 2, 3, 1).contiguous()
-            if self.road_attention_merge_mode == "residual":
-                x = x * (1.0 + self.road_alpha * road_attention)
-
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        if road_attention is not None and self.road_attention_merge_mode == "merge_attention":
-            a0 = road_attention[:, 0::2, 0::2, :]
-            a1 = road_attention[:, 1::2, 0::2, :]
-            a2 = road_attention[:, 0::2, 1::2, :]
-            a3 = road_attention[:, 1::2, 1::2, :]
-            patch_tokens = torch.stack([x0, x1, x2, x3], dim=-2)
-            patch_road_prior = torch.stack([a0, a1, a2, a3], dim=-2)
-            patch_tokens = self._apply_road_merge_attention(
-                patch_tokens,
-                patch_road_prior,
-            )
-            x0, x1, x2, x3 = patch_tokens.unbind(dim=-2)
         x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
         x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
 
@@ -990,22 +880,13 @@ class BasicLayer(nn.Module):
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
-                 road_attention_head=None, road_alpha_init=0.1, use_road_bias=False,
-                 road_attention_modulates_downsample=True,
-                 road_attention_merge_mode="residual"):
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
 
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
         self.use_checkpoint = use_checkpoint
-        self.road_attention_head = road_attention_head
-        self.last_road_attention = None
-        self.road_alpha_init = float(road_alpha_init)
-        self.use_road_bias = bool(use_road_bias)
-        self.road_attention_modulates_downsample = bool(road_attention_modulates_downsample)
-        self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
         self.last_pre_downsample = None
 
         # build blocks
@@ -1017,8 +898,7 @@ class BasicLayer(nn.Module):
                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer,
-                                 use_road_bias=self.use_road_bias)
+                                 norm_layer=norm_layer)
             for i in range(depth)])
 
         # patch merging layer
@@ -1027,37 +907,21 @@ class BasicLayer(nn.Module):
                 input_resolution,
                 dim=dim,
                 norm_layer=norm_layer,
-                road_alpha_init=self.road_alpha_init,
-                road_attention_merge_mode=self.road_attention_merge_mode,
             )
         else:
             self.downsample = None
 
-    def forward(self, x, road_prior=None, exchange=None):
+    def forward(self, x, exchange=None):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, None, None, None, None, road_prior)
+                x = checkpoint.checkpoint(blk, x)
             else:
-                x = blk(x, road_prior=road_prior)
+                x = blk(x)
         if exchange is not None:
             x = exchange(x)
-        self.last_road_attention = None
         self.last_pre_downsample = x
         if self.downsample is not None:
-            road_attention = None
-            if self.road_attention_head is not None:
-                H, W = self.input_resolution
-                x_map = token_to_map(x, H, W)
-                road_attention = self.road_attention_head(x_map)
-                self.last_road_attention = road_attention
-            x = self.downsample(
-                x,
-                road_attention=(
-                    road_attention
-                    if self.road_attention_modulates_downsample
-                    else None
-                ),
-            )
+            x = self.downsample(x)
         return x
 
     def extra_repr(self) -> str:
@@ -1418,15 +1282,12 @@ class SwinTransformerSys(nn.Module):
 
         # build encoder and bottleneck layers
         self.layers = nn.ModuleList()
-        self.encoder_stage1_road_attention_head = RoadAttentionHead(embed_dim)
-        self.encoder_stage2_road_attention_head = RoadAttentionHead(embed_dim * 2)
-        print(
-            "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
-            "Stage3 attention bias; A1/A2 -> residual PatchMerging priors".format(
-                embed_dim,
-                embed_dim * 2,
-            )
-        )
+        # Consume only the removed heads' original initialization draws so all
+        # retained weights and the post-construction RNG match the 1af9580 base.
+        # These temporary objects are never registered or used in forward.
+        removed_heads = (RoadAttentionHead(embed_dim), RoadAttentionHead(embed_dim * 2))
+        del removed_heads
+        print("[INFO] A1/A2 removed: no road-prior heads, merge modulation or attention bias")
         for i_layer in range(self.num_layers):
             layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
@@ -1440,22 +1301,7 @@ class SwinTransformerSys(nn.Module):
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                               use_checkpoint=use_checkpoint,
-                               road_attention_head=(
-                                   self.encoder_stage1_road_attention_head
-                                   if i_layer == 0
-                                   else self.encoder_stage2_road_attention_head
-                                   if i_layer == 1
-                                   else None
-                               ),
-                               road_alpha_init=(
-                                   0.1
-                               ),
-                               use_road_bias=(i_layer == 2),
-                               road_attention_modulates_downsample=(i_layer in (0, 1)),
-                               road_attention_merge_mode=(
-                                   "residual"
-                               ))
+                               use_checkpoint=use_checkpoint)
             self.layers.append(layer)
 
         # build decoder layers
@@ -1831,9 +1677,7 @@ class SwinTransformerSys(nn.Module):
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
         x_downsample = []
-        road_attentions = []
-        stage1_road_attention = None
-        stage2_road_attention = None
+        road_attentions = []  # Keep the public return slot empty for existing callers.
         encoder_aux_outputs = []
         self.last_encoder_features = {}
         if encoder_structure is not None:
@@ -1862,29 +1706,8 @@ class SwinTransformerSys(nn.Module):
                     return tokens
             x = layer(
                 x,
-                road_prior=(
-                    (stage1_road_attention, stage2_road_attention)
-                    if i_layer == 2
-                    else None
-                ),
                 exchange=exchange,
             )
-            if i_layer == 0 and layer.last_road_attention is not None:
-                stage1_road_attention = layer.last_road_attention
-                road_attentions.append(
-                    {
-                        "stage": "encoder_stage{}_road_attention".format(i_layer + 1),
-                        "road_attention": stage1_road_attention,
-                    }
-                )
-            if i_layer == 1 and layer.last_road_attention is not None:
-                stage2_road_attention = layer.last_road_attention
-                road_attentions.append(
-                    {
-                        "stage": "encoder_stage{}_road_attention".format(i_layer + 1),
-                        "road_attention": stage2_road_attention,
-                    }
-                )
 
         x = self.bottleneck_context_fusion(x)
         x = self.bottleneck_swin_block(x)
@@ -2533,8 +2356,6 @@ class SwinTransformerSys(nn.Module):
                     "highres_structure_skeleton": highres_structure_skeleton,
                 }
             )
-        if self.return_skeleton and road_attentions:
-            structure_outputs.extend(road_attentions)
         x = self.up_x4(
             x,
             structure_outputs=structure_outputs if self.return_skeleton else None,

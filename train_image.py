@@ -1254,8 +1254,8 @@ if __name__ == "__main__":
     args.num_classes = 1
     with open(os.path.join(args.output_dir, 'resolved_config.json'), 'w', encoding='utf-8') as config_file:
         json.dump({
-            'architecture_id': ('h0_encoder_road_skeleton_v1'
-                                if args.encoder_structure_exchange else 'h0_599a410_control'),
+            'architecture_id': ('h0_encoder_road_skeleton_no_a1a2_v1'
+                                if args.encoder_structure_exchange else 'h0_599a410_no_a1a2_control'),
             'base_commit': '599a410de8d341850e1810417307e4b3bbdfc82d',
             'args': vars(args),
             'effective_skeleton_coefficients': {

@@ -1,4 +1,4 @@
-"""Run H0 encoder road/skeleton exchange and its original-H0 control on Massachusetts."""
+"""Run the 1af9580 H0 A1/A2 ablation and its disabled-exchange control on Massachusetts."""
 import argparse
 from datetime import datetime
 import hashlib
@@ -78,7 +78,7 @@ def verify_checkpoint(path):
     if checkpoint.get('base_commit') != BASE_COMMIT:
         raise ValueError('Checkpoint does not record the 599a410 H0 base commit')
     architecture_id = checkpoint.get('architecture_id')
-    if architecture_id not in (MODEL_NAME, 'h0_599a410_control'):
+    if architecture_id not in (MODEL_NAME, 'h0_599a410_no_a1a2_control'):
         raise ValueError(f'Unexpected architecture_id: {architecture_id}')
     validate_training_args(checkpoint.get('args', {}))
     if checkpoint.get('ema_state_dict') is not None:
@@ -113,6 +113,7 @@ def manifest(args, checkpoint_info, selection=None):
                     'evaluation/road_comparison/compare_predictions.py',
                     'evaluation/road_comparison/road_metrics.py',
                     'docs/H0_ENCODER_ROAD_SKELETON_PRESERVATION_SPEC.md',
+                    'docs/H0_NO_A1A2.md', 'scripts/verify_h0_no_a1a2.py',
                     'scripts/verify_h0_encoder.py']
     source_files += ['networks/vision_transformer.py', 'networks/skeleton_guided_head.py',
                      'networks/swin_transformer_unet_skip_expand_decoder_sys.py']
@@ -168,7 +169,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--control', action='store_true',
-                        help='train the original H0 control with encoder exchange and auxiliary heads off')
+                        help='train the no-A1/A2 control with encoder exchange and auxiliary heads off')
     parser.add_argument('--thresholds', type=float, nargs='+',
                         default=[round(i / 100, 2) for i in range(5, 100, 5)])
     parser.add_argument('--recompute', action='store_true', help='recompute cached test topology metrics')
@@ -187,7 +188,7 @@ def main():
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or (('mass_h0_control_' if args.control else 'mass_h0_encoder_')
+        args.run_name = args.run_name or (('mass_h0_no_a1a2_control_' if args.control else 'mass_h0_encoder_no_a1a2_')
                                          + datetime.now().strftime('%Y%m%d_%H%M%S'))
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
@@ -201,7 +202,7 @@ def main():
     args.model_path = args.model_path.resolve()
     checkpoint_info = verify_checkpoint(args.model_path)
     if args.mode == 'resume':
-        args.control = checkpoint_info['name'] == 'h0_599a410_control'
+        args.control = checkpoint_info['name'] == 'h0_599a410_no_a1a2_control'
         args.run_name = args.model_path.parent.name
         args.pretrain_ckpt = Path(checkpoint_info['args']['pretrain_ckpt'])
         run(train_command(args) + ['--resume', str(args.model_path)], env)

@@ -332,7 +332,7 @@ if __name__ == "__main__":
     # 加载模型
     if checkpoint is not None:
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            if checkpoint.get('architecture_id') == 'h0_encoder_road_skeleton_v1':
+            if checkpoint.get('architecture_id') == 'h0_encoder_road_skeleton_no_a1a2_v1':
                 if not args.encoder_structure_exchange:
                     raise RuntimeError('Checkpoint requires encoder structure exchange')
                 model.load_state_dict(checkpoint['model_state_dict'], strict=True)
