@@ -188,8 +188,13 @@ def main():
         parser.error('num_workers must be nonnegative')
     args.local_gap_config = json.dumps(LocalGapConfig.parse(args.local_gap_config).to_dict(), sort_keys=True)
     verify_base_model()
+    # Keep PyTorch's allocator default unless the caller explicitly configures it.
+    # In particular, do not force the experimental expandable-segments allocator.
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.gpu, OPENCV_LOG_LEVEL='ERROR',
-               PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True', PYTHONUNBUFFERED='1')
+               PYTHONUNBUFFERED='1')
+    print('[CUDA] allocator=' + env.get('PYTORCH_ALLOC_CONF',
+          env.get('PYTORCH_CUDA_ALLOC_CONF', 'default')) +
+          '; launch_blocking=' + env.get('CUDA_LAUNCH_BLOCKING', '0'), flush=True)
     if args.mode == 'train':
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')

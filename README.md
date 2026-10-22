@@ -61,6 +61,8 @@ GPU=0 bash scripts/run_h0_local_gap_mass1500.sh diagnose
 DATA默认/home/gjj/Swin-Unet-main/Massachusetts/tiff；RESULTS默认/home/gjj/SwinNet-roadbias/model_out。
 PRETRAIN默认/home/gjj/Swin-Unet-main/pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth。
 RUN、SEED、GPU、DATA、RESULTS可由环境变量覆盖。LOCAL_GAP_CONFIG传入JSON覆盖用于新训练。
+CUDA内存分配器沿用PyTorch默认或调用者环境，不强制expandable_segments。
+遇到CUDA驱动错误时可用PYTORCH_CUDA_ALLOC_CONF=backend:native和CUDA_LAUNCH_BLOCKING=1定位。
 latest_h0_local_gap_run.txt记录run；run内latest_unified_audit.txt记录扫阈值目录。
 resume读取last，test读取best和验证阈值。强制核对架构/协议；优化器恢复失败则报错。
 

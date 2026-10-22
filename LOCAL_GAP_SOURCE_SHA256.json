@@ -1,8 +1,8 @@
 {
-  "README.md": "94164757494a11f0702164f21bf86dcf7cd32c044b39b638a512e4d19f28c8dd",
+  "README.md": "28010394e68b126741d42016fe5ca3ae65cd56f7d2e66ea989eace984f7757c2",
   "train_image.py": "b4dc0f9d5b05bdd524e1b530094803cab8365628b2981dbe7f00c09fb681b8c7",
   "test_image.py": "f75696eb0ac8287b8e529b1e08b4820ee35db569190b5e80f0937f952aa0234b",
-  "mass_h0.py": "966d8a50ae04aeb5f460ffa020af7894893cc751f8d0b4fdf1dcf3df765cf7e6",
+  "mass_h0.py": "88a453acb644717aa20b8e155e0e3399a4d509e8f6b9ab29a6e35054dfa23bfb",
   "mass_protocol.py": "192c4eb4da9fac8950b2fda3efaa44e8118dba9abb92a32e4635fb611f59ae9d",
   "local_gap_config.py": "4f8e6c70bb7dca0a236047cecc35068756a9babd30621fd90e30b6f7e64a0d33",
   "gap_candidates.py": "8d5ca5946115c533208e4cd8e7085d47feaffa7d6d9ead7c3e82a0fe40791a63",
