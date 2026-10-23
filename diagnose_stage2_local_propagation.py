@@ -63,6 +63,11 @@ def propagation_weight_maps(skeleton, connectivity):
     return raw, effective
 
 
+@torch.no_grad()
+def set_propagation_beta(propagation, value):
+    propagation.beta.copy_(value)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root_path', required=True)
@@ -110,11 +115,11 @@ def main():
             image = sample['image'][None].to(args.device)
             target_mask = sample['mask'][0].numpy() > .5
             target = prepare_target(target_mask, protocol)
-            propagation.beta.zero_()
+            set_propagation_beta(propagation, 0.)
             off_logits, _ = stitch_logits(model, image)
             stage_calls.clear()
             propagation_records.clear()
-            propagation.beta.copy_(saved_beta)
+            set_propagation_beta(propagation, saved_beta)
             on_logits, _ = stitch_logits(model, image)
 
             if len(stage_calls) != len(propagation_records):
@@ -184,7 +189,7 @@ def main():
             print(f'[STAGE2-LOCAL] {index+1}/{count} {name}: beta={float(saved_beta):.6g}; '
                   f'changed={per_image[-1]["changed_pixel_fraction"]:.4f}', flush=True)
     finally:
-        propagation.beta.copy_(saved_beta)
+        set_propagation_beta(propagation, saved_beta)
         stage_handle.remove()
         propagation_handle.remove()
 
