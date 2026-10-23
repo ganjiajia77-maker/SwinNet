@@ -77,6 +77,39 @@ stride 256. The head-training pass uses one deterministic random 512 crop
 from up to 256 training images. Outputs include `validation1_per_tile.csv`,
 `validation2_head_training.json`, and `summary.json`.
 
+## Independent E1/H0 pixel recognition on the same missed set
+
+After the ten probe heads have been trained and `sweep` has written
+`val_selection.json`, `pixel_diagnostic` evaluates E1 and H0 separately on
+the exact same native-test pixels:
+
+```text
+Zhang-Suen skeleton(GT road) AND
+original_surface probability < original_surface threshold selected on val
+```
+
+The report checks whether this set contains the expected 55,865 pixels. It
+uses each probe's own validation-selected threshold to report its hit count
+and recall on that shared set, plus continuous score quantiles, probability
+on already-covered GT skeleton, and a separate false-positive rate over GT
+background. It does not save prediction masks and does not choose thresholds
+on test. If the observed pixel count is not 55,865, inspect the recorded
+baseline threshold, split, and code/checkpoint provenance before comparing
+with earlier results.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 OPENCV_LOG_LEVEL=ERROR \
+python -u a400_probe_experiment.py pixel_diagnostic \
+  --probe_repo "$A400_REPO" \
+  --root_path "$DATA" --model_path "$A400_CKPT" \
+  --run_dir "$PROBE_RUN" --expected_missed_pixels 55865
+```
+
+This writes `test_e1_h0_missed_pixel_diagnostics.csv` (per-image rows and
+micro totals) and `test_missed_pixel_set.json` into the existing probe run
+directory. E1/H0 are independent probe outputs; their probabilities are not
+combined.
+
 `gap_recall` counts overlapping validation tiles, so a native gap may appear
 in more than one tile. Compare variants only on the same run and candidate
 budget. The changed common pool also means R0/R1/R2 cannot be compared

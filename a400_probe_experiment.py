@@ -68,7 +68,8 @@ def write_json(path, value):
 
 def write_csv(path, rows):
     with path.open('w', newline='', encoding='utf-8') as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -577,10 +578,119 @@ def test(args, tap, heads, probe_payload, backbone_hash, device):
     print((args.run_dir / 'test_probe_summary.csv').read_text(encoding='utf-8'), flush=True)
 
 
+def pixel_diagnostic(args, tap, heads, probe_payload, backbone_hash, device):
+    """Score E1 and H0 independently on one fixed baseline-missed skeleton set."""
+    selected_path = args.run_dir / 'val_selection.json'
+    if not selected_path.is_file():
+        raise FileNotFoundError('Run sweep first: val_selection.json is missing')
+    selection = json.loads(selected_path.read_text(encoding='utf-8'))
+    if (selection.get('protocol_version') != PROTOCOL_VERSION
+            or selection.get('selected_on') != 'val'
+            or selection.get('backbone_sha256') != backbone_hash):
+        raise ValueError('Validation selection belongs to another checkpoint')
+    if set(selection['models']) != set(ALL_NAMES):
+        raise ValueError('Validation selection is incomplete')
+
+    baseline_threshold = float(selection['models']['original_surface']['threshold'])
+    names = ('E1', 'H0')
+    stats = {
+        name: {'missed': 0, 'detected': 0, 'miss_sum': 0.0,
+               'miss_scores': [], 'covered': 0, 'covered_sum': 0.0,
+               'background': 0, 'background_predicted': 0}
+        for name in names
+    }
+    rows = []
+    image_count = 0
+    from evaluation.road_comparison.road_metrics import skeletonize
+    for case, rgb, target in native_cases(args.root_path, 'test'):
+        probabilities = native_probabilities(tap, heads, rgb, device)
+        skeleton = skeletonize(target)
+        baseline_missed = skeleton & (probabilities['original_surface'] < baseline_threshold)
+        covered_skeleton = skeleton & ~baseline_missed
+        missing_count = int(baseline_missed.sum())
+        background = ~target
+        for name in names:
+            threshold = float(selection['models'][name]['threshold'])
+            probability = probabilities[name]
+            missed_scores = probability[baseline_missed].astype(np.float64, copy=False)
+            covered_scores = probability[covered_skeleton]
+            detected = int((missed_scores >= threshold).sum())
+            background_predicted = int(((probability >= threshold) & background).sum())
+            background_count = int(background.sum())
+            slot = stats[name]
+            slot['missed'] += missing_count
+            slot['detected'] += detected
+            slot['miss_sum'] += float(missed_scores.sum())
+            slot['miss_scores'].append(missed_scores.astype(np.float32, copy=False))
+            slot['covered'] += int(covered_skeleton.sum())
+            slot['covered_sum'] += float(covered_scores.sum())
+            slot['background'] += background_count
+            slot['background_predicted'] += background_predicted
+            rows.append({
+                'image': case,
+                'probe': name,
+                'probe_threshold_selected_on_val': threshold,
+                'fixed_baseline_missed_gt_skeleton_pixels': missing_count,
+                'missed_pixels_predicted_road': detected,
+                'missed_pixel_recall': detected / missing_count if missing_count else None,
+                'mean_probe_probability_on_missed_pixels': float(missed_scores.mean()) if missed_scores.size else None,
+                'covered_gt_skeleton_pixels': int(covered_skeleton.sum()),
+                'mean_probe_probability_on_covered_gt_skeleton': float(covered_scores.mean()) if covered_scores.size else None,
+                'gt_background_pixels': background_count,
+                'gt_background_predicted_road': background_predicted,
+                'gt_background_false_positive_rate': background_predicted / background_count if background_count else None,
+            })
+        image_count += 1
+        print(f'Pixel diagnostic {image_count}: {case}', flush=True)
+
+    expected = args.expected_missed_pixels
+    total_missed = stats['E1']['missed']
+    if stats['H0']['missed'] != total_missed:
+        raise RuntimeError('E1 and H0 were not evaluated on the same missed-pixel set')
+    for name in names:
+        slot = stats[name]
+        scores_on_misses = np.concatenate(slot['miss_scores']) if slot['miss_scores'] else np.empty(0, np.float32)
+        missed_count = int(slot['missed'])
+        rows.append({
+            'image': '__micro_total__',
+            'probe': name,
+            'probe_threshold_selected_on_val': float(selection['models'][name]['threshold']),
+            'fixed_baseline_missed_gt_skeleton_pixels': missed_count,
+            'expected_missed_pixel_count': expected,
+            'matches_expected_missed_pixel_count': missed_count == expected,
+            'missed_pixels_predicted_road': int(slot['detected']),
+            'missed_pixel_recall': slot['detected'] / missed_count if missed_count else None,
+            'mean_probe_probability_on_missed_pixels': slot['miss_sum'] / missed_count if missed_count else None,
+            'missed_probability_p25': float(np.quantile(scores_on_misses, .25)) if scores_on_misses.size else None,
+            'missed_probability_p50': float(np.quantile(scores_on_misses, .50)) if scores_on_misses.size else None,
+            'missed_probability_p75': float(np.quantile(scores_on_misses, .75)) if scores_on_misses.size else None,
+            'covered_gt_skeleton_pixels': int(slot['covered']),
+            'mean_probe_probability_on_covered_gt_skeleton': slot['covered_sum'] / slot['covered'] if slot['covered'] else None,
+            'gt_background_pixels': int(slot['background']),
+            'gt_background_predicted_road': int(slot['background_predicted']),
+            'gt_background_false_positive_rate': slot['background_predicted'] / slot['background'] if slot['background'] else None,
+        })
+    write_csv(args.run_dir / 'test_e1_h0_missed_pixel_diagnostics.csv', rows)
+    write_json(args.run_dir / 'test_missed_pixel_set.json', {
+        'split': 'test', 'images': image_count,
+        'baseline_probe': 'original_surface',
+        'baseline_threshold_selected_on_val': baseline_threshold,
+        'fixed_missed_set': 'Zhang-Suen skeletonize(GT road) AND baseline original_surface probability below the validation-selected baseline threshold',
+        'expected_pixels': expected, 'observed_pixels': total_missed,
+        'matches_expected_count': total_missed == expected,
+        'per_probe_thresholds_selected_on_val': {name: selection['models'][name]['threshold'] for name in names},
+        'probe_checkpoint': str(args.run_dir / 'probe_best.pth'),
+        'backbone': str(args.model_path), 'backbone_sha256': backbone_hash,
+        'probe_best_epoch': {name: probe_payload['best_epoch'].get(name) for name in names},
+        'interpretation': 'E1 and H0 are measured separately on exactly the same baseline-missed GT skeleton pixels; threshold hit rate is reported alongside score quantiles and a separate GT-background false-positive rate.'
+    })
+    print((args.run_dir / 'test_e1_h0_missed_pixel_diagnostics.csv').read_text(encoding='utf-8'), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--probe_repo', type=Path, required=True)
-    parser.add_argument('mode', choices=('train', 'resume', 'sweep', 'test'))
+    parser.add_argument('mode', choices=('train', 'resume', 'sweep', 'test', 'pixel_diagnostic'))
     parser.add_argument('--root_path', type=Path, required=True)
     parser.add_argument('--model_path', type=Path, required=True)
     parser.add_argument('--run_dir', type=Path, required=True)
@@ -591,6 +701,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--expected_missed_pixels', type=int, default=55865,
+                        help='expected fixed baseline-missed GT skeleton pixel count; reported as a match check, not a hard assertion')
     args = parser.parse_args()
     if args.max_epochs < 1 or args.patience < 1 or args.batch_size < 1 or args.num_workers < 0:
         parser.error('Epochs, patience, and batch size must be positive; workers nonnegative')
@@ -616,6 +728,8 @@ def main():
             heads, probe_payload = load_heads(args.run_dir / 'probe_best.pth', backbone_hash, device)
             if args.mode == 'sweep':
                 sweep(args, tap, heads, backbone_hash, device)
+            elif args.mode == 'pixel_diagnostic':
+                pixel_diagnostic(args, tap, heads, probe_payload, backbone_hash, device)
             else:
                 test(args, tap, heads, probe_payload, backbone_hash, device)
     finally:
