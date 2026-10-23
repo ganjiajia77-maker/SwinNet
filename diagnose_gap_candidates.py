@@ -167,8 +167,9 @@ def classify_gap(gap, skeleton, endpoints_yx, component_labels, radius):
                     path_ratios.append(distance / max(euclidean, 1e-6))
             path_ratio = max(path_ratios, default=1.)
             y0, y1, x0, x1 = gap[1]
-            local = skeleton[max(0, y0-radius):min(skeleton.shape[0], y1+radius),
-                             max(0, x0-radius):min(skeleton.shape[1], x1+radius)]
+            radius_px = int(np.ceil(radius))
+            local = skeleton[max(0, y0-radius_px):min(skeleton.shape[0], y1+radius_px),
+                             max(0, x0-radius_px):min(skeleton.shape[1], x1+radius_px)]
             padded = np.pad(local.astype(np.uint8), 1)
             hh, ww = local.shape
             degree = sum(padded[1+dy:1+dy+hh, 1+dx:1+dx+ww]
