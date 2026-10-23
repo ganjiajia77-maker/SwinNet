@@ -569,7 +569,8 @@ class SwinUnet(nn.Module):
                  stage_skeleton_mode="prior_residual",
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
-                 remove_stage2_pre_topology_source=False, local_gap_config=None):
+                 remove_stage2_pre_topology_source=False, local_gap_config=None,
+                 enable_stage2_local_propagation=True, enable_gap_refinement=True):
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -617,7 +618,10 @@ class SwinUnet(nn.Module):
                                  stage_skeleton_mode=stage_skeleton_mode,
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
-                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source, local_gap_config=local_gap_config)
+                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source,
+                                 local_gap_config=local_gap_config,
+                                 enable_stage2_local_propagation=enable_stage2_local_propagation,
+                                 enable_gap_refinement=enable_gap_refinement)
     def forward(
         self,
         x,

@@ -873,7 +873,7 @@ class DecoderStructureRefinement(nn.Module):
                 diagnostics['p2_logits'] = self.p2_head(
                     scale_gradient(x, self.skeleton_gradient_ratio)
                 )
-                if apply_feature_refinement:
+                if apply_feature_refinement and getattr(self, 'enable_local_propagation', True):
                     out = self.local_propagation(x, skeleton_prob, connectivity_logits.sigmoid())
             return out, skeleton_logits, connectivity_logits, direction_logits, None, diagnostics
         connectivity_feat = self.connectivity_context(structure_feat)

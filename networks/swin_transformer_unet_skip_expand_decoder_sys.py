@@ -1275,6 +1275,7 @@ class SwinTransformerSys(nn.Module):
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False, local_gap_config=None,
+                 enable_stage2_local_propagation=True, enable_gap_refinement=True,
                   **kwargs):
         super().__init__()
 
@@ -1770,6 +1771,8 @@ class SwinTransformerSys(nn.Module):
         self.local_gap_config = LocalGapConfig.parse(local_gap_config)
         self.decoder_structure_blocks['2'].configure_connections('local')
         self.decoder_structure_blocks['3'].configure_connections('gap')
+        self.decoder_structure_blocks['2'].enable_local_propagation = bool(enable_stage2_local_propagation)
+        self.enable_gap_refinement = bool(enable_gap_refinement)
         self.gap_connection = GapConnectivity(embed_dim, self.highres_structure_channels, self.local_gap_config)
         for block in self.dca_blocks:
             block.weight_conv = None  # discard the original unused branch after matched initialization
@@ -2197,12 +2200,13 @@ class SwinTransformerSys(nn.Module):
                         self.last_stage_features["H2"] = highres_skeleton_feat
                     else:
                         stage3_structure_feat = None
-                    local_output = next(item for item in structure_outputs if item.get('stage') == 2)
-                    x_map, gap_record = self.gap_connection(
-                        x_map, highres_skeleton_feat, local_output['p2_logits'],
-                        local_output['skeleton'].sigmoid(),
-                    )
-                    structure_outputs.append(gap_record)
+                    if self.enable_gap_refinement:
+                        local_output = next(item for item in structure_outputs if item.get('stage') == 2)
+                        x_map, gap_record = self.gap_connection(
+                            x_map, highres_skeleton_feat, local_output['p2_logits'],
+                            local_output['skeleton'].sigmoid(),
+                        )
+                        structure_outputs.append(gap_record)
                     x = map_to_token(x_map)
                     self._append_structure_output(
                         structure_outputs,
