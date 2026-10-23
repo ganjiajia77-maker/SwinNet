@@ -119,10 +119,9 @@ def gradient_audit(model, sample, cfg, device, top, left):
     hook = model.swin_unet.gap_connection.register_forward_hook(
         lambda _, inputs, outputs: captured.append((inputs, outputs[1])))
     try:
-        region = (slice(top, top+512), slice(left, left+512))
-        image = sample['image'][None, :, *region].to(device)
-        surface = sample['mask'][None, :, *region].to(device)
-        skeleton = sample['skeleton'][None, :, *region].numpy() > .5
+        image = sample['image'][None, :, top:top+512, left:left+512].to(device)
+        surface = sample['mask'][None, :, top:top+512, left:left+512].to(device)
+        skeleton = sample['skeleton'][None, :, top:top+512, left:left+512].numpy() > .5
         outputs = model(image)
         if len(captured) != 1:
             raise RuntimeError('Gradient audit expected one Gap invocation')
