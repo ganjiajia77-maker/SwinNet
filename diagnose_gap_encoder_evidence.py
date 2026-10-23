@@ -1,9 +1,9 @@
 """Paired diagnostics for encoder evidence in H0 local-gap candidate discovery.
 
 Validation 1 evaluates fixed P2-only proposals against proposals augmented by
-frozen E2/H_E2/H_E3 probe evidence. Validation 2 trains capacity-matched
-candidate scorers on frozen F2/H_E2/H_E3 path features and reports validation
-ranking/coverage. It never updates either backbone or selects a test threshold.
+frozen E2/H_E2/H_E3/E1/H0/F1 probe evidence. Validation 2 trains matched
+candidate scorers on frozen path features and reports validation ranking and
+coverage. It never updates either backbone or selects a test threshold.
 
 Run from the local-gap diagnostics checkout. --probe_repo must point to the
 checkout that contains the 1af9580 H0 encoder-exchange probe_experiment.py.
@@ -37,10 +37,21 @@ from local_gap_config import LocalGapConfig
 from losses.gap_losses import label_edges, proposal_gap_coverage
 from mass_protocol import sliding_positions
 from evaluation.road_comparison.road_metrics import skeletonize
+from extra_h0_probes import EXTRA_NAMES, ExtraFeatureTap, load_extra_heads
 
 
 PROBE_NAMES = ("E2", "H_E2", "H_E3")
-FEATURE_DIMS = (96, 64, 64)  # local-gap decoder F2, encoder H_E2, encoder H_E3
+FEATURE_LAYOUT = {"F2": 96, "H_E2": 64, "H_E3": 64,
+                  "E1": 96, "H0": 64, "F1": 192}
+FEATURE_DIMS = tuple(FEATURE_LAYOUT.values())
+SCORER_FEATURES = {
+    "R0_F2": ("F2",),
+    "R1_F2_HE2": ("F2", "H_E2"),
+    "R2_F2_HE2_HE3": ("F2", "H_E2", "H_E3"),
+    "R3_F2_E1": ("F2", "E1"),
+    "R4_F2_H0": ("F2", "H0"),
+    "R5_F2_F1": ("F2", "F1"),
+}
 GEOMETRY_DIMS = 8
 FEATURE_DIM = sum(FEATURE_DIMS) + GEOMETRY_DIMS
 
@@ -196,7 +207,7 @@ def pooled_path_feature(feature: np.ndarray, edge, p2_hw):
 
 def build_edge_features(feature_maps, edge, geometry, p2_hw):
     pieces = []
-    for name, channels in zip(("F2", "H_E2", "H_E3"), FEATURE_DIMS):
+    for name, channels in FEATURE_LAYOUT.items():
         value = feature_maps.get(name)
         if value is None:
             pooled = np.zeros(channels, np.float32)
@@ -226,7 +237,7 @@ def average_precision(y, score):
 
 
 class CandidateScorer(nn.Module):
-    """Identical parameter count for R0/R1/R2; excluded branches are zeroed."""
+    """Identical parameter count for every R variant; excluded blocks are zeroed."""
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(nn.Linear(FEATURE_DIM, 64), nn.GELU(), nn.Linear(64, 1))
@@ -267,12 +278,13 @@ def fit_scorer(train_x, train_y, seed, device, epochs=15):
 
 def enabled_input(x, variant):
     result = x.copy()
-    if variant == "R0_F2":
-        result[FEATURE_DIMS[0]:sum(FEATURE_DIMS)] = 0
-    elif variant == "R1_F2_HE2":
-        result[sum(FEATURE_DIMS[:2]):sum(FEATURE_DIMS)] = 0
-    elif variant != "R2_F2_HE2_HE3":
+    if variant not in SCORER_FEATURES:
         raise ValueError(variant)
+    offset = 0
+    for name, channels in FEATURE_LAYOUT.items():
+        if name not in SCORER_FEATURES[variant]:
+            result[..., offset:offset + channels] = 0
+        offset += channels
     return result
 
 
@@ -291,10 +303,11 @@ def make_feature_tap_gap(model):
     return captured, handles
 
 
-def extract_probe_probabilities(exp, heads, features, size=(128, 128)):
+def extract_probe_probabilities(exp, heads, extra_heads, features, size=(128, 128)):
     output = {}
-    for name in PROBE_NAMES:
-        logits = exp.probe_logits(heads[name], features[name])
+    for name in (*PROBE_NAMES, *EXTRA_NAMES):
+        head = heads[name] if name in PROBE_NAMES else extra_heads[name]
+        logits = exp.probe_logits(head, features[name])
         probability = logits.sigmoid()
         probability = F.interpolate(probability, size=size, mode="bilinear", align_corners=False)
         output[name] = probability[0, 0].float().cpu().numpy()
@@ -329,7 +342,7 @@ def tile_iter(dataset, split, max_images, seed):
                    "top": top, "left": left, "tile_index": tile_index}
 
 
-def process_tile(tile, gap_model, encoder_tap, heads, exp, capture, cfg,
+def process_tile(tile, gap_model, encoder_tap, heads, extra_heads, exp, capture, cfg,
                  candidate_pool, candidate_budget, evidence_threshold, device):
     image = tile["image"].to(device)
     capture.clear()
@@ -340,16 +353,18 @@ def process_tile(tile, gap_model, encoder_tap, heads, exp, capture, cfg,
         p2 = capture["p2"][0, 0].float().sigmoid().cpu().numpy()
         f2 = to_numpy_feature(capture["f2"])
         features, _ = encoder_tap(image)
-        probe_probs = extract_probe_probabilities(exp, heads, features)
-    feature_maps = {"F2": f2,
-                    "H_E2": to_numpy_feature(features["H_E2"]),
-                    "H_E3": to_numpy_feature(features["H_E3"])}
+        probe_probs = extract_probe_probabilities(exp, heads, extra_heads, features)
+    feature_maps = {"F2": f2, **{name: to_numpy_feature(features[name])
+                                 for name in FEATURE_LAYOUT if name != "F2"}}
     variants = {"P0_P2_only": generate_candidates([p2], cfg)[0]}
     evidence_sets = {
         "P1_P2_plus_E2": ("E2",),
         "P2_P2_plus_HE2": ("H_E2",),
         "P3_P2_plus_HE3": ("H_E3",),
         "P4_P2_plus_HE2_HE3": ("H_E2", "H_E3"),
+        "P5_P2_plus_E1": ("E1",),
+        "P6_P2_plus_H0": ("H0",),
+        "P7_P2_plus_F1": ("F1",),
     }
     expanded = {}
     for name, sources in evidence_sets.items():
@@ -417,21 +432,17 @@ def proposal_rows(record, cfg, candidate_budget):
 
 
 def score_validation_heads(train_records, val_records, cfg, device, seed, epochs, candidate_budget):
-    variants = ("R0_F2", "R1_F2_HE2", "R2_F2_HE2_HE3")
+    variants = tuple(SCORER_FEATURES)
     train_x = np.concatenate([record["descriptors"] for record in train_records if len(record["descriptors"])])
     train_y = np.concatenate([record["union_labels"] for record in train_records if len(record["union_labels"])])
     # Standardize once from the training partition only; this preserves a
-    # fair, identical feature scale across all three scorers.
+    # fair, identical feature scale across all scorers.
     valid = train_y >= 0
     mean = train_x[valid].mean(0)
     std = train_x[valid].std(0).clip(1e-4)
     results, history_all = {}, {}
     for variant in variants:
-        x = (train_x - mean) / std
-        if variant == "R0_F2":
-            x[:, FEATURE_DIMS[0]:sum(FEATURE_DIMS)] = 0
-        elif variant == "R1_F2_HE2":
-            x[:, sum(FEATURE_DIMS[:2]):sum(FEATURE_DIMS)] = 0
+        x = enabled_input((train_x - mean) / std, variant)
         model, history = fit_scorer(x, train_y, seed, device, epochs)
         history_all[variant] = history
         val_scores, val_labels = [], []
@@ -440,11 +451,7 @@ def score_validation_heads(train_records, val_records, cfg, device, seed, epochs
         with torch.no_grad():
             for record in val_records:
                 raw = record["descriptors"]
-                xval = (raw - mean) / std
-                if variant == "R0_F2":
-                    xval[:, FEATURE_DIMS[0]:sum(FEATURE_DIMS)] = 0
-                elif variant == "R1_F2_HE2":
-                    xval[:, sum(FEATURE_DIMS[:2]):sum(FEATURE_DIMS)] = 0
+                xval = enabled_input((raw - mean) / std, variant)
                 logits = model(torch.as_tensor(xval, device=device)).cpu().numpy() if len(xval) else np.zeros(0)
                 order = np.argsort(-logits, kind="stable")[:candidate_budget]
                 edges = record["union_edges"][order]
@@ -476,6 +483,7 @@ def main():
     parser.add_argument("--probe_repo", required=True, help="checkout with probe_experiment.py")
     parser.add_argument("--probe_model_path", required=True, help="1af9580 encoder-exchange checkpoint")
     parser.add_argument("--probe_head_path", required=True, help="matching probe_best.pth")
+    parser.add_argument("--extra_probe_head_path", required=True, help="matching trained E1/H0/F1 extra_probe_best.pth")
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max_val_images", type=int, default=0)
@@ -502,13 +510,16 @@ def main():
     # been created; this preserves both implementations in one process.
     exp, probe_model, heads, probe_tap, probe_payload = load_probe_stack(
         Path(args.probe_repo), Path(args.probe_model_path), Path(args.probe_head_path), device)
-    probe_model.eval(); heads.eval()
+    extra_heads, extra_payload = load_extra_heads(
+        Path(args.extra_probe_head_path), probe_payload["backbone_sha256"], device)
+    probe_tap = ExtraFeatureTap(probe_tap)
+    probe_model.eval(); heads.eval(); extra_heads.eval()
     args.output_dir.mkdir(parents=True)
     val_records, val_rows, val_totals = [], [], {}
     try:
         with torch.inference_mode():
             for record_index, tile in enumerate(tile_iter(dataset, "val", args.max_val_images, args.seed), 1):
-                record = process_tile(tile, gap_model, probe_tap, heads, exp, gap_capture, cfg,
+                record = process_tile(tile, gap_model, probe_tap, heads, extra_heads, exp, gap_capture, cfg,
                                       args.candidate_pool, args.candidate_budget,
                                       args.evidence_threshold, device)
                 rows, totals = proposal_rows(record, cfg, args.candidate_budget)
@@ -531,7 +542,7 @@ def main():
             train_records = []
             with torch.inference_mode():
                 for record_index, tile in enumerate(tile_iter(train_dataset, "train", args.max_train_images, args.seed), 1):
-                    record = process_tile(tile, gap_model, probe_tap, heads, exp, gap_capture, cfg,
+                    record = process_tile(tile, gap_model, probe_tap, heads, extra_heads, exp, gap_capture, cfg,
                                           args.candidate_pool, args.candidate_budget,
                                           args.evidence_threshold, device)
                     train_records.append(record)
@@ -541,7 +552,7 @@ def main():
                 train_records, val_records, cfg, device, args.seed, args.head_epochs, args.candidate_budget)
             write_json(args.output_dir / "validation2_head_training.json", {
                 "train_crops": len(train_records), "val_tiles": len(val_records),
-                "input_features": {"R0": "F2", "R1": "F2+H_E2", "R2": "F2+H_E2+H_E3"},
+                "input_features": {name: list(features) for name, features in SCORER_FEATURES.items()},
                 "same_candidate_pool": True, "scorer_parameters": sum(p.numel() for p in CandidateScorer().parameters()),
                 "epochs": args.head_epochs, "optimizer": "AdamW(lr=1e-3, weight_decay=1e-4)",
                 "batch_size": 512, "positive_weight": "clip(negative_count/positive_count, 1, 20)",
@@ -551,7 +562,9 @@ def main():
             "gap_checkpoint": str(Path(args.gap_model_path).resolve()),
             "probe_backbone": str(Path(args.probe_model_path).resolve()),
             "probe_heads": str(Path(args.probe_head_path).resolve()),
+            "extra_probe_heads": str(Path(args.extra_probe_head_path).resolve()),
             "probe_backbone_sha256": probe_payload.get("backbone_sha256"),
+            "extra_probe_best_epochs": extra_payload.get("best_epoch"),
             "candidate_protocol": {"p2_threshold": cfg.threshold,
                                    "evidence_threshold": args.evidence_threshold,
                                    "gap_config": cfg.to_dict(),
