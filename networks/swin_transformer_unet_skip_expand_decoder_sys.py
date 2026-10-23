@@ -1772,6 +1772,7 @@ class SwinTransformerSys(nn.Module):
         self.decoder_structure_blocks['2'].configure_connections('local')
         self.decoder_structure_blocks['3'].configure_connections('gap')
         self.decoder_structure_blocks['2'].enable_local_propagation = bool(enable_stage2_local_propagation)
+        self.decoder_structure_blocks['2'].enable_p2_candidate_head = bool(enable_gap_refinement)
         self.enable_gap_refinement = bool(enable_gap_refinement)
         self.gap_connection = GapConnectivity(embed_dim, self.highres_structure_channels, self.local_gap_config)
         for block in self.dca_blocks:

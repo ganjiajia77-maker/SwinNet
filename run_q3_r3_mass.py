@@ -319,14 +319,17 @@ def smoke(args, model):
     image = sample['image'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
     mask = sample['mask'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
     skeleton = sample['skeleton'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
-    calls = {'local': 0, 'gap': 0}
+    calls = {'local': 0, 'gap': 0, 'p2': 0}
     def local_hook(*unused):
         calls['local'] += 1
     def gap_hook(*unused):
         calls['gap'] += 1
+    def p2_hook(*unused):
+        calls['p2'] += 1
     local = model.base.swin_unet.decoder_structure_blocks['2'].local_propagation
     handles = [local.register_forward_hook(local_hook),
-               model.base.swin_unet.gap_connection.register_forward_hook(gap_hook)]
+               model.base.swin_unet.gap_connection.register_forward_hook(gap_hook),
+               model.base.swin_unet.decoder_structure_blocks['2'].p2_head.register_forward_hook(p2_hook)]
     try:
         output = model(image)
         loss, stats = repair_losses(output, mask, skeleton, args.lambda_q)
@@ -341,8 +344,8 @@ def smoke(args, model):
     finally:
         for handle in handles:
             handle.remove()
-    if calls != {'local': 0, 'gap': 0}:
-        raise RuntimeError(f'Disabled propagation/gap still ran: {calls}')
+    if calls != {'local': 0, 'gap': 0, 'p2': 0}:
+        raise RuntimeError(f'Disabled propagation/gap/P2 path still ran: {calls}')
     if any(parameter.grad is not None for parameter in model.base.parameters()):
         raise RuntimeError('Frozen base received gradients')
     if not bool(torch.isfinite(loss)):

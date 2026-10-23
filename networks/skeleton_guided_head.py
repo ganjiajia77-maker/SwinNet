@@ -870,9 +870,10 @@ class DecoderStructureRefinement(nn.Module):
                     skeleton_prob=runtime_connectivity_skeleton.detach(),
                 )
                 # Candidate generation uses the pre-propagation Stage 2 road map.
-                diagnostics['p2_logits'] = self.p2_head(
-                    scale_gradient(x, self.skeleton_gradient_ratio)
-                )
+                if getattr(self, 'enable_p2_candidate_head', True):
+                    diagnostics['p2_logits'] = self.p2_head(
+                        scale_gradient(x, self.skeleton_gradient_ratio)
+                    )
                 if apply_feature_refinement and getattr(self, 'enable_local_propagation', True):
                     out = self.local_propagation(x, skeleton_prob, connectivity_logits.sigmoid())
             return out, skeleton_logits, connectivity_logits, direction_logits, None, diagnostics
