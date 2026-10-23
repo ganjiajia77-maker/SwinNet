@@ -194,6 +194,104 @@ def classify_gap(gap, skeleton, endpoints_yx, component_labels, radius):
     return category, [int(value.size) for value in hits], 0, None
 
 
+def save_gap_overlay(image_tensor, gt_skeleton, p2_skeleton, pred_endpoints, gap, path):
+    """Save a crop with GT/P2 centerlines, predicted endpoints, and both gap flanks."""
+    mean = np.asarray([0.485, 0.456, 0.406], np.float32)[:, None, None]
+    std = np.asarray([0.229, 0.224, 0.225], np.float32)[:, None, None]
+    rgb = np.clip((image_tensor.detach().cpu().numpy() * std + mean).transpose(1, 2, 0) * 255,
+                  0, 255).astype(np.uint8)
+    canvas = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    _, (y0, y1, x0, x1), region, anchors, _, _ = gap
+    overlay = canvas.copy()
+    gt = gt_skeleton.astype(bool)
+    p2 = p2_skeleton.astype(bool)
+    overlay[gt] = (255, 180, 0)
+    overlay[p2] = (255, 0, 255)
+    overlay[gt & p2] = (255, 255, 255)
+    local_overlay = overlay[y0:y1, x0:x1]
+    local_overlay[region] = (0, 255, 255)
+    canvas = cv2.addWeighted(canvas, .48, overlay, .52, 0)
+    for anchor_id, (anchor, _, _) in enumerate(anchors):
+        for y, x in np.argwhere(anchor) + [y0, x0]:
+            cv2.circle(canvas, (int(x), int(y)), 2,
+                       (0, 128, 255) if anchor_id % 2 == 0 else (255, 255, 0), -1)
+    for y, x in pred_endpoints:
+        cv2.circle(canvas, (int(x), int(y)), 3, (0, 255, 0), -1)
+    margin = 48
+    ya, yb = max(0, y0 - margin), min(canvas.shape[0], y1 + margin)
+    xa, xb = max(0, x0 - margin), min(canvas.shape[1], x1 + margin)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), canvas[ya:yb, xa:xb])
+
+
+def gt_path_evidence(gaps, feature_shape, device, dtype):
+    """GT-only corridor evidence for an explicitly optimistic writeback upper bound."""
+    corridor = np.zeros((512, 512), np.uint8)
+    for _, (y0, y1, x0, x1), region, anchors, pairs, _ in gaps:
+        if not pairs:
+            continue
+        local = region.astype(np.uint8)
+        for anchor, _, _ in anchors:
+            local |= anchor.astype(np.uint8)
+        corridor[y0:y1, x0:x1] |= local
+    corridor = cv2.dilate(corridor, np.ones((5, 5), np.uint8))
+    height, width = feature_shape
+    resized = cv2.resize(corridor.astype(np.float32), (width, height),
+                         interpolation=cv2.INTER_AREA)
+    return torch.as_tensor(resized > 0, device=device, dtype=dtype)[None, None]
+
+
+def oracle_forward(model, capture, image, edges, geometry, force_high=False, path_evidence=None):
+    """Run one fixed crop with injected oracle edges and optional diagnostic overrides."""
+    original_generator = gap_module.generate_candidates
+    gap_module.generate_candidates = lambda _p, _c: [{
+        'edges': edges, 'geometry': geometry,
+        'endpoint_count': len(edges) * 2, 'retained_endpoints': len(edges) * 2,
+        'eligible_pairs': len(edges)}]
+    gap_head = model.swin_unet.gap_connection.edge_mlp
+    original_edge_forward = gap_head.forward
+    original_rasterizer = gap_module.rasterize_evidence
+    if force_high:
+        gap_head.forward = lambda features: features.new_full((features.shape[0], 1), 12.)
+    if path_evidence is not None:
+        gap_module.rasterize_evidence = lambda _edges, _scores, _h, _w, _r: path_evidence
+    try:
+        capture.clear()
+        outputs = model(image)
+        if len(capture) != 1:
+            raise RuntimeError(f'Expected one Gap call, got {len(capture)}')
+        return outputs, capture[-1]
+    finally:
+        gap_module.generate_candidates = original_generator
+        gap_head.forward = original_edge_forward
+        gap_module.rasterize_evidence = original_rasterizer
+
+
+def update_intervention_summary(summary, name, gaps, baseline_probability,
+                                baseline_logits, output, gt_mask, threshold):
+    surface_logits = output[0][0, 0].float().detach().cpu().numpy()
+    probability = 1 / (1 + np.exp(-np.clip(surface_logits, -80, 80)))
+    baseline_mask = baseline_probability >= threshold
+    predicted_mask = probability >= threshold
+    rows = gap_metrics(gaps, predicted_mask, baseline_logits, surface_logits, 2)
+    values = summary.setdefault(name, {'tiles': 0, 'gaps': 0, 'closed_gaps': 0,
+                                       'connected_flanks': 0, 'recovered_fraction_sum': 0.,
+                                       'gap_logit_delta_sum': 0., 'added_gt_pixels': 0,
+                                       'added_background_pixels': 0,
+                                       'probability_abs_delta_sum': 0., 'probability_pixels': 0})
+    values['tiles'] += 1
+    values['gaps'] += len(rows)
+    values['closed_gaps'] += sum(row['complete_closure'] for row in rows)
+    values['connected_flanks'] += sum(row['connected_flanks'] for row in rows)
+    values['recovered_fraction_sum'] += sum(row['centerline_recovered_fraction'] for row in rows)
+    values['gap_logit_delta_sum'] += sum(row['mean_gap_logit_delta'] for row in rows)
+    values['added_gt_pixels'] += int((predicted_mask & ~baseline_mask & gt_mask).sum())
+    values['added_background_pixels'] += int((predicted_mask & ~baseline_mask & ~gt_mask).sum())
+    values['probability_abs_delta_sum'] += float(np.abs(probability-baseline_probability).sum())
+    values['probability_pixels'] += int(probability.size)
+    return probability, rows
+
+
 def oracle_proposals(gaps, feature_shape, cfg, skeleton, mask):
     """Build ideal GT-flank endpoints, then retain only positive local-path labels."""
     scale = np.asarray(skeleton.shape) / np.asarray(feature_shape)
@@ -321,8 +419,9 @@ def main():
     parser.add_argument('--reference_threshold', type=float, default=.5)
     parser.add_argument('--gradient_audit', action='store_true')
     parser.add_argument('--gt_oracle', action='store_true',
-                        help='Run extra GT-proposal forwards through Gap MLP and trained surface writeback')
+                        help='Run paired B0-B3 oracle-candidate interventions (GT diagnostic upper bounds)')
     parser.add_argument('--surface_threshold', type=float, default=.45)
+    parser.add_argument('--examples_per_category', type=int, default=6)
     args = parser.parse_args()
     if not 0 < args.reference_threshold < 1:
         parser.error('reference_threshold must be in (0,1)')
@@ -345,13 +444,14 @@ def main():
     first_positive = None
     per_tile = []
     per_gap = []
+    intervention_rows = []
+    intervention_summary = {}
+    saved_examples = defaultdict(int)
+    examples_dir = args.output_dir / 'gap_examples'
     gap_categories = defaultdict(int)
     unique_gap_categories = defaultdict(int)
     seen_gap_keys = set()
     oracle_summary = {'tiles': 0, 'candidates': 0, 'positive_logits': 0,
-                      'closed_gaps': 0, 'baseline_closed_gaps': 0,
-                      'centerline_recovered_fraction_sum': 0., 'baseline_centerline_recovered_fraction_sum': 0.,
-                      'oracle_added_gt_pixels': 0, 'oracle_added_background_pixels': 0,
                       'feature_delta_l2_sum': 0., 'feature_input_l2_sum': 0.,
                       'probability_abs_delta_sum': 0., 'probability_pixels': 0}
     native_writeback = {'tiles': 0, 'gamma': float(model.swin_unet.gap_connection.gamma.detach().cpu()),
@@ -410,6 +510,14 @@ def main():
                             if gap_key not in seen_gap_keys:
                                 seen_gap_keys.add(gap_key)
                                 unique_gap_categories[category] += 1
+                                if saved_examples[category] < args.examples_per_category:
+                                    example_name = (f'{Path(sample["image_name"]).stem}_'
+                                                    f'y{top+gy0}_x{left+gx0}.png')
+                                    tile_rgb = sample['image'][:, top:top+512, left:left+512]
+                                    save_gap_overlay(tile_rgb, gt_skeleton, p2_mask > 0,
+                                                     pred_endpoints, gap,
+                                                     examples_dir / category / example_name)
+                                    saved_examples[category] += 1
                             per_gap.append({'image': sample['image_name'], 'top': top, 'left': left,
                                             'gap_id': gap_id, 'pixels': gap[-1],
                                             'approx_unique_key': f'{gap_key[0]}:{gap_key[1]}:{gap_key[2]}',
@@ -473,62 +581,86 @@ def main():
                             oracle_edges, oracle_geometry = oracle_proposals(
                                 gaps, probability.shape, cfg, gt_skeleton, gt_mask)
                             if len(oracle_edges):
-                                original_generator = gap_module.generate_candidates
-                                gap_module.generate_candidates = lambda _p, _c: [{
-                                    'edges': oracle_edges, 'geometry': oracle_geometry,
-                                    'endpoint_count': len(oracle_edges)*2,
-                                    'retained_endpoints': len(oracle_edges)*2,
-                                    'eligible_pairs': len(oracle_edges)}]
-                                try:
+                                tile_image = image[:, :, top:top+512, left:left+512]
+                                base_logits = outputs[0][0, 0].float().cpu().numpy()
+                                base_rows = gap_metrics(gaps, surface_probability >= args.surface_threshold,
+                                                        base_logits, base_logits, 2)
+                                base_key = 'B0_native_candidates_native_MLP_native_writeback'
+                                base_slot = intervention_summary.setdefault(base_key, {
+                                    'tiles': 0, 'gaps': 0, 'closed_gaps': 0,
+                                    'connected_flanks': 0, 'recovered_fraction_sum': 0.,
+                                    'gap_logit_delta_sum': 0., 'added_gt_pixels': 0,
+                                    'added_background_pixels': 0, 'probability_abs_delta_sum': 0.,
+                                    'probability_pixels': 0})
+                                base_slot['tiles'] += 1
+                                base_slot['gaps'] += len(base_rows)
+                                base_slot['closed_gaps'] += sum(r['complete_closure'] for r in base_rows)
+                                base_slot['connected_flanks'] += sum(r['connected_flanks'] for r in base_rows)
+                                base_slot['recovered_fraction_sum'] += sum(
+                                    r['centerline_recovered_fraction'] for r in base_rows)
+                                base_slot['gap_logit_delta_sum'] += sum(r['mean_gap_logit_delta'] for r in base_rows)
+                                base_slot['probability_pixels'] += int(surface_probability.size)
+
+                                path_map = gt_path_evidence(
+                                    gaps, record['gap_evidence'].shape[-2:], args.device,
+                                    record['gap_evidence'].dtype)
+                                variants = (
+                                    ('B1_oracle_candidates_native_MLP_native_writeback', False, None),
+                                    ('B2_oracle_candidates_forced_high_native_writeback', True, None),
+                                    ('B3_oracle_candidates_forced_high_GT_path_evidence_learned_writeback',
+                                     True, path_map),
+                                )
+                                b1_logits = None
+                                for variant_name, force_high, evidence in variants:
                                     capture.clear()
-                                    oracle_outputs = model(image[:, :, top:top+512, left:left+512])
-                                finally:
-                                    gap_module.generate_candidates = original_generator
-                                oracle_inputs, oracle_decoder_out, oracle_record = capture[-1]
-                                oracle_logits = oracle_record['gap_logits'][0].cpu().numpy()
-                                oracle_surface_logits = oracle_outputs[0][0, 0].float().cpu().numpy()
-                                base_surface_logits = outputs[0][0, 0].float().cpu().numpy()
-                                base_mask = surface_probability >= args.surface_threshold
-                                oracle_probability = 1 / (1 + np.exp(-np.clip(oracle_surface_logits, -80, 80)))
-                                oracle_mask = oracle_probability >= args.surface_threshold
-                                baseline_gap_rows = gap_metrics(gaps, base_mask, base_surface_logits,
-                                                                base_surface_logits, 2)
-                                oracle_gap_rows = gap_metrics(gaps, oracle_mask, base_surface_logits,
-                                                              oracle_surface_logits, 2)
-                                oracle_summary['tiles'] += 1
-                                oracle_summary['candidates'] += len(oracle_edges)
-                                oracle_summary['positive_logits'] += int((oracle_logits >= 0).sum())
-                                oracle_summary['closed_gaps'] += sum(r['complete_closure'] for r in oracle_gap_rows)
-                                oracle_summary['baseline_closed_gaps'] += sum(r['complete_closure'] for r in baseline_gap_rows)
-                                oracle_summary['centerline_recovered_fraction_sum'] += sum(
-                                    r['centerline_recovered_fraction'] for r in oracle_gap_rows)
-                                oracle_summary['baseline_centerline_recovered_fraction_sum'] += sum(
-                                    r['centerline_recovered_fraction'] for r in baseline_gap_rows)
-                                oracle_summary['oracle_added_gt_pixels'] += int((oracle_mask & ~base_mask & gt_mask).sum())
-                                oracle_summary['oracle_added_background_pixels'] += int(
-                                    (oracle_mask & ~base_mask & ~gt_mask).sum())
-                                delta = oracle_decoder_out.detach().float() - oracle_inputs[0].detach().float()
-                                oracle_summary['feature_delta_l2_sum'] += float(delta.norm().cpu())
-                                oracle_summary['feature_input_l2_sum'] += float(oracle_inputs[0].detach().float().norm().cpu())
-                                oracle_summary['probability_abs_delta_sum'] += float(
-                                    np.abs(oracle_probability-surface_probability).sum())
-                                oracle_summary['probability_pixels'] += int(oracle_probability.size)
-                                per_tile[-1].update(oracle_candidates=len(oracle_edges),
-                                                    oracle_positive_logits=int((oracle_logits >= 0).sum()),
-                                                    oracle_closed=sum(r['complete_closure'] for r in oracle_gap_rows),
-                                                    baseline_closed=sum(r['complete_closure'] for r in baseline_gap_rows))
+                                    variant_outputs, (variant_inputs, variant_decoder_out, variant_record) = oracle_forward(
+                                        model, capture, tile_image, oracle_edges, oracle_geometry,
+                                        force_high=force_high, path_evidence=evidence)
+                                    variant_logits = variant_record['gap_logits'][0].detach().cpu().numpy()
+                                    variant_probability, variant_rows = update_intervention_summary(
+                                        intervention_summary, variant_name, gaps, surface_probability,
+                                        base_logits, variant_outputs, gt_mask, args.surface_threshold)
+                                    for gap_row in variant_rows:
+                                        intervention_rows.append({
+                                            'image': sample['image_name'], 'top': top, 'left': left,
+                                            'scenario': variant_name, **gap_row})
+                                    per_tile[-1][variant_name + '_closed'] = sum(
+                                        row['complete_closure'] for row in variant_rows)
+                                    per_tile[-1][variant_name + '_mean_gap_delta'] = (
+                                        float(np.mean([row['mean_gap_logit_delta'] for row in variant_rows]))
+                                        if variant_rows else None)
+                                    if variant_name.startswith('B1_'):
+                                        b1_logits = variant_logits.copy()
+                                        oracle_summary['tiles'] += 1
+                                        oracle_summary['candidates'] += len(oracle_edges)
+                                        oracle_summary['positive_logits'] += int((variant_logits >= 0).sum())
+                                        delta = variant_decoder_out.detach().float() - variant_inputs[0].detach().float()
+                                        oracle_summary['feature_delta_l2_sum'] += float(delta.norm().cpu())
+                                        oracle_summary['feature_input_l2_sum'] += float(
+                                            variant_inputs[0].detach().float().norm().cpu())
+                                        oracle_summary['probability_abs_delta_sum'] += float(
+                                            np.abs(variant_probability-surface_probability).sum())
+                                        oracle_summary['probability_pixels'] += int(variant_probability.size)
+                                per_tile[-1]['oracle_candidates'] = len(oracle_edges)
+                                per_tile[-1]['oracle_mlp_positive'] = int((b1_logits >= 0).sum())
                     if args.max_tiles_per_image and tile_index >= args.max_tiles_per_image:
                         break
                 print(f'[GAP-CANDIDATES] {index+1}/{count} images; tiles={candidate_tiles}; GT gaps={gap_total}', flush=True)
     finally:
         handle.remove()
     with (args.output_dir / 'per_tile.csv').open('w', newline='', encoding='utf-8') as stream:
-        writer = csv.DictWriter(stream, fieldnames=per_tile[0].keys())
+        fields = list(dict.fromkeys(key for row in per_tile for key in row))
+        writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader(); writer.writerows(per_tile)
     if per_gap:
         with (args.output_dir / 'per_gap.csv').open('w', newline='', encoding='utf-8') as stream:
             writer = csv.DictWriter(stream, fieldnames=per_gap[0].keys())
             writer.writeheader(); writer.writerows(per_gap)
+    if intervention_rows:
+        with (args.output_dir / 'b0_b3_per_gap.csv').open('w', newline='', encoding='utf-8') as stream:
+            fields = list(dict.fromkeys(key for row in intervention_rows for key in row))
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader(); writer.writerows(intervention_rows)
     for mode in modes:
         for stage in stage_names:
             slot = totals[mode][stage]
@@ -576,9 +708,27 @@ def main():
         oracle_summary['oracle_logit_positive_fraction'] = (
             oracle_summary['positive_logits'] / max(oracle_summary['candidates'], 1))
         oracle_summary['scope'] = ('GT supplies geometrically positive local connections as proposals; they still pass '
-                                   'the trained Gap MLP and learned Surface writeback. This is an optimistic '
-                                   'diagnostic and uses overlapping tiles.')
+                                   'the trained Gap MLP and learned Surface writeback in B1. B2 forces high '
+                                   'connection scores; B3 additionally uses a GT path-evidence corridor. B2/B3 are '
+                                   'diagnostic upper bounds, not deployable model results.')
+        for name, values in intervention_summary.items():
+            values['closure_rate'] = values['closed_gaps'] / max(values['gaps'], 1)
+            values['connected_flank_rate'] = values['connected_flanks'] / max(values['gaps'], 1)
+            values['mean_centerline_recovered_fraction'] = (
+                values['recovered_fraction_sum'] / max(values['gaps'], 1))
+            values['mean_gap_logit_delta'] = values['gap_logit_delta_sum'] / max(values['gaps'], 1)
+            values['mean_added_gt_pixels_per_tile'] = values['added_gt_pixels'] / max(values['tiles'], 1)
+            values['mean_added_background_pixels_per_tile'] = (
+                values['added_background_pixels'] / max(values['tiles'], 1))
+            values['mean_probability_abs_delta'] = (
+                values['probability_abs_delta_sum'] / max(values['probability_pixels'], 1))
+        oracle_summary['b0_b3_paired_interventions'] = intervention_summary
+        oracle_summary['representative_overlay_dir'] = str(examples_dir)
         summary['gt_oracle'] = oracle_summary
+    summary['representative_gap_examples'] = {
+        'directory': str(examples_dir), 'saved_per_category': dict(saved_examples),
+        'overlay': 'GT skeleton=cyan, P2 skeleton=magenta, shared pixels=white, missing GT gap=yellow, '
+                   'flank anchors=orange/cyan dots, final-surface skeleton endpoints=green dots.'}
     if args.gradient_audit:
         with torch.enable_grad():
             location = first_positive or (0, 0, 0)

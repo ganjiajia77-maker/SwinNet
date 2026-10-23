@@ -1,9 +1,13 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
+import torch
 
 from diagnose_gap_candidates import (average_precision, classify_gap, gap_covered,
-                                     oracle_proposals, ranked_pairs)
+                                     gt_path_evidence, oracle_proposals, ranked_pairs,
+                                     save_gap_overlay)
 from gap_candidates import endpoints, generate_candidates
 from local_gap_config import LocalGapConfig
 
@@ -58,6 +62,30 @@ class CandidateDiagnosticTests(unittest.TestCase):
         edges, geometry = oracle_proposals([gap], (128, 128), LocalGapConfig(), skeleton, mask)
         self.assertEqual(edges.shape, (1, 2, 2))
         self.assertEqual(geometry.shape, (1, 8))
+
+    def test_gt_path_evidence_is_feature_sized_float_map(self):
+        region = np.zeros((20, 20), bool); region[8, 5:15] = True
+        anchor_a = np.zeros_like(region); anchor_a[8, 4] = True
+        anchor_b = np.zeros_like(region); anchor_b[8, 15] = True
+        gap = (1, (20, 40, 30, 50), region, [(anchor_a, None, None),
+                                               (anchor_b, None, None)], [(0, 1)], 10)
+        evidence = gt_path_evidence([gap], (16, 16), 'cpu', torch.float32)
+        self.assertEqual(tuple(evidence.shape), (1, 1, 16, 16))
+        self.assertEqual(evidence.dtype, torch.float32)
+        self.assertGreater(float(evidence.sum()), 0)
+
+    def test_overlay_writer_creates_gap_crop(self):
+        image = torch.zeros((3, 64, 64))
+        skeleton = np.zeros((64, 64), bool); skeleton[30, 10:50] = True
+        region = np.zeros_like(skeleton); region[30, 25:35] = True
+        anchor_a = np.zeros((20, 20), bool); anchor_a[10, 5] = True
+        anchor_b = np.zeros_like(anchor_a); anchor_b[10, 15] = True
+        gap = (1, (20, 40, 20, 40), region[20:40, 20:40],
+               [(anchor_a, None, None), (anchor_b, None, None)], [(0, 1)], 10)
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / 'class' / 'example.png'
+            save_gap_overlay(image, skeleton, skeleton, np.asarray([[30, 20]]), gap, output)
+            self.assertTrue(output.is_file())
 
 
 if __name__ == '__main__':
