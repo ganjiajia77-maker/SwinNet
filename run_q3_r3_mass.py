@@ -316,9 +316,9 @@ def smoke(args, model):
     dataset = RoadSkeletonDataset(str(args.root_path), 'train', image_size=512,
                                   source_patch_size=1500, random_crop_train=True)
     sample = dataset[0]
-    image = sample['image'][None].to(args.device)
-    mask = sample['mask'][None].to(args.device)
-    skeleton = sample['skeleton'][None].to(args.device)
+    image = sample['image'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
+    mask = sample['mask'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
+    skeleton = sample['skeleton'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
     calls = {'local': 0, 'gap': 0}
     def local_hook(*unused):
         calls['local'] += 1
