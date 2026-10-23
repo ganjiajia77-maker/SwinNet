@@ -227,6 +227,11 @@ def diagnose(args):
     paired = []
     gradients = []
     weight = blend_weight(TILE_SIZE, device)
+    gradient_image_indices = set(np.linspace(
+        0, len(images) - 1, min(args.gradient_samples, len(images)), dtype=int).tolist()
+    ) if args.gradient_samples else set()
+    window_rows = sliding_positions(SOURCE_SIZE, TILE_SIZE, STRIDE)
+    gradient_position = (window_rows[len(window_rows) // 2], window_rows[len(window_rows) // 2])
     direction_cfg = {key: saved[key] for key in ('pca_radius', 'min_support', 'road_radius',
                                                  'min_coherence', 'lambda_encoder_direction')}
     for index, image_name in enumerate(images, 1):
@@ -276,7 +281,7 @@ def diagnose(args):
                     direction_valid += int((direction_weight > 0).sum())
                     del feature, updated, raw, q, delta, target, direction_weight
                 n_windows += 1
-                if len(gradients) < args.gradient_samples:
+                if index - 1 in gradient_image_indices and (top, left) == gradient_position:
                     audit = gradient_audit(model, crop, road, skel, direction_cfg)
                     if audit['valid_direction_pixels']:
                         audit.update(image=image_name, top=top, left=left)
