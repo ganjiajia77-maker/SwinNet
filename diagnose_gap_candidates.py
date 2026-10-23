@@ -1,6 +1,7 @@
 """Frozen P2 candidate recall and Gap head audit; never selects a test threshold."""
 import argparse
 from collections import defaultdict
+from collections import deque
 from dataclasses import replace
 import csv
 import json
@@ -15,12 +16,13 @@ from config import _C
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from evaluation.road_comparison.road_metrics import skeletonize
 from gap_candidates import endpoints
-from gap_diagnostic_metrics import verified_gaps
+from gap_diagnostic_metrics import verified_gaps, gap_metrics
 from local_gap_config import LocalGapConfig
 from losses.gap_losses import label_edges
 from mass_h0 import verify_checkpoint
 from mass_protocol import sliding_positions
 from networks.vision_transformer import SwinUnet, load_topology_checkpoint_state
+import networks.local_gap_connectivity as gap_module
 
 
 def ranked_pairs(points, cfg, dual=False, high_points=None):
@@ -76,8 +78,12 @@ def gap_covered(gap, edges, scale, snap_radius):
         if not len(coords):
             hits.append(np.zeros((len(native), 2), bool))
         else:
-            distance = np.linalg.norm(native[:, :, None, :] - coords[None, None, :, :], axis=-1)
-            hits.append((distance <= snap_radius).any(axis=-1))
+            anchor_hits = []
+            for start in range(0, len(native), 256):
+                chunk = native[start:start+256]
+                distance = np.linalg.norm(chunk[:, :, None, :] - coords[None, None, :, :], axis=-1)
+                anchor_hits.append((distance <= snap_radius).any(axis=-1))
+            hits.append(np.concatenate(anchor_hits, axis=0))
     for i, j in pairs:
         if np.any((hits[i][:, 0] & hits[j][:, 1]) | (hits[j][:, 0] & hits[i][:, 1])):
             return True
@@ -93,6 +99,131 @@ def average_precision(labels, scores):
     order = np.argsort(-s, kind='stable')
     positive = (y[order] == 1).astype(np.float64)
     return float((positive * (positive.cumsum() / np.arange(1, len(y)+1))).sum() / positive.sum())
+
+
+def prediction_endpoints(probability, threshold, min_component=4):
+    skeleton = skeletonize(probability >= threshold).astype(bool)
+    count, components, stats, _ = cv2.connectedComponentsWithStats(skeleton.astype(np.uint8), 8)
+    keep = np.zeros(count, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_component
+    skeleton &= keep[components]
+    padded = np.pad(skeleton.astype(np.uint8), 1)
+    h, w = skeleton.shape
+    degree = sum(padded[1+dy:1+dy+h, 1+dx:1+dx+w]
+                 for dy, dx in ((-1, 0), (-1, 1), (0, 1), (1, 1),
+                                (1, 0), (1, -1), (0, -1), (-1, -1)))
+    points = np.argwhere(skeleton & (degree == 1))
+    _, labels = cv2.connectedComponents(skeleton.astype(np.uint8), connectivity=8)
+    return points, labels, skeleton
+
+
+def endpoint_path_stats(skeleton, start, finish):
+    h, w = skeleton.shape
+    queue = deque([(tuple(start), 0)])
+    seen = {tuple(start)}
+    while queue:
+        (y, x), distance = queue.popleft()
+        if (y, x) == tuple(finish):
+            return distance, False
+        for dy, dx in ((-1, 0), (-1, 1), (0, 1), (1, 1),
+                       (1, 0), (1, -1), (0, -1), (-1, -1)):
+            point = (y+dy, x+dx)
+            if (0 <= point[0] < h and 0 <= point[1] < w and skeleton[point]
+                    and point not in seen):
+                seen.add(point)
+                queue.append((point, distance+1))
+    return None, False
+
+
+def classify_gap(gap, skeleton, endpoints_yx, component_labels, radius):
+    """Classify whether output centerline endpoints land on each GT gap flank."""
+    _, (y0, y1, x0, x1), _, anchors, pairs, _ = gap
+    hits = []
+    for anchor, _, _ in anchors:
+        coords = np.argwhere(anchor) + [y0, x0]
+        if len(coords) and len(endpoints_yx):
+            distances = np.linalg.norm(endpoints_yx[:, None] - coords[None], axis=-1)
+            hit_ids = np.flatnonzero((distances <= radius).any(axis=1))
+        else:
+            hit_ids = np.empty(0, dtype=np.int64)
+        hits.append(hit_ids)
+    matched_pairs = []
+    for first, second in pairs:
+        for a in hits[first]:
+            for b in hits[second]:
+                matched_pairs.append((int(a), int(b)))
+    if matched_pairs:
+        same_pairs = [(a, b) for a, b in matched_pairs
+                      if component_labels[tuple(endpoints_yx[a])] ==
+                      component_labels[tuple(endpoints_yx[b])]]
+        if not same_pairs:
+            category, path_ratio = 'both_flanks_disconnected', None
+        else:
+            path_ratios = []
+            for a, b in same_pairs:
+                distance, _ = endpoint_path_stats(skeleton, endpoints_yx[a], endpoints_yx[b])
+                euclidean = np.linalg.norm(endpoints_yx[a] - endpoints_yx[b])
+                if distance is not None:
+                    path_ratios.append(distance / max(euclidean, 1e-6))
+            path_ratio = max(path_ratios, default=1.)
+            y0, y1, x0, x1 = gap[1]
+            local = skeleton[max(0, y0-radius):min(skeleton.shape[0], y1+radius),
+                             max(0, x0-radius):min(skeleton.shape[1], x1+radius)]
+            padded = np.pad(local.astype(np.uint8), 1)
+            hh, ww = local.shape
+            degree = sum(padded[1+dy:1+dy+hh, 1+dx:1+dx+ww]
+                         for dy, dx in ((-1, 0), (-1, 1), (0, 1), (1, 1),
+                                        (1, 0), (1, -1), (0, -1), (-1, -1)))
+            if np.any(local & (degree >= 3)):
+                category = 'both_flanks_same_component_near_junction'
+            elif path_ratio > 2.0:
+                category = 'both_flanks_same_component_long_route'
+            else:
+                category = 'both_flanks_same_component'
+        return category, [int(value.size) for value in hits], len(matched_pairs), path_ratio
+    flank_count = sum(bool(value.size) for value in hits)
+    if flank_count:
+        return 'endpoint_on_one_or_more_flanks', [int(value.size) for value in hits], 0, None
+    # Distinguish no nearby centerline endpoint from endpoints that miss GT flank matching.
+    local = endpoints_yx[(endpoints_yx[:, 0] >= y0-radius) &
+                         (endpoints_yx[:, 0] < y1+radius) &
+                         (endpoints_yx[:, 1] >= x0-radius) &
+                         (endpoints_yx[:, 1] < x1+radius)] if len(endpoints_yx) else endpoints_yx
+    category = 'endpoint_near_gap_unmatched' if len(local) else 'no_endpoint_near_gap'
+    return category, [int(value.size) for value in hits], 0, None
+
+
+def oracle_proposals(gaps, feature_shape, cfg, skeleton, mask):
+    """Build ideal GT-flank endpoints, then retain only positive local-path labels."""
+    scale = np.asarray(skeleton.shape) / np.asarray(feature_shape)
+    edges, geometry = [], []
+    for _, (y0, y1, x0, x1), _, anchors, pairs, _ in gaps:
+        choices = []
+        for i, j in pairs:
+            ci = anchors[i][1]  # OpenCV (x,y), local to the gap crop
+            cj = anchors[j][1]
+            u = np.asarray([ci[1] + y0, ci[0] + x0], np.float32)
+            v = np.asarray([cj[1] + y0, cj[0] + x0], np.float32)
+            uf = (u + .5) / scale - .5
+            vf = (v + .5) / scale - .5
+            distance = float(np.linalg.norm(vf-uf))
+            if cfg.min_distance <= distance <= cfg.max_distance:
+                choices.append((distance, uf, vf))
+        if choices:
+            _, uf, vf = min(choices, key=lambda item: item[0])
+            edges.append([uf, vf])
+    edge_array = np.asarray(edges, np.float32).reshape(-1, 2, 2)
+    if not len(edge_array):
+        return edge_array, np.empty((0, 8), np.float32)
+    labels, _ = label_edges(skeleton, mask, edge_array, feature_shape, cfg)
+    edge_array = edge_array[labels == 1]
+    rows = []
+    for edge in edge_array:
+        delta = (edge[1] - edge[0])[::-1]
+        distance = float(np.linalg.norm(delta))
+        unit = delta / max(distance, 1e-6)
+        rows.append([distance/cfg.max_distance, 1., 1., -1., unit[0], unit[1], 1., 1.])
+    return edge_array[:cfg.max_edges], np.asarray(rows[:cfg.max_edges], np.float32).reshape(-1, 8)
 
 
 def training_history(path):
@@ -188,9 +319,14 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--reference_threshold', type=float, default=.5)
     parser.add_argument('--gradient_audit', action='store_true')
+    parser.add_argument('--gt_oracle', action='store_true',
+                        help='Run extra GT-proposal forwards through Gap MLP and trained surface writeback')
+    parser.add_argument('--surface_threshold', type=float, default=.45)
     args = parser.parse_args()
     if not 0 < args.reference_threshold < 1:
         parser.error('reference_threshold must be in (0,1)')
+    if not 0 < args.surface_threshold < 1:
+        parser.error('surface_threshold must be in (0,1)')
     if args.output_dir.exists():
         parser.error('Choose a new output_dir')
     model, cfg = load_model(args.model_path, args.device)
@@ -206,10 +342,21 @@ def main():
     no_positive_tiles = candidate_tiles = 0
     first_positive = None
     per_tile = []
+    per_gap = []
+    gap_categories = defaultdict(int)
+    oracle_summary = {'tiles': 0, 'candidates': 0, 'positive_logits': 0,
+                      'closed_gaps': 0, 'baseline_closed_gaps': 0,
+                      'centerline_recovered_fraction_sum': 0., 'baseline_centerline_recovered_fraction_sum': 0.,
+                      'oracle_added_gt_pixels': 0, 'oracle_added_background_pixels': 0,
+                      'feature_delta_l2_sum': 0., 'feature_input_l2_sum': 0.,
+                      'probability_abs_delta_sum': 0., 'probability_pixels': 0}
+    native_writeback = {'tiles': 0, 'gamma': float(model.swin_unet.gap_connection.gamma.detach().cpu()),
+                        'saved_writeback_scale': float(model.swin_unet.gap_connection.writeback_scale.detach().cpu()),
+                        'delta_l2_sum': 0., 'decoder_l2_sum': 0., 'residual_abs_mean_sum': 0.}
     capture = []
 
     def hook(_, inputs, outputs):
-        capture.append(outputs[1])
+        capture.append((inputs, outputs[0], outputs[1]))
 
     handle = model.swin_unet.gap_connection.register_forward_hook(hook)
     try:
@@ -230,7 +377,12 @@ def main():
                         outputs = model(image[:, :, top:top+512, left:left+512])
                         if len(capture) != 1:
                             raise RuntimeError(f'Expected one Gap call, got {len(capture)}')
-                        record = capture[0]
+                        gap_inputs, gap_decoder_out, record = capture[0]
+                        native_delta = gap_decoder_out.detach().float() - gap_inputs[0].detach().float()
+                        native_writeback['tiles'] += 1
+                        native_writeback['delta_l2_sum'] += float(native_delta.norm().cpu())
+                        native_writeback['decoder_l2_sum'] += float(gap_inputs[0].detach().float().norm().cpu())
+                        native_writeback['residual_abs_mean_sum'] += float(record['gap_residual_abs_mean'].cpu())
                         probability = record['p2_logits'][0, 0].sigmoid().cpu().numpy()
                         surface_probability = outputs[0][0, 0].sigmoid().cpu().numpy()
                         gt_mask = mask[top:top+512, left:left+512]
@@ -239,6 +391,18 @@ def main():
                                              (512, 512), interpolation=cv2.INTER_NEAREST)
                         gaps, _ = verified_gaps(gt_skeleton, p2_mask > 0, 2, 20, 3)
                         gap_total += len(gaps)
+                        pred_endpoints, pred_components, pred_skeleton = prediction_endpoints(
+                            surface_probability, args.surface_threshold)
+                        for gap_id, gap in enumerate(gaps):
+                            category, flank_endpoint_counts, matched_pairs, path_ratio = classify_gap(
+                                gap, pred_skeleton, pred_endpoints, pred_components, cfg.gt_snap_radius)
+                            gap_categories[category] += 1
+                            per_gap.append({'image': sample['image_name'], 'top': top, 'left': left,
+                                            'gap_id': gap_id, 'pixels': gap[-1],
+                                            'endpoint_class': category,
+                                            'matched_endpoints_per_flank': json.dumps(flank_endpoint_counts),
+                                            'matched_flank_pairs': matched_pairs,
+                                            'same_component_path_ratio': path_ratio})
                         scale = np.asarray(gt_mask.shape) / np.asarray(probability.shape)
                         high, _ = endpoints(probability, replace(cfg, threshold=.5))
                         high_set = {item[0] for item in high}
@@ -256,7 +420,12 @@ def main():
                                       'dual_05_03': (dual[:cfg.max_endpoints], True),
                                       'surface_512': (surface_points, False)}
                         tile_row = {'image': sample['image_name'], 'top': top, 'left': left,
-                                    'verified_gt_gaps': len(gaps)}
+                                    'verified_gt_gaps': len(gaps),
+                                    'gap_gamma': native_writeback['gamma'],
+                                    'gap_writeback_scale': native_writeback['saved_writeback_scale'],
+                                    'gap_residual_abs_mean': float(record['gap_residual_abs_mean'].cpu()),
+                                    'gap_delta_relative_l2': float(native_delta.norm().cpu()) /
+                                        max(float(gap_inputs[0].detach().float().norm().cpu()), 1e-12)}
                         for mode, (points, is_dual) in point_sets.items():
                             candidate_cfg = surface_cfg if mode == 'surface_512' else cfg
                             candidate_scale = np.ones(2) if mode == 'surface_512' else scale
@@ -283,6 +452,54 @@ def main():
                                         final_negative=int((labels == 0).sum()),
                                         final_ignored=int((labels == -1).sum()))
                         per_tile.append(tile_row)
+                        if args.gt_oracle:
+                            oracle_edges, oracle_geometry = oracle_proposals(
+                                gaps, probability.shape, cfg, gt_skeleton, gt_mask)
+                            if len(oracle_edges):
+                                original_generator = gap_module.generate_candidates
+                                gap_module.generate_candidates = lambda _p, _c: [{
+                                    'edges': oracle_edges, 'geometry': oracle_geometry,
+                                    'endpoint_count': len(oracle_edges)*2,
+                                    'retained_endpoints': len(oracle_edges)*2,
+                                    'eligible_pairs': len(oracle_edges)}]
+                                try:
+                                    capture.clear()
+                                    oracle_outputs = model(image[:, :, top:top+512, left:left+512])
+                                finally:
+                                    gap_module.generate_candidates = original_generator
+                                oracle_inputs, oracle_decoder_out, oracle_record = capture[-1]
+                                oracle_logits = oracle_record['gap_logits'][0].cpu().numpy()
+                                oracle_surface_logits = oracle_outputs[0][0, 0].float().cpu().numpy()
+                                base_surface_logits = outputs[0][0, 0].float().cpu().numpy()
+                                base_mask = surface_probability >= args.surface_threshold
+                                oracle_probability = 1 / (1 + np.exp(-np.clip(oracle_surface_logits, -80, 80)))
+                                oracle_mask = oracle_probability >= args.surface_threshold
+                                baseline_gap_rows = gap_metrics(gaps, base_mask, base_surface_logits,
+                                                                base_surface_logits, 2)
+                                oracle_gap_rows = gap_metrics(gaps, oracle_mask, base_surface_logits,
+                                                              oracle_surface_logits, 2)
+                                oracle_summary['tiles'] += 1
+                                oracle_summary['candidates'] += len(oracle_edges)
+                                oracle_summary['positive_logits'] += int((oracle_logits >= 0).sum())
+                                oracle_summary['closed_gaps'] += sum(r['complete_closure'] for r in oracle_gap_rows)
+                                oracle_summary['baseline_closed_gaps'] += sum(r['complete_closure'] for r in baseline_gap_rows)
+                                oracle_summary['centerline_recovered_fraction_sum'] += sum(
+                                    r['centerline_recovered_fraction'] for r in oracle_gap_rows)
+                                oracle_summary['baseline_centerline_recovered_fraction_sum'] += sum(
+                                    r['centerline_recovered_fraction'] for r in baseline_gap_rows)
+                                oracle_summary['oracle_added_gt_pixels'] += int((oracle_mask & ~base_mask & gt_mask).sum())
+                                oracle_summary['oracle_added_background_pixels'] += int(
+                                    (oracle_mask & ~base_mask & ~gt_mask).sum())
+                                delta = oracle_decoder_out.detach().float() - oracle_inputs[0].detach().float()
+                                oracle_summary['feature_delta_l2_sum'] += float(delta.norm().cpu())
+                                oracle_summary['feature_input_l2_sum'] += float(oracle_inputs[0].detach().float().norm().cpu())
+                                oracle_summary['probability_abs_delta_sum'] += float(
+                                    np.abs(oracle_probability-surface_probability).sum())
+                                oracle_summary['probability_pixels'] += int(oracle_probability.size)
+                                per_tile[-1].update(oracle_candidates=len(oracle_edges),
+                                                    oracle_positive_logits=int((oracle_logits >= 0).sum()),
+                                                    oracle_closed=sum(r['complete_closure'] for r in oracle_gap_rows),
+                                                    baseline_closed=sum(r['complete_closure'] for r in baseline_gap_rows))
                     if args.max_tiles_per_image and tile_index >= args.max_tiles_per_image:
                         break
                 print(f'[GAP-CANDIDATES] {index+1}/{count} images; tiles={candidate_tiles}; GT gaps={gap_total}', flush=True)
@@ -291,6 +508,10 @@ def main():
     with (args.output_dir / 'per_tile.csv').open('w', newline='', encoding='utf-8') as stream:
         writer = csv.DictWriter(stream, fieldnames=per_tile[0].keys())
         writer.writeheader(); writer.writerows(per_tile)
+    if per_gap:
+        with (args.output_dir / 'per_gap.csv').open('w', newline='', encoding='utf-8') as stream:
+            writer = csv.DictWriter(stream, fieldnames=per_gap[0].keys())
+            writer.writeheader(); writer.writerows(per_gap)
     for mode in modes:
         for stage in stage_names:
             slot = totals[mode][stage]
@@ -310,12 +531,30 @@ def main():
                               'negative_logit_quantiles': np.quantile(score[labels == 0], [.1, .5, .9]).tolist()
                               if (labels == 0).any() else None},
                'training_history': training_history(Path(args.model_path).parent / 'local_gap_audit.jsonl'),
+               'gap_endpoint_classification': dict(gap_categories),
+               'native_gap_writeback': dict(native_writeback,
+                   mean_delta_relative_l2=native_writeback['delta_l2_sum'] /
+                       max(native_writeback['decoder_l2_sum'], 1e-12),
+                   mean_residual_abs_mean=native_writeback['residual_abs_mean_sum'] /
+                       max(native_writeback['tiles'], 1)),
+               'surface_threshold_for_endpoint_audit': args.surface_threshold,
                'definition': 'Fixed GT gaps are verified from P2 at the reference threshold. An edge covers a gap '
                              'when its endpoints match opposite GT flanks within gt_snap_radius; this is '
                              'candidate availability, not a successful surface repair. Tiles overlap. '
                              'Surface512 uses the same maximum endpoints and edges, with spatial distances '
                              'and trace length scaled by four.',
                'scope': 'Frozen checkpoint; candidate thresholds are diagnostic only; no test selection'}
+    if args.gt_oracle:
+        oracle_summary['mean_feature_delta_to_input_ratio'] = (
+            oracle_summary['feature_delta_l2_sum'] / max(oracle_summary['feature_input_l2_sum'], 1e-12))
+        oracle_summary['mean_probability_abs_delta'] = (
+            oracle_summary['probability_abs_delta_sum'] / max(oracle_summary['probability_pixels'], 1))
+        oracle_summary['oracle_logit_positive_fraction'] = (
+            oracle_summary['positive_logits'] / max(oracle_summary['candidates'], 1))
+        oracle_summary['scope'] = ('GT supplies geometrically positive local connections as proposals; they still pass '
+                                   'the trained Gap MLP and learned Surface writeback. This is an optimistic '
+                                   'diagnostic and uses overlapping tiles.')
+        summary['gt_oracle'] = oracle_summary
     if args.gradient_audit:
         with torch.enable_grad():
             location = first_positive or (0, 0, 0)
