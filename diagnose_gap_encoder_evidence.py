@@ -6,7 +6,7 @@ candidate scorers on frozen path features and reports validation ranking and
 coverage. It never updates either backbone or selects a test threshold.
 
 Run from the local-gap diagnostics checkout. --probe_repo must point to the
-checkout that contains the 1af9580 H0 encoder-exchange probe_experiment.py.
+exact a4001b3 E2-direction code checkout; the heads must match its checkpoint.
 """
 from __future__ import annotations
 
@@ -37,10 +37,9 @@ from local_gap_config import LocalGapConfig
 from losses.gap_losses import label_edges, proposal_gap_coverage
 from mass_protocol import sliding_positions
 from evaluation.road_comparison.road_metrics import skeletonize
-from extra_h0_probes import EXTRA_NAMES, ExtraFeatureTap, load_extra_heads
 
 
-PROBE_NAMES = ("E2", "H_E2", "H_E3")
+PROBE_NAMES = ("E2", "H_E2", "H_E3", "E1", "H0", "F1")
 FEATURE_LAYOUT = {"F2": 96, "H_E2": 64, "H_E3": 64,
                   "E1": 96, "H0": 64, "F1": 192}
 FEATURE_DIMS = tuple(FEATURE_LAYOUT.values())
@@ -71,15 +70,16 @@ def write_csv(path: Path, rows):
 
 
 def load_probe_stack(probe_repo: Path, backbone_path: Path, probes_path: Path, device):
-    """Load the encoder checkpoint in an isolated module namespace after H0 Gap is built."""
+    """Load the strict a400 encoder checkpoint after the 39e Gap model is built."""
     probe_repo = probe_repo.resolve()
-    if not (probe_repo / "probe_experiment.py").is_file():
-        raise FileNotFoundError(f"probe_experiment.py missing under --probe_repo {probe_repo}")
+    if not (probe_repo / "h0_e2_config.py").is_file():
+        raise FileNotFoundError(f"a4001b3 code missing under --probe_repo {probe_repo}")
     # Both source trees use top-level packages named networks/config/datasets.
     # The already-created Gap model retains its module objects; clear import
     # cache entries before importing the second, encoder-exchange source tree.
     for name in list(sys.modules):
-        if (name == "probe_experiment" or name == "h0_encoder_protocol" or
+        if (name == "a400_probe_experiment" or name == "h0_e2_config" or
+                name == "h0_encoder_protocol" or
                 name == "networks" or name.startswith("networks.") or
                 name == "config" or name.startswith("config.") or
                 name == "datasets" or name.startswith("datasets.") or
@@ -87,7 +87,7 @@ def load_probe_stack(probe_repo: Path, backbone_path: Path, probes_path: Path, d
             sys.modules.pop(name, None)
     sys.path.insert(0, str(probe_repo))
     try:
-        exp = importlib.import_module("probe_experiment")
+        exp = importlib.import_module("a400_probe_experiment")
         backbone = exp.load_backbone(str(backbone_path), device)
         backbone_hash = exp.file_sha256(backbone_path)
         heads, payload = exp.load_heads(probes_path, backbone_hash, device)
@@ -303,11 +303,10 @@ def make_feature_tap_gap(model):
     return captured, handles
 
 
-def extract_probe_probabilities(exp, heads, extra_heads, features, size=(128, 128)):
+def extract_probe_probabilities(exp, heads, features, size=(128, 128)):
     output = {}
-    for name in (*PROBE_NAMES, *EXTRA_NAMES):
-        head = heads[name] if name in PROBE_NAMES else extra_heads[name]
-        logits = exp.probe_logits(head, features[name])
+    for name in PROBE_NAMES:
+        logits = exp.probe_logits(heads[name], features[name])
         probability = logits.sigmoid()
         probability = F.interpolate(probability, size=size, mode="bilinear", align_corners=False)
         output[name] = probability[0, 0].float().cpu().numpy()
@@ -342,7 +341,7 @@ def tile_iter(dataset, split, max_images, seed):
                    "top": top, "left": left, "tile_index": tile_index}
 
 
-def process_tile(tile, gap_model, encoder_tap, heads, extra_heads, exp, capture, cfg,
+def process_tile(tile, gap_model, encoder_tap, heads, exp, capture, cfg,
                  candidate_pool, candidate_budget, evidence_threshold, device):
     image = tile["image"].to(device)
     capture.clear()
@@ -353,7 +352,7 @@ def process_tile(tile, gap_model, encoder_tap, heads, extra_heads, exp, capture,
         p2 = capture["p2"][0, 0].float().sigmoid().cpu().numpy()
         f2 = to_numpy_feature(capture["f2"])
         features, _ = encoder_tap(image)
-        probe_probs = extract_probe_probabilities(exp, heads, extra_heads, features)
+        probe_probs = extract_probe_probabilities(exp, heads, features)
     feature_maps = {"F2": f2, **{name: to_numpy_feature(features[name])
                                  for name in FEATURE_LAYOUT if name != "F2"}}
     variants = {"P0_P2_only": generate_candidates([p2], cfg)[0]}
@@ -480,10 +479,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root_path", required=True)
     parser.add_argument("--gap_model_path", required=True, help="39e1398 local-gap checkpoint")
-    parser.add_argument("--probe_repo", required=True, help="checkout with probe_experiment.py")
-    parser.add_argument("--probe_model_path", required=True, help="1af9580 encoder-exchange checkpoint")
-    parser.add_argument("--probe_head_path", required=True, help="matching probe_best.pth")
-    parser.add_argument("--extra_probe_head_path", required=True, help="matching trained E1/H0/F1 extra_probe_best.pth")
+    parser.add_argument("--probe_repo", required=True, help="checkout of a4001b3 source")
+    parser.add_argument("--probe_model_path", required=True, help="a4001b3 E2-direction checkpoint")
+    parser.add_argument("--probe_head_path", required=True, help="matching ten-probe probe_best.pth")
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max_val_images", type=int, default=0)
@@ -506,20 +504,17 @@ def main():
     gap_capture, hooks = make_feature_tap_gap(gap_model)
     dataset = RoadSkeletonDataset(args.root_path, split="val", image_size=None,
                                   source_patch_size=1500, return_full_image=True)
-    # Import and construct the second (1af) model only after the 39e model has
+    # Import and construct the second (a400) model only after the 39e model has
     # been created; this preserves both implementations in one process.
     exp, probe_model, heads, probe_tap, probe_payload = load_probe_stack(
         Path(args.probe_repo), Path(args.probe_model_path), Path(args.probe_head_path), device)
-    extra_heads, extra_payload = load_extra_heads(
-        Path(args.extra_probe_head_path), probe_payload["backbone_sha256"], device)
-    probe_tap = ExtraFeatureTap(probe_tap)
-    probe_model.eval(); heads.eval(); extra_heads.eval()
+    probe_model.eval(); heads.eval()
     args.output_dir.mkdir(parents=True)
     val_records, val_rows, val_totals = [], [], {}
     try:
         with torch.inference_mode():
             for record_index, tile in enumerate(tile_iter(dataset, "val", args.max_val_images, args.seed), 1):
-                record = process_tile(tile, gap_model, probe_tap, heads, extra_heads, exp, gap_capture, cfg,
+                record = process_tile(tile, gap_model, probe_tap, heads, exp, gap_capture, cfg,
                                       args.candidate_pool, args.candidate_budget,
                                       args.evidence_threshold, device)
                 rows, totals = proposal_rows(record, cfg, args.candidate_budget)
@@ -542,7 +537,7 @@ def main():
             train_records = []
             with torch.inference_mode():
                 for record_index, tile in enumerate(tile_iter(train_dataset, "train", args.max_train_images, args.seed), 1):
-                    record = process_tile(tile, gap_model, probe_tap, heads, extra_heads, exp, gap_capture, cfg,
+                    record = process_tile(tile, gap_model, probe_tap, heads, exp, gap_capture, cfg,
                                           args.candidate_pool, args.candidate_budget,
                                           args.evidence_threshold, device)
                     train_records.append(record)
@@ -562,9 +557,7 @@ def main():
             "gap_checkpoint": str(Path(args.gap_model_path).resolve()),
             "probe_backbone": str(Path(args.probe_model_path).resolve()),
             "probe_heads": str(Path(args.probe_head_path).resolve()),
-            "extra_probe_heads": str(Path(args.extra_probe_head_path).resolve()),
             "probe_backbone_sha256": probe_payload.get("backbone_sha256"),
-            "extra_probe_best_epochs": extra_payload.get("best_epoch"),
             "candidate_protocol": {"p2_threshold": cfg.threshold,
                                    "evidence_threshold": args.evidence_threshold,
                                    "gap_config": cfg.to_dict(),
@@ -573,7 +566,7 @@ def main():
                                    "gt_labeler": "existing losses.gap_losses.label_edges",
                                    "overlap_tiles": "512x512 stride256; tile-level counts include overlap duplicates"},
             "validation1": val_summary,
-            "interpretation": "P2 is from 39e1398. E2/H_E probes and H features are from the separate 1af9580 encoder checkpoint; this tests external probe evidence for candidate discovery, not an internal 39e encoder path.",
+            "interpretation": "P2 is from 39e1398. E/H/F probe evidence is from the separate a4001b3 E2-direction checkpoint; this tests external evidence for candidate discovery, not an internal 39e encoder path or a causal direction-aggregation ablation.",
             "false_candidate_note": "no_local_path_negatives are the existing GT labeler's proxy for unsupported straight joins; they are not a dedicated parallel-road confusion classifier.",
         })
         print(json.dumps(val_summary, indent=2), flush=True)

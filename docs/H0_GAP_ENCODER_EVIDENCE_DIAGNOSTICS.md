@@ -1,52 +1,43 @@
-# H0 gap candidate and encoder evidence diagnostics
+# a4001b3 E2-direction encoder evidence in local-gap candidate discovery
 
-This diagnostic is based on the `codex/h0-local-gap-mass1500` implementation
-and reuses its candidate GT labeler. It does not modify either checkpoint or
-run surface writeback.
+This is a paired diagnostic, not another full-model training run. The P2
+candidate generator and F2 feature belong to the `39e1398` local-gap model.
+`a4001b3` does not have that P2 gap-candidate head, so the diagnostic reads
+the a400 E/H/F features from its separate checkpoint. The E2 direction
+aggregation is active in that checkpoint. The two backbones remain frozen.
 
-## What it compares
+The old `1af9580` seven-probe checkpoint must not be used: it was trained
+against different encoder weights and its architecture does not contain the
+E2 direction aggregator. `a400_probe_experiment.py` strictly loads the a400
+checkpoint and trains ten independent 1x1 road heads on that same frozen
+backbone: E1, E2, E3, H0, H_E2, H_E3, F1, F2, F3, and surface_prehead.
+Each head is selected by fixed-center validation-crop IoU; test is not used
+for head training or diagnostic selection.
 
-Validation 1 compares a P2-only baseline with P2 endpoints augmented by
-endpoints extracted from frozen E2, H_E2, H_E3, E1, H0, and F1 road probes.
-E1 is the encoder stage-1 output at 128x128. H0 is the adapted prepatch
-high-resolution structure state before E/H exchange at 128x128. F1 is the output of decoder
-`layers_up[1]` after its 1/16 skip and upsampling to 64x64. P2 endpoints
-remain first-priority anchors. Probe maps are resized to P2 resolution and
-used to add endpoint proposals and rank the line evidence; probabilities are
-not summed. Every result is capped at the same candidate budget (default 64).
-GT labels are applied only after candidates are generated, using the existing
-`losses.gap_losses.label_edges` and `proposal_gap_coverage` functions.
+E1 is the 128x128 encoder stage-1 output. H0 is the adapted `z_struct` before
+E/H exchange, also 128x128. F1 is decoder `layers_up[1]` output after its
+1/16 skip and upsampling to 64x64. There is no separate
+`enable_e128_stage_fusion` branch in a400; ordinary 128x128 E1 still exists.
 
-Validation 2 forms one coordinate-deduplicated union candidate pool per tile.
-It trains six identical-capacity MLP scorers on frozen path-pooled features:
-R0 uses F2, R1 uses F2+H_E2, R2 uses F2+H_E2+H_E3, and R3/R4/R5 use
-F2+E1, F2+H0, and F2+F1 respectively. All scorers
-see the same candidates, labels, train crops, and validation tiles; excluded
-feature blocks are zeroed. The head predicts candidate validity only; it does
-not write corrections back to the surface.
+Validation 1 compares P2 alone against P2 augmented by a400 E2, H_E2,
+H_E3, E1, H0, and F1 road-probe evidence. P2 endpoints remain first-priority
+anchors. Evidence proposes additional endpoints and ranks straight candidate
+paths; probabilities are not simply summed. The same per-tile candidate
+budget (default 64) and existing GT labeler apply to every variant.
 
-The 39e1398 checkpoint does not contain H_E2/H_E3. Therefore P2/F2 come from
-the 39e1398 Gap checkpoint, while E1/E2/H0/H_E2/H_E3/F1 maps come from the
-separate 1af9580 encoder-exchange checkpoint and its matching frozen probe heads. This
-is an external-evidence diagnostic, not evidence that the 39e1398 model has
-an internal encoder-to-decoder path. The output records these checkpoint
-sources explicitly.
+Validation 2 builds one coordinate-deduplicated candidate union per tile and
+trains six identical-capacity MLP scorers on frozen path features: R0=F2,
+R1=F2+H_E2, R2=F2+H_E2+H_E3, R3=F2+E1, R4=F2+H0, and R5=F2+F1.
+All scorers see the same candidates, labels, training crops, and validation
+tiles; excluded feature blocks are set to zero. No score is written back to
+the surface. Candidate coverage and edge AP are diagnostic measurements,
+not a measured segmentation improvement.
 
-Both the original H0/local-gap path and the 1af9580 encoder-exchange path use
-`z_struct` from the prepatch high-resolution structure encoder. H0 is its
-adapted feature before the first E/H exchange in the 1af9580 path. The
-1af9580 model also has the ordinary 128x128 E1 encoder feature. It does not
-have the separately named `enable_e128_stage_fusion` experiment switch.
+## Server commands
 
-The existing seven-probe checkpoint is kept intact. `extra_h0_probes.py`
-trains only three additional 1x1 road heads, E1/H0/F1, with the encoder
-backbone frozen. Its checkpoint records and checks the encoder checkpoint
-SHA-256. Adding three proposal sources expands the shared candidate union;
-all R variants see identical candidates. R0/R1/R2 retain their feature
-definitions, but their results cannot be compared numerically with an older
-run whose union candidate pool had only P0–P4.
-
-## Server command
+Use the exact a400 checkout and the checkpoint from the 80-epoch run. Set
+`GAP_CKPT` to the `39e1398` local-gap checkpoint already used for P2. The
+separate ten-probe heads are trained once on a400 before diagnosis.
 
 ```bash
 cd /home/gjj/SwinNet-h0-gap-encoder-probe-diagnostics
@@ -54,62 +45,39 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate swinunet
 
 DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
-GAP_CKPT=/home/gjj/SwinNet-h0-local-gap/model_out/<39e1398_run>/best.pth
-PROBE_REPO=/home/gjj/SwinNet-h0-probe7-9432ac1
-PROBE_CKPT=/home/gjj/SwinNet-road-skeleton/model_out/<1af9580_run>/best.pth
-PROBE_HEADS=/home/gjj/SwinNet-h0-probe7-9432ac1/model_out/<probe_run>/probe_best.pth
-OUT=/home/gjj/SwinNet-h0-local-gap/diagnostics/encoder_evidence_$(date +%Y%m%d_%H%M%S)
-EXTRA_RUN=/home/gjj/SwinNet-h0-local-gap/diagnostics/extra_probes_$(date +%Y%m%d_%H%M%S)
+A400_REPO=/home/gjj/SwinNet-h0-e2-direction-a4001b3
+A400_CKPT=/home/gjj/SwinNet-roadbias/model_out/mass_h0_e2dir_no_decoder_d_fp32_s1234_20261022_233816/best.pth
+GAP_CKPT=/path/to/39e1398-local-gap-run/best.pth
+PROBE_RUN=/home/gjj/SwinNet-roadbias/model_out/a400_probe10_$(date +%Y%m%d_%H%M%S)
 
 CUDA_VISIBLE_DEVICES=2 OPENCV_LOG_LEVEL=ERROR \
-python -u extra_h0_probes.py \
-  --probe_repo "$PROBE_REPO" \
-  --probe_model_path "$PROBE_CKPT" \
-  --probe_head_path "$PROBE_HEADS" \
-  --root_path "$DATA" \
-  --output_dir "$EXTRA_RUN" \
-  --device cuda:0 \
-  --max_train_images 256 \
-  --max_epochs 15 \
-  --batch_size 2 \
-  --seed 1234
-EXTRA_HEADS="$EXTRA_RUN/extra_probe_best.pth"
+python -u a400_probe_experiment.py train \
+  --probe_repo "$A400_REPO" \
+  --root_path "$DATA" --model_path "$A400_CKPT" \
+  --run_dir "$PROBE_RUN" --seed 1234 \
+  --max_epochs 15 --max_train_images 256 \
+  --batch_size 2 --num_workers 4
 
+OUT=/home/gjj/SwinNet-roadbias/model_out/a400_gap_encoder_evidence_$(date +%Y%m%d_%H%M%S)
 CUDA_VISIBLE_DEVICES=2 OPENCV_LOG_LEVEL=ERROR \
 python -u diagnose_gap_encoder_evidence.py \
-  --root_path "$DATA" \
-  --gap_model_path "$GAP_CKPT" \
-  --probe_repo "$PROBE_REPO" \
-  --probe_model_path "$PROBE_CKPT" \
-  --probe_head_path "$PROBE_HEADS" \
-  --extra_probe_head_path "$EXTRA_HEADS" \
-  --output_dir "$OUT" \
-  --device cuda:0 \
-  --candidate_pool 256 \
-  --candidate_budget 64 \
-  --evidence_threshold 0.45 \
-  --max_train_images 256 \
-  --head_epochs 15 \
-  --seed 1234
+  --root_path "$DATA" --gap_model_path "$GAP_CKPT" \
+  --probe_repo "$A400_REPO" --probe_model_path "$A400_CKPT" \
+  --probe_head_path "$PROBE_RUN/probe_best.pth" \
+  --output_dir "$OUT" --device cuda:0 \
+  --candidate_pool 256 --candidate_budget 64 \
+  --evidence_threshold 0.45 --max_train_images 256 \
+  --head_epochs 15 --seed 1234
 ```
 
-The validation pass uses the complete validation split with 512 crops at
-stride 256, matching the existing 350-tile candidate audit when that split
-contains 14 images. The head-training pass takes one deterministic random
-512 crop from each of up to 256 training images. No test images are read.
+The validation pass uses native 1500 images and overlapping 512 tiles at
+stride 256. The head-training pass uses one deterministic random 512 crop
+from up to 256 training images. Outputs include `validation1_per_tile.csv`,
+`validation2_head_training.json`, and `summary.json`.
 
-Outputs:
-
-- `validation1_per_tile.csv`: per-source candidate count, GT-positive and
-  negative edges, verified gap coverage, and gap recall at the fixed budget.
-- `extra_probe_best.pth` and `training_history.json` under `$EXTRA_RUN`: the
-  three additional probe heads and their fixed-center-crop validation scores.
-- `validation2_head_training.json`: R0–R5 validation edge AP and gap recall
-  after ranking the same candidate pool, plus training loss history.
-- `summary.json`: checkpoint sources and frozen candidate/label protocol.
-
-`gap_recall` is computed over overlapping validation tiles, so the same native
-gap may appear in multiple tiles. Compare every variant on these exact same
-tiles; do not interpret the tile count as a unique native-gap count.
-`no_local_path_negatives` is a useful proxy for unsupported straight joins,
-but it is not a dedicated classifier for parallel-road confusions.
+`gap_recall` counts overlapping validation tiles, so a native gap may appear
+in more than one tile. Compare variants only on the same run and candidate
+budget. The changed common pool also means R0/R1/R2 cannot be compared
+numerically with an older P0–P4-only run. This protocol does not isolate
+the effect of direction aggregation itself; that requires same-checkpoint
+forward ablations with the aggregator on and off.
