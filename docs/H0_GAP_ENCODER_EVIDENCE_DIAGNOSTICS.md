@@ -32,6 +32,8 @@ All scorers see the same candidates, labels, training crops, and validation
 tiles; excluded feature blocks are set to zero. No score is written back to
 the surface. Candidate coverage and edge AP are diagnostic measurements,
 not a measured segmentation improvement.
+Tiles with no candidates keep a `(0, feature_dim)` descriptor matrix and
+still contribute their verified-gap count with zero covered gaps.
 
 ## Server commands
 

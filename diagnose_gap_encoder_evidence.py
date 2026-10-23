@@ -373,7 +373,7 @@ def process_tile(tile, gap_model, encoder_tap, heads, exp, capture, cfg,
         variants[name] = {"edges": proposal["edges"][:candidate_budget],
                           "geometry": proposal["geometry"][:candidate_budget]}
     # The common pool for validation 2 is the coordinate-deduplicated union of
-    # all candidates. The three scorers receive exactly the same examples.
+    # all candidates. Every scorer receives exactly the same examples.
     union = {}
     candidate_sets = [variants["P0_P2_only"], *[expanded[name] for name in evidence_sets]]
     max_count = max((len(candidate_set["edges"]) for candidate_set in candidate_sets), default=0)
@@ -394,7 +394,7 @@ def process_tile(tile, gap_model, encoder_tap, heads, exp, capture, cfg,
     union_edges = np.asarray([item[0] for item in union_items], np.float32).reshape(-1, 2, 2)
     union_geometry = np.asarray([item[1] for item in union_items], np.float32).reshape(-1, 8)
     descriptors = np.asarray([build_edge_features(feature_maps, edge, geom, p2.shape)
-                              for edge, geom in zip(union_edges, union_geometry)], np.float32)
+                              for edge, geom in zip(union_edges, union_geometry)], np.float32).reshape(-1, FEATURE_DIM)
     labels, reasons = label_edges(tile["skeleton"], tile["mask"], union_edges, p2.shape, cfg)
     compact_tile = {key: value for key, value in tile.items() if key != "image"}
     return {"tile": compact_tile, "p2": p2,
@@ -432,11 +432,18 @@ def proposal_rows(record, cfg, candidate_budget):
 
 def score_validation_heads(train_records, val_records, cfg, device, seed, epochs, candidate_budget):
     variants = tuple(SCORER_FEATURES)
-    train_x = np.concatenate([record["descriptors"] for record in train_records if len(record["descriptors"])])
-    train_y = np.concatenate([record["union_labels"] for record in train_records if len(record["union_labels"])])
+    nonempty_train = [record for record in train_records if len(record["descriptors"])]
+    if not nonempty_train:
+        raise RuntimeError("No training candidates were generated; candidate scorers cannot be trained")
+    train_x = np.concatenate([record["descriptors"] for record in nonempty_train])
+    train_y = np.concatenate([record["union_labels"] for record in nonempty_train])
+    if train_x.shape != (len(train_y), FEATURE_DIM):
+        raise RuntimeError(f"Training candidate feature shape mismatch: {train_x.shape}, {train_y.shape}")
     # Standardize once from the training partition only; this preserves a
     # fair, identical feature scale across all scorers.
     valid = train_y >= 0
+    if not valid.any():
+        raise RuntimeError("All training candidates have ambiguous GT labels")
     mean = train_x[valid].mean(0)
     std = train_x[valid].std(0).clip(1e-4)
     results, history_all = {}, {}
@@ -450,6 +457,8 @@ def score_validation_heads(train_records, val_records, cfg, device, seed, epochs
         with torch.no_grad():
             for record in val_records:
                 raw = record["descriptors"]
+                if raw.shape != (len(record["union_labels"]), FEATURE_DIM):
+                    raise RuntimeError(f"Validation candidate feature shape mismatch: {raw.shape}")
                 xval = enabled_input((raw - mean) / std, variant)
                 logits = model(torch.as_tensor(xval, device=device)).cpu().numpy() if len(xval) else np.zeros(0)
                 order = np.argsort(-logits, kind="stable")[:candidate_budget]
