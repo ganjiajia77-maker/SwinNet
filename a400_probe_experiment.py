@@ -50,6 +50,7 @@ CFG = ROOT / 'configs' / 'swin_tiny_patch4_window7_224_lite.yaml'
 PROTOCOL_VERSION = 'h0-a400-ten-road-probes-v1'
 PROBES = ('E1', 'E2', 'E3', 'H0', 'H_E2', 'H_E3', 'F1', 'F2', 'F3', 'surface_prehead')
 ALL_NAMES = (*PROBES, 'original_surface')
+SEVEN_PROBES = ('E2', 'E3', 'H_E2', 'H_E3', 'F2', 'F3', 'surface_prehead')
 SIZE, NATIVE, STRIDE = 512, 1500, 256
 THRESHOLDS = tuple(round(i / 100, 2) for i in range(5, 100, 5))
 
@@ -579,112 +580,386 @@ def test(args, tap, heads, probe_payload, backbone_hash, device):
 
 
 def pixel_diagnostic(args, tap, heads, probe_payload, backbone_hash, device):
-    """Score E1 and H0 independently on one fixed baseline-missed skeleton set."""
+    """Pair E1/H0 on current-checkpoint baseline and seven-probe missed pixels."""
     selected_path = args.run_dir / 'val_selection.json'
     if not selected_path.is_file():
         raise FileNotFoundError('Run sweep first: val_selection.json is missing')
     selection = json.loads(selected_path.read_text(encoding='utf-8'))
     if (selection.get('protocol_version') != PROTOCOL_VERSION
             or selection.get('selected_on') != 'val'
+            or selection.get('criterion') != 'global_iou'
             or selection.get('backbone_sha256') != backbone_hash):
-        raise ValueError('Validation selection belongs to another checkpoint')
+        raise ValueError('Validation selection belongs to another protocol or checkpoint')
     if set(selection['models']) != set(ALL_NAMES):
         raise ValueError('Validation selection is incomplete')
+    if (selection.get('tile_size') != SIZE or selection.get('stride') != STRIDE
+            or selection.get('merge') != 'weighted logits then sigmoid'):
+        raise ValueError('Validation selection uses a different native-image protocol')
+    if probe_payload.get('backbone_sha256') != backbone_hash:
+        raise ValueError('Probe heads belong to another backbone')
+    thresholds = {name: float(selection['models'][name]['threshold']) for name in ALL_NAMES}
+    if any(not 0.0 < value < 1.0 for value in thresholds.values()):
+        raise ValueError('Invalid validation-selected threshold')
+    if args.expected_missed_pixels is not None:
+        print('[WARN] --expected_missed_pixels is deprecated and ignored: '
+              '55,865 belongs to the earlier 1af9580 seven-probe checkpoint.', flush=True)
 
-    baseline_threshold = float(selection['models']['original_surface']['threshold'])
+    def rate(numerator, denominator):
+        return numerator / denominator if denominator else None
+
+    def mask_hash(mask):
+        packed = np.packbits(np.asarray(mask, dtype=np.uint8).ravel(), bitorder='little')
+        return hashlib.sha256(
+            np.asarray(mask.shape, dtype='<i8').tobytes() + packed.tobytes()
+        ).hexdigest()
+
+    def coordinates_hash(indices):
+        return hashlib.sha256(
+            np.asarray(indices, dtype='<i8').tobytes()
+        ).hexdigest()
+
+    def score_stats(scores, prefix):
+        return {
+            f'{prefix}_prob_mean': float(scores.mean()) if scores.size else None,
+            f'{prefix}_prob_p25': float(np.quantile(scores, .25)) if scores.size else None,
+            f'{prefix}_prob_p50': float(np.quantile(scores, .50)) if scores.size else None,
+            f'{prefix}_prob_p75': float(np.quantile(scores, .75)) if scores.size else None,
+        }
+
+    def ast_function_hash(path, function_name):
+        if not path.is_file():
+            return None
+        import ast
+        module = ast.parse(path.read_text(encoding='utf-8'))
+        matches = [node for node in module.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name == function_name]
+        if len(matches) != 1:
+            return None
+        return hashlib.sha256(
+            ast.dump(matches[0], include_attributes=False).encode('utf-8')
+        ).hexdigest()
+
+    def ast_method_hash(path, class_name, method_name):
+        if not path.is_file():
+            return None
+        import ast
+        module = ast.parse(path.read_text(encoding='utf-8'))
+        classes = [node for node in module.body
+                   if isinstance(node, ast.ClassDef) and node.name == class_name]
+        if len(classes) != 1:
+            return None
+        methods = [node for node in classes[0].body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name == method_name]
+        if len(methods) != 1:
+            return None
+        return hashlib.sha256(
+            ast.dump(methods[0], include_attributes=False).encode('utf-8')
+        ).hexdigest()
+
+    from evaluation.road_comparison import road_metrics as metrics_module
+    skeletonize = metrics_module.skeletonize
     names = ('E1', 'H0')
-    stats = {
-        name: {'missed': 0, 'detected': 0, 'miss_sum': 0.0,
-               'miss_scores': [], 'covered': 0, 'covered_sum': 0.0,
-               'background': 0, 'background_predicted': 0}
-        for name in names
+    set_names = ('baseline_missed', 'seven_probe_all_missed')
+    accum = {
+        set_name: {'pixels': 0, 'e1': 0, 'h0': 0, 'both': 0,
+                   'only_e1': 0, 'only_h0': 0, 'neither': 0,
+                   'scores': {name: [] for name in names}}
+        for set_name in set_names
     }
-    rows = []
-    image_count = 0
-    from evaluation.road_comparison.road_metrics import skeletonize
+    background_pixels = 0
+    background_predicted = {name: 0 for name in names}
+    rows, image_checks, ordered_names = [], [], []
+    seen_names = set()
     for case, rgb, target in native_cases(args.root_path, 'test'):
+        if case in seen_names:
+            raise ValueError(f'Duplicate test image stem: {case}')
+        seen_names.add(case)
+        ordered_names.append(case)
         probabilities = native_probabilities(tap, heads, rgb, device)
+        if set(probabilities) != set(ALL_NAMES):
+            raise RuntimeError(f'Missing native probability maps for {case}')
+        if any(probability.shape != target.shape or not np.isfinite(probability).all()
+               for probability in probabilities.values()):
+            raise RuntimeError(f'Unaligned or non-finite native probability map for {case}')
         skeleton = skeletonize(target)
-        baseline_missed = skeleton & (probabilities['original_surface'] < baseline_threshold)
-        covered_skeleton = skeleton & ~baseline_missed
-        missing_count = int(baseline_missed.sum())
+        if skeleton.shape != target.shape or np.any(skeleton & ~target):
+            raise RuntimeError(f'GT skeleton is not aligned with the road mask for {case}')
+        baseline_missed = skeleton & (probabilities['original_surface'] < thresholds['original_surface'])
+        seven_probe_all_missed = baseline_missed.copy()
+        seven_missed_on_baseline = {}
+        for name in SEVEN_PROBES:
+            missed_by_probe = probabilities[name] < thresholds[name]
+            seven_probe_all_missed &= missed_by_probe
+            seven_missed_on_baseline[name] = int((baseline_missed & missed_by_probe).sum())
+        if np.any(seven_probe_all_missed & ~baseline_missed):
+            raise RuntimeError(f'Seven-probe set escaped baseline-missed mask for {case}')
         background = ~target
+        background_count = int(background.sum())
+        background_pixels += background_count
+        image_background = {}
         for name in names:
-            threshold = float(selection['models'][name]['threshold'])
-            probability = probabilities[name]
-            missed_scores = probability[baseline_missed].astype(np.float64, copy=False)
-            covered_scores = probability[covered_skeleton]
-            detected = int((missed_scores >= threshold).sum())
-            background_predicted = int(((probability >= threshold) & background).sum())
-            background_count = int(background.sum())
-            slot = stats[name]
-            slot['missed'] += missing_count
-            slot['detected'] += detected
-            slot['miss_sum'] += float(missed_scores.sum())
-            slot['miss_scores'].append(missed_scores.astype(np.float32, copy=False))
-            slot['covered'] += int(covered_skeleton.sum())
-            slot['covered_sum'] += float(covered_scores.sum())
-            slot['background'] += background_count
-            slot['background_predicted'] += background_predicted
+            count = int(((probabilities[name] >= thresholds[name]) & background).sum())
+            background_predicted[name] += count
+            image_background[name] = count
+        masks = {'baseline_missed': baseline_missed,
+                 'seven_probe_all_missed': seven_probe_all_missed}
+        checks = {
+            'image': case,
+            'native_shape': list(target.shape),
+            'gt_road_mask_sha256': mask_hash(target),
+            'gt_skeleton_mask_sha256': mask_hash(skeleton),
+            'baseline_missed_pixels': int(baseline_missed.sum()),
+            'seven_probe_all_missed_pixels': int(seven_probe_all_missed.sum()),
+            'seven_probe_all_missed_subset_of_baseline': True,
+            'seven_probe_missed_pixels_within_baseline': seven_missed_on_baseline,
+            'all_probability_maps_aligned_to_native_gt': True,
+        }
+        for set_name, mask in masks.items():
+            indices = np.flatnonzero(mask)
+            n = int(indices.size)
+            coordinate_hash = coordinates_hash(indices)
+            checks[f'{set_name}_coordinate_sha256'] = coordinate_hash
+            checks[f'{set_name}_mask_sha256'] = mask_hash(mask)
+            e1_scores = probabilities['E1'].ravel()[indices].astype(np.float64, copy=False)
+            h0_scores = probabilities['H0'].ravel()[indices].astype(np.float64, copy=False)
+            e1_hits = e1_scores >= thresholds['E1']
+            h0_hits = h0_scores >= thresholds['H0']
+            counts = {
+                'e1': int(e1_hits.sum()),
+                'h0': int(h0_hits.sum()),
+                'both': int((e1_hits & h0_hits).sum()),
+                'only_e1': int((e1_hits & ~h0_hits).sum()),
+                'only_h0': int((~e1_hits & h0_hits).sum()),
+                'neither': int((~e1_hits & ~h0_hits).sum()),
+            }
+            if (counts['both'] + counts['only_e1'] + counts['only_h0']
+                    + counts['neither'] != n
+                    or counts['e1'] != counts['both'] + counts['only_e1']
+                    or counts['h0'] != counts['both'] + counts['only_h0']):
+                raise RuntimeError(f'Paired pixel partition failed for {case}, {set_name}')
+            slot = accum[set_name]
+            slot['pixels'] += n
+            for key, value in counts.items():
+                slot[key] += value
+            slot['scores']['E1'].append(e1_scores.astype(np.float32, copy=False))
+            slot['scores']['H0'].append(h0_scores.astype(np.float32, copy=False))
             rows.append({
-                'image': case,
-                'probe': name,
-                'probe_threshold_selected_on_val': threshold,
-                'fixed_baseline_missed_gt_skeleton_pixels': missing_count,
-                'missed_pixels_predicted_road': detected,
-                'missed_pixel_recall': detected / missing_count if missing_count else None,
-                'mean_probe_probability_on_missed_pixels': float(missed_scores.mean()) if missed_scores.size else None,
-                'covered_gt_skeleton_pixels': int(covered_skeleton.sum()),
-                'mean_probe_probability_on_covered_gt_skeleton': float(covered_scores.mean()) if covered_scores.size else None,
+                'image': case, 'pixel_set': set_name, 'pixels': n,
+                'pixel_coordinate_sha256': coordinate_hash,
+                'e1_h0_used_identical_pixel_coordinates': True,
+                'e1_threshold_selected_on_val': thresholds['E1'],
+                'h0_threshold_selected_on_val': thresholds['H0'],
+                **{f'{key}_pixels': value for key, value in counts.items()},
+                **{f'{key}_fraction': rate(value, n) for key, value in counts.items()},
+                **score_stats(e1_scores, 'e1'),
+                **score_stats(h0_scores, 'h0'),
                 'gt_background_pixels': background_count,
-                'gt_background_predicted_road': background_predicted,
-                'gt_background_false_positive_rate': background_predicted / background_count if background_count else None,
+                'e1_gt_background_predicted_road': image_background['E1'],
+                'h0_gt_background_predicted_road': image_background['H0'],
+                'e1_gt_background_false_positive_rate': rate(image_background['E1'], background_count),
+                'h0_gt_background_false_positive_rate': rate(image_background['H0'], background_count),
             })
-        image_count += 1
-        print(f'Pixel diagnostic {image_count}: {case}', flush=True)
+        image_checks.append(checks)
+        print(f'Pixel diagnostic {len(ordered_names)}: {case} | '
+              f'baseline={checks["baseline_missed_pixels"]} '
+              f'seven_all_missed={checks["seven_probe_all_missed_pixels"]}', flush=True)
+    if not ordered_names:
+        raise RuntimeError('No test images found')
 
-    expected = args.expected_missed_pixels
-    total_missed = stats['E1']['missed']
-    if stats['H0']['missed'] != total_missed:
-        raise RuntimeError('E1 and H0 were not evaluated on the same missed-pixel set')
-    for name in names:
-        slot = stats[name]
-        scores_on_misses = np.concatenate(slot['miss_scores']) if slot['miss_scores'] else np.empty(0, np.float32)
-        missed_count = int(slot['missed'])
-        rows.append({
-            'image': '__micro_total__',
-            'probe': name,
-            'probe_threshold_selected_on_val': float(selection['models'][name]['threshold']),
-            'fixed_baseline_missed_gt_skeleton_pixels': missed_count,
-            'expected_missed_pixel_count': expected,
-            'matches_expected_missed_pixel_count': missed_count == expected,
-            'missed_pixels_predicted_road': int(slot['detected']),
-            'missed_pixel_recall': slot['detected'] / missed_count if missed_count else None,
-            'mean_probe_probability_on_missed_pixels': slot['miss_sum'] / missed_count if missed_count else None,
-            'missed_probability_p25': float(np.quantile(scores_on_misses, .25)) if scores_on_misses.size else None,
-            'missed_probability_p50': float(np.quantile(scores_on_misses, .50)) if scores_on_misses.size else None,
-            'missed_probability_p75': float(np.quantile(scores_on_misses, .75)) if scores_on_misses.size else None,
-            'covered_gt_skeleton_pixels': int(slot['covered']),
-            'mean_probe_probability_on_covered_gt_skeleton': slot['covered_sum'] / slot['covered'] if slot['covered'] else None,
-            'gt_background_pixels': int(slot['background']),
-            'gt_background_predicted_road': int(slot['background_predicted']),
-            'gt_background_false_positive_rate': slot['background_predicted'] / slot['background'] if slot['background'] else None,
-        })
-    write_csv(args.run_dir / 'test_e1_h0_missed_pixel_diagnostics.csv', rows)
-    write_json(args.run_dir / 'test_missed_pixel_set.json', {
-        'split': 'test', 'images': image_count,
-        'baseline_probe': 'original_surface',
-        'baseline_threshold_selected_on_val': baseline_threshold,
-        'fixed_missed_set': 'Zhang-Suen skeletonize(GT road) AND baseline original_surface probability below the validation-selected baseline threshold',
-        'expected_pixels': expected, 'observed_pixels': total_missed,
-        'matches_expected_count': total_missed == expected,
-        'per_probe_thresholds_selected_on_val': {name: selection['models'][name]['threshold'] for name in names},
-        'probe_checkpoint': str(args.run_dir / 'probe_best.pth'),
-        'backbone': str(args.model_path), 'backbone_sha256': backbone_hash,
-        'probe_best_epoch': {name: probe_payload['best_epoch'].get(name) for name in names},
-        'interpretation': 'E1 and H0 are measured separately on exactly the same baseline-missed GT skeleton pixels; threshold hit rate is reported alongside score quantiles and a separate GT-background false-positive rate.'
-    })
-    print((args.run_dir / 'test_e1_h0_missed_pixel_diagnostics.csv').read_text(encoding='utf-8'), flush=True)
+    summaries = {}
+    for set_name in set_names:
+        slot = accum[set_name]
+        n = slot['pixels']
+        e1_scores = np.concatenate(slot['scores']['E1'])
+        h0_scores = np.concatenate(slot['scores']['H0'])
+        summary = {
+            'pixels': n,
+            **{f'{key}_pixels': slot[key] for key in
+               ('e1', 'h0', 'both', 'only_e1', 'only_h0', 'neither')},
+            **{f'{key}_fraction': rate(slot[key], n) for key in
+               ('e1', 'h0', 'both', 'only_e1', 'only_h0', 'neither')},
+            **score_stats(e1_scores, 'e1'),
+            **score_stats(h0_scores, 'h0'),
+            'gt_background_pixels': background_pixels,
+            'e1_gt_background_predicted_road': background_predicted['E1'],
+            'h0_gt_background_predicted_road': background_predicted['H0'],
+            'e1_gt_background_false_positive_rate': rate(background_predicted['E1'], background_pixels),
+            'h0_gt_background_false_positive_rate': rate(background_predicted['H0'], background_pixels),
+        }
+        summaries[set_name] = summary
+        rows.append({'image': '__micro_total__', 'pixel_set': set_name,
+                     'e1_threshold_selected_on_val': thresholds['E1'],
+                     'h0_threshold_selected_on_val': thresholds['H0'], **summary})
+    if summaries['seven_probe_all_missed']['pixels'] > summaries['baseline_missed']['pixels']:
+        raise RuntimeError('Seven-probe missed count exceeds baseline missed count')
+    output_csv = args.run_dir / 'test_e1_h0_missed_pixel_diagnostics.csv'
+    write_csv(output_csv, rows)
+
+    old_run = args.historical_seven_probe_run
+    old_selection_path = old_run / 'val_selection.json' if old_run else None
+    old_selection = (json.loads(old_selection_path.read_text(encoding='utf-8'))
+                     if old_selection_path and old_selection_path.is_file() else None)
+    old_backbone_path = args.historical_backbone_path
+    old_backbone_sha = (file_sha256(old_backbone_path)
+                        if old_backbone_path and old_backbone_path.is_file() else None)
+    old_selection_sha = old_selection.get('backbone_sha256') if old_selection else None
+    old_prediction_dir = (old_run / 'test_predictions' / 'original_surface' / 'surface'
+                          if old_run else None)
+    old_image_names = (sorted(path.stem.removesuffix('_pred') for path in
+                              old_prediction_dir.glob('*_pred.png'))
+                       if old_prediction_dir and old_prediction_dir.is_dir() else None)
+    old_repo = args.historical_seven_probe_repo
+    current_script = Path(__file__).resolve()
+    current_metrics = Path(metrics_module.__file__).resolve()
+    current_dataset = args.probe_repo / 'datasets' / 'dataset_road_skeleton.py'
+    current_protocol = args.probe_repo / 'h0_encoder_protocol.py'
+    old_script = old_repo / 'probe_experiment.py' if old_repo else None
+    old_metrics = old_repo / 'evaluation' / 'road_comparison' / 'road_metrics.py' if old_repo else None
+    old_dataset = old_repo / 'datasets' / 'dataset_road_skeleton.py' if old_repo else None
+    old_protocol = old_repo / 'h0_encoder_protocol.py' if old_repo else None
+    source_checks = {
+        'native_case_reader_same_ast': (
+            ast_function_hash(current_script, 'native_cases')
+            == ast_function_hash(old_script, 'native_cases')
+            if old_script and old_script.is_file() else None),
+        'native_stitcher_same_ast': (
+            ast_function_hash(current_script, 'native_probabilities')
+            == ast_function_hash(old_script, 'native_probabilities')
+            if old_script and old_script.is_file() else None),
+        'gt_skeleton_source_same_sha256': (
+            file_sha256(current_metrics) == file_sha256(old_metrics)
+            if old_metrics and old_metrics.is_file() else None),
+        'gt_skeleton_function_same_ast': (
+            ast_function_hash(current_metrics, 'skeletonize')
+            == ast_function_hash(old_metrics, 'skeletonize')
+            if old_metrics and old_metrics.is_file() else None),
+        'dataset_source_same_sha256': (
+            file_sha256(current_dataset) == file_sha256(old_dataset)
+            if old_dataset and old_dataset.is_file() else None),
+        'native_center_crop_or_pad_same_ast': (
+            ast_method_hash(current_dataset, 'RoadSkeletonDataset', '_center_crop_or_pad')
+            == ast_method_hash(old_dataset, 'RoadSkeletonDataset', '_center_crop_or_pad')
+            if old_dataset and old_dataset.is_file() else None),
+        'native_label_lookup_same_ast': (
+            ast_method_hash(current_dataset, 'RoadSkeletonDataset', '_find_label_name')
+            == ast_method_hash(old_dataset, 'RoadSkeletonDataset', '_find_label_name')
+            if old_dataset and old_dataset.is_file() else None),
+        'blend_weight_same_ast': (
+            ast_function_hash(current_protocol, 'blend_weight')
+            == ast_function_hash(old_protocol, 'blend_weight')
+            if old_protocol and old_protocol.is_file() else None),
+        'sliding_positions_same_ast': (
+            ast_function_hash(current_protocol, 'sliding_positions')
+            == ast_function_hash(old_protocol, 'sliding_positions')
+            if old_protocol and old_protocol.is_file() else None),
+    }
+    old_threshold = (float(old_selection['models']['original_surface']['threshold'])
+                     if old_selection and 'original_surface' in old_selection.get('models', {})
+                     else 0.5)
+    count_delta = summaries['baseline_missed']['pixels'] - 99885
+    count_explanation = (
+        'The earlier 99,885 baseline-missed pixels and 55,865 seven-probe-all-missed '
+        'pixels came from the 1af9580 backbone and its seven probe heads. The current '
+        'a400 backbone and ten probe heads use a different checkpoint. '
+        'The current baseline count differs by ' + str(count_delta) + ' pixels. '
+        + (f'The original_surface threshold also differs from the historical {old_threshold:.2f}.'
+           if thresholds['original_surface'] != old_threshold else
+           f'The original_surface threshold matches the historical {old_threshold:.2f}. '
+           'Different model weights or architecture can change which skeleton '
+           'pixels fall below that threshold. The exact per-pixel cause cannot '
+           'be partitioned without paired old probability maps.')
+    )
+    report = {
+        'schema': 2,
+        'split': 'test',
+        'definitions': {
+            'baseline_missed': 'Zhang-Suen skeleton(GT road) AND current original_surface probability < its validation-selected threshold',
+            'seven_probe_all_missed': 'baseline_missed AND E2, E3, H_E2, H_E3, F2, F3, surface_prehead probabilities each below their own validation-selected threshold',
+            'recognized': 'probe probability >= its own validation-selected threshold',
+            'background_false_positive_rate': 'predicted road pixels over all GT background pixels; independent of which missed set is evaluated',
+        },
+        'current_provenance': {
+            'architecture_id': MODEL_NAME,
+            'expected_source_commit': 'a4001b3dada8006b35fec5d119ea8a382a2134c7',
+            'probe_source_path': str(args.probe_repo),
+            'probe_source_config_sha256': file_sha256(args.probe_repo / 'h0_e2_config.py'),
+            'backbone_path': str(args.model_path),
+            'backbone_sha256': backbone_hash,
+            'probe_checkpoint': str(args.run_dir / 'probe_best.pth'),
+            'probe_checkpoint_sha256': file_sha256(args.run_dir / 'probe_best.pth'),
+            'probe_checkpoint_backbone_sha256': probe_payload['backbone_sha256'],
+            'validation_selection_path': str(selected_path),
+            'validation_selection_sha256': file_sha256(selected_path),
+            'thresholds_selected_on_val': thresholds,
+            'validation_criterion': selection['criterion'],
+            'ordered_test_images': ordered_names,
+            'ordered_test_images_sha256': hashlib.sha256(
+                json.dumps(ordered_names, ensure_ascii=False).encode('utf-8')
+            ).hexdigest(),
+            'test_images': len(ordered_names),
+            'gt_road_threshold': 'grayscale > 127',
+            'gt_skeleton': 'evaluation.road_comparison.road_metrics.skeletonize; NumPy Zhang-Suen with zero padding',
+            'gt_skeleton_source_sha256': file_sha256(current_metrics),
+            'native_size': NATIVE,
+            'tile_size': SIZE,
+            'stride': STRIDE,
+            'tile_merge': 'weighted logits then sigmoid',
+            'blend_weight': 'outer product of 1 - abs(linspace(-1,1,512)), clamped at 0.1',
+        },
+        'historical_seven_probe_comparison': {
+            'source_backbone_commit': '1af958056f5953f0eb6edbffcdb9f1a9db77ba63',
+            'historical_selection_protocol_version': (
+                old_selection.get('protocol_version') if old_selection else None),
+            'historical_selection_criterion': (
+                old_selection.get('criterion') if old_selection else None),
+            'historical_backbone_path': str(old_backbone_path) if old_backbone_path else None,
+            'historical_backbone_sha256': old_backbone_sha,
+            'historical_selection_backbone_sha256': old_selection_sha,
+            'historical_backbone_file_matches_its_selection': (
+                old_backbone_sha == old_selection_sha
+                if old_backbone_sha and old_selection_sha else None),
+            'same_backbone_sha256_as_current': (
+                old_selection_sha == backbone_hash
+                if old_selection_sha else
+                (old_backbone_sha == backbone_hash if old_backbone_sha else None)),
+            'historical_test_images': 49,
+            'current_test_image_count_matches_historical': len(ordered_names) == 49,
+            'historical_baseline_missed_pixels': 99885,
+            'historical_seven_probe_all_missed_pixels': 55865,
+            'historical_surface_threshold': old_threshold,
+            'current_surface_threshold_matches_historical': thresholds['original_surface'] == old_threshold,
+            'historical_test_prediction_images_available': old_image_names is not None,
+            'same_ordered_test_image_names_as_historical_predictions': (
+                old_image_names == ordered_names
+                if old_image_names is not None else None),
+            'historical_image_order_hash_available': False,
+            'historical_gt_skeleton_coordinate_hashes_available': False,
+            'image_order_rule': 'Both scripts iterate sorted RoadSkeletonDataset.image_files',
+            'source_checks': source_checks,
+            'current_baseline_minus_historical_baseline_pixels': count_delta,
+            'count_difference_explanation': count_explanation,
+            'historical_55865_is_not_an_expected_current_count': True,
+        },
+        'coordinate_checks': {
+            'all_probability_maps_match_native_gt_shape': True,
+            'all_seven_probe_all_missed_pixels_are_within_baseline_missed': True,
+            'e1_and_h0_use_the_same_flat_pixel_indices_for_each_set': True,
+            'pixel_index_order': 'row-major within each native 1500x1500 image',
+            'per_image_mask_and_coordinate_hashes': image_checks,
+        },
+        'summary': summaries,
+        'per_image_csv': str(output_csv),
+        'interpretation_limit': 'Frozen one-layer probe detections indicate readable evidence at fixed validation thresholds; they do not prove that the original decoder could use it or that changing the model would improve connectivity.',
+    }
+    output_json = args.run_dir / 'test_missed_pixel_set.json'
+    write_json(output_json, report)
+    print(json.dumps({'current_baseline_missed': summaries['baseline_missed']['pixels'],
+                      'current_seven_probe_all_missed': summaries['seven_probe_all_missed']['pixels'],
+                      'seven_all_missed_e1': summaries['seven_probe_all_missed']['e1_pixels'],
+                      'seven_all_missed_h0': summaries['seven_probe_all_missed']['h0_pixels'],
+                      'report': str(output_json)}, ensure_ascii=False), flush=True)
 
 
 def main():
@@ -701,8 +976,14 @@ def main():
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--expected_missed_pixels', type=int, default=55865,
-                        help='expected fixed baseline-missed GT skeleton pixel count; reported as a match check, not a hard assertion')
+    parser.add_argument('--historical_seven_probe_run', type=Path,
+                        help='optional 1af9580 seven-probe run for validation-selection and test-image audit')
+    parser.add_argument('--historical_backbone_path', type=Path,
+                        help='optional 1af9580 best.pth for exact SHA256 comparison')
+    parser.add_argument('--historical_seven_probe_repo', type=Path,
+                        help='optional 9432ac1 seven-probe source checkout for protocol source comparison')
+    parser.add_argument('--expected_missed_pixels', type=int, default=None,
+                        help='deprecated and ignored; historical 55,865 is from another checkpoint')
     args = parser.parse_args()
     if args.max_epochs < 1 or args.patience < 1 or args.batch_size < 1 or args.num_workers < 0:
         parser.error('Epochs, patience, and batch size must be positive; workers nonnegative')

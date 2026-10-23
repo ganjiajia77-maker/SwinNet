@@ -77,38 +77,55 @@ stride 256. The head-training pass uses one deterministic random 512 crop
 from up to 256 training images. Outputs include `validation1_per_tile.csv`,
 `validation2_head_training.json`, and `summary.json`.
 
-## Independent E1/H0 pixel recognition on the same missed set
+## Paired E1/H0 pixel recognition on two missed sets
 
-After the ten probe heads have been trained and `sweep` has written
-`val_selection.json`, `pixel_diagnostic` evaluates E1 and H0 separately on
-the exact same native-test pixels:
+The previous `expected_pixels=55865` check was incorrect. The 55,865 pixels
+were the seven-probe-all-missed subset in the **1af9580** experiment, whose
+baseline Surface missed 99,885 GT skeleton pixels. The a400 run reported
+99,702 baseline-missed pixels. It has a different trained backbone and probe
+heads, so its seven-probe-all-missed set must be rebuilt on that checkpoint.
+
+`pixel_diagnostic` constructs both sets on the same native test image and
+pixel grid:
 
 ```text
-Zhang-Suen skeleton(GT road) AND
-original_surface probability < original_surface threshold selected on val
+baseline_missed = Zhang-Suen skeleton(GT road)
+                  AND original_surface probability < its val-selected threshold
+seven_probe_all_missed = baseline_missed
+                         AND E2, E3, H_E2, H_E3, F2, F3, surface_prehead
+                             each below its own val-selected threshold
 ```
 
-The report checks whether this set contains the expected 55,865 pixels. It
-uses each probe's own validation-selected threshold to report its hit count
-and recall on that shared set, plus continuous score quantiles, probability
-on already-covered GT skeleton, and a separate false-positive rate over GT
-background. It does not save prediction masks and does not choose thresholds
-on test. If the observed pixel count is not 55,865, inspect the recorded
-baseline threshold, split, and code/checkpoint provenance before comparing
-with earlier results.
+For each set, E1 and H0 use the **same pixel indices**. The report includes
+each head's recognition fraction, both/only-E1/only-H0/neither fractions,
+probability quartiles, and independent GT-background false-positive rates.
+It writes image-level rows and micro totals to
+`test_e1_h0_missed_pixel_diagnostics.csv`. `test_missed_pixel_set.json`
+records all thresholds, current checkpoint SHA256, ordered image names and
+their hash, per-image GT/skeleton/set hashes, subset and partition checks,
+historical protocol comparisons, and both set summaries. No training or
+test-set threshold selection occurs; prediction masks are not exported.
 
 ```bash
+OLD_REPO=/home/gjj/SwinNet-h0-probe7-9432ac1
+OLD_RUN=$(cat "$OLD_REPO/probe7_run_dir.txt")
+OLD_BACKBONE=/home/gjj/SwinNet-roadbias/model_out/mass_h0_encoder_s1234_20261022_000647/best.pth
+
 CUDA_VISIBLE_DEVICES=2 OPENCV_LOG_LEVEL=ERROR \
 python -u a400_probe_experiment.py pixel_diagnostic \
   --probe_repo "$A400_REPO" \
   --root_path "$DATA" --model_path "$A400_CKPT" \
-  --run_dir "$PROBE_RUN" --expected_missed_pixels 55865
+  --run_dir "$PROBE_RUN" \
+  --historical_seven_probe_repo "$OLD_REPO" \
+  --historical_seven_probe_run "$OLD_RUN" \
+  --historical_backbone_path "$OLD_BACKBONE"
 ```
 
-This writes `test_e1_h0_missed_pixel_diagnostics.csv` (per-image rows and
-micro totals) and `test_missed_pixel_set.json` into the existing probe run
-directory. E1/H0 are independent probe outputs; their probabilities are not
-combined.
+The three historical arguments are optional. If old outputs are unavailable,
+the JSON marks their exact SHA and image-list comparisons as unknown. The
+source code comparison still documents the shared sorted image order,
+Zhang-Suen skeletonization, and 512/256 weighted-logit stitching protocol.
+The old 55,865 count is historical context, never an expected a400 count.
 
 `gap_recall` counts overlapping validation tiles, so a native gap may appear
 in more than one tile. Compare variants only on the same run and candidate
