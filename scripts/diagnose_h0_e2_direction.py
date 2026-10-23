@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 import torch
 from torch.nn import functional as F
+from scipy.stats import rankdata
 
 from config import get_config
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
@@ -192,12 +193,144 @@ def gradient_audit(model, image, road, skeleton, direction_cfg):
             return {'valid_direction_pixels': int(valid),
                     'surface_loss': float(surface.detach()), 'direction_loss': float(d_loss.detach()),
                     'surface_e2_grad_norm': float(a_norm), 'weighted_D_e2_grad_norm': float(b_norm),
-                    'weighted_D_to_surface_grad_ratio': float(b_norm / a_norm.clamp_min(1e-12)),
+                    'weighted_D_to_surface_grad_ratio': float(b_norm / a_norm)
+                    if a_norm > 0 else None,
                     'gradient_cosine': float(F.cosine_similarity(a[None], b[None]))
                     if a_norm > 0 and b_norm > 0 else None}
     finally:
         hook.remove()
         feature_box.clear()
+
+
+def run_variant(model, image, mode, seed):
+    """Forward A/B/C/D while changing only E2's diagnostic-time aggregation."""
+    module = model.swin_unet.e2_direction
+    captured = []
+    original_forward = module.forward
+
+    def diagnostic_forward(feature):
+        raw = module.direction_head(feature)
+        gate = module.gate_head(feature).sigmoid()
+        weights = module.radius_head(feature).softmax(1)
+        sampled_raw = raw
+        if mode == 'D':
+            generator = torch.Generator(device='cpu').manual_seed(seed)
+            permutation = torch.randperm(raw.shape[-2] * raw.shape[-1], generator=generator).to(raw.device)
+            sampled_raw = raw.flatten(2)[:, :, permutation].view_as(raw)
+        tangent = module.tangent(sampled_raw)
+        message, valid = module.aggregate(feature, tangent, weights)
+        projected = module.projection(message)
+        effective_gate = torch.ones_like(gate) if mode == 'C' else gate
+        delta = module.gamma * effective_gate * projected * valid.to(feature.dtype)
+        if mode == 'B':
+            delta = torch.zeros_like(delta)
+        updated = feature + delta
+        captured.append({'feature': feature.detach(), 'updated': updated.detach(),
+                         'delta': delta.detach(), 'raw': raw.detach(), 'gate': gate.detach(),
+                         'direction_used': sampled_raw.detach()})
+        return updated, raw
+
+    try:
+        if mode == 'A':
+            def capture(_module, inputs, output):
+                feature, updated = inputs[0], output[0]
+                q = _module.gate_head(feature).sigmoid()
+                captured.append({'feature': feature.detach(), 'updated': updated.detach(),
+                    'delta': (updated - feature).detach(), 'raw': output[1].detach(),
+                    'gate': q.detach(), 'direction_used': output[1].detach()})
+            hook = module.register_forward_hook(capture)
+            try:
+                outputs = model(image)
+            finally:
+                hook.remove()
+        else:
+            module.forward = diagnostic_forward
+            try:
+                outputs = model(image)
+            finally:
+                module.forward = original_forward
+    finally:
+        module.forward = original_forward
+    if len(captured) != 1:
+        raise RuntimeError(f'E2 diagnostic forward {mode} called {len(captured)} times')
+    return outputs[0].float(), captured[0]
+
+
+def feature_pair_scores(before, after, road, skeleton, probability, seed):
+    """Sample local GT-defined continuous/gap/near-but-disconnected E2 pairs."""
+    h, w = before.shape[-2:]
+    road64 = F.adaptive_avg_pool2d(road, (h, w))[0, 0].detach().cpu().numpy()
+    skeleton64 = F.adaptive_max_pool2d(skeleton, (h, w))[0, 0].detach().cpu().numpy() > .5
+    probability64 = F.adaptive_avg_pool2d(probability, (h, w))[0, 0].detach().cpu().numpy()
+    # Thin the downsampled centerline, then label local 8-connected strands.
+    skeleton64 = road_metrics.skeletonize(skeleton64)
+    n_components, component = cv2.connectedComponents(skeleton64.astype(np.uint8), connectivity=8)
+    points = np.argwhere(skeleton64)
+    if len(points) < 2:
+        return {}
+    if len(points) > 384:
+        choose = np.linspace(0, len(points) - 1, 384, dtype=int)
+        points = points[choose]
+    from scipy.spatial import cKDTree
+    candidate_pairs = sorted(cKDTree(points).query_pairs(r=8.0))
+    if not candidate_pairs:
+        return {}
+    # GT support near the straight segment distinguishes a real low-response gap from
+    # an arbitrary chord through background.
+    support = cv2.dilate((road64 >= .10).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    before_grid = F.normalize(before[0].float(), dim=0, eps=1e-8).permute(1, 2, 0).detach().cpu().numpy()
+    after_grid = F.normalize(after[0].float(), dim=0, eps=1e-8).permute(1, 2, 0).detach().cpu().numpy()
+    rng = np.random.default_rng(seed)
+    rng.shuffle(candidate_pairs)
+    grouped = {'continuous': [], 'difficult_gap': [], 'near_disconnected': []}
+    for ia, ib in candidate_pairs:
+        y1, x1 = map(int, points[ia]); y2, x2 = map(int, points[ib])
+        distance = float(np.hypot(y2 - y1, x2 - x1))
+        if distance < 2.0 or distance > 8.0:
+            continue
+        samples = np.linspace(0.0, 1.0, max(5, int(distance * 2) + 1))
+        line_y = np.rint(y1 + samples * (y2 - y1)).astype(int).clip(0, h - 1)
+        line_x = np.rint(x1 + samples * (x2 - x1)).astype(int).clip(0, w - 1)
+        supported = float(support[line_y, line_x].mean()) >= .75
+        same_component = component[y1, x1] == component[y2, x2]
+        category = None
+        if same_component and supported and distance <= 5.0:
+            category = 'continuous'
+        elif (same_component and supported and distance >= 3.0
+              and probability64[y1, x1] >= .5 and probability64[y2, x2] >= .5
+              and float(probability64[line_y, line_x].mean()) < .35):
+            category = 'difficult_gap'
+        elif not same_component and distance <= 6.0:
+            category = 'near_disconnected'
+        if category is None:
+            continue
+        grouped[category].append((ia, ib, y1, x1, y2, x2))
+    result = {}
+    for category, pairs in grouped.items():
+        if len(pairs) > 256:
+            pairs = [pairs[i] for i in np.linspace(0, len(pairs) - 1, 256, dtype=int)]
+        scores_before, scores_after = [], []
+        for _, _, y1, x1, y2, x2 in pairs:
+            scores_before.append(float(np.dot(before_grid[y1, x1], before_grid[y2, x2])))
+            scores_after.append(float(np.dot(after_grid[y1, x1], after_grid[y2, x2])))
+        result[category] = {'count': len(pairs),
+            'cosine_before_mean': float(np.mean(scores_before)) if pairs else None,
+            'cosine_after_mean': float(np.mean(scores_after)) if pairs else None,
+            'cosine_delta_mean': float(np.mean(np.asarray(scores_after) - np.asarray(scores_before)))
+                if pairs else None,
+            'positive_cosine_fraction_before': float(np.mean(np.asarray(scores_before) > .5)) if pairs else None,
+            'positive_cosine_fraction_after': float(np.mean(np.asarray(scores_after) > .5)) if pairs else None,
+            '_scores_before': scores_before, '_scores_after': scores_after}
+    return result
+
+
+def auc_from_scores(positive, negative):
+    if not positive or not negative:
+        return None
+    scores = np.asarray(positive + negative, dtype=np.float64)
+    ranks = rankdata(scores, method='average')
+    n_pos, n_neg = len(positive), len(negative)
+    return float((ranks[:n_pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
 def diagnose(args):
@@ -213,7 +346,9 @@ def diagnose(args):
     if not images:
         raise ValueError('No images to diagnose')
     args.output_dir.mkdir(parents=True)
-    for name in ('direction_on', 'direction_off'):
+    modes = {'A': 'predicted_D_predicted_q', 'B': 'aggregation_off',
+             'C': 'predicted_D_q_fixed_one', 'D': 'spatially_shuffled_D'}
+    for name in modes:
         (args.output_dir / name).mkdir()
     model_hash = hashlib.sha256()
     with args.checkpoint.open('rb') as handle:
@@ -223,15 +358,20 @@ def diagnose(args):
     angle_sum = angle_weight = direction_valid = relative_sum = 0.0
     n_windows = 0
     q_hist = {'road': np.zeros(10, np.int64), 'background': np.zeros(10, np.int64)}
-    rows = {'direction_on': [], 'direction_off': []}
+    rows = {name: [] for name in modes}
     paired = []
     gradients = []
+    pair_scores = {category: {'before': [], 'after': []} for category in
+                   ('continuous', 'difficult_gap', 'near_disconnected')}
     weight = blend_weight(TILE_SIZE, device)
     gradient_image_indices = set(np.linspace(
         0, len(images) - 1, min(args.gradient_samples, len(images)), dtype=int).tolist()
     ) if args.gradient_samples else set()
     window_rows = sliding_positions(SOURCE_SIZE, TILE_SIZE, STRIDE)
     gradient_position = (window_rows[len(window_rows) // 2], window_rows[len(window_rows) // 2])
+    feature_image_indices = set(np.linspace(
+        0, len(images) - 1, min(args.feature_images, len(images)), dtype=int).tolist()
+    ) if args.feature_images else set()
     direction_cfg = {key: saved[key] for key in ('pca_radius', 'min_support', 'road_radius',
                                                  'min_coherence', 'lambda_encoder_direction')}
     for index, image_name in enumerate(images, 1):
@@ -239,30 +379,23 @@ def diagnose(args):
         prepared = road_metrics.prepare_target(gt, {**road_metrics.DEFAULT_PROTOCOL,
             'image_size': SOURCE_SIZE})
         canvases = {name: torch.zeros((1, 1, SOURCE_SIZE, SOURCE_SIZE), device=device)
-                    for name in rows}
-        divisor = torch.zeros_like(canvases['direction_on'])
+                    for name in modes}
+        divisor = torch.zeros_like(canvases['A'])
         for top in sliding_positions(SOURCE_SIZE, TILE_SIZE, STRIDE):
             for left in sliding_positions(SOURCE_SIZE, TILE_SIZE, STRIDE):
                 crop = native_image[:, :, top:top + TILE_SIZE, left:left + TILE_SIZE].to(device)
                 road = torch.from_numpy(gt[top:top + TILE_SIZE, left:left + TILE_SIZE].copy()).to(device)[None, None].float()
                 skel = torch.from_numpy(skeleton[top:top + TILE_SIZE, left:left + TILE_SIZE].copy()).to(device)[None, None].float()
-                captured = []
-
-                def capture(_module, inputs, output):
-                    feature, updated = inputs[0], output[0]
-                    captured.append((feature, updated, output[1]))
-
-                hook = module.register_forward_hook(capture)
-                try:
+                logits, captures = {}, {}
+                seed_base = int.from_bytes(hashlib.sha256(
+                    f'{Path(image_name).stem}:{top}:{left}'.encode()).digest()[:4], 'little')
+                for mode in modes:
                     with torch.no_grad():
-                        on = model(crop)[0].float()
-                finally:
-                    hook.remove()
-                if len(captured) != 1:
-                    raise RuntimeError('E2 aggregation was not called exactly once')
-                feature, updated, raw = captured.pop()
+                        logits[mode], captures[mode] = run_variant(model, crop, mode, seed_base)
+                capture = captures['A']
+                feature, updated, raw = capture['feature'], capture['updated'], capture['raw']
+                q = capture['gate']
                 with torch.no_grad():
-                    q = module.gate_head(feature).sigmoid()
                     road_cells = F.adaptive_avg_pool2d(road, q.shape[-2:]) >= .5
                     delta = (updated - feature).abs().mean(1, keepdim=True)
                     stats['q_road'].add(q[road_cells])
@@ -279,6 +412,13 @@ def diagnose(args):
                     angle_sum += float((angle * direction_weight).sum())
                     angle_weight += float(direction_weight.sum())
                     direction_valid += int((direction_weight > 0).sum())
+                    if (index - 1 in feature_image_indices
+                            and (top, left) == gradient_position):
+                        pair_result = feature_pair_scores(
+                            feature, updated, road, skel, torch.sigmoid(logits['A']), seed_base)
+                        for category, values in pair_result.items():
+                            pair_scores[category]['before'].extend(values.pop('_scores_before'))
+                            pair_scores[category]['after'].extend(values.pop('_scores_after'))
                     del feature, updated, raw, q, delta, target, direction_weight
                 n_windows += 1
                 if index - 1 in gradient_image_indices and (top, left) == gradient_position:
@@ -286,18 +426,11 @@ def diagnose(args):
                     if audit['valid_direction_pixels']:
                         audit.update(image=image_name, top=top, left=left)
                         gradients.append(audit)
-                # Forward hook replaces only E2's updated feature; all parameters stay unchanged.
-                off_hook = module.register_forward_hook(lambda _module, inputs, output: (inputs[0], output[1]))
-                try:
-                    with torch.no_grad():
-                        off = model(crop)[0].float()
-                finally:
-                    off_hook.remove()
                 region = (slice(None), slice(None), slice(top, top + TILE_SIZE), slice(left, left + TILE_SIZE))
-                canvases['direction_on'][region] += on * weight
-                canvases['direction_off'][region] += off * weight
+                for mode in modes:
+                    canvases[mode][region] += logits[mode] * weight
                 divisor[region] += weight
-                del crop, road, skel, on, off
+                del crop, road, skel, logits, captures
         if bool((divisor <= 0).any()):
             raise RuntimeError('Uncovered native pixels')
         probabilities = {name: (canvas / divisor).sigmoid()[0, 0].cpu().numpy()
@@ -311,21 +444,28 @@ def diagnose(args):
                 'image_size': SOURCE_SIZE})
             row['case_id'] = Path(image_name).stem
             rows[name].append(row)
-        on, off = binary['direction_on'], binary['direction_off']
-        onprob, offprob = probabilities['direction_on'], probabilities['direction_off']
-        missing = skeleton & ~on
-        paired.append({'case_id': Path(image_name).stem,
-            'probability_abs_change_mean': float(np.abs(onprob - offprob).mean()),
-            'probability_abs_change_on_on_missed_GT_skeleton': float(np.abs(onprob - offprob)[missing].mean())
-                if missing.any() else None,
-            'mask_flip_fraction': float(np.mean(on != off)),
-            'GT_road_added_by_direction': int((on & ~off & gt).sum()),
-            'background_added_by_direction': int((on & ~off & ~gt).sum()),
-            'GT_road_removed_by_direction': int((off & ~on & gt).sum()),
-            'background_removed_by_direction': int((off & ~on & ~gt).sum()),
-            'missed_GT_skeleton_after_direction': int(missing.sum()),
-            'missed_GT_skeleton_recovered_by_direction': int((skeleton & on & ~off).sum())})
-        print(f'[{index}/{len(images)}] {image_name} paired native {SOURCE_SIZE} done', flush=True)
+        row = {'case_id': Path(image_name).stem}
+        for mode in ('B', 'C', 'D'):
+            reference, variant = binary['A'], binary[mode]
+            ref_prob, var_prob = probabilities['A'], probabilities[mode]
+            tag = f'A_vs_{mode}'
+            miss = skeleton & ~reference
+            row.update({
+                f'{tag}_probability_abs_change_mean': float(np.abs(ref_prob - var_prob).mean()),
+                f'{tag}_prob_change_on_A_missed_GT_skeleton':
+                    float(np.abs(ref_prob - var_prob)[miss].mean()) if miss.any() else None,
+                f'{tag}_mask_flip_fraction': float(np.mean(reference != variant)),
+                f'{tag}_GT_road_added': int((variant & ~reference & gt).sum()),
+                f'{tag}_background_added': int((variant & ~reference & ~gt).sum()),
+                f'{tag}_GT_road_removed': int((reference & ~variant & gt).sum()),
+                f'{tag}_background_removed': int((reference & ~variant & ~gt).sum()),
+            })
+        row['A_missed_GT_skeleton'] = int((skeleton & ~binary['A']).sum())
+        row['A_GT_skeleton_pixels_recovered_by_B'] = int((skeleton & binary['B'] & ~binary['A']).sum())
+        row['A_GT_skeleton_pixels_recovered_by_C'] = int((skeleton & binary['C'] & ~binary['A']).sum())
+        row['A_GT_skeleton_pixels_recovered_by_D'] = int((skeleton & binary['D'] & ~binary['A']).sum())
+        paired.append(row)
+        print(f'[{index}/{len(images)}] {image_name} A/B/C/D native {SOURCE_SIZE} done', flush=True)
     summary = {name: road_metrics.summarize(items) for name, items in rows.items()}
     keys = ('iou', 'f1', 'cldice', 'break_rate', 'short_pred_components',
             'fragment_density_per_1000_px', 'apls_gt_to_pred_approx',
@@ -355,16 +495,48 @@ def diagnose(args):
                    'direction_weighted_angle_error_deg': angle_sum / angle_weight if angle_weight else None,
                    'direction_valid_E2_cells_counting_overlaps': direction_valid,
                    'direction_weight_sum_counting_overlaps': angle_weight},
-        'paired_same_checkpoint_fixed_val_threshold': {'direction_on': summary['direction_on'],
-            'direction_off': summary['direction_off'],
-            'on_minus_off': {key: summary['direction_on'][key] - summary['direction_off'][key]
-                             for key in keys},
-            'limits': 'This is a frozen-checkpoint intervention. It cannot estimate retraining benefit.'},
+        'paired_same_checkpoint_fixed_val_threshold': {
+            'A': {'definition': modes['A'], 'metrics': summary['A']},
+            'B': {'definition': modes['B'], 'metrics': summary['B'],
+                  'A_minus_B': {key: summary['A'][key] - summary['B'][key] for key in keys}},
+            'C': {'definition': modes['C'], 'metrics': summary['C'],
+                  'A_minus_C': {key: summary['A'][key] - summary['C'][key] for key in keys}},
+            'D': {'definition': modes['D'], 'metrics': summary['D'],
+                  'A_minus_D': {key: summary['A'][key] - summary['D'][key] for key in keys}},
+            'D_vs_A_is_primary': True,
+            'limits': 'Frozen-checkpoint interventions measure dependence on forward behavior, not retraining benefit.'},
+        'feature_pair_diagnostic': {
+            'images_used': min(args.feature_images, len(images)),
+            'pair_rules': {
+                'continuous': 'downsampled GT skeleton cells in same 8-connected component; 2-5 E2 cells apart',
+                'difficult_gap': 'same component; GT road supports the straight segment; endpoints A surface probability >=0.5; segment mean <0.35',
+                'near_disconnected': 'different downsampled GT skeleton components within 6 E2 cells',
+            },
+            'metrics': {category: {'pairs': len(values['before']),
+                'cosine_before_mean': float(np.mean(values['before'])) if values['before'] else None,
+                'cosine_after_mean': float(np.mean(values['after'])) if values['after'] else None,
+                'cosine_delta_mean': float(np.mean(np.asarray(values['after']) - np.asarray(values['before'])))
+                    if values['before'] else None}
+                for category, values in pair_scores.items()},
+            'continuous_vs_near_disconnected_auc': {
+                'before': auc_from_scores(pair_scores['continuous']['before'],
+                                          pair_scores['near_disconnected']['before']),
+                'after': auc_from_scores(pair_scores['continuous']['after'],
+                                         pair_scores['near_disconnected']['after'])},
+            'difficult_gap_vs_near_disconnected_auc': {
+                'before': auc_from_scores(pair_scores['difficult_gap']['before'],
+                                          pair_scores['near_disconnected']['before']),
+                'after': auc_from_scores(pair_scores['difficult_gap']['after'],
+                                         pair_scores['near_disconnected']['after'])},
+            'limits': 'Pairs are local sampled probes under the declared rules; they are not a learned matcher or road-instance benchmark.'},
         'surface_gradient_audit': gradients,
-        'paired_pixel_changes': {key: sum(item[key] for item in paired) for key in
-            ('GT_road_added_by_direction', 'background_added_by_direction',
-             'GT_road_removed_by_direction', 'background_removed_by_direction',
-             'missed_GT_skeleton_recovered_by_direction')},
+        'paired_pixel_changes': {mode: {
+            'GT_road_added': sum(item[f'A_vs_{mode}_GT_road_added'] for item in paired),
+            'background_added': sum(item[f'A_vs_{mode}_background_added'] for item in paired),
+            'GT_road_removed': sum(item[f'A_vs_{mode}_GT_road_removed'] for item in paired),
+            'background_removed': sum(item[f'A_vs_{mode}_background_removed'] for item in paired),
+            'A_missed_GT_skeleton_recovered': sum(item[f'A_GT_skeleton_pixels_recovered_by_{mode}'] for item in paired),
+        } for mode in ('B', 'C', 'D')},
         'missing_components': 'This architecture has no P2 gap candidate generator or repair head; Gap AP and candidate recall are inapplicable.'}
     log_path = args.log_path or (args.checkpoint.parent / 'e2_direction.jsonl')
     if log_path.is_file():
@@ -382,7 +554,8 @@ def diagnose(args):
     print(json.dumps({'threshold': threshold, 'images': len(images),
                       'complete_split': report['complete_split'],
                       'module': report['module'],
-                      'on_minus_off': report['paired_same_checkpoint_fixed_val_threshold']['on_minus_off'],
+                      'paired_metrics': report['paired_same_checkpoint_fixed_val_threshold'],
+                      'feature_pairs': report['feature_pair_diagnostic'],
                       'gradient_audit': gradients}, ensure_ascii=False, indent=2), flush=True)
 
 
@@ -392,7 +565,7 @@ def main():
     logs = sub.add_parser('logs', help='summarize existing training JSONL; no model or data needed')
     logs.add_argument('--log_path', type=Path, required=True)
     logs.add_argument('--output', type=Path)
-    check = sub.add_parser('checkpoint', help='paired on/off inference and E2 diagnostics')
+    check = sub.add_parser('checkpoint', help='paired A/B/C/D inference and E2 feature diagnostics')
     check.add_argument('--checkpoint', type=Path, required=True)
     check.add_argument('--root_path', type=Path, required=True)
     check.add_argument('--selection', type=Path, required=True)
@@ -403,6 +576,8 @@ def main():
     check.add_argument('--max_images', type=int, default=0, help='0 runs the complete split')
     check.add_argument('--gradient_samples', type=int, default=1,
                        help='extra frozen-checkpoint surface vs D backward crops; 0 disables')
+    check.add_argument('--feature_images', type=int, default=8,
+                       help='number of evenly spaced images used for E2 feature-pair probes; 0 disables')
     args = parser.parse_args()
     if args.mode == 'logs':
         result = summarize_log(args.log_path)
@@ -413,8 +588,8 @@ def main():
             args.output.write_text(content, encoding='utf-8')
         print(content)
         return
-    if args.max_images < 0 or args.gradient_samples < 0:
-        parser.error('--max_images and --gradient_samples must be nonnegative')
+    if args.max_images < 0 or args.gradient_samples < 0 or args.feature_images < 0:
+        parser.error('--max_images, --gradient_samples, and --feature_images must be nonnegative')
     if args.device.startswith('cuda') and not torch.cuda.is_available():
         parser.error('CUDA is not available; use --device cpu for a small diagnostic')
     torch.set_num_threads(min(torch.get_num_threads(), 4))
