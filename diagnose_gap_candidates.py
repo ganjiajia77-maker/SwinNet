@@ -337,6 +337,7 @@ def main():
     stage_names = ('endpoints', 'distance', 'direction', 'top3', 'top64')
     totals = {mode: {stage: {'candidates': 0, 'covered_gaps': 0} for stage in stage_names}
               for mode in modes}
+    unique_gap_coverage = {mode: {stage: set() for stage in stage_names} for mode in modes}
     gap_total = 0
     final_labels, final_scores = [], []
     no_positive_tiles = candidate_tiles = 0
@@ -344,6 +345,8 @@ def main():
     per_tile = []
     per_gap = []
     gap_categories = defaultdict(int)
+    unique_gap_categories = defaultdict(int)
+    seen_gap_keys = set()
     oracle_summary = {'tiles': 0, 'candidates': 0, 'positive_logits': 0,
                       'closed_gaps': 0, 'baseline_closed_gaps': 0,
                       'centerline_recovered_fraction_sum': 0., 'baseline_centerline_recovered_fraction_sum': 0.,
@@ -397,8 +400,18 @@ def main():
                             category, flank_endpoint_counts, matched_pairs, path_ratio = classify_gap(
                                 gap, pred_skeleton, pred_endpoints, pred_components, cfg.gt_snap_radius)
                             gap_categories[category] += 1
+                            _, (gy0, gy1, gx0, gx1), gap_region, _, _, _ = gap
+                            gap_pixels = np.argwhere(gap_region)
+                            global_gap_pixels = gap_pixels + [top+gy0, left+gx0]
+                            first_pixel = global_gap_pixels.min(axis=0)
+                            gap_key = (Path(sample['image_name']).stem,
+                                       int(first_pixel[0]), int(first_pixel[1]))
+                            if gap_key not in seen_gap_keys:
+                                seen_gap_keys.add(gap_key)
+                                unique_gap_categories[category] += 1
                             per_gap.append({'image': sample['image_name'], 'top': top, 'left': left,
                                             'gap_id': gap_id, 'pixels': gap[-1],
+                                            'approx_unique_key': f'{gap_key[0]}:{gap_key[1]}:{gap_key[2]}',
                                             'endpoint_class': category,
                                             'matched_endpoints_per_flank': json.dumps(flank_endpoint_counts),
                                             'matched_flank_pairs': matched_pairs,
@@ -431,10 +444,13 @@ def main():
                             candidate_scale = np.ones(2) if mode == 'surface_512' else scale
                             stages = ranked_pairs(points, candidate_cfg, is_dual, high_set)
                             for stage, edges in stages.items():
-                                covered = sum(gap_covered(gap, edges, candidate_scale, cfg.gt_snap_radius)
-                                              for gap in gaps)
+                                covered_flags = [gap_covered(gap, edges, candidate_scale, cfg.gt_snap_radius)
+                                                 for gap in gaps]
+                                covered = sum(covered_flags)
                                 totals[mode][stage]['candidates'] += len(edges)
                                 totals[mode][stage]['covered_gaps'] += covered
+                                if any(covered_flags):
+                                    unique_gap_coverage[mode][stage].add(gap_key)
                                 tile_row[f'{mode}_{stage}_candidates'] = len(edges)
                                 tile_row[f'{mode}_{stage}_covered'] = covered
                         edges = record['gap_edges'][0].cpu().numpy()
@@ -517,6 +533,9 @@ def main():
             slot = totals[mode][stage]
             slot['recall'] = slot['covered_gaps'] / gap_total if gap_total else None
             slot['candidates_per_tile'] = slot['candidates'] / candidate_tiles
+            slot['approx_unique_covered_gaps'] = len(unique_gap_coverage[mode][stage])
+            slot['approx_unique_recall'] = (slot['approx_unique_covered_gaps'] / len(seen_gap_keys)
+                                             if seen_gap_keys else None)
     labels = np.asarray(final_labels)
     score = np.asarray(final_scores)
     summary = {'checkpoint': args.model_path, 'split': args.split, 'images': count,
@@ -531,7 +550,9 @@ def main():
                               'negative_logit_quantiles': np.quantile(score[labels == 0], [.1, .5, .9]).tolist()
                               if (labels == 0).any() else None},
                'training_history': training_history(Path(args.model_path).parent / 'local_gap_audit.jsonl'),
-               'gap_endpoint_classification': dict(gap_categories),
+               'gap_endpoint_classification': {'overlapping_tile_instances': dict(gap_categories),
+                                               'approx_unique_gaps': dict(unique_gap_categories),
+                                               'unique_count': len(seen_gap_keys)},
                'native_gap_writeback': dict(native_writeback,
                    mean_delta_relative_l2=native_writeback['delta_l2_sum'] /
                        max(native_writeback['decoder_l2_sum'], 1e-12),
@@ -543,7 +564,9 @@ def main():
                              'candidate availability, not a successful surface repair. Tiles overlap. '
                              'Surface512 uses the same maximum endpoints and edges, with spatial distances '
                              'and trace length scaled by four.',
-               'scope': 'Frozen checkpoint; candidate thresholds are diagnostic only; no test selection'}
+               'scope': 'Frozen checkpoint; candidate thresholds are diagnostic only; no test selection. '
+                        'Tile gap counts include overlap duplicates; approx_unique_gaps deduplicates by image and '
+                        'global first missing-skeleton pixel and is an approximate key.'}
     if args.gt_oracle:
         oracle_summary['mean_feature_delta_to_input_ratio'] = (
             oracle_summary['feature_delta_l2_sum'] / max(oracle_summary['feature_input_l2_sum'], 1e-12))
