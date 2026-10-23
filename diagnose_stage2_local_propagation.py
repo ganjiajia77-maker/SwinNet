@@ -100,7 +100,7 @@ def main():
             'connectivity': inputs[2].detach().float().cpu(),
         })
 
-    stage_handle = stage.register_forward_hook(stage_hook)
+    stage_handle = stage2.register_forward_hook(stage_hook)
     propagation_handle = propagation.register_forward_hook(propagation_hook)
     count = len(dataset) if args.max_images <= 0 else min(len(dataset), args.max_images)
     threshold_logit = float(np.log(args.threshold / (1 - args.threshold)))
