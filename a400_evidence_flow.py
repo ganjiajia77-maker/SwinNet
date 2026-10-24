@@ -215,6 +215,87 @@ def _native_all(tap, probe_heads, readouts, rgb, device, direction_off=False):
             for name, canvas in canvases.items()}
 
 
+def summarize_evidence_flow(set_rows, trace_rows):
+    """Aggregate fixed-coordinate responses with their own val thresholds."""
+    report = {}
+    for set_name in ('H0_exclusive', 'all_unrecognized'):
+        rows = [row for row in set_rows if row['set'] == set_name]
+        pixels = sum(row['pixels'] for row in rows)
+        selected = {'pixels': pixels, 'direction': {}}
+        for mode in ('on', 'off'):
+            mode_rows = [row for row in trace_rows
+                         if row['set'] == set_name and row['direction'] == mode]
+            stage_names = ('H0', 'trace_H_E1', 'trace_H_E2', 'trace_H_E3',
+                           'F2', 'F3', 'surface_prehead', 'original_surface',
+                           *FUSION_NAMES, *FUSION_H_NAMES, *CONTEXT_NAMES)
+            stages = {}
+            for name in stage_names:
+                stages[name] = {
+                    'road_probability_mean': (
+                        sum(row['pixels'] * row[f'{mode}_{name}_mean']
+                            for row in rows if row['pixels']) / pixels if pixels else None),
+                    'road_hit_fraction_at_own_val_threshold': (
+                        sum(row['pixels'] * row[f'{mode}_{name}_hit_fraction']
+                            for row in rows if row['pixels']) / pixels if pixels else None),
+                    'val_threshold': rows[0][f'{mode}_{name}_threshold'] if rows else None,
+                }
+            background_pixels = sum(row['background_pixels'] for row in mode_rows)
+            fusion = {}
+            for stage in (2, 3):
+                before = f'fusion{stage}_decoder_in'
+                after = f'fusion{stage}_out'
+                for name in (before, after):
+                    stages[name]['background_probability_mean'] = (
+                        sum(row['background_pixels'] * row[f'{name}_background_mean']
+                            for row in mode_rows) / background_pixels
+                        if background_pixels else None)
+                    stages[name]['background_false_positive_rate'] = (
+                        sum(row['background_pixels'] * row[f'{name}_background_false_positive_rate']
+                            for row in mode_rows) / background_pixels
+                        if background_pixels else None)
+                    if stages[name]['road_hit_fraction_at_own_val_threshold'] is not None:
+                        stages[name]['road_minus_background_hit_rate'] = (
+                            stages[name]['road_hit_fraction_at_own_val_threshold']
+                            - stages[name]['background_false_positive_rate'])
+                fusion[f'stage{stage}'] = {
+                    'road_hit_fraction_change': (
+                        stages[after]['road_hit_fraction_at_own_val_threshold']
+                        - stages[before]['road_hit_fraction_at_own_val_threshold']
+                        if pixels else None),
+                    'background_false_positive_rate_change': (
+                        stages[after]['background_false_positive_rate']
+                        - stages[before]['background_false_positive_rate']
+                        if background_pixels else None),
+                    'road_vs_background_separation_change': (
+                        stages[after]['road_minus_background_hit_rate']
+                        - stages[before]['road_minus_background_hit_rate']
+                        if pixels and background_pixels else None),
+                }
+            context = {}
+            for size in (3, 5):
+                key = f'{mode}_context{size}_hit_count'
+                context[f'context{size}_hits'] = sum(row[key] for row in rows)
+                context[f'context{size}_fraction'] = (
+                    context[f'context{size}_hits'] / pixels if pixels else None)
+            context['either_context_hits'] = sum(row[f'{mode}_context_union_hit_count']
+                                                 for row in rows)
+            context['either_context_fraction'] = (
+                context['either_context_hits'] / pixels if pixels else None)
+            selected['direction'][mode] = {'stage_readouts': stages,
+                                           'fusion_before_after': fusion,
+                                           'local_context': context}
+        report[set_name] = selected
+    return {
+        'fixed_sets': report,
+        'interpretation_limits': [
+            'All probe thresholds were selected on validation; test pixels were not used to tune thresholds.',
+            'Each fusion input/output has an independently trained readout. Compare its road hit rate relative to its own background false-positive rate; raw probability differences alone do not prove feature suppression.',
+            'Representative road appearances require human review of representative_cases images; categories are not inferred from probe scores.',
+            'Direction off changes this checkpoint only at inference and is not a retrained architecture ablation.',
+        ],
+    }
+
+
 def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
     old_selection_path = args.run_dir / 'val_selection.json'
     old_selection = json.loads(old_selection_path.read_text(encoding='utf-8'))
@@ -244,16 +325,37 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
         out.rename(backup)
         print(f'Preserved incomplete evidence-flow output: {backup}', flush=True)
     out.mkdir(parents=True, exist_ok=False)
-    summary = {'schema': 1, 'backbone_sha256': backbone_sha,
+    reference_path = args.run_dir / 'test_missed_pixel_set.json'
+    reference = (json.loads(reference_path.read_text(encoding='utf-8'))
+                 if reference_path.is_file() else None)
+    if (reference is not None
+            and reference['current_provenance']['backbone_sha256'] != backbone_sha):
+        raise ValueError('Existing fixed-set report belongs to another backbone checkpoint')
+    reference_images = ({row['image']: row for row in
+                         reference['coordinate_checks']['per_image_mask_and_coordinate_hashes']}
+                        if reference is not None else {})
+    reference_csv = args.run_dir / 'test_e1_h0_missed_pixel_diagnostics.csv'
+    if reference is not None and not reference_csv.is_file():
+        raise FileNotFoundError(f'Prior fixed-set per-image CSV is missing: {reference_csv}')
+    if reference is not None:
+        with reference_csv.open(newline='', encoding='utf-8') as stream:
+            reference_set_rows = {
+                row['image']: row for row in csv.DictReader(stream)
+                if row['pixel_set'] == 'seven_probe_all_missed'
+                and row['image'] != '__micro_total__'}
+    else:
+        reference_set_rows = {}
+    summary = {'schema': 2, 'backbone_sha256': backbone_sha,
                'probe_checkpoint_sha256': base.file_sha256(args.run_dir / 'probe_best.pth'),
                'readout_checkpoint_sha256': base.file_sha256(readout_path),
                'thresholds_selected_on_val': thresholds,
                'definitions': {
-                   'H0_exclusive': 'baseline_missed AND H0 >= H0 val threshold AND every other existing 1x1 probe < its own val threshold',
-                   'all_unrecognized': 'baseline_missed AND every existing 1x1 probe, including H0, < its own val threshold',
+                   'H0_exclusive': 'seven_probe_all_missed AND E1 below its val threshold AND H0 at or above its val threshold; F1 is not part of this historical fixed set',
+                   'all_unrecognized': 'seven_probe_all_missed AND E1 and H0 both below their own val thresholds; F1 is not part of this historical fixed set',
                    'sets_are_fixed_from': 'direction-on pass of this exact a4001b3 checkpoint',
                    'direction_off': 'forward hook bypasses E2DirectionAggregation by returning its input; all weights/checkpoint unchanged'},
-               'expected_pixel_counts_reference_only': {'H0_exclusive': 13930, 'all_unrecognized': 41181},
+               'historical_reference_counts': {'H0_exclusive': 13930, 'all_unrecognized': 41181},
+               'fixed_set_reference_path': str(reference_path) if reference else None,
                'per_image': []}
     trace_rows, set_rows = [], []
     review_dir = out / 'representative_cases'
@@ -270,13 +372,23 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
         off = _native_all(tap, probe_heads, readouts, rgb, device, direction_off=True)
         skeleton = skeletonize(target)
         base_missed = skeleton & (on['original_surface'] < thresholds['original_surface'])
-        other = [name for name in base.PROBES if name != 'H0']
-        h0_exclusive = base_missed & (on['H0'] >= thresholds['H0'])
-        for name in other:
-            h0_exclusive &= on[name] < thresholds[name]
-        all_unrecognized = base_missed.copy()
-        for name in base.PROBES:
-            all_unrecognized &= on[name] < thresholds[name]
+        seven_missed = base_missed.copy()
+        for name in base.SEVEN_PROBES:
+            seven_missed &= on[name] < thresholds[name]
+        h0_exclusive = (seven_missed & (on['E1'] < thresholds['E1'])
+                        & (on['H0'] >= thresholds['H0']))
+        all_unrecognized = (seven_missed & (on['E1'] < thresholds['E1'])
+                            & (on['H0'] < thresholds['H0']))
+        reference_image = reference_images.get(case)
+        reference_set_row = reference_set_rows.get(case)
+        if reference is not None:
+            seven_hash = hashlib.sha256(
+                np.flatnonzero(seven_missed).astype('<i8').tobytes()).hexdigest()
+            if reference_image is None or reference_set_row is None or (
+                    seven_hash != reference_image['seven_probe_all_missed_coordinate_sha256']
+                    or int(h0_exclusive.sum()) != int(reference_set_row['only_h0_pixels'])
+                    or int(all_unrecognized.sum()) != int(reference_set_row['neither_pixels'])):
+                raise ValueError(f'Fixed test-pixel coordinates differ from prior report: {case}')
         sets = {'H0_exclusive': h0_exclusive, 'all_unrecognized': all_unrecognized}
         for mode in ('on', 'off'):
             total[mode]['baseline_missed'] += int(base_missed.sum())
@@ -288,6 +400,11 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
             per_set = {'image': case, 'set': name, 'pixels': n,
                        'coordinate_sha256': hashlib.sha256(idx.astype('<i8').tobytes()).hexdigest()}
             for mode, maps in (('on', on), ('off', off)):
+                context3 = ((maps['H0_context3'] >= thresholds['H0_context3']) & mask)
+                context5 = ((maps['H0_context5'] >= thresholds['H0_context5']) & mask)
+                per_set[f'{mode}_context3_hit_count'] = int(context3.sum())
+                per_set[f'{mode}_context5_hit_count'] = int(context5.sum())
+                per_set[f'{mode}_context_union_hit_count'] = int((context3 | context5).sum())
                 for probe_name in ('H0', 'trace_H_E1', 'trace_H_E2', 'trace_H_E3',
                                    'F2', 'F3', 'original_surface',
                                    *FUSION_NAMES, *FUSION_H_NAMES, *CONTEXT_NAMES):
@@ -389,6 +506,9 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
             total[mode].setdefault('tp', 0); total[mode].setdefault('fn', 0); total[mode].setdefault('gt', 0)
             total[mode]['tp'] += tp; total[mode]['fn'] += int((~prediction & target).sum()); total[mode]['gt'] += int(target.sum())
         summary['per_image'].append({'image': case, 'baseline_missed': int(base_missed.sum()),
+                                     'seven_probe_all_missed': int(seven_missed.sum()),
+                                     'seven_probe_coordinate_sha256': hashlib.sha256(
+                                         np.flatnonzero(seven_missed).astype('<i8').tobytes()).hexdigest(),
                                      'H0_exclusive': int(h0_exclusive.sum()),
                                      'all_unrecognized': int(all_unrecognized.sum()),
                                      'sets_disjoint': not bool((h0_exclusive & all_unrecognized).any()),
@@ -407,8 +527,17 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
     summary['expected_counts_match'] = {
         'H0_exclusive_13930': total['on']['H0_exclusive'] == 13930,
         'all_unrecognized_41181': total['on']['all_unrecognized'] == 41181}
+    if reference is not None:
+        expected = reference['summary']['seven_probe_all_missed']
+        if (total['on']['H0_exclusive'] != expected['only_h0_pixels']
+                or total['on']['all_unrecognized'] != expected['neither_pixels']
+                or len(reference_images) != len(summary['per_image'])):
+            raise ValueError('Fixed-set totals differ from the prior E1/H0 pixel report')
+        summary['matches_prior_fixed_pixel_report'] = True
     base.write_csv(out / 'fixed_set_stage_probability_traces.csv', trace_rows)
     base.write_csv(out / 'fixed_set_probe_response.csv', set_rows)
+    base.write_json(out / 'evidence_flow_analysis.json',
+                    summarize_evidence_flow(set_rows, trace_rows))
     base.write_csv(out / 'representative_cases.csv', review_rows)
     manifest = {
         'data_root': str(args.root_path),
