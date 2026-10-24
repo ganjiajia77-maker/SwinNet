@@ -6,6 +6,7 @@ pixel sets derived from the direction-on checkpoint pass.
 """
 import argparse
 import csv
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -178,6 +179,7 @@ def native_readouts(tap, heads, rgb, device, direction_off=False):
             for name, canvas in canvases.items()}
 
 
+@torch.no_grad()
 def _native_all(tap, probe_heads, readouts, rgb, device, direction_off=False):
     tap.direction_off = direction_off
     weight = base.blend_weight(base.SIZE, device)
@@ -234,6 +236,13 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
                        for name, value in payload['thresholds_selected_on_val'].items()})
     from evaluation.road_comparison.road_metrics import skeletonize
     out = args.run_dir / 'evidence_flow'
+    if out.exists():
+        if (out / 'evidence_flow_summary.json').exists():
+            raise FileExistsError(f'Completed evidence-flow output already exists: {out}')
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+        backup = out.with_name(f'{out.name}_incomplete_{stamp}')
+        out.rename(backup)
+        print(f'Preserved incomplete evidence-flow output: {backup}', flush=True)
     out.mkdir(parents=True, exist_ok=False)
     summary = {'schema': 1, 'backbone_sha256': backbone_sha,
                'probe_checkpoint_sha256': base.file_sha256(args.run_dir / 'probe_best.pth'),
@@ -247,7 +256,9 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
                'expected_pixel_counts_reference_only': {'H0_exclusive': 13930, 'all_unrecognized': 41181},
                'per_image': []}
     trace_rows, set_rows = [], []
-    review_candidates = []
+    review_dir = out / 'representative_cases'
+    review_dir.mkdir()
+    review_rows = []
     test_pred = out / 'direction_predictions'
     for mode in ('on', 'off'):
         (test_pred / f'direction_{mode}' / 'surface').mkdir(parents=True, exist_ok=True)
@@ -312,7 +323,30 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
                     y, x = int(ys[pos]), int(xs[pos])
                     if any((y - py) ** 2 + (x - px) ** 2 < 96 ** 2 for py, px in last):
                         continue
-                    review_candidates.append((case, rgb, target, on, group_name, y, x))
+                    half = 96
+                    y0, y1 = max(0, y - half), min(base.NATIVE, y + half)
+                    x0, x1 = max(0, x - half), min(base.NATIVE, x + half)
+                    patch = rgb[y0:y1, x0:x1]
+                    gt = target[y0:y1, x0:x1]
+                    pred3 = on['H0_context3'][y0:y1, x0:x1] >= thresholds['H0_context3']
+                    pred5 = on['H0_context5'][y0:y1, x0:x1] >= thresholds['H0_context5']
+                    overlay = patch.astype(np.float32)
+                    overlay[gt, 0] = np.minimum(255, overlay[gt, 0] * .45 + 140)
+                    overlay[pred3 | pred5, 1] = np.minimum(
+                        255, overlay[pred3 | pred5, 1] * .45 + 140)
+                    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+                    cv2.circle(overlay, (x - x0, y - y0), 5, (255, 255, 0), 1)
+                    filename = f'{case}_{group_name}_{y}_{x}.png'
+                    if not cv2.imwrite(str(review_dir / filename),
+                                       cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)):
+                        raise OSError(f'Could not write representative example {filename}')
+                    review_rows.append({
+                        'image': case, 'group': group_name, 'row': y, 'column': x,
+                        'patch_path': str(review_dir / filename),
+                        'context3_probability': float(on['H0_context3'][y, x]),
+                        'context5_probability': float(on['H0_context5'][y, x]),
+                        'review_category': '',
+                        'category_options': 'visible_thin_road;occlusion;intersection;possible_label_ambiguity;other'})
                     last.append((y, x)); taken += 1
                     if taken >= 4:
                         break
@@ -375,32 +409,6 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
         'all_unrecognized_41181': total['on']['all_unrecognized'] == 41181}
     base.write_csv(out / 'fixed_set_stage_probability_traces.csv', trace_rows)
     base.write_csv(out / 'fixed_set_probe_response.csv', set_rows)
-    review_dir = out / 'representative_cases'
-    review_dir.mkdir()
-    review_rows = []
-    for case, rgb, target, maps, group_name, y, x in review_candidates:
-        half = 96
-        y0, y1 = max(0, y - half), min(base.NATIVE, y + half)
-        x0, x1 = max(0, x - half), min(base.NATIVE, x + half)
-        patch = rgb[y0:y1, x0:x1].copy()
-        gt = target[y0:y1, x0:x1]
-        pred3 = maps['H0_context3'][y0:y1, x0:x1] >= thresholds['H0_context3']
-        pred5 = maps['H0_context5'][y0:y1, x0:x1] >= thresholds['H0_context5']
-        # Overlay GT in red and either local-context prediction in green.
-        overlay = patch.astype(np.float32)
-        overlay[gt, 0] = np.minimum(255, overlay[gt, 0] * .45 + 140)
-        overlay[pred3 | pred5, 1] = np.minimum(255, overlay[pred3 | pred5, 1] * .45 + 140)
-        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-        cv2.circle(overlay, (x - x0, y - y0), 5, (255, 255, 0), 1)
-        filename = f'{case}_{group_name}_{y}_{x}.png'
-        if not cv2.imwrite(str(review_dir / filename), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)):
-            raise OSError(f'Could not write representative example {filename}')
-        review_rows.append({'image': case, 'group': group_name, 'row': y, 'column': x,
-                            'patch_path': str(review_dir / filename),
-                            'context3_probability': float(maps['H0_context3'][y, x]),
-                            'context5_probability': float(maps['H0_context5'][y, x]),
-                            'review_category': '',
-                            'category_options': 'visible_thin_road;occlusion;intersection;possible_label_ambiguity;other'})
     base.write_csv(out / 'representative_cases.csv', review_rows)
     manifest = {
         'data_root': str(args.root_path),
