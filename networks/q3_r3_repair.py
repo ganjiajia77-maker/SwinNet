@@ -90,7 +90,7 @@ class Q3R3Repair(nn.Module):
         self.base.eval()
         return self
 
-    def forward(self, image):
+    def forward(self, image, capture_diagnostics=False):
         captured = []
 
         def stage3_hook(module, inputs, output):
@@ -142,10 +142,15 @@ class Q3R3Repair(nn.Module):
                  self.eta_minus * delta_minus)
         z1 = z0 + F.interpolate(delta, size=z0.shape[-2:],
                                 mode='bilinear', align_corners=False)
-        return {'z0': z0, 'z1': z1, 'q_logits': q_logits, 'q': q,
+        result = {'z0': z0, 'z1': z1, 'q_logits': q_logits, 'q': q,
                 'delta': delta, 'delta_plus': delta_plus, 'delta_minus': delta_minus,
                 'stage2_s': stage2['skeleton'].detach(),
                 'stage2_c': stage2['connectivity'].detach()}
+        if capture_diagnostics:
+            result.update(stage2_d=(stage2.get('direction').detach()
+                                    if stage2.get('direction') is not None else None),
+                          highres_h=highres.detach(), stage3_h=captured[0])
+        return result
 
 
 @torch.no_grad()
