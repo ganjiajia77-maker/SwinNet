@@ -1,4 +1,4 @@
-"""Shared binary-mask metrics. APLS is a raster proxy, not official APLS."""
+"""Shared mask metrics with distinct clDice and raster-derived graph scores."""
 
 import cv2
 import numpy as np
@@ -6,19 +6,28 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
+from graph_topology import graph_scores, prepare_graph
 
-METRIC_VERSION = "road-mask-v1.1"
+
+METRIC_VERSION = "road-mask-v2.0-raster-graph"
 DEFAULT_PROTOCOL = {
     "metric_version": METRIC_VERSION,
     "image_size": 1024,
     "short_area_threshold": 20,
     "apls_max_nodes": 64,
     "apls_snap_radius": 5.0,
+    "topo_local_radius_px": 300.0,
+    "topo_sample_interval_px": 5.0,
+    "topo_match_radius_px": 5.0,
+    "topo_max_seeds": 16,
     "connectivity": 8,
     "skeleton": "numpy_zhang_suen_zero_padded",
     "snap_rule": "distance <= radius; ties use lowest row-major node",
     "segmentation_aggregation": "global TP/FP/FN",
-    "topology_aggregation": "per-image mean; bidirectional APLS harmonic per image",
+    "topology_aggregation": "per-image mean; directional graph scores and bidirectional APLS harmonic per image",
+    "graph_protocol": "pixel-skeleton 8-neighbor graph; control points snapped to nearest edge and inserted",
+    "graph_units": "pixels; not Sat2Graph/SpaceNet official vector-GT scores",
+    "tlts_unmatched_rule": "unmatched endpoint pairs and disconnected matched pairs count infeasible",
     "postprocessing": "none; use supplied binary masks without resizing",
     "gt_encoding": "single-channel or identical-channel RGB binary mask; predictions single-channel",
 }
@@ -158,10 +167,13 @@ def directional_apls(reference, proposal, radius):
 
 def prepare_target(target, protocol):
     skeleton = skeletonize(target)
+    paths = prepare_paths(skeleton, protocol["apls_max_nodes"])
     return {
         "mask": target, "skeleton": skeleton,
         "components": component_stats(target, protocol["short_area_threshold"]),
-        "paths": prepare_paths(skeleton, protocol["apls_max_nodes"]),
+        "paths": paths,
+        "graph": prepare_graph(paths["points"], paths["graph"], protocol["apls_max_nodes"],
+                               controls=paths["nodes"], lengths=paths["paths"]),
     }
 
 
@@ -186,15 +198,19 @@ def image_metrics(pred, prepared, protocol):
     topo_precision = ratio((pred_skeleton & target).sum(), pred_skeleton.sum())
     topo_recall = ratio((gt_skeleton & pred).sum(), gt_skeleton.sum())
     pred_paths = prepare_paths(pred_skeleton, protocol["apls_max_nodes"])
+    pred_graph = prepare_graph(pred_paths["points"], pred_paths["graph"],
+                               protocol["apls_max_nodes"], controls=pred_paths["nodes"],
+                               lengths=pred_paths["paths"])
     forward, forward_pairs = directional_apls(
         prepared["paths"], pred_paths, protocol["apls_snap_radius"],
     )
     reverse, reverse_pairs = directional_apls(
         pred_paths, prepared["paths"], protocol["apls_snap_radius"],
     )
+    graph_result = graph_scores(prepared["graph"], pred_graph, protocol)
     row = confusion(pred, target)
     row.update({
-        "topo_precision": topo_precision, "topo_recall": topo_recall,
+        "cldice_precision": topo_precision, "cldice_recall": topo_recall,
         "cldice": harmonic(topo_precision, topo_recall),
         "pred_components": pred_stats["count"], "gt_components": gt_stats["count"],
         "frag_idx": ratio(pred_stats["count"], max(gt_stats["count"], 1)),
@@ -209,6 +225,7 @@ def image_metrics(pred, prepared, protocol):
         "apls_bidirectional_approx": harmonic(forward, reverse),
         "apls_gt_valid_pairs": forward_pairs, "apls_pred_valid_pairs": reverse_pairs,
     })
+    row.update(graph_result)
     return row
 
 
@@ -218,5 +235,4 @@ def summarize(rows):
     for key in rows[0]:
         if key not in {"case_id", "tp", "fp", "fn"}:
             result[key] = float(np.mean([row[key] for row in rows]))
-    result["topo_f1"] = result["cldice"]
     return result

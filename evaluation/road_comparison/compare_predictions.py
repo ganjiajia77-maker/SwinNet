@@ -19,6 +19,19 @@ from road_metrics import (DEFAULT_PROTOCOL, confusion, image_metrics, prepare_ta
 
 EXTENSIONS = {".png", ".tif", ".tiff", ".bmp", ".npy"}
 
+# Existing validation sweeps selected thresholds by pixel IoU only. Their
+# selections remain usable when the topology protocol is upgraded.
+LEGACY_V1_PROTOCOL = {
+    "metric_version": "road-mask-v1.1", "image_size": 1024,
+    "short_area_threshold": 20, "apls_max_nodes": 64, "apls_snap_radius": 5.0,
+    "connectivity": 8, "skeleton": "numpy_zhang_suen_zero_padded",
+    "snap_rule": "distance <= radius; ties use lowest row-major node",
+    "segmentation_aggregation": "global TP/FP/FN",
+    "topology_aggregation": "per-image mean; bidirectional APLS harmonic per image",
+    "postprocessing": "none; use supplied binary masks without resizing",
+    "gt_encoding": "single-channel or identical-channel RGB binary mask; predictions single-channel",
+}
+
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
@@ -125,16 +138,20 @@ def write_csv(path, rows):
 def validate_manifest(manifest):
     protocol = dict(DEFAULT_PROTOCOL)
     overrides = manifest.get("protocol", {})
-    adjustable = {"image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius"}
+    adjustable = {"image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius",
+                  "topo_local_radius_px", "topo_sample_interval_px", "topo_match_radius_px",
+                  "topo_max_seeds"}
     if set(overrides) - adjustable:
         raise ValueError(f"Unsupported protocol settings: {set(overrides) - adjustable}")
     protocol.update(overrides)
-    for key in ("image_size", "short_area_threshold", "apls_max_nodes"):
+    for key in ("image_size", "short_area_threshold", "apls_max_nodes", "topo_max_seeds"):
         value = protocol[key]
         if not isinstance(value, int) or value < (2 if key == "apls_max_nodes" else 1):
             raise ValueError(f"Invalid {key}: {value}")
-    if not np.isfinite(protocol["apls_snap_radius"]) or protocol["apls_snap_radius"] <= 0:
-        raise ValueError("apls_snap_radius must be finite and positive")
+    for key in ("apls_snap_radius", "topo_local_radius_px", "topo_sample_interval_px",
+                "topo_match_radius_px"):
+        if not np.isfinite(protocol[key]) or protocol[key] <= 0:
+            raise ValueError(f"{key} must be finite and positive")
     names = [m["name"] for m in manifest["models"]]
     if not names or len(names) != len(set(names)):
         raise ValueError("Model names must be unique and nonempty")
@@ -148,10 +165,29 @@ def model_identity(model):
     return digest({"name": model["name"], "provenance": model["provenance"]})
 
 
+def threshold_protocol_hash(protocol):
+    return digest({"image_size": protocol["image_size"],
+                   "gt_encoding": protocol["gt_encoding"],
+                   "segmentation_aggregation": protocol["segmentation_aggregation"]})
+
+
+def compatible_selection(selection, protocol):
+    if selection.get("selected_on") != "val":
+        return False
+    if selection.get("protocol_hash") == digest(protocol):
+        return True
+    old = dict(LEGACY_V1_PROTOCOL)
+    for key in ("image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius"):
+        old[key] = protocol[key]
+    return selection.get("protocol_hash") == digest(old)
+
+
 def select_validation(manifest, base, protocol, output, progress):
     labels = label_index(resolve_path(manifest["data_root"], base), "val")
-    selection = {"schema": 1, "selected_on": "val", "criterion": "global_iou",
-                 "protocol_hash": digest(protocol), "val_cases_hash": digest(sorted(labels)),
+    selection = {"schema": 2, "selected_on": "val", "criterion": "global_iou",
+                 "protocol_hash": digest(protocol),
+                 "threshold_protocol_hash": threshold_protocol_hash(protocol),
+                 "val_cases_hash": digest(sorted(labels)),
                  "val_images": len(labels), "models": {}}
     sweep = []
     for model in manifest["models"]:
@@ -187,8 +223,9 @@ def select_validation(manifest, base, protocol, output, progress):
 
 def import_declared_selection(manifest, base, protocol):
     # This checks evidence existence, not the semantic content of a handwritten log.
-    selection = {"schema": 1, "selected_on": "val", "criterion": "declared_validation_result",
-                 "protocol_hash": digest(protocol), "models": {}}
+    selection = {"schema": 2, "selected_on": "val", "criterion": "declared_validation_result",
+                 "protocol_hash": digest(protocol),
+                 "threshold_protocol_hash": threshold_protocol_hash(protocol), "models": {}}
     for model in manifest["models"]:
         declared = model["validation_selection"]
         if declared["selected_on"] != "val" or declared["criterion"] not in {"global_iou", "global_f1"}:
@@ -205,8 +242,8 @@ def import_declared_selection(manifest, base, protocol):
 
 
 def evaluate(manifest, base, protocol, split, selection, output, progress):
-    if selection.get("selected_on") != "val" or selection.get("protocol_hash") != digest(protocol):
-        raise ValueError("Selection must originate from val with this exact metric protocol")
+    if not compatible_selection(selection, protocol):
+        raise ValueError("Selection must originate from val with this metric protocol or verified v1 protocol")
     labels = label_index(resolve_path(manifest["data_root"], base), split)
     models = []
     for model in manifest["models"]:
@@ -263,6 +300,10 @@ def evaluate(manifest, base, protocol, split, selection, output, progress):
                           **summarize(rows_by_model[model["name"]])})
     report = {
         "split": split, "protocol": protocol, "threshold_selection": selection,
+        "metric_implementation_sha256": {
+            name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+            for name in ("compare_predictions.py", "road_metrics.py", "graph_topology.py")
+        },
         "case_ids": sorted(labels), "case_ids_sha256": digest(sorted(labels)),
         "binary_content_sha256": {key: value.hexdigest() for key, value in content_hashes.items()},
         "provenance": {m["name"]: m["provenance"] for m, _, _ in models},
@@ -276,8 +317,8 @@ def evaluate(manifest, base, protocol, split, selection, output, progress):
     write_csv(output / f"{split}_comparison.csv", summaries)
     for row in summaries:
         print(f"{row['name']}: IoU={row['iou']:.6f} clDice={row['cldice']:.6f} "
-              f"break={row['break_rate']:.6f} APLS_GT={row['apls_gt_to_pred_approx']:.6f} "
-              f"APLS_bidir={row['apls_bidirectional_approx']:.6f}", flush=True)
+              f"TOPO_F1={row['topo_f1']:.6f} APLS_graph={row['apls_bidirectional']:.6f} "
+              f"TLTS_infeasible={row['tlts_infeasible']:.6f}", flush=True)
     return report
 
 
