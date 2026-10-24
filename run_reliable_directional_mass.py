@@ -520,7 +520,7 @@ def main():
     parser.add_argument('--q3_checkpoint', type=Path, required=True)
     parser.add_argument('--dynamic_checkpoint', type=Path)
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--epochs', type=int, default=40)
+    parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--val_interval', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=4)

@@ -57,7 +57,7 @@ python -u run_reliable_directional_mass.py smoke \
 python -u run_reliable_directional_mass.py train \
   --root_path "$DATA" --output_dir "$RUN_DIR" \
   --base_checkpoint "$BASE" --q3_checkpoint "$Q3" --device cuda \
-  --epochs 40 --batch_size 2 --num_workers 4 --val_interval 5 \
+  --epochs 20 --batch_size 2 --num_workers 4 --val_interval 5 \
   2>&1 | tee "$RUN_DIR.train.log"
 
 python -u run_reliable_directional_mass.py val \
