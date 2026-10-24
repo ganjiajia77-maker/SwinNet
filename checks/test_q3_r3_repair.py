@@ -6,7 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from networks.q3_r3_repair import Q3R3Repair, make_q_target, repair_losses
+from networks.q3_r3_repair import (Q3R3Repair, make_q_target, missed_segments,
+                                   recovery_losses, repair_losses)
 from run_q3_r3_mass import gap_proxy
 
 
@@ -43,7 +44,7 @@ class FakeBase(nn.Module):
 
 
 class RepairTests(unittest.TestCase):
-    def test_initial_identity_and_trainable_gradient_path(self):
+    def test_initial_near_identity_and_trainable_gradient_path(self):
         torch.manual_seed(7)
         model = Q3R3Repair(FakeBase())
         model.train()
@@ -54,12 +55,15 @@ class RepairTests(unittest.TestCase):
         optimizer = torch.optim.SGD((p for p in model.parameters() if p.requires_grad), lr=.1)
         result = model(image)
         self.assertEqual(tuple(result['q'].shape), (2, 1, 8, 8))
-        torch.testing.assert_close(result['z0'], result['z1'])
+        self.assertLess(float((result['z1'] - result['z0']).abs().max()), 0.02)
+        self.assertTrue(bool((result['delta_plus'] >= 0).all()))
+        self.assertTrue(bool((result['delta_minus'] >= 0).all()))
         loss, _ = repair_losses(result, mask, skeleton, lambda_q=.1)
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
         self.assertGreater(float(model.q_head.weight.grad.abs().sum()), 0)
-        self.assertGreater(float(model.r_head.weight.grad.abs().sum()), 0)
+        self.assertGreater(float(model.r_plus_head.weight.grad.abs().sum()), 0)
+        self.assertGreater(float(model.r_minus_head.weight.grad.abs().sum()), 0)
         self.assertTrue(all(p.grad is None for p in model.base.parameters()))
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -75,6 +79,28 @@ class RepairTests(unittest.TestCase):
         z0 = torch.full_like(skeleton, -8.)
         target = make_q_target(skeleton, z0, (8, 8))
         self.assertGreater(float(target.sum()), 0)
+
+    def test_recovery_loss_averages_segments_and_respects_threshold(self):
+        skeleton = torch.zeros((1, 1, 32, 32))
+        skeleton[0, 0, 8, 4:9] = 1
+        skeleton[0, 0, 20, 16:28] = 1
+        mask = skeleton.clone()
+        z0 = torch.full_like(mask, -4.)
+        z1 = z0.clone()
+        z1[0, 0, 20, 16:28] = -2.
+        z1.requires_grad_()
+        result = {'z0': z0, 'z1': z1}
+        self.assertEqual(len(missed_segments(skeleton, z0)[0]), 2)
+        recover, background, segments, pixels = recovery_losses(result, mask, skeleton)
+        self.assertEqual((segments, pixels), (2, 17))
+        target_logit = float(torch.logit(torch.tensor(0.45)) + 0.2)
+        self.assertAlmostEqual(float(recover), target_logit + 3., places=5)
+        self.assertGreater(float(background), 0)
+        recover.backward()
+        self.assertLess(float(z1.grad[0, 0, 8, 4:9].mean()), 0)
+        closed = {'z0': z0, 'z1': torch.zeros_like(z1)}
+        recovered, _, _, _ = recovery_losses(closed, mask, skeleton)
+        self.assertEqual(float(recovered), 0.)
 
     def test_gap_proxy_detects_closed_reference_gap(self):
         gt = np.zeros((24, 24), dtype=bool)

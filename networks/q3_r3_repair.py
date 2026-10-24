@@ -36,12 +36,33 @@ class MultiScaleFeatures(nn.Module):
         return x + self.fuse(torch.cat([branch(x) for branch in self.branches], dim=1))
 
 
+class DirectionalFeatures(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.stripes = nn.ModuleList()
+        for dilation in (1, 2):
+            for kernel in ((1, 7), (7, 1)):
+                padding = tuple(dilation * (size // 2) for size in kernel)
+                self.stripes.append(nn.Sequential(
+                    nn.Conv2d(width, width, kernel, padding=padding,
+                              dilation=dilation, groups=width, bias=False),
+                    nn.Conv2d(width, width, 1, bias=False),
+                    nn.GroupNorm(8, width), nn.GELU(),
+                ))
+        self.fuse = nn.Sequential(nn.Conv2d(width * 5, width, 1, bias=False),
+                                  nn.GroupNorm(8, width), nn.GELU())
+
+    def forward(self, x):
+        return x + self.fuse(torch.cat([x] + [branch(x) for branch in self.stripes], dim=1))
+
+
 class Q3R3Repair(nn.Module):
-    def __init__(self, base_model, eta=0.5, width=32, enable_stage2_local_propagation=False,
+    def __init__(self, base_model, eta_plus=0.5, eta_minus=0.5, width=32,
+                 enable_stage2_local_propagation=False,
                  enable_gap_refinement=False, enable_q3_r3=True):
         super().__init__()
-        if eta <= 0:
-            raise ValueError('eta must be positive')
+        if eta_plus <= 0 or eta_minus <= 0:
+            raise ValueError('Both repair scales must be positive')
         self.base = base_model.requires_grad_(False)
         self.base.swin_unet.decoder_structure_blocks['2'].enable_local_propagation = bool(
             enable_stage2_local_propagation)
@@ -52,10 +73,14 @@ class Q3R3Repair(nn.Module):
         self.q_features = MultiScaleFeatures(stage_channels + highres_channels + 10, width)
         self.q_head = nn.Conv2d(width, 1, 1)
         self.r_features = MultiScaleFeatures(width + 2, width)
-        self.r_head = nn.Conv2d(width, 1, 1)
-        nn.init.zeros_(self.r_head.weight)
-        nn.init.zeros_(self.r_head.bias)
-        self.eta = float(eta)
+        self.r_directional = DirectionalFeatures(width)
+        self.r_plus_head = nn.Conv2d(width, 1, 1)
+        self.r_minus_head = nn.Conv2d(width, 1, 1)
+        for head, bias in ((self.r_plus_head, -4.), (self.r_minus_head, -6.)):
+            nn.init.zeros_(head.weight)
+            nn.init.constant_(head.bias, bias)
+        self.eta_plus = float(eta_plus)
+        self.eta_minus = float(eta_minus)
         self.enable_q3_r3 = bool(enable_q3_r3)
         self.base.eval()
 
@@ -82,7 +107,8 @@ class Q3R3Repair(nn.Module):
         if not self.enable_q3_r3:
             zero_q = z0.new_zeros((z0.shape[0], 1, *captured[0].shape[-2:]))
             return {'z0': z0, 'z1': z0, 'q_logits': zero_q, 'q': zero_q,
-                    'delta': zero_q, 'stage2_s': zero_q,
+                    'delta': zero_q, 'delta_plus': zero_q, 'delta_minus': zero_q,
+                    'stage2_s': zero_q,
                     'stage2_c': zero_q.expand(-1, 8, -1, -1)}
         structure = base_outputs[-1]
         stage2 = next((item for item in structure if item.get('stage') == 2
@@ -107,12 +133,16 @@ class Q3R3Repair(nn.Module):
         q_logits = self.q_head(features)
         q = q_logits.sigmoid()
         repair_features = self.r_features(torch.cat((features, q, align(p0)), dim=1))
-        delta = self.r_head(repair_features)
-        gated_delta = (0.2 + 0.8 * q) * delta
-        z1 = z0 + self.eta * F.interpolate(gated_delta, size=z0.shape[-2:],
-                                           mode='bilinear', align_corners=False)
+        repair_features = self.r_directional(repair_features)
+        delta_plus = F.softplus(self.r_plus_head(repair_features))
+        delta_minus = F.softplus(self.r_minus_head(repair_features))
+        delta = (self.eta_plus * (0.2 + 0.8 * q) * delta_plus -
+                 self.eta_minus * delta_minus)
+        z1 = z0 + F.interpolate(delta, size=z0.shape[-2:],
+                                mode='bilinear', align_corners=False)
         return {'z0': z0, 'z1': z1, 'q_logits': q_logits, 'q': q,
-                'delta': delta, 'stage2_s': stage2['skeleton'].detach(),
+                'delta': delta, 'delta_plus': delta_plus, 'delta_minus': delta_minus,
+                'stage2_s': stage2['skeleton'].detach(),
                 'stage2_c': stage2['connectivity'].detach()}
 
 
@@ -143,7 +173,51 @@ def dice_loss(logits, target):
             (prob.sum(dims) + target.sum(dims) + 1)).mean()
 
 
-def repair_losses(result, mask, skeleton, lambda_q=0.1):
+@torch.no_grad()
+def missed_segments(skeleton, z0, threshold=0.45, min_segment_pixels=3):
+    if skeleton.shape != z0.shape:
+        raise ValueError('Skeleton and initial surface must share the training grid')
+    near_p0 = F.max_pool2d(z0.sigmoid(), 5, stride=1, padding=2)
+    missing = ((skeleton > 0.5) & (near_p0 < threshold)).cpu().numpy().astype(np.uint8)
+    segments = []
+    for binary in missing[:, 0]:
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        regions = []
+        for index in range(1, count):
+            if stats[index, cv2.CC_STAT_AREA] >= min_segment_pixels:
+                ys, xs = np.nonzero(labels == index)
+                regions.append((torch.as_tensor(ys, device=z0.device),
+                                torch.as_tensor(xs, device=z0.device)))
+        segments.append(regions)
+    return segments
+
+
+def recovery_losses(result, mask, skeleton, threshold=0.45, margin=0.2,
+                    background_radius=8):
+    segments = missed_segments(skeleton, result['z0'], threshold)
+    target_logit = torch.logit(result['z1'].new_tensor(threshold)) + margin
+    per_segment = []
+    missing_mask = torch.zeros_like(mask, dtype=torch.bool)
+    for batch_index, regions in enumerate(segments):
+        for ys, xs in regions:
+            missing_mask[batch_index, 0, ys, xs] = True
+            deficit = F.relu(target_logit - result['z1'][batch_index, 0, ys, xs])
+            hardest = deficit.topk(max(1, (deficit.numel() + 3) // 4)).values.mean()
+            per_segment.append(0.5 * deficit.mean() + 0.5 * hardest)
+    zero = result['z1'].sum() * 0.
+    recover = torch.stack(per_segment).mean() if per_segment else zero
+    radius = int(background_radius)
+    near_missing = F.max_pool2d(missing_mask.float(), 2 * radius + 1,
+                                stride=1, padding=radius) > 0
+    background = near_missing & (mask < 0.5)
+    background_loss = (F.binary_cross_entropy_with_logits(
+        result['z1'][background], torch.zeros_like(result['z1'][background]))
+        if background.any() else zero)
+    return recover, background_loss, len(per_segment), int(missing_mask.sum().item())
+
+
+def repair_losses(result, mask, skeleton, lambda_q=0.1, lambda_recover=0.05,
+                  lambda_background=0.02, recovery_threshold=0.45, recovery_margin=0.2):
     z1 = result['z1']
     q_logits = result['q_logits']
     q_target = make_q_target(skeleton, result['z0'], q_logits.shape[-2:])
@@ -157,7 +231,12 @@ def repair_losses(result, mask, skeleton, lambda_q=0.1):
     balanced = balanced * 0.5 + (q_bce[negative].mean() if negative.any()
                                   else q_bce.new_zeros(())) * 0.5
     q_loss = balanced + 0.5 * dice_loss(q_logits, q_target)
-    total = surface + lambda_q * q_loss
+    recover, background, segment_count, missed_pixels = recovery_losses(
+        result, mask, skeleton, threshold=recovery_threshold, margin=recovery_margin)
+    total = (surface + lambda_q * q_loss + lambda_recover * recover +
+             lambda_background * background)
     return total, {'surface': surface.detach(), 'q': q_loss.detach(),
+                   'recover': recover.detach(), 'near_background': background.detach(),
+                   'missing_segments': segment_count, 'missing_pixels': missed_pixels,
                    'q_positive_fraction': q_target.mean().detach(),
                    'q_high_fraction': (result['q'] > 0.5).float().mean().detach()}

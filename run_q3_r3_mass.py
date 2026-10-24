@@ -72,25 +72,45 @@ def load_experiment(args):
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     print(f'[LOAD] strict checkpoint: {len(model.state_dict())} tensors, '
           'missing=0, unexpected=0, shape_mismatch=0', flush=True)
-    repair = Q3R3Repair(model, eta=args.eta,
+    repair = Q3R3Repair(model, eta_plus=args.eta_plus, eta_minus=args.eta_minus,
                         enable_stage2_local_propagation=args.enable_stage2_local_propagation,
                         enable_gap_refinement=args.enable_gap_refinement).to(args.device)
     frozen = sum(p.numel() for p in repair.base.parameters())
     trainable = sum(p.numel() for p in repair.parameters() if p.requires_grad)
     print(f'[PARAMS] frozen={frozen:,} trainable_Q3_R3={trainable:,}', flush=True)
-    if args.repair_checkpoint:
-        saved_repair = torch.load(args.repair_checkpoint, map_location='cpu', weights_only=False)
+    repair_source = args.repair_checkpoint or args.init_repair_checkpoint
+    if repair_source:
+        saved_repair = torch.load(repair_source, map_location='cpu', weights_only=False)
         if Path(saved_repair['base_checkpoint']) != args.base_checkpoint.resolve():
             raise ValueError('Repair checkpoint references a different base checkpoint')
-        for name in ('q_features', 'q_head', 'r_features', 'r_head'):
+        old_repair = args.init_repair_checkpoint is not None
+        names = (('q_features', 'q_head', 'r_features') if old_repair else
+                 ('q_features', 'q_head', 'r_features', 'r_directional',
+                  'r_plus_head', 'r_minus_head'))
+        if old_repair and 'r_head' not in saved_repair:
+            raise ValueError('Expected an original single-head Q3/R3 checkpoint')
+        if not old_repair and saved_repair.get('repair_version') != 'dual_recovery_v1':
+            raise ValueError('Expected a dual-recovery Q3/R3 checkpoint')
+        for name in names:
             getattr(repair, name).load_state_dict(saved_repair[name], strict=True)
+        if old_repair:
+            print('[LOAD] reused old Q3/R3 features; signed r_head omitted; '
+                  'directional features and dual heads initialized anew', flush=True)
+        else:
+            repair.eta_plus = float(saved_repair['eta_plus'])
+            repair.eta_minus = float(saved_repair['eta_minus'])
+            print(f'[LOAD] strict dual repair: epoch={saved_repair["epoch"]} '
+                  f'eta_plus={repair.eta_plus} eta_minus={repair.eta_minus}', flush=True)
     return repair
 
 
-def save_repair(model, path, base_checkpoint, epoch, val_iou):
+def save_repair(model, path, base_checkpoint, epoch, val_iou, training_config=None):
     state = {'base_checkpoint': str(base_checkpoint.resolve()), 'epoch': epoch,
-             'val_iou': val_iou, 'eta': model.eta}
-    for name in ('q_features', 'q_head', 'r_features', 'r_head'):
+             'val_iou': val_iou, 'repair_version': 'dual_recovery_v1',
+             'eta_plus': model.eta_plus, 'eta_minus': model.eta_minus,
+             'training_config': training_config}
+    for name in ('q_features', 'q_head', 'r_features', 'r_directional',
+                 'r_plus_head', 'r_minus_head'):
         state[name] = getattr(model, name).state_dict()
     temporary = path.with_suffix('.tmp')
     torch.save(state, temporary)
@@ -122,14 +142,14 @@ def full_dataset(root, split):
                                return_full_image=True)
 
 
-def val_iou(model, root, device, max_images=0):
+def val_iou(model, root, device, max_images=0, threshold=0.45):
     model.eval()
     dataset = full_dataset(root, 'val')
     total_tp = total_fp = total_fn = 0
     for index in range(min(len(dataset), max_images or len(dataset))):
         sample = dataset[index]
         _, z1, _ = stitch_three(model, sample['image'][None].to(device))
-        pred = z1 >= 0
+        pred = z1 >= float(np.log(threshold / (1 - threshold)))
         gt = sample['mask'][0].numpy() > 0.5
         total_tp += int((pred & gt).sum())
         total_fp += int((pred & ~gt).sum())
@@ -139,7 +159,7 @@ def val_iou(model, root, device, max_images=0):
 
 def train(args, model):
     if args.repair_checkpoint:
-        raise ValueError('Training resumes are not enabled; start with base checkpoint only')
+        raise ValueError('Training resumes are not enabled; use --init_repair_checkpoint only')
     args.output_dir.mkdir(parents=True, exist_ok=False)
     dataset = RoadSkeletonDataset(str(args.root_path), 'train', image_size=512,
                                   source_patch_size=1500, random_crop_train=True,
@@ -149,18 +169,27 @@ def train(args, model):
                         num_workers=args.num_workers, pin_memory=True)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=0.01)
+    training_config = {name: getattr(args, name) for name in
+                       ('lambda_q', 'lambda_recover', 'lambda_background',
+                        'recovery_threshold', 'recovery_margin', 'lr', 'batch_size',
+                        'epochs', 'seed')}
     best = -1.
     for epoch in range(1, args.epochs + 1):
         dataset.set_epoch(epoch)
         model.train()
-        loss_sum = q_fraction = q_high = 0.
+        loss_sum = q_fraction = q_high = recover_sum = segments_sum = 0.
         for batch in loader:
             image = batch['image'].to(args.device, non_blocking=True)
             mask = batch['mask'].to(args.device, non_blocking=True)
             skeleton = batch['skeleton'].to(args.device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             result = model(image)
-            loss, stats = repair_losses(result, mask, skeleton, lambda_q=args.lambda_q)
+            loss, stats = repair_losses(
+                result, mask, skeleton, lambda_q=args.lambda_q,
+                lambda_recover=args.lambda_recover,
+                lambda_background=args.lambda_background,
+                recovery_threshold=args.recovery_threshold,
+                recovery_margin=args.recovery_margin)
             if not bool(torch.isfinite(loss)):
                 raise RuntimeError(f'Nonfinite repair loss at epoch {epoch}')
             loss.backward()
@@ -168,16 +197,23 @@ def train(args, model):
             loss_sum += float(loss.detach())
             q_fraction += float(stats['q_positive_fraction'])
             q_high += float(stats['q_high_fraction'])
+            recover_sum += float(stats['recover'])
+            segments_sum += stats['missing_segments']
         mean_loss = loss_sum / len(loader)
         print(f'[TRAIN] epoch={epoch} loss={mean_loss:.6f} '
-              f'q_pos={q_fraction/len(loader):.6f} q_high={q_high/len(loader):.6f}', flush=True)
-        save_repair(model, args.output_dir / 'last.pth', args.base_checkpoint, epoch, None)
+              f'q_pos={q_fraction/len(loader):.6f} q_high={q_high/len(loader):.6f} '
+              f'recover={recover_sum/len(loader):.6f} '
+              f'missing_segments_per_batch={segments_sum/len(loader):.2f}', flush=True)
+        save_repair(model, args.output_dir / 'last.pth', args.base_checkpoint, epoch,
+                    None, training_config)
         if epoch % args.val_interval == 0 or epoch == args.epochs:
-            score = val_iou(model, args.root_path, args.device, args.max_images)
-            print(f'[VAL] epoch={epoch} IoU@0.50={score:.6f}', flush=True)
+            score = val_iou(model, args.root_path, args.device, args.max_images,
+                            threshold=args.recovery_threshold)
+            print(f'[VAL] epoch={epoch} IoU@{args.recovery_threshold:.2f}={score:.6f}', flush=True)
             if score > best:
                 best = score
-                save_repair(model, args.output_dir / 'best.pth', args.base_checkpoint, epoch, score)
+                save_repair(model, args.output_dir / 'best.pth', args.base_checkpoint,
+                            epoch, score, training_config)
 
 
 def gap_proxy(p0, p1, gt_skeleton, gt_mask):
@@ -291,8 +327,10 @@ def evaluate(args, model):
                   'added_background_pixels': sum(r['added_background_pixels'] for r in extras),
                   'removed_gt_pixels': sum(r['removed_gt_pixels'] for r in extras),
                   'removed_background_pixels': sum(r['removed_background_pixels'] for r in extras),
-                  'p0_gt_skeleton_uncovered_rate': rows['p0'][0]['break_rate'],
-                  'p1_gt_skeleton_uncovered_rate': rows['p1'][0]['break_rate'],
+                  'p0_gt_skeleton_uncovered_rate': float(np.mean(
+                      [row['break_rate'] for row in rows['p0']])),
+                  'p1_gt_skeleton_uncovered_rate': float(np.mean(
+                      [row['break_rate'] for row in rows['p1']])),
                   'eligible_p0_gaps': sum(r['eligible_p0_gaps'] for r in extras),
                   'closed_p0_gaps': sum(r['closed_p0_gaps'] for r in extras),
                   'gap_closure_rate_proxy': sum(r['closed_p0_gaps'] for r in extras) /
@@ -332,14 +370,17 @@ def smoke(args, model):
                model.base.swin_unet.decoder_structure_blocks['2'].p2_head.register_forward_hook(p2_hook)]
     try:
         output = model(image)
-        loss, stats = repair_losses(output, mask, skeleton, args.lambda_q)
+        loss, stats = repair_losses(
+            output, mask, skeleton, args.lambda_q, args.lambda_recover,
+            args.lambda_background, args.recovery_threshold, args.recovery_margin)
         loss.backward()
         initial_delta = float((output['z1'] - output['z0']).detach().abs().sum())
         optimizer = torch.optim.SGD((p for p in model.parameters() if p.requires_grad), lr=0.01)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         output = model(image)
-        surface_only, _ = repair_losses(output, mask, skeleton, lambda_q=0.)
+        surface_only, _ = repair_losses(output, mask, skeleton, lambda_q=0.,
+                                        lambda_recover=0., lambda_background=0.)
         surface_only.backward()
     finally:
         for handle in handles:
@@ -353,8 +394,12 @@ def smoke(args, model):
     gradients = {name: float(sum(p.grad.abs().sum() for p in module.parameters()
                                  if p.grad is not None))
                  for name, module in (('q_features', model.q_features), ('q_head', model.q_head),
-                                      ('r_features', model.r_features), ('r_head', model.r_head))}
-    if gradients['q_head'] <= 0 or gradients['r_head'] <= 0 or gradients['r_features'] <= 0:
+                                      ('r_features', model.r_features),
+                                      ('r_directional', model.r_directional),
+                                      ('r_plus_head', model.r_plus_head),
+                                      ('r_minus_head', model.r_minus_head))}
+    if any(gradients[name] <= 0 for name in ('q_head', 'r_plus_head', 'r_minus_head',
+                                             'r_features', 'r_directional')):
         raise RuntimeError(f'Q3/R3 head gradients are zero: {gradients}')
     report = {'shapes': {k: list(v.shape) for k, v in output.items() if torch.is_tensor(v)},
               'loss': float(loss.detach()), 'gradients': gradients,
@@ -373,9 +418,16 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--base_checkpoint', type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument('--repair_checkpoint', type=Path)
+    parser.add_argument('--init_repair_checkpoint', type=Path,
+                        help='reuse Q3 and shared R3 features from the old single-head repair')
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--eta', type=float, default=0.5)
+    parser.add_argument('--eta_plus', type=float, default=0.5)
+    parser.add_argument('--eta_minus', type=float, default=0.5)
     parser.add_argument('--lambda_q', type=float, default=0.1)
+    parser.add_argument('--lambda_recover', type=float, default=0.05)
+    parser.add_argument('--lambda_background', type=float, default=0.02)
+    parser.add_argument('--recovery_threshold', type=float, default=0.45)
+    parser.add_argument('--recovery_margin', type=float, default=0.2)
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--val_interval', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=2)
@@ -389,6 +441,12 @@ def main():
     parser.add_argument('--max_images', type=int, default=0, help='0 uses the entire split')
     args = parser.parse_args()
     args.base_checkpoint = args.base_checkpoint.resolve()
+    if args.repair_checkpoint and args.init_repair_checkpoint:
+        parser.error('Choose either --repair_checkpoint or --init_repair_checkpoint')
+    if args.init_repair_checkpoint and args.mode not in ('train', 'smoke'):
+        parser.error('--init_repair_checkpoint is only supported for train/smoke')
+    if not 0 < args.recovery_threshold < 1 or args.recovery_margin < 0:
+        parser.error('Recovery threshold must be in (0,1) and margin nonnegative')
     args.device = torch.device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
