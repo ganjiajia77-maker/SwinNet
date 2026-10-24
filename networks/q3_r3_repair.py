@@ -83,6 +83,7 @@ class Q3R3Repair(nn.Module):
         self.eta_minus = float(eta_minus)
         self.positive_gate_floor = 0.2
         self.enable_q3_r3 = bool(enable_q3_r3)
+        self.q_only = False
         self.base.eval()
 
     def train(self, mode=True):
@@ -133,6 +134,13 @@ class Q3R3Repair(nn.Module):
         features = self.q_features(q_input)
         q_logits = self.q_head(features)
         q = q_logits.sigmoid()
+        if self.q_only:
+            return {'z0': z0, 'z1': z0, 'q_logits': q_logits, 'q': q,
+                    'stage2_s': stage2['skeleton'].detach(),
+                    'stage2_c': stage2['connectivity'].detach(),
+                    'stage2_d': (stage2['direction'].detach()
+                                 if stage2.get('direction') is not None else None),
+                    'highres_h': highres.detach(), 'stage3_h': stage3_feature}
         repair_features = self.r_features(torch.cat((features, q, align(p0)), dim=1))
         repair_features = self.r_directional(repair_features)
         delta_plus = F.softplus(self.r_plus_head(repair_features))
