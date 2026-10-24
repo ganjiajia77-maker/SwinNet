@@ -1,0 +1,21 @@
+{
+  "sat2graph": {
+    "repository": "https://github.com/songtaohe/Sat2Graph",
+    "commit": "7ca4a345a2ceae4c62c120661608a60e9e962be4",
+    "source": "metrics/topo/main.py, metrics/topo/topo.py and metrics/topo/graph.py",
+    "license": "sat2graph/LICENSE (MIT)",
+    "topo_source_sha256": "e67e5f89c568d411b8fe55482cd4f80c68725d6b2cbf3607f20813af722ea152",
+    "main_source_sha256": "99b9374aa42c9f1e0ed0be02e6bbdf60bc6dc69f49f53584f9452adda1b96f8c",
+    "graph_source_sha256": "4ccb508074b5fc665445e7f2a08aa21229993a565f4b680ab95176c5d966ff6f",
+    "python3_port": "Run build_sat2graph_port.py. It applies lib2to3, removes SVG output, and replaces equivalent list membership checks with constant-time dict/set checks."
+  },
+  "cosmiq_apls": {
+    "repository": "https://github.com/CosmiQ/apls",
+    "commit": "4a78807cafde62b773e3a1190177526853c61207",
+    "source": "apls/apls.py and apls/apls_utils.py",
+    "license": "cosmiq/LICENSE.txt (Apache-2.0)",
+    "apls_source_sha256": "7f42bff9391f56d9939db6689424d42aad44e40b89d6cb933b101ae3d5ae5a3a",
+    "utils_source_sha256": "27a3270f1309ad49eb453b13c1b571abf5f9c913bf48c560c560ba9198d99319",
+    "loader": "official_graph_metrics.py compiles the named original function bodies via AST; unrelated GDAL/plotting imports are omitted."
+  }
+}

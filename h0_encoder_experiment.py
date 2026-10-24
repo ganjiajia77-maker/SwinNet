@@ -112,7 +112,12 @@ def manifest(args, checkpoint_info, selection=None):
                     'datasets/dataset_road_skeleton.py', 'config.py',
                     'evaluation/road_comparison/compare_predictions.py',
                     'evaluation/road_comparison/road_metrics.py',
-                    'evaluation/road_comparison/graph_topology.py',
+                    'evaluation/road_comparison/official_graph_metrics.py',
+                    'evaluation/road_comparison/vendor/sat2graph/topo.upstream.py.txt',
+                    'evaluation/road_comparison/vendor/sat2graph/main.upstream.py.txt',
+                    'evaluation/road_comparison/vendor/sat2graph/graph.upstream.py.txt',
+                    'evaluation/road_comparison/vendor/cosmiq/apls.upstream.py.txt',
+                    'evaluation/road_comparison/vendor/cosmiq/apls_utils.upstream.py.txt',
                     'docs/H0_ENCODER_ROAD_SKELETON_PRESERVATION_SPEC.md',
                     'docs/H0_NO_A1A2.md', 'scripts/verify_h0_no_a1a2.py',
                     'scripts/verify_h0_encoder.py']

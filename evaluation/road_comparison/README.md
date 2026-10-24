@@ -1,78 +1,66 @@
-# Unified road mask and raster graph evaluation (v2)
+# Unified road evaluation: official graph metric functions (v3)
 
-The evaluator accepts the same native-size binary masks and manifests as v1.
-Validation threshold selection still uses global IoU only; topology is computed
-after that selection, on the chosen validation or test masks. No training or
-model inference is required to re-evaluate saved masks.
+This evaluator accepts saved native-resolution binary surface masks. The
+validation threshold remains selected by global IoU; topology runs only after
+selection. It does not retrain or re-infer any network.
 
-## Corrected metric names
+## What the scores actually call
 
-| Output column | Meaning |
+| Output | Implementation |
 | --- | --- |
-| `cldice`, `cldice_precision`, `cldice_recall` | Hard Zhang–Suen skeleton / road-region overlap. |
-| `topo_f1`, `topo_precision`, `topo_recall` | **Raster-graph local reachability**. A seed's graph-distance neighborhood is compared with the matched neighborhood in the other graph. These are no longer aliases of clDice. |
-| `apls_gt_to_pred`, `apls_pred_to_gt`, `apls_bidirectional` | Sampled control-point shortest-path similarity on pixel graphs. Matched control points are projected to and inserted into the other graph's edges. |
-| `tlts_infeasible` | Fraction of connected GT control-point pairs for which the prediction has no matched traversable path. |
-| `tlts_unmatched_pairs`, `tlts_disconnected_pairs`, `tlts_matched_pairs` | Explain whether infeasibility came from missing endpoints or graph disconnection. |
-| `apls_*_approx` | v1 sampled pixel-node proxy, retained for comparison and explicitly marked approximate. |
+| `cldice` | The existing hard Zhang–Suen skeleton / road-mask overlap. |
+| `topo_precision`, `topo_recall`, `topo_f1` | [Sat2Graph](https://github.com/songtaohe/Sat2Graph) `TOPOGenerateStartingPoints`, `TOPOGeneratePairs`, `TOPOWithPairs`, `TOPO121`, `topoAvg`. Its one-to-one matching and coverage factor are used. |
+| `apls_gt_to_pred`, `apls_pred_to_gt`, `apls_bidirectional` | [CosmiQ APLS](https://github.com/CosmiQ/apls) `make_graphs`, `path_sim_metric`, `compute_apls_metric`. The last value is its harmonic bidirectional output. |
+| `tlts_infeasible` | Diagnostic on the **same GT control-point routes used by official APLS**: fraction with unmatched or disconnected endpoints in the inserted prediction graph. TLTS is not part of either official library and must be labelled a raster-derived diagnostic. |
 
-Every mask is skeletonized by the same zero-padded Zhang–Suen routine. Each
-skeleton pixel is a graph node; 8-neighbor edges have Euclidean pixel lengths.
-The raster graph is planar under this convention, so adjacent diagonal pixels
-can form connections absent from a vector road network. A GT binary mask cannot
-reconstruct overpass levels or the original annotation's vector nodes.
+The sources, exact upstream commits, untouched downloaded files, licences and
+SHA256 checksums are in `vendor/UPSTREAM.json`. Sat2Graph's Python 2 source is
+ported to Python 3 by `vendor/build_sat2graph_port.py`; SVG rendering is omitted,
+while matching, walking, seed generation and scoring are preserved. CosmiQ's
+original function bodies are compiled directly from the saved source by the
+adapter; unrelated GDAL, plotting and OSM loaders are not imported.
 
-The default graph protocol uses at most 64 deterministic control points per
-image, a 5-pixel edge matching radius, at most 16 TOPO seeds per direction,
-300-pixel local geodesic radius, 5-pixel sampling cells and 5-pixel matching
-tolerance. These **pixel** values are not Sat2Graph's 300-meter setting.
-TOPO uses one-to-one spatial matching of sampled reachable local nodes. APLS
-uses the mean directional path score and their per-image harmonic mean.
-Infeasible includes a reference path whose endpoint cannot be matched;
-`tlts_disconnected_matched_rate` isolates true disconnections among matched
-endpoint pairs. Images with no GT control-point path have an infeasible rate of
-zero and a reported `apls_gt_pairs` count of zero.
+Both GT and predictions use the same zero-padded Zhang–Suen skeleton and
+8-neighbour pixel graph. For APLS, degree-two chains are contracted to exact
+polylines with original pixel-path lengths; there is **no 64-point cap**.
+CosmiQ's midpoint insertion, edge projection, path matching and score are run
+with a 50-pixel control spacing, 5-pixel snap radius, and 10-pixel minimum
+reference path. Sat2Graph's own `main.py` settings are used: 50-metre seed
+spacing, 5-metre marble/hole interval, approximately 11-metre match threshold,
+and 150/300-metre local graph radius according to its image extent rule. Raster
+pixels are mapped to its synthetic one-metre coordinates. The old manifest field
+`apls_max_nodes=64` is accepted solely to read existing manifests and has no
+effect on v3 scores.
 
-The report stores all settings, image hashes, and SHA256 hashes of the metric
-implementation. IoU/F1/precision/recall use global TP/FP/FN. Graph and clDice
-scores use per-image means; pair counts in the summary are also per-image means.
-Compare models only with the same `metric_version`, settings and GT masks.
+**Reporting boundary:** These are official *algorithm functions applied to
+graphs reconstructed from raster masks*. The dataset supplies no original
+vector GT graph or overpass levels. Thus the resulting numbers are not the
+published SpaceNet or Sat2Graph benchmark scores. Report graph extraction,
+coordinate scale and parameters alongside the result. Existing v1/v2 numbers
+must be recomputed for every model before comparing with v3.
 
-**Publication label:** use "raster-derived local TOPO-F1", "raster-derived
-sampled graph APLS" and "TLTS infeasible under raster control-point matching".
-Do not call these the official Sat2Graph or SpaceNet benchmark scores. The
-official implementations require graph inputs and make different seed, distance,
-coordinate and control-point choices. In particular, this TOPO implementation
-uses deterministic pixel seeds and 5-pixel spatial cells, rather than the
-official geographic-coordinate sampling protocol.
-
-Sources: [Sat2Graph paper](https://www.ecva.net/papers/eccv_2020/papers_ECCV/papers/123690052.pdf),
-[Sat2Graph metric code](https://github.com/songtaohe/Sat2Graph/tree/master/metrics),
-[CosmiQ APLS](https://github.com/CosmiQ/apls), and
-[TLTS definition and limitations](https://www.ecva.net/papers/eccv_2020/papers_ECCV/papers/123730698.pdf).
-
-## Re-evaluate saved masks
-
-Use the *existing* `comparison.json`, `val_selection.json`, and test surface
-mask folders from the experiment. The evaluator accepts v1 selection hashes
-when the image size and v1 protocol settings match; it does not select a new
-threshold on the test set.
+## Install and re-evaluate saved test masks
 
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate swinunet
 REPO=/home/gjj/SwinNet-h0-encoder-no-a1a2-mass1500
 AUDIT=/path/to/existing/unified_eval
+python -m pip install -r "$REPO/evaluation/road_comparison/requirements.txt"
+
 python -u "$REPO/evaluation/road_comparison/compare_predictions.py" \
   --manifest "$AUDIT/comparison.json" \
   --split test \
   --selection "$AUDIT/val/val_selection.json" \
-  --output_dir "$AUDIT/test_graph_v2" \
-  --progress_every 10
-cat "$AUDIT/test_graph_v2/test_comparison.csv"
+  --output_dir "$AUDIT/test_official_graph_v3" \
+  --progress_every 1
+
+cat "$AUDIT/test_official_graph_v3/test_comparison.csv"
 ```
 
-`--output_dir` must be new or empty. For a custom three-model manifest, use the
-same command and its own saved validation selection. Case IDs must match the GT
-exactly; the evaluator rejects missing, extra or duplicated masks. It never
-silently resizes an image.
+Use the existing manifest and threshold selection together, so checkpoint
+identity and saved mask directories remain paired. The output directory must be
+new or empty. The evaluator rejects missing, extra, duplicated or resized masks.
+The full official APLS workflow computes all-pairs graph paths and can take
+substantial CPU time or memory on complex 1500-pixel masks. Per-image CSV rows
+are flushed immediately so progress is visible.

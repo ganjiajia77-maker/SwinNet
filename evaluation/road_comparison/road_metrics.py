@@ -1,33 +1,32 @@
-"""Shared mask metrics with distinct clDice and raster-derived graph scores."""
+"""Shared mask metrics; graph scores call pinned official TOPO and APLS code."""
 
 import cv2
 import numpy as np
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import dijkstra
-from scipy.spatial import cKDTree
 
-from graph_topology import graph_scores, prepare_graph
+from official_graph_metrics import graph_scores, prepare_official_graph
 
 
-METRIC_VERSION = "road-mask-v2.0-raster-graph"
+METRIC_VERSION = "road-mask-v3.0-official-graph-functions"
 DEFAULT_PROTOCOL = {
     "metric_version": METRIC_VERSION,
     "image_size": 1024,
     "short_area_threshold": 20,
-    "apls_max_nodes": 64,
+    "legacy_apls_max_nodes_ignored": 64,
     "apls_snap_radius": 5.0,
-    "topo_local_radius_px": 300.0,
-    "topo_sample_interval_px": 5.0,
-    "topo_match_radius_px": 5.0,
-    "topo_max_seeds": 16,
+    "apls_control_spacing_px": 50.0,
+    "apls_min_path_px": 10.0,
     "connectivity": 8,
     "skeleton": "numpy_zhang_suen_zero_padded",
-    "snap_rule": "distance <= radius; ties use lowest row-major node",
+    "snap_rule": "official CosmiQ nearest-edge projection and control-point insertion",
     "segmentation_aggregation": "global TP/FP/FN",
-    "topology_aggregation": "per-image mean; directional graph scores and bidirectional APLS harmonic per image",
-    "graph_protocol": "pixel-skeleton 8-neighbor graph; control points snapped to nearest edge and inserted",
-    "graph_units": "pixels; not Sat2Graph/SpaceNet official vector-GT scores",
-    "tlts_unmatched_rule": "unmatched endpoint pairs and disconnected matched pairs count infeasible",
+    "topology_aggregation": "per-image mean of official Sat2Graph TOPO and CosmiQ APLS function outputs",
+    "graph_protocol": "raster skeleton to 8-neighbor graph; exact degree-two chain contraction for APLS",
+    "graph_units": "mask pixels mapped to synthetic metres for Sat2Graph; not vector-GT benchmark scores",
+    "topo_source": "Sat2Graph 7ca4a345a2ceae4c62c120661608a60e9e962be4",
+    "apls_source": "CosmiQ/apls 4a78807cafde62b773e3a1190177526853c61207",
+    "topo_settings": "official main.py: density 0.00050, step 0.00005, threshold 0.00010, radius 0.00150 or 0.00300 degrees",
+    "tlts_unmatched_rule": "GT paths from official APLS; unmatched or disconnected predicted route is infeasible",
     "postprocessing": "none; use supplied binary masks without resizing",
     "gt_encoding": "single-channel or identical-channel RGB binary mask; predictions single-channel",
 }
@@ -104,76 +103,13 @@ def skeleton_graph(skeleton):
     return points, graph
 
 
-def sample_graph_nodes(graph, max_nodes):
-    nodes = np.arange(graph.shape[0])
-    if len(nodes) <= max_nodes:
-        return nodes
-    special = nodes[np.diff(graph.indptr) != 2]
-    if len(special) >= max_nodes:
-        return special[np.linspace(0, len(special) - 1, max_nodes).astype(int)]
-    regular = nodes[np.diff(graph.indptr) == 2]
-    return np.concatenate((special, regular[np.linspace(
-        0, len(regular) - 1, max_nodes - len(special),
-    ).astype(int)]))
-
-
-def prepare_paths(skeleton, max_nodes):
-    points, graph = skeleton_graph(skeleton)
-    nodes = sample_graph_nodes(graph, max_nodes)
-    paths = (np.atleast_2d(dijkstra(graph, directed=False, indices=nodes))
-             if len(nodes) else np.empty((0, 0)))
-    return {"points": points, "graph": graph, "nodes": nodes, "paths": paths}
-
-
-def snap_nodes(source, target, radius):
-    snapped = np.full(len(source), -1, dtype=np.int64)
-    if not len(target):
-        return snapped
-    tree = cKDTree(target)
-    distances, _ = tree.query(source)
-    for i, distance in enumerate(distances):
-        if distance > radius:
-            continue
-        candidates = np.asarray(tree.query_ball_point(source[i], distance + 1e-9))
-        squared = ((target[candidates] - source[i]) ** 2).sum(axis=1)
-        snapped[i] = candidates[squared == squared.min()].min()
-    return snapped
-
-
-def directional_apls(reference, proposal, radius):
-    nodes = reference["nodes"]
-    if len(nodes) < 2:
-        return 0.0, 0
-    snapped = snap_nodes(reference["points"][nodes], proposal["points"], radius)
-    matched = np.unique(snapped[snapped >= 0])
-    proposed_paths = (np.atleast_2d(dijkstra(
-        proposal["graph"], directed=False, indices=matched,
-    )) if len(matched) else None)
-    source_rows = {int(node): i for i, node in enumerate(matched)}
-    scores = []
-    for i in range(len(nodes)):
-        for j in range(i + 1, len(nodes)):
-            length = reference["paths"][i, nodes[j]]
-            if not np.isfinite(length) or length <= 0:
-                continue
-            score = 0.0
-            if snapped[i] >= 0 and snapped[j] >= 0:
-                proposed = proposed_paths[source_rows[int(snapped[i])], snapped[j]]
-                if np.isfinite(proposed):
-                    score = max(0.0, 1.0 - abs(proposed - length) / length)
-            scores.append(score)
-    return (float(np.mean(scores)) if scores else 0.0), len(scores)
-
-
 def prepare_target(target, protocol):
     skeleton = skeletonize(target)
-    paths = prepare_paths(skeleton, protocol["apls_max_nodes"])
+    points, pixel_graph = skeleton_graph(skeleton)
     return {
         "mask": target, "skeleton": skeleton,
         "components": component_stats(target, protocol["short_area_threshold"]),
-        "paths": paths,
-        "graph": prepare_graph(paths["points"], paths["graph"], protocol["apls_max_nodes"],
-                               controls=paths["nodes"], lengths=paths["paths"]),
+        "graph": prepare_official_graph(points, pixel_graph),
     }
 
 
@@ -197,16 +133,8 @@ def image_metrics(pred, prepared, protocol):
     gap_stats = component_stats(missing, 2)
     topo_precision = ratio((pred_skeleton & target).sum(), pred_skeleton.sum())
     topo_recall = ratio((gt_skeleton & pred).sum(), gt_skeleton.sum())
-    pred_paths = prepare_paths(pred_skeleton, protocol["apls_max_nodes"])
-    pred_graph = prepare_graph(pred_paths["points"], pred_paths["graph"],
-                               protocol["apls_max_nodes"], controls=pred_paths["nodes"],
-                               lengths=pred_paths["paths"])
-    forward, forward_pairs = directional_apls(
-        prepared["paths"], pred_paths, protocol["apls_snap_radius"],
-    )
-    reverse, reverse_pairs = directional_apls(
-        pred_paths, prepared["paths"], protocol["apls_snap_radius"],
-    )
+    pred_points, pred_pixel_graph = skeleton_graph(pred_skeleton)
+    pred_graph = prepare_official_graph(pred_points, pred_pixel_graph, id_offset=1_000_000_000)
     graph_result = graph_scores(prepared["graph"], pred_graph, protocol)
     row = confusion(pred, target)
     row.update({
@@ -221,9 +149,6 @@ def image_metrics(pred, prepared, protocol):
         "gt_largest_component_ratio": gt_stats["largest_ratio"],
         "break_pixels": int(missing.sum()), "break_rate": ratio(missing.sum(), gt_skeleton.sum()),
         "gap_components": gap_stats["count"], "max_gap_pixels": gap_stats["max_area"],
-        "apls_gt_to_pred_approx": forward, "apls_pred_to_gt_approx": reverse,
-        "apls_bidirectional_approx": harmonic(forward, reverse),
-        "apls_gt_valid_pairs": forward_pairs, "apls_pred_valid_pairs": reverse_pairs,
     })
     row.update(graph_result)
     return row

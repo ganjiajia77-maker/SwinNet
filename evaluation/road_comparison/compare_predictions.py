@@ -10,8 +10,10 @@ import re
 import time
 
 import cv2
+import networkx
 import numpy as np
 import scipy
+import shapely
 
 from road_metrics import (DEFAULT_PROTOCOL, confusion, image_metrics, prepare_target,
                           segmentation, summarize)
@@ -137,19 +139,19 @@ def write_csv(path, rows):
 
 def validate_manifest(manifest):
     protocol = dict(DEFAULT_PROTOCOL)
-    overrides = manifest.get("protocol", {})
+    overrides = dict(manifest.get("protocol", {}))
     adjustable = {"image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius",
-                  "topo_local_radius_px", "topo_sample_interval_px", "topo_match_radius_px",
-                  "topo_max_seeds"}
+                  "apls_control_spacing_px", "apls_min_path_px"}
     if set(overrides) - adjustable:
         raise ValueError(f"Unsupported protocol settings: {set(overrides) - adjustable}")
+    if "apls_max_nodes" in overrides:
+        protocol["legacy_apls_max_nodes_ignored"] = overrides.pop("apls_max_nodes")
     protocol.update(overrides)
-    for key in ("image_size", "short_area_threshold", "apls_max_nodes", "topo_max_seeds"):
+    for key in ("image_size", "short_area_threshold", "legacy_apls_max_nodes_ignored"):
         value = protocol[key]
-        if not isinstance(value, int) or value < (2 if key == "apls_max_nodes" else 1):
+        if not isinstance(value, int) or value < (2 if key == "legacy_apls_max_nodes_ignored" else 1):
             raise ValueError(f"Invalid {key}: {value}")
-    for key in ("apls_snap_radius", "topo_local_radius_px", "topo_sample_interval_px",
-                "topo_match_radius_px"):
+    for key in ("apls_snap_radius", "apls_control_spacing_px", "apls_min_path_px"):
         if not np.isfinite(protocol[key]) or protocol[key] <= 0:
             raise ValueError(f"{key} must be finite and positive")
     names = [m["name"] for m in manifest["models"]]
@@ -176,9 +178,12 @@ def compatible_selection(selection, protocol):
         return False
     if selection.get("protocol_hash") == digest(protocol):
         return True
+    if selection.get("schema") == 2 and selection.get("threshold_protocol_hash") == threshold_protocol_hash(protocol):
+        return True
     old = dict(LEGACY_V1_PROTOCOL)
-    for key in ("image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius"):
+    for key in ("image_size", "short_area_threshold", "apls_snap_radius"):
         old[key] = protocol[key]
+    old["apls_max_nodes"] = protocol["legacy_apls_max_nodes_ignored"]
     return selection.get("protocol_hash") == digest(old)
 
 
@@ -302,13 +307,18 @@ def evaluate(manifest, base, protocol, split, selection, output, progress):
         "split": split, "protocol": protocol, "threshold_selection": selection,
         "metric_implementation_sha256": {
             name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-            for name in ("compare_predictions.py", "road_metrics.py", "graph_topology.py")
+            for name in ("compare_predictions.py", "road_metrics.py", "official_graph_metrics.py",
+                         "vendor/sat2graph/graph.py", "vendor/sat2graph/topo.py",
+                         "vendor/sat2graph/main.upstream.py.txt",
+                         "vendor/sat2graph/graph.upstream.py.txt", "vendor/sat2graph/topo.upstream.py.txt",
+                         "vendor/cosmiq/apls.upstream.py.txt", "vendor/cosmiq/apls_utils.upstream.py.txt")
         },
         "case_ids": sorted(labels), "case_ids_sha256": digest(sorted(labels)),
         "binary_content_sha256": {key: value.hexdigest() for key, value in content_hashes.items()},
         "provenance": {m["name"]: m["provenance"] for m, _, _ in models},
         "environment": {"python": platform.python_version(), "numpy": np.__version__,
-                        "scipy": scipy.__version__, "opencv": cv2.__version__},
+                        "scipy": scipy.__version__, "opencv": cv2.__version__,
+                        "networkx": networkx.__version__, "shapely": shapely.__version__},
         "summaries": summaries,
         "metric_runtime_seconds": time.perf_counter() - started,
         "timing_note": "CPU mask evaluation only; no model inference timing can be obtained from PNG",
