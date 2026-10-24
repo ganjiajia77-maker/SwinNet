@@ -140,6 +140,16 @@ def manifest(args, checkpoint_info, selection=None):
                                   for name in source_files}},
                 'predictions': {'val': val, 'test': test}}]}
     destination = args.output_dir / 'comparison.json'
+    if selection is not None and destination.is_file():
+        previous = json.loads(destination.read_text(encoding='utf-8'))
+        old_models = previous.get('models', [])
+        if (len(old_models) == 1 and
+                old_models[0].get('name') == checkpoint_info['name'] and
+                old_models[0].get('provenance', {}).get('checkpoint') == str(args.model_path)):
+            # Topology code may change after val selected a threshold. Keep
+            # the saved checkpoint identity; test mask provenance stays tied
+            # to the actual inference run, not to this evaluator update.
+            data['models'][0]['provenance'] = old_models[0]['provenance']
     destination.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return destination
 
