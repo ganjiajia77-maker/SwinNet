@@ -136,6 +136,7 @@ class FeatureTap:
     def __init__(self, model):
         self.model = model
         self.values = {}
+        self.direction_off = False
         backbone = model.swin_unet
         self.handles = [
             backbone.layers_up[1].register_forward_hook(self._f1_hook),
@@ -143,6 +144,42 @@ class FeatureTap:
             backbone.decoder_structure_blocks['3'].register_forward_hook(self._decoder_hook('F3')),
             backbone.guided_head.surface_head.register_forward_pre_hook(self._surface_hook),
         ]
+        if getattr(backbone, 'encoder_structure_exchange', False):
+            for stage, module in enumerate(backbone.encoder_exchanges):
+                self.handles.append(module.register_forward_hook(self._exchange_hook(stage)))
+            for stage, module in backbone.highres_structure_fusion.items():
+                self.handles.append(module.register_forward_hook(self._fusion_hook(stage)))
+            self.handles.append(backbone.e2_direction.register_forward_hook(self._direction_hook))
+
+    def _exchange_hook(self, stage):
+        def hook(_module, inputs, output):
+            if len(inputs) < 2 or not isinstance(output, (tuple, list)) or len(output) < 2:
+                raise RuntimeError(f'Unexpected E/H exchange interface at stage {stage + 1}')
+            # Keep the pre/post H feature maps. These are the exact tensors
+            # consumed and produced by the existing E/H interaction module.
+            self.values[f'H_E{stage + 1}_fusion_in'] = inputs[1].detach()
+            self.values[f'H_E{stage + 1}'] = output[1].detach()
+        return hook
+
+    def _fusion_hook(self, stage):
+        def hook(_module, inputs, output):
+            if not inputs or not isinstance(inputs[0], torch.Tensor) or not isinstance(output, torch.Tensor):
+                raise RuntimeError(f'Unexpected H0-to-decoder fusion interface at stage {stage}')
+            self.values[f'fusion{stage}_decoder_in'] = inputs[0].detach()
+            self.values[f'fusion{stage}_h_in'] = inputs[1].detach()
+            self.values[f'fusion{stage}_out'] = output.detach()
+        return hook
+
+    def _direction_hook(self, _module, inputs, output):
+        if self.direction_off:
+            if not inputs or not isinstance(inputs[0], torch.Tensor):
+                raise RuntimeError('Unexpected E2 direction aggregation interface')
+            if isinstance(output, (tuple, list)) and len(output) == 2:
+                # Preserve the auxiliary raw direction output; only bypass the
+                # E2 feature residual for this inference pass.
+                return (inputs[0], output[1])
+            return inputs[0]
+        return output
 
     def _f1_hook(self, _module, _inputs, output):
         if not isinstance(output, torch.Tensor) or output.ndim != 3:
@@ -168,10 +205,15 @@ class FeatureTap:
         with torch.no_grad():
             outputs = self.model(images)
         backbone = self.model.swin_unet
-        for name in ('E1', 'E2', 'E3', 'H0', 'H_E2', 'H_E3'):
+        for name in ('E1', 'E2', 'E3', 'H0', 'H_E1', 'H_E2', 'H_E3'):
+            if name not in backbone.last_encoder_features:
+                if name == 'H_E1':
+                    continue
+                raise RuntimeError(f'Missing encoder feature {name}')
             self.values[name] = backbone.last_encoder_features[name].detach()
-        if set(self.values) != set(PROBES):
-            raise RuntimeError(f'Incomplete feature taps: {sorted(self.values)}')
+        required = set(PROBES) | {'H_E1'}
+        if not required.issubset(self.values):
+            raise RuntimeError(f'Incomplete feature taps: {sorted(required - set(self.values))}')
         if any(value.ndim != 4 or value.shape[0] != images.shape[0]
                for value in self.values.values()):
             raise RuntimeError('Feature tap returned an invalid tensor')
