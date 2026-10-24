@@ -36,8 +36,13 @@ class ContextHeads(nn.Module):
             'H0_context5': nn.Sequential(nn.Conv2d(channels['H0'], 32, 5, padding=2),
                                          nn.GELU(), nn.Conv2d(32, 1, 1)),
         })
-        self.pointwise = nn.ModuleDict({name: nn.Conv2d(channels[name], 1, 1)
-                                        for name in ('H_E1_probe', *FUSION_NAMES)})
+        # H_E1_probe is the readout name, while its feature-map key remains
+        # H_E1. Keep that translation explicit so the dynamically discovered
+        # channel table and the output/readout names cannot drift apart.
+        self.pointwise = nn.ModuleDict({
+            name: nn.Conv2d(channels['H_E1' if name == 'H_E1_probe' else name], 1, 1)
+            for name in ('H_E1_probe', *FUSION_NAMES)
+        })
         self.to(device)
 
     def forward(self, features):
