@@ -81,6 +81,7 @@ class Q3R3Repair(nn.Module):
             nn.init.constant_(head.bias, bias)
         self.eta_plus = float(eta_plus)
         self.eta_minus = float(eta_minus)
+        self.positive_gate_floor = 0.2
         self.enable_q3_r3 = bool(enable_q3_r3)
         self.base.eval()
 
@@ -136,7 +137,8 @@ class Q3R3Repair(nn.Module):
         repair_features = self.r_directional(repair_features)
         delta_plus = F.softplus(self.r_plus_head(repair_features))
         delta_minus = F.softplus(self.r_minus_head(repair_features))
-        delta = (self.eta_plus * (0.2 + 0.8 * q) * delta_plus -
+        delta = (self.eta_plus * (self.positive_gate_floor +
+                 (1. - self.positive_gate_floor) * q) * delta_plus -
                  self.eta_minus * delta_minus)
         z1 = z0 + F.interpolate(delta, size=z0.shape[-2:],
                                 mode='bilinear', align_corners=False)
