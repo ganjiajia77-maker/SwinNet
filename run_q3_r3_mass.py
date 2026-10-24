@@ -180,15 +180,14 @@ def train(args, model):
                 save_repair(model, args.output_dir / 'best.pth', args.base_checkpoint, epoch, score)
 
 
-def gap_proxy(p0, p1, gt_skeleton, gt_mask):
-    """Count P0 two-flank missed segments closed by P1; not vector-road truth."""
+def reference_gaps(p0, gt_skeleton, gt_mask):
+    """Identify P0 missed centerline segments with two GT-supported flanks."""
     kernel = np.ones((5, 5), np.uint8)
     near_p0 = cv2.dilate(p0.astype(np.uint8), kernel) > 0
     missing = (gt_skeleton & ~near_p0).astype(np.uint8)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(missing, connectivity=8)
     _, p0_labels = cv2.connectedComponents(p0.astype(np.uint8), connectivity=8)
-    _, p1_labels = cv2.connectedComponents(p1.astype(np.uint8), connectivity=8)
-    eligible = closed = 0
+    gaps = []
     for index in range(1, count):
         if stats[index, cv2.CC_STAT_AREA] < 3:
             continue
@@ -198,7 +197,18 @@ def gap_proxy(p0, p1, gt_skeleton, gt_mask):
         flank_labels = flank_labels[flank_labels > 0]
         if len(flank_labels) < 2:
             continue
-        eligible += 1
+        gaps.append((index, int(stats[index, cv2.CC_STAT_AREA]), flank_labels))
+    return labels, p0_labels, gaps
+
+
+def gap_proxy(p0, p1, gt_skeleton, gt_mask):
+    """Count P0 two-flank missed segments closed by P1; not vector-road truth."""
+    labels, p0_labels, gaps = reference_gaps(p0, gt_skeleton, gt_mask)
+    _, p1_labels = cv2.connectedComponents(p1.astype(np.uint8), connectivity=8)
+    closed = 0
+    for index, _, flank_labels in gaps:
+        region = labels == index
+        flank = cv2.dilate(region.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
         if p1[region].mean() >= 0.8:
             linked = [set(np.unique(p1_labels[flank & (p0_labels == label) & gt_mask])) - {0}
                       for label in flank_labels]
@@ -210,10 +220,10 @@ def gap_proxy(p0, p1, gt_skeleton, gt_mask):
     for index in range(1, count):
         if stats[index, cv2.CC_STAT_AREA] < 3:
             continue
-        near = cv2.dilate((labels == index).astype(np.uint8), kernel) > 0
+        near = cv2.dilate((labels == index).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         sources = np.unique(p0_labels[near])
         bridge_count += int((sources > 0).sum() >= 2)
-    return eligible, closed, bridge_count
+    return len(gaps), closed, bridge_count
 
 
 def evaluate(args, model):

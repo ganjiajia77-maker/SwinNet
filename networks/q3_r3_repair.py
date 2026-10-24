@@ -64,7 +64,17 @@ class Q3R3Repair(nn.Module):
         self.base.eval()
         return self
 
-    def forward(self, image):
+    def refine_with_q(self, z0, features, p0_q, q):
+        if q.shape != p0_q.shape or q.shape[1] != 1:
+            raise ValueError('Q and the aligned initial surface must have matching shapes')
+        repair_features = self.r_features(torch.cat((features, q, p0_q), dim=1))
+        delta = self.r_head(repair_features)
+        gated_delta = (0.2 + 0.8 * q) * delta
+        z1 = z0 + self.eta * F.interpolate(gated_delta, size=z0.shape[-2:],
+                                           mode='bilinear', align_corners=False)
+        return z1, delta
+
+    def forward(self, image, return_aux=False):
         captured = []
 
         def stage3_hook(module, inputs, output):
@@ -106,23 +116,24 @@ class Q3R3Repair(nn.Module):
         features = self.q_features(q_input)
         q_logits = self.q_head(features)
         q = q_logits.sigmoid()
-        repair_features = self.r_features(torch.cat((features, q, align(p0)), dim=1))
-        delta = self.r_head(repair_features)
-        gated_delta = (0.2 + 0.8 * q) * delta
-        z1 = z0 + self.eta * F.interpolate(gated_delta, size=z0.shape[-2:],
-                                           mode='bilinear', align_corners=False)
-        return {'z0': z0, 'z1': z1, 'q_logits': q_logits, 'q': q,
-                'delta': delta, 'stage2_s': stage2['skeleton'].detach(),
-                'stage2_c': stage2['connectivity'].detach()}
+        p0_q = align(p0)
+        z1, delta = self.refine_with_q(z0, features, p0_q, q)
+        result = {'z0': z0, 'z1': z1, 'q_logits': q_logits, 'q': q,
+                  'delta': delta, 'stage2_s': stage2['skeleton'].detach(),
+                  'stage2_c': stage2['connectivity'].detach()}
+        if return_aux:
+            result['q_features'] = features
+            result['p0_q'] = p0_q
+        return result
 
 
 @torch.no_grad()
-def make_q_target(skeleton, z0, output_size, min_segment_pixels=3):
+def make_q_target(skeleton, z0, output_size, min_segment_pixels=3, threshold=0.5):
     """Missed GT centerline is a training proxy, not a true gap oracle."""
     if skeleton.shape != z0.shape:
         raise ValueError('Skeleton and initial surface must share the training grid')
     nearby_p0 = F.max_pool2d(z0.sigmoid(), 5, stride=1, padding=2)
-    missed = ((skeleton > 0.5) & (nearby_p0 < 0.5)).cpu().numpy().astype(np.uint8)
+    missed = ((skeleton > 0.5) & (nearby_p0 < threshold)).cpu().numpy().astype(np.uint8)
     targets = []
     for binary in missed[:, 0]:
         count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
