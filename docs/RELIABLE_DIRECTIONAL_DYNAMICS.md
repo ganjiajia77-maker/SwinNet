@@ -78,3 +78,24 @@ counts, tensor sizes, all key gradient norms, W's measured influence on U3,
 and peak GPU memory and batch time. Validation saves the selected threshold,
 P0/P1 paired metrics, length-binned gap proxies and representative repair
 panels, including eight separate W maps.
+
+## Failure audit
+
+The audit reads the saved checkpoint and all validation images, selecting the
+P0 gap-rich 512 tile from each image. It writes full, Q3-high, GT gap-center,
+and Q3-high background distributions for R/W/B/A, three update steps, and the
+final surface. Counterfactual forwards open the internal and final A gates,
+shift B, and rotate W without changing saved weights. One training batch checks
+loss terms, gradients, and an optimizer step in memory only.
+
+```bash
+python -u diagnostics/diagnose_reliable_directional_dynamics.py \
+  --root_path "$DATA" --base_checkpoint "$BASE" --q3_checkpoint "$Q3" \
+  --dynamic_checkpoint "$RUN_DIR/best.pth" \
+  --output_json "$RUN_DIR/reliable_directional_failure_audit.json" \
+  --device cuda --max_images 14 --threshold 0.45
+```
+
+The original initial module weights were not saved. The audit reconstructs
+them using the training seed and current code, and labels that comparison
+accordingly. The saved `best.pth` and `last.pth` are never modified.

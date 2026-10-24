@@ -177,7 +177,12 @@ class ReliableDirectionalRepair(nn.Module):
         self.frozen.eval()
         return self
 
-    def forward(self, image, capture_diagnostics=False):
+    def forward(self, image, capture_diagnostics=False, diagnostic_override=None):
+        diagnostic_override = diagnostic_override or {}
+        unknown = set(diagnostic_override) - {'internal_a_one', 'final_a_one',
+                                               'proposal_shift', 'rotate_w'}
+        if unknown:
+            raise ValueError(f'Unknown diagnostic override: {sorted(unknown)}')
         with torch.no_grad():
             old = self.frozen(image, capture_diagnostics=True)
         z0, q = old['z0'].detach(), old['q'].detach()
@@ -200,6 +205,12 @@ class ReliableDirectionalRepair(nn.Module):
         proposal = (torch.logit(p0.clamp(1e-5, 1. - 1e-5)) + proposal_delta).sigmoid()
         accept_features = torch.cat((proposal_features, proposal), dim=1)
         accept = self.accept_head(accept_features).sigmoid()
+        if diagnostic_override.get('proposal_shift'):
+            proposal = (p0 + float(diagnostic_override['proposal_shift'])).clamp(0., 1.)
+        if diagnostic_override.get('rotate_w'):
+            weights = weights.roll(shifts=1, dims=1)
+        if diagnostic_override.get('internal_a_one'):
+            accept = torch.ones_like(accept)
         states, masses, available = self.dynamics(
             visual, p0, q, reliable, proposal, accept, weights)
         full_size = z0.shape[-2:]
@@ -210,6 +221,8 @@ class ReliableDirectionalRepair(nn.Module):
                                             u3_full, accept_full, p0_full), dim=1))
         detail = .5 * torch.tanh(detail)
         refined = (torch.logit(u3_full.clamp(1e-5, 1. - 1e-5)) + detail).sigmoid()
+        if diagnostic_override.get('final_a_one'):
+            accept_full = torch.ones_like(accept_full)
         p1 = (1. - accept_full) * p0_full + accept_full * refined
         z1 = torch.logit(p1.clamp(1e-6, 1. - 1e-6))
         result = {'z0': z0, 'z1': z1, 'p0': p0_full, 'p1': p1,
@@ -217,9 +230,25 @@ class ReliableDirectionalRepair(nn.Module):
                   'a': accept, 'e_two': two, 'e_one': one,
                   'u0': states[0], 'u1': states[1], 'u2': states[2], 'u3': states[3]}
         if capture_diagnostics:
+            rates, transport, propose, stay = [], [], [], []
+            for state, availability in zip(states[:-1], available):
+                coefficient = self.dynamics.rates(torch.cat((
+                    visual, p0, q, reliable, proposal, accept, state,
+                    availability), dim=1)).softmax(dim=1)
+                step_transport = accept * coefficient[:, 1:2] * availability
+                step_propose = .2 * accept * coefficient[:, 2:3]
+                rates.append(coefficient)
+                transport.append(step_transport)
+                propose.append(step_propose)
+                stay.append(1. - step_transport - step_propose - coefficient[:, 3:4])
             result.update(source_mass=torch.stack(masses, dim=1),
                           source_available=torch.stack(available, dim=1),
-                          detail=detail, visual=visual)
+                          rate_coefficients=torch.stack(rates, dim=1),
+                          transport=torch.stack(transport, dim=1),
+                          propose=torch.stack(propose, dim=1),
+                          stay=torch.stack(stay, dim=1),
+                          detail=detail, visual=visual, p0_work=p0,
+                          accept_full=accept_full, t_full=refined)
         return result
 
 def gt_branch_segments(skeleton, min_pixels=4):
@@ -240,7 +269,8 @@ def gt_branch_segments(skeleton, min_pixels=4):
 
 
 def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_cont=.2,
-                   temperature=15., max_paths_per_image=128):
+                   temperature=15., max_paths_per_image=128,
+                   return_live_terms=False):
     z1, p1, p0, q = result['z1'], result['p1'], result['p0'], result['q']
     if mask.shape != z1.shape or skeleton.shape != z1.shape:
         raise ValueError('Surface, mask and GT skeleton must share the final grid')
@@ -276,6 +306,9 @@ def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_cont=.2,
     else:
         continuity = z1.sum() * 0.
     total = segmentation + lambda_cont * continuity
-    return total, {'seg': segmentation.detach(), 'cont': continuity.detach(),
-                   'focal': focal.detach(), 'dice': dice.mean().detach(),
-                   'paths': len(path_losses)}
+    terms = {'seg': segmentation.detach(), 'cont': continuity.detach(),
+             'focal': focal.detach(), 'dice': dice.mean().detach(),
+             'paths': len(path_losses)}
+    if return_live_terms:
+        terms.update(seg_live=segmentation, cont_live=continuity)
+    return total, terms

@@ -73,6 +73,24 @@ class DirectionalRepairTests(unittest.TestCase):
                         if p.grad is not None)
             self.assertGreater(total, 0., name)
 
+    def test_diagnostic_overrides_preserve_baseline_and_expose_bottleneck(self):
+        torch.manual_seed(23)
+        model = ReliableDirectionalRepair(Q3R3Repair(FakeBase())).eval()
+        image = torch.randn(1, 3, 32, 32)
+        with torch.no_grad():
+            baseline = model(image, capture_diagnostics=True)
+            repeated = model(image, diagnostic_override={})
+            final_open = model(image, diagnostic_override={'final_a_one': True})
+            internal_open = model(image, diagnostic_override={'internal_a_one': True})
+            proposal = model(image, diagnostic_override={'proposal_shift': .5})
+            rotated = model(image, diagnostic_override={'rotate_w': True})
+        self.assertTrue(torch.equal(baseline['p1'], repeated['p1']))
+        self.assertGreater(float((final_open['p1'] - baseline['p1']).abs().mean()), 0.)
+        self.assertGreater(float((internal_open['u3'] - baseline['u3']).abs().mean()), 0.)
+        self.assertGreater(float((proposal['u3'] - baseline['u3']).abs().mean()), 0.)
+        self.assertGreater(float((rotated['u3'] - baseline['u3']).abs().mean()), 0.)
+        self.assertEqual(tuple(baseline['rate_coefficients'].shape), (1, 3, 4, 8, 8))
+
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is unavailable')
     def test_cuda_512_batch_two_forward_backward(self):
         model = ReliableDirectionalRepair(Q3R3Repair(FakeBase())).cuda()
