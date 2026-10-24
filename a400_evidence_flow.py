@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -230,6 +231,19 @@ def summarize_evidence_flow(set_rows, trace_rows):
                            *FUSION_NAMES, *FUSION_H_NAMES, *CONTEXT_NAMES)
             stages = {}
             for name in stage_names:
+                if name == 'surface_prehead':
+                    # The saved stage trace contains its probability summaries,
+                    # but the per-set CSV did not include a thresholded hit count.
+                    stages[name] = {
+                        'road_probability_mean': (
+                            sum(row['pixels'] * row['surface_prehead_mean']
+                                for row in mode_rows if row['pixels']) / pixels
+                            if pixels else None),
+                        'road_hit_fraction_at_own_val_threshold': None,
+                        'val_threshold': (mode_rows[0]['surface_prehead_threshold']
+                                          if mode_rows else None),
+                    }
+                    continue
                 stages[name] = {
                     'road_probability_mean': (
                         sum(row['pixels'] * row[f'{mode}_{name}_mean']
@@ -561,11 +575,135 @@ def trace_test(args, tap, probe_heads, probe_payload, backbone_sha, device):
                       'global_recall': summary['direction_on_off_global_recall']}, indent=2), flush=True)
 
 
+def _read_saved_rows(path):
+    with path.open(newline='', encoding='utf-8') as stream:
+        result = []
+        for row in csv.DictReader(stream):
+            parsed = {}
+            for key, value in row.items():
+                if value == '':
+                    parsed[key] = None
+                elif key in ('image', 'set', 'direction', 'coordinate_sha256'):
+                    parsed[key] = value
+                elif key in ('pixels', 'background_pixels') or key.endswith('_hit_count'):
+                    parsed[key] = int(value)
+                else:
+                    try:
+                        parsed[key] = float(value)
+                    except ValueError:
+                        parsed[key] = value
+            result.append(parsed)
+    return result
+
+
+def finalize_saved(args):
+    """Finish an interrupted 49-image trace from saved CSV and predictions."""
+    out = args.run_dir / 'evidence_flow'
+    set_rows = _read_saved_rows(out / 'fixed_set_probe_response.csv')
+    trace_rows = _read_saved_rows(out / 'fixed_set_stage_probability_traces.csv')
+    reference = json.loads((args.run_dir / 'test_missed_pixel_set.json').read_text(encoding='utf-8'))
+    selection = json.loads((args.run_dir / 'val_selection.json').read_text(encoding='utf-8'))
+    backbone_sha = base.file_sha256(args.model_path)
+    if (reference['current_provenance']['backbone_sha256'] != backbone_sha
+            or selection['backbone_sha256'] != backbone_sha):
+        raise ValueError('Saved fixed-set report, validation thresholds, and backbone differ')
+    expected = reference['summary']['seven_probe_all_missed']
+    reference_images = {
+        row['image']: row
+        for row in reference['coordinate_checks']['per_image_mask_and_coordinate_hashes']}
+    with (args.run_dir / 'test_e1_h0_missed_pixel_diagnostics.csv').open(
+            newline='', encoding='utf-8') as stream:
+        expected_rows = {
+            row['image']: row for row in csv.DictReader(stream)
+            if row['pixel_set'] == 'seven_probe_all_missed'
+            and row['image'] != '__micro_total__'}
+    by_set = {
+        name: {row['image']: row for row in set_rows if row['set'] == name}
+        for name in ('H0_exclusive', 'all_unrecognized')}
+    names = set(reference_images)
+    if (len(names) != 49 or any(set(rows) != names for rows in by_set.values())
+            or len(set_rows) != 2 * len(names) or len(trace_rows) != 4 * len(names)):
+        raise ValueError('Saved trace CSVs do not contain every test image and fixed set')
+    for case in names:
+        if (by_set['H0_exclusive'][case]['pixels'] != int(expected_rows[case]['only_h0_pixels'])
+                or by_set['all_unrecognized'][case]['pixels'] != int(expected_rows[case]['neither_pixels'])):
+            raise ValueError(f'Saved fixed-set counts differ from the original report: {case}')
+    counts = {name: sum(row['pixels'] for row in rows.values())
+              for name, rows in by_set.items()}
+    if (counts['H0_exclusive'] != expected['only_h0_pixels']
+            or counts['all_unrecognized'] != expected['neither_pixels']):
+        raise ValueError('Saved fixed-set totals differ from the original report')
+    for name in ('on', 'off'):
+        mask_dir = out / 'direction_predictions' / f'direction_{name}' / 'surface'
+        observed = {path.name.removesuffix('_pred.png')
+                    for path in mask_dir.glob('*_pred.png')}
+        if observed != names:
+            raise ValueError(f'Direction {name} has {len(observed)} test masks, expected {len(names)}')
+    analysis = summarize_evidence_flow(set_rows, trace_rows)
+    summary = {
+        'schema': 2, 'recovered_from_saved_49_image_trace': True,
+        'backbone_sha256': backbone_sha,
+        'probe_checkpoint_sha256': base.file_sha256(args.run_dir / 'probe_best.pth'),
+        'readout_checkpoint_sha256': base.file_sha256(args.readout_dir / 'readouts_best.pth'),
+        'fixed_set_reference_path': str(args.run_dir / 'test_missed_pixel_set.json'),
+        'observed_pixel_counts': counts,
+        'matches_prior_fixed_pixel_report': True,
+        'per_image': [
+            {'image': case,
+             'baseline_missed': reference_images[case]['baseline_missed_pixels'],
+             'seven_probe_all_missed': reference_images[case]['seven_probe_all_missed_pixels'],
+             'H0_exclusive': by_set['H0_exclusive'][case]['pixels'],
+             'all_unrecognized': by_set['all_unrecognized'][case]['pixels'],
+             'coordinate_sha256': {
+                 name: by_set[name][case]['coordinate_sha256'] for name in by_set}}
+            for case in sorted(names)],
+    }
+    review_dir = out / 'representative_cases'
+    pattern = re.compile(r'^(.*)_(context_rescued|context_unresolved)_(\d+)_(\d+)\.png$')
+    review_rows = []
+    for path in sorted(review_dir.glob('*.png')):
+        match = pattern.fullmatch(path.name)
+        if match is None or match.group(1) not in names:
+            raise ValueError(f'Unrecognized representative image: {path}')
+        review_rows.append({
+            'image': match.group(1), 'group': match.group(2),
+            'row': int(match.group(3)), 'column': int(match.group(4)),
+            'patch_path': str(path), 'review_category': '',
+            'category_options': 'visible_thin_road;occlusion;intersection;possible_label_ambiguity;other',
+            'note': 'Exact point probabilities were not saved before the interrupted summary; the overlay and fixed-set CSV remain available.'})
+    if not review_rows:
+        raise ValueError('No representative case images were saved')
+    threshold = float(selection['models']['original_surface']['threshold'])
+    manifest = {
+        'data_root': str(args.root_path),
+        'protocol': {'image_size': base.NATIVE, 'short_area_threshold': 20,
+                     'apls_max_nodes': 64, 'apls_snap_radius': 5.0},
+        'models': []}
+    for mode in ('on', 'off'):
+        manifest['models'].append({
+            'name': f'a400_direction_{mode}',
+            'provenance': {'backbone_sha256': backbone_sha,
+                           'direction_aggregation': mode,
+                           'readout_probe_sha256': summary['probe_checkpoint_sha256']},
+            'validation_selection': {'selected_on': 'val', 'criterion': 'global_iou',
+                                     'threshold': threshold,
+                                     'evidence': str(args.run_dir / 'val_selection.json')},
+            'predictions': {'test': [{'threshold': threshold,
+                                     'path': str(out / 'direction_predictions'
+                                                 / f'direction_{mode}' / 'surface')}]}})
+    base.write_json(out / 'evidence_flow_analysis.json', analysis)
+    base.write_csv(out / 'representative_cases.csv', review_rows)
+    base.write_json(out / 'direction_on_off_manifest.json', manifest)
+    base.write_json(out / 'evidence_flow_summary.json', summary)
+    print(json.dumps({'out': str(out), 'fixed_set_counts': counts,
+                      'representative_images': len(review_rows)}, indent=2), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--probe_repo', type=Path, required=True,
                         help='exact a4001b3 source checkout')
-    parser.add_argument('mode', choices=('fit_readouts', 'trace_test'))
+    parser.add_argument('mode', choices=('fit_readouts', 'trace_test', 'finalize_saved'))
     parser.add_argument('--root_path', type=Path, required=True)
     parser.add_argument('--model_path', type=Path, required=True)
     parser.add_argument('--run_dir', type=Path, required=True,
@@ -583,6 +721,9 @@ def main():
     args.root_path = args.root_path.resolve(strict=True)
     args.run_dir = args.run_dir.resolve(strict=True)
     args.readout_dir = args.readout_dir.resolve()
+    if args.mode == 'finalize_saved':
+        finalize_saved(args)
+        return
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     if device.type != 'cuda':
         parser.error('This a400 diagnostic expects CUDA')
