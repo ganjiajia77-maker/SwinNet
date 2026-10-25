@@ -189,14 +189,17 @@ class DirectionalDynamics(nn.Module):
             self.rates[-1].bias.copy_(torch.tensor([2.5, 0., -1., 1.]))
 
     def forward(self, visual, p0, q, reliable, proposal, accept, weights,
-                capture_diagnostics=False, transport_gate=None):
+                capture_diagnostics=False, transport_gate=None,
+                freeze_generated_sources=False):
         state = p0
         states, masses, availabilities = [state], [], []
         diagnostics = {key: [] for key in (
             'alpha', 'beta', 'gamma', 'stay', 'm',
             'transport_delta', 'proposal_delta', 'anchor_delta')}
         for _ in range(self.steps):
-            if transport_gate is not None:
+            if freeze_generated_sources:
+                support = reliable
+            elif transport_gate is not None:
                 gained = ((state - p0).clamp_min(0.) /
                           (1. - p0).clamp_min(1e-5)).clamp_max(1.)
                 support = reliable + (1. - reliable) * gained
@@ -288,7 +291,8 @@ class ReliableDirectionalRepair(nn.Module):
         self.frozen.eval()
         return self
 
-    def forward(self, image, capture_diagnostics=False, weights_override=None):
+    def forward(self, image, capture_diagnostics=False, weights_override=None,
+                freeze_generated_sources=False, reliable_override=None):
         with torch.no_grad():
             old = self.frozen(image, capture_diagnostics=True)
         z0, q = old['z0'].detach(), old['q'].detach()
@@ -302,6 +306,10 @@ class ReliableDirectionalRepair(nn.Module):
         p0 = align(p0_full).detach()
         q = align(q) if q.shape[-2:] != size else q
         reliable = p0 * self.reliable_head(torch.cat((visual, p0), dim=1)).sigmoid()
+        if reliable_override is not None:
+            if reliable_override.shape != reliable.shape:
+                raise ValueError('The diagnostic R override must match the work grid')
+            reliable = reliable_override
         weights, two, one, transport_gate = self.relations(visual, p0, reliable)
         if weights_override is not None:
             if weights_override.shape != weights.shape:
@@ -377,7 +385,8 @@ class ReliableDirectionalRepair(nn.Module):
         dynamics_output = self.dynamics(
             visual, p0, q, reliable, proposal, accept, weights,
             capture_diagnostics=capture_diagnostics,
-            transport_gate=transport_gate)
+            transport_gate=transport_gate,
+            freeze_generated_sources=freeze_generated_sources)
         states, masses, available = dynamics_output[:3]
         z1, delta_logit = compose_surface_logits(z0, p0, states[-1])
         p1 = z1.sigmoid()
@@ -386,6 +395,8 @@ class ReliableDirectionalRepair(nn.Module):
                   'g_transport': (transport_gate if transport_gate is not None else
                                   1. - weight_sum),
                   'a': accept, 'a_raw': accept_raw, 'e_two': two, 'e_one': one,
+                  'proposal_raw': (proposal_raw if self.bridge_route else
+                                   proposal_delta),
                   'u0': states[0], 'u1': states[1], 'u2': states[2], 'u3': states[3]}
         if capture_diagnostics:
             result.update(source_mass=torch.stack(masses, dim=1),
