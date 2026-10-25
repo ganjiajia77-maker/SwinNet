@@ -1,15 +1,23 @@
 """Focused validation-only causal contrasts for the v6 directional dynamics."""
 
+# ruff: noqa: E402
+
 import argparse
 import csv
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+# Running this file directly puts diagnostics/, not the repository root, on sys.path.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from evaluation.road_comparison.road_metrics import (
     image_metrics,
