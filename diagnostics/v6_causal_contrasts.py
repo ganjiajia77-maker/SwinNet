@@ -40,6 +40,12 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def to_numpy(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
 def work_mask(mask, size):
     return F.adaptive_max_pool2d(mask.float(), size) > 0
 
@@ -616,7 +622,7 @@ def connection_pair_rows(arrays, sample, threshold):
     from scipy.spatial import cKDTree
 
     case = sample["case_name"]
-    skeleton = sample["skeleton"][0].numpy() > 0.5
+    skeleton = to_numpy(sample["skeleton"][0]) > 0.5
     p0 = 1.0 / (1.0 + np.exp(-np.clip(arrays["p0"], -80, 80)))
     support = (
         cv2.dilate((p0 >= threshold).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
@@ -1031,7 +1037,7 @@ def gate_region_stats(result, regions, case):
 
 
 def image_level_metrics(arrays, sample, threshold):
-    gt = sample["mask"][0].numpy() > 0.5
+    gt = to_numpy(sample["mask"][0]) > 0.5
     prepared = prepare_target(gt, PROTOCOL)
     rows = []
     p0_prob = 1.0 / (1.0 + np.exp(-np.clip(arrays["p0"], -80.0, 80.0)))
@@ -1081,12 +1087,12 @@ def image_level_metrics(arrays, sample, threshold):
 
 
 def save_case_image(path, sample, arrays):
-    image = sample["image"].numpy().transpose(1, 2, 0)
+    image = to_numpy(sample["image"]).transpose(1, 2, 0)
     image = np.uint8(
         np.clip((image * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406]) * 255, 0, 255)
     )
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    gt = sample["mask"][0].numpy() > 0.5
+    gt = to_numpy(sample["mask"][0]) > 0.5
     panels = [("image", image), ("GT", gt.astype(np.float32))]
     for name in (
         "p0",
