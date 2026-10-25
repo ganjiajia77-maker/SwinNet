@@ -124,9 +124,11 @@ class DirectionalDynamics(nn.Module):
         with torch.no_grad():
             self.rates[-1].bias.copy_(torch.tensor([2.5, 0., -1., 1.]))
 
-    def forward(self, visual, p0, q, reliable, proposal, accept, weights):
+    def forward(self, visual, p0, q, reliable, proposal, accept, weights,
+                capture_diagnostics=False):
         state = p0
         states, masses, availabilities = [state], [], []
+        diagnostics = {key: [] for key in ('alpha', 'beta', 'gamma', 'stay', 'm')}
         for _ in range(self.steps):
             support = reliable + (1. - reliable) * accept * state
             mass = torch.zeros_like(state)
@@ -143,10 +145,18 @@ class DirectionalDynamics(nn.Module):
             propose = .2 * accept * coefficients[:, 2:3]
             anchor = coefficients[:, 3:4]
             stay = 1. - transport - propose - anchor
+            if capture_diagnostics:
+                for key, value in (('alpha', transport), ('beta', propose),
+                                   ('gamma', anchor), ('stay', stay),
+                                   ('m', propagated)):
+                    diagnostics[key].append(value)
             state = stay * state + transport * propagated + propose * proposal + anchor * p0
             states.append(state)
             masses.append(mass)
             availabilities.append(available)
+        if capture_diagnostics:
+            return states, masses, availabilities, {
+                key: torch.stack(values, dim=1) for key, values in diagnostics.items()}
         return states, masses, availabilities
 
 
@@ -177,6 +187,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.width = width
         self.steps = steps
         self.accept_floor = 0.
+        self.legacy_route = False
 
     def set_accept_floor(self, value):
         if not 0. <= value < 1.:
@@ -188,7 +199,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.frozen.eval()
         return self
 
-    def forward(self, image, capture_diagnostics=False):
+    def forward(self, image, capture_diagnostics=False, weights_override=None):
         with torch.no_grad():
             old = self.frozen(image, capture_diagnostics=True)
         z0, q = old['z0'].detach(), old['q'].detach()
@@ -203,18 +214,39 @@ class ReliableDirectionalRepair(nn.Module):
         q = align(q) if q.shape[-2:] != size else q
         reliable = p0 * self.reliable_head(torch.cat((visual, p0), dim=1)).sigmoid()
         weights, two, one = self.relations(visual, p0, reliable)
+        if weights_override is not None:
+            if weights_override.shape != weights.shape:
+                raise ValueError('The diagnostic W override must retain eight directions')
+            weights = weights_override
         two_mean, one_mean = two.mean(1, keepdim=True), one.mean(1, keepdim=True)
         weight_sum = weights.sum(1, keepdim=True)
+        bilateral = (weights * two.repeat_interleave(2, dim=1)).sum(1, keepdim=True) / (
+            weight_sum + 1e-6)
+        directional_neighbor = sum(
+            weights[:, index:index+1] * shifted(p0, dy, dx)
+            for index, (dy, dx) in enumerate(DIRECTIONS)) / (weight_sum + 1e-6)
+        relation_balance = (bilateral - one_mean) / (bilateral + one_mean + .05)
         proposal_features = torch.cat((visual, p0, q, reliable, two_mean,
-                                        one_mean, weight_sum, two.amax(1, keepdim=True)), dim=1)
+                                        one_mean, weight_sum if self.legacy_route else bilateral,
+                                        two.amax(1, keepdim=True)), dim=1)
         proposal_delta = self.proposal_head(proposal_features)
-        proposal = (torch.logit(p0.clamp(1e-5, 1. - 1e-5)) + proposal_delta).sigmoid()
+        p0_logit = torch.logit(p0.clamp(1e-5, 1. - 1e-5))
+        if not self.legacy_route:
+            candidate = p0 + bilateral * (directional_neighbor - p0)
+            proposal_delta = proposal_delta + (
+                torch.logit(candidate.clamp(1e-5, 1. - 1e-5)) - p0_logit)
+        proposal = (p0_logit + proposal_delta).sigmoid()
         accept_features = torch.cat((proposal_features, proposal), dim=1)
-        accept_raw = self.accept_head(accept_features).sigmoid()
+        accept_logit = self.accept_head(accept_features)
+        if not self.legacy_route:
+            accept_logit = accept_logit + relation_balance
+        accept_raw = accept_logit.sigmoid()
         floor = self.accept_floor if self.training else 0.
         accept = floor + (1. - floor) * accept_raw
-        states, masses, available = self.dynamics(
-            visual, p0, q, reliable, proposal, accept, weights)
+        dynamics_output = self.dynamics(
+            visual, p0, q, reliable, proposal, accept, weights,
+            capture_diagnostics=capture_diagnostics)
+        states, masses, available = dynamics_output[:3]
         z1, delta_logit = compose_surface_logits(z0, p0, states[-1])
         p1 = z1.sigmoid()
         result = {'z0': z0, 'z1': z1, 'p0': p0_full, 'p1': p1,
@@ -224,7 +256,11 @@ class ReliableDirectionalRepair(nn.Module):
         if capture_diagnostics:
             result.update(source_mass=torch.stack(masses, dim=1),
                           source_available=torch.stack(available, dim=1),
-                          delta_logit=delta_logit, visual=visual)
+                          delta_logit=delta_logit, visual=visual,
+                          directional_bilateral=bilateral,
+                          directional_neighbor=directional_neighbor,
+                          relation_balance=relation_balance,
+                          **dynamics_output[3])
         return result
 
 @torch.no_grad()

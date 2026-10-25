@@ -23,7 +23,7 @@ from run_q3_r3_mass import (DEFAULT_CHECKPOINT, PROTOCOL, full_dataset,
 from mass_protocol import sliding_positions
 
 
-VERSION = 'reliable_directional_dynamics_v2'
+VERSION = 'reliable_directional_dynamics_v3'
 MODULE_NAMES = ('visual', 'reliable_head', 'relations', 'proposal_head',
                 'accept_head', 'dynamics')
 THRESHOLDS = tuple(round(float(x), 2) for x in np.arange(.35, .751, .05))
@@ -44,7 +44,9 @@ def load_model(args):
         raise RuntimeError('Frozen structure routing does not match this experiment')
     if args.dynamic_checkpoint:
         payload = torch.load(args.dynamic_checkpoint, map_location='cpu', weights_only=False)
-        if payload.get('version') != VERSION:
+        checkpoint_version = payload.get('version')
+        if checkpoint_version != VERSION and not (
+                args.mode == 'audit' and checkpoint_version == 'reliable_directional_dynamics_v2'):
             raise ValueError('Wrong directional dynamics checkpoint version')
         expected = {'base_checkpoint': str(args.base_checkpoint.resolve()),
                     'q3_checkpoint': str(args.q3_checkpoint.resolve()),
@@ -60,6 +62,7 @@ def load_model(args):
             raise ValueError(f'Checkpoint source/config/module mismatch: {mismatches}')
         for name in MODULE_NAMES:
             getattr(model, name).load_state_dict(payload['modules'][name], strict=True)
+        model.legacy_route = checkpoint_version == 'reliable_directional_dynamics_v2'
         print(f'[LOAD] strict new modules epoch={payload["epoch"]}', flush=True)
     frozen_count = sum(parameter.numel() for parameter in model.frozen.parameters())
     new_count = sum(parameter.numel() for parameter in model.parameters()
@@ -724,7 +727,7 @@ def evaluate(args, model):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('smoke', 'train', 'resume', 'val', 'test'))
+    parser.add_argument('mode', choices=('smoke', 'train', 'resume', 'val', 'test', 'audit'))
     parser.add_argument('--root_path', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--base_checkpoint', type=Path, default=DEFAULT_CHECKPOINT)
@@ -745,16 +748,18 @@ def main():
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--max_images', type=int, default=0)
     parser.add_argument('--visualizations', type=int, default=8)
+    parser.add_argument('--audit_threshold', type=float, default=.45)
     args = parser.parse_args()
     if (args.width % 8 or args.width < 8 or args.batch_size < 1 or args.epochs < 1 or
             args.val_interval < 1 or args.lambda_bg < 0 or args.lambda_cont < 0 or
             args.max_images < 0 or args.visualizations < 0 or
             not 0 <= args.accept_floor_initial < 1 or
             args.accept_floor_anneal_epochs < 1 or
-            not 0 < args.missing_threshold < 1):
+            not 0 < args.missing_threshold < 1 or
+            not 0 < args.audit_threshold < 1):
         parser.error('Invalid model, training, or evaluation configuration')
-    if args.mode in ('resume', 'val', 'test') and not args.dynamic_checkpoint:
-        parser.error('--dynamic_checkpoint is required for resume/val/test')
+    if args.mode in ('resume', 'val', 'test', 'audit') and not args.dynamic_checkpoint:
+        parser.error('--dynamic_checkpoint is required for resume/val/test/audit')
     if args.mode == 'train' and args.dynamic_checkpoint:
         parser.error('Use resume to continue a directional dynamics checkpoint')
     args.base_checkpoint = args.base_checkpoint.resolve()
@@ -767,6 +772,9 @@ def main():
         smoke(args, model)
     elif args.mode in ('train', 'resume'):
         train(args, model)
+    elif args.mode == 'audit':
+        from diagnostics.audit_directional_dynamics import audit
+        audit(args, model)
     else:
         evaluate(args, model)
 

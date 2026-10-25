@@ -75,6 +75,39 @@ class DirectionalRepairTests(unittest.TestCase):
         self.assertTrue(all(float(item.detach().max()) == 0. for item in masses + avail))
         self.assertTrue(all(torch.allclose(item, p0, atol=1e-6) for item in states))
 
+    def test_dynamics_reports_effective_rates_and_transport_target(self):
+        dynamics = DirectionalDynamics(32)
+        p0 = torch.rand(1, 1, 8, 8)
+        visual = torch.randn(1, 32, 8, 8)
+        weights = torch.full((1, 8, 8, 8), .08)
+        states, masses, available, detail = dynamics(
+            visual, p0, p0, p0, p0, torch.full_like(p0, .5), weights,
+            capture_diagnostics=True)
+        self.assertEqual(detail['alpha'].shape, (1, 3, 1, 8, 8))
+        for step in range(3):
+            reconstructed = (detail['stay'][:, step] * states[step] +
+                             detail['alpha'][:, step] * detail['m'][:, step] +
+                             detail['beta'][:, step] * p0 +
+                             detail['gamma'][:, step] * p0)
+            self.assertTrue(torch.allclose(states[step+1], reconstructed, atol=1e-6))
+            self.assertTrue(bool((available[step] <= 1).all()))
+
+    def test_direction_reroute_changes_proposal_and_accept_only_in_v3(self):
+        torch.manual_seed(37)
+        model = ReliableDirectionalRepair(Q3R3Repair(FakeBase())).eval()
+        image = torch.randn(1, 3, 32, 32)
+        with torch.no_grad():
+            baseline = model(image)
+            rotated = baseline['w'].roll(2, dims=1)
+            changed = model(image, weights_override=rotated)
+            self.assertGreater(float((changed['b'] - baseline['b']).abs().sum()), 0.)
+            self.assertGreater(float((changed['a'] - baseline['a']).abs().sum()), 0.)
+            model.legacy_route = True
+            legacy = model(image)
+            legacy_changed = model(image, weights_override=legacy['w'].roll(2, dims=1))
+            self.assertTrue(torch.allclose(legacy['b'], legacy_changed['b'], atol=1e-6))
+            self.assertTrue(torch.allclose(legacy['a'], legacy_changed['a'], atol=1e-6))
+
     def test_length_binned_gap_closure_uses_fixed_p0(self):
         ground = np.zeros((64, 64), dtype=bool)
         ground[32, 5:59] = True
