@@ -46,7 +46,8 @@ def load_model(args):
         payload = torch.load(args.dynamic_checkpoint, map_location='cpu', weights_only=False)
         checkpoint_version = payload.get('version')
         if checkpoint_version != VERSION and not (
-                args.mode == 'audit' and checkpoint_version == 'reliable_directional_dynamics_v2'):
+                args.mode in ('audit', 'val', 'test') and
+                checkpoint_version == 'reliable_directional_dynamics_v2'):
             raise ValueError('Wrong directional dynamics checkpoint version')
         expected = {'base_checkpoint': str(args.base_checkpoint.resolve()),
                     'q3_checkpoint': str(args.q3_checkpoint.resolve()),
@@ -719,6 +720,8 @@ def evaluate(args, model):
         model, dataset, args.device, tuple(dict.fromkeys((threshold, p0_threshold))),
         args.max_images)
     report = reports[threshold]
+    report['checkpoint_version'] = ('reliable_directional_dynamics_v2'
+                                    if model.legacy_route else VERSION)
     report['fair_comparison'] = {
         'selection_split': 'val',
         'p0_threshold': p0_threshold,
@@ -727,7 +730,8 @@ def evaluate(args, model):
         'p1_at_own_val_threshold': reports[threshold]['p1'],
         'note': 'Fixed-threshold paired diagnostics remain in p0/p1/paired above.'}
     report['evaluation_seconds'] = elapsed
-    report['version'] = VERSION
+    report['version'] = report['checkpoint_version']
+    report['evaluation_tool_version'] = VERSION
     report['base_checkpoint'] = str(args.base_checkpoint.resolve())
     report['q3_checkpoint'] = str(args.q3_checkpoint.resolve())
     report['checkpoint'] = str(args.dynamic_checkpoint.resolve())
