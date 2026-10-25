@@ -7,7 +7,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from networks.reliable_directional_repair import ReliableDirectionalRepair, dynamic_losses
+from networks.reliable_directional_repair import (DirectionalDynamics,
+                                                  ReliableDirectionalRepair,
+                                                  dynamic_losses)
 
 
 class FrozenConditions(nn.Module):
@@ -70,7 +72,8 @@ class BridgeRouteTests(unittest.TestCase):
             self.assertGreater(float((original[key] - disabled[key]).abs().sum()), 0., key)
 
     def test_legacy_head_shapes_remain_available(self):
-        model = ReliableDirectionalRepair(FrozenConditions(), bridge_route=False)
+        model = ReliableDirectionalRepair(FrozenConditions(), bridge_route=False,
+                                          conditional_transport=False)
         self.assertEqual(model.proposal_head[0].in_channels, 39)
         self.assertEqual(model.proposal_head[-1].out_channels, 1)
         self.assertEqual(model.accept_head[0].in_channels, 40)
@@ -85,9 +88,58 @@ class BridgeRouteTests(unittest.TestCase):
         skeleton[:, :, 16, 4:28] = 1.
         _, terms = dynamic_losses(result, skeleton, skeleton, return_live_terms=True)
         self.assertEqual(terms['paths'], 1)
-        gradient = torch.autograd.grad(
-            terms['cont_live'], model.relations.direction_head.weight)[0]
-        self.assertGreater(float(gradient.abs().sum()), 0.)
+        weight_gradient, bias_gradient = torch.autograd.grad(
+            terms['cont_live'], (model.relations.direction_head.weight,
+                                 model.relations.direction_head.bias))
+        self.assertGreater(float(weight_gradient.abs().sum()), 0.)
+        self.assertGreater(float(bias_gradient[0].abs()), 0.)
+
+    def test_conditional_weights_and_gate_are_separate(self):
+        torch.manual_seed(15)
+        model = ReliableDirectionalRepair(FrozenConditions()).eval()
+        with torch.no_grad():
+            result = model(torch.randn(1, 3, 32, 32), capture_diagnostics=True)
+        self.assertTrue(torch.allclose(result['w'].sum(1),
+                                       torch.ones_like(result['w'][:, 0]), atol=1e-6))
+        self.assertTrue(bool((result['g_transport'] >= 0).all()))
+        self.assertTrue(bool((result['g_transport'] <= 1).all()))
+        self.assertGreater(float(result['source_available'].mean()), 0.)
+        self.assertTrue(bool(torch.isfinite(result['transport_delta']).all()))
+
+    def test_no_reliable_source_closes_permission(self):
+        torch.manual_seed(16)
+        model = ReliableDirectionalRepair(FrozenConditions()).eval()
+        visual = torch.randn(1, 32, 8, 8)
+        empty = torch.zeros(1, 1, 8, 8)
+        with torch.no_grad():
+            directions, _, _, permission = model.relations(visual, empty, empty)
+        self.assertTrue(torch.allclose(directions.sum(1),
+                                       torch.ones_like(empty[:, 0]), atol=1e-6))
+        self.assertLess(float(permission.max()), 1e-3)
+
+    def test_v5_parameter_shapes_load_strictly(self):
+        old = ReliableDirectionalRepair(FrozenConditions(), conditional_transport=False)
+        restored = ReliableDirectionalRepair(FrozenConditions(), conditional_transport=False)
+        for name in ('visual', 'reliable_head', 'relations', 'proposal_head',
+                     'accept_head', 'dynamics'):
+            getattr(restored, name).load_state_dict(getattr(old, name).state_dict(),
+                                                    strict=True)
+
+    def test_newly_gained_road_can_become_next_step_source(self):
+        dynamics = DirectionalDynamics(32)
+        visual = torch.zeros(1, 32, 8, 8)
+        p0 = torch.zeros(1, 1, 8, 8)
+        p0[:, :, 4, 1] = .9
+        reliable = p0.clone()
+        proposal = torch.full_like(p0, .6)
+        weights = torch.zeros(1, 8, 8, 8)
+        weights[:, 0] = 1.
+        states, _, available = dynamics(
+            visual, p0, p0, reliable, proposal, torch.ones_like(p0), weights,
+            transport_gate=torch.ones_like(p0))
+        self.assertEqual(float(available[0][0, 0, 4, 3]), 0.)
+        self.assertGreater(float(states[1][0, 0, 4, 2].detach()), 0.)
+        self.assertGreater(float(available[1][0, 0, 4, 3].detach()), 0.)
 
 
 if __name__ == '__main__':

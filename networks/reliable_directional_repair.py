@@ -69,9 +69,10 @@ class VisualProjection(nn.Module):
 
 
 class DirectionRelations(nn.Module):
-    def __init__(self, width, bridge_route=False):
+    def __init__(self, width, bridge_route=False, conditional_transport=False):
         super().__init__()
         self.bridge_route = bridge_route
+        self.conditional_transport = conditional_transport
         self.semantic = nn.Conv2d(width, 1, 3, padding=1)
         self.tangent = nn.Conv2d(width, 4, 3, padding=1)
         self.pair = nn.Sequential(nn.Conv2d(16, 16, 1), nn.GELU(),
@@ -135,7 +136,11 @@ class DirectionRelations(nn.Module):
                         tangent_minus, tangent_plus, width_compatible,
                         v_minus, v_plus, radius_feature), dim=1)
                 relation = self.pair(evidence).sigmoid()
-                if self.bridge_route:
+                if self.conditional_transport:
+                    two = (relation[:, 0:1] * torch.minimum(r_minus, r_plus) *
+                           v_minus * v_plus)
+                    one_scale = .2
+                elif self.bridge_route:
                     tangent_support = .5 + .5 * tangent_minus * tangent_plus
                     corridor_support = .5 + .5 * torch.minimum(
                         semantic, torch.minimum(semantic_minus, semantic_plus))
@@ -160,10 +165,17 @@ class DirectionRelations(nn.Module):
             direction_evidence.extend((two + one_minus, two + one_plus))
         directional = torch.cat(direction_evidence, dim=1)
         logits = self.direction_head(torch.cat((visual, directional), dim=1))
+        if self.conditional_transport:
+            direction_logits = logits[:, 1:] + torch.log(directional + .05)
+            weights = direction_logits.softmax(dim=1)
+            source_evidence = directional.amax(dim=1, keepdim=True)
+            transport_gate = torch.sigmoid(
+                logits[:, :1] + torch.log(source_evidence.clamp_min(1e-6)))
+            return weights, torch.cat(two_maps, dim=1), torch.cat(one_maps, dim=1), transport_gate
         logits = torch.cat((logits[:, :1], logits[:, 1:] +
                             torch.log(directional + .05)), dim=1)
         weights = logits.softmax(dim=1)[:, 1:]
-        return weights, torch.cat(two_maps, dim=1), torch.cat(one_maps, dim=1)
+        return weights, torch.cat(two_maps, dim=1), torch.cat(one_maps, dim=1), None
 
 
 class DirectionalDynamics(nn.Module):
@@ -177,14 +189,19 @@ class DirectionalDynamics(nn.Module):
             self.rates[-1].bias.copy_(torch.tensor([2.5, 0., -1., 1.]))
 
     def forward(self, visual, p0, q, reliable, proposal, accept, weights,
-                capture_diagnostics=False):
+                capture_diagnostics=False, transport_gate=None):
         state = p0
         states, masses, availabilities = [state], [], []
         diagnostics = {key: [] for key in (
             'alpha', 'beta', 'gamma', 'stay', 'm',
             'transport_delta', 'proposal_delta', 'anchor_delta')}
         for _ in range(self.steps):
-            support = reliable + (1. - reliable) * accept * state
+            if transport_gate is not None:
+                gained = ((state - p0).clamp_min(0.) /
+                          (1. - p0).clamp_min(1e-5)).clamp_max(1.)
+                support = reliable + (1. - reliable) * gained
+            else:
+                support = reliable + (1. - reliable) * accept * state
             mass = torch.zeros_like(state)
             numerator = torch.zeros_like(state)
             for index, (dy, dx) in enumerate(DIRECTIONS):
@@ -192,10 +209,13 @@ class DirectionalDynamics(nn.Module):
                 mass = mass + source
                 numerator = numerator + source * shifted(state, dy, dx)
             available = mass.clamp(0., 1.)
-            propagated = numerator / mass.clamp_min(1e-6)
+            propagated = torch.where(mass > 1e-6, numerator / mass.clamp_min(1e-6),
+                                     state)
             coefficients = self.rates(torch.cat((visual, p0, q, reliable, proposal,
                                                  accept, state, available), dim=1)).softmax(dim=1)
-            transport = accept * coefficients[:, 1:2] * available
+            transport = (coefficients[:, 1:2] * transport_gate
+                         if transport_gate is not None else
+                         accept * coefficients[:, 1:2] * available)
             propose = .2 * accept * coefficients[:, 2:3]
             anchor = coefficients[:, 3:4]
             stay = 1. - transport - propose - anchor
@@ -218,8 +238,11 @@ class DirectionalDynamics(nn.Module):
 
 
 class ReliableDirectionalRepair(nn.Module):
-    def __init__(self, frozen_q3, width=32, steps=3, bridge_route=True):
+    def __init__(self, frozen_q3, width=32, steps=3, bridge_route=True,
+                 conditional_transport=True):
         super().__init__()
+        if conditional_transport and not bridge_route:
+            raise ValueError('Conditional transport requires bridge evidence')
         self.frozen = frozen_q3.requires_grad_(False)
         self.frozen.q_only = True
         self.frozen.eval()
@@ -231,7 +254,8 @@ class ReliableDirectionalRepair(nn.Module):
                                            nn.GELU(), nn.Conv2d(width, 1, 1))
         nn.init.zeros_(self.reliable_head[-1].weight)
         nn.init.constant_(self.reliable_head[-1].bias, 1.5)
-        self.relations = DirectionRelations(width, bridge_route=bridge_route)
+        self.relations = DirectionRelations(width, bridge_route=bridge_route,
+                                            conditional_transport=conditional_transport)
         proposal_channels = (2 * width + 7) if bridge_route else (width + 7)
         self.proposal_head = nn.Sequential(nn.Conv2d(proposal_channels, width, 3, padding=1),
                                            nn.GELU(), nn.Conv2d(width, 2 if bridge_route else 1, 1))
@@ -252,6 +276,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.legacy_route = False
         self.visual_transport_route = True
         self.bridge_route = bridge_route
+        self.conditional_transport = conditional_transport
 
     def set_accept_floor(self, value):
         if not 0. <= value < 1.:
@@ -277,7 +302,7 @@ class ReliableDirectionalRepair(nn.Module):
         p0 = align(p0_full).detach()
         q = align(q) if q.shape[-2:] != size else q
         reliable = p0 * self.reliable_head(torch.cat((visual, p0), dim=1)).sigmoid()
-        weights, two, one = self.relations(visual, p0, reliable)
+        weights, two, one, transport_gate = self.relations(visual, p0, reliable)
         if weights_override is not None:
             if weights_override.shape != weights.shape:
                 raise ValueError('The diagnostic W override must retain eight directions')
@@ -306,14 +331,21 @@ class ReliableDirectionalRepair(nn.Module):
             for index, (dy, dx) in enumerate(DIRECTIONS)) / (weight_sum + 1e-6)
         p0_logit = torch.logit(p0.clamp(1e-5, 1. - 1e-5))
         if self.bridge_route:
+            if self.conditional_transport:
+                local_support = .05 * q * self.relations.semantic(visual).sigmoid()
+                positive_support = (connection_support + local_support).clamp(0., 1.)
+                transported_for_heads = source_visual
+            else:
+                positive_support = connection_support
+                transported_for_heads = visual_coverage * source_visual
             proposal_features = torch.cat((
-                visual, visual_coverage * source_visual,
-                p0, q, reliable, bridge, one_side, connection_support,
+                visual, transported_for_heads,
+                p0, q, reliable, bridge, one_side, positive_support,
                 visual_coverage), dim=1)
             proposal_raw = self.proposal_head(proposal_features)
             delta_plus = 8. * proposal_raw[:, :1].sigmoid()
             delta_minus = 4. * proposal_raw[:, 1:2].sigmoid()
-            proposal = (p0_logit + connection_support * delta_plus - delta_minus).sigmoid()
+            proposal = (p0_logit + positive_support * delta_plus - delta_minus).sigmoid()
             accept_features = torch.cat((proposal_features, proposal - p0), dim=1)
             relation_balance = (bridge - one_side) / (bridge + one_side + .05)
             continuation = connection_support
@@ -336,16 +368,23 @@ class ReliableDirectionalRepair(nn.Module):
         if not self.legacy_route:
             accept_logit = accept_logit + relation_balance
         accept_raw = accept_logit.sigmoid()
+        if self.conditional_transport:
+            positive_fraction = torch.sigmoid(10. * (proposal - p0))
+            acceptance_cap = .1 + .9 * positive_support
+            accept_raw = accept_raw * (1. - positive_fraction * (1. - acceptance_cap))
         floor = self.accept_floor if self.training else 0.
         accept = floor + (1. - floor) * accept_raw
         dynamics_output = self.dynamics(
             visual, p0, q, reliable, proposal, accept, weights,
-            capture_diagnostics=capture_diagnostics)
+            capture_diagnostics=capture_diagnostics,
+            transport_gate=transport_gate)
         states, masses, available = dynamics_output[:3]
         z1, delta_logit = compose_surface_logits(z0, p0, states[-1])
         p1 = z1.sigmoid()
         result = {'z0': z0, 'z1': z1, 'p0': p0_full, 'p1': p1,
                   'q': q, 'r': reliable, 'w': weights, 'b': proposal,
+                  'g_transport': (transport_gate if transport_gate is not None else
+                                  1. - weight_sum),
                   'a': accept, 'a_raw': accept_raw, 'e_two': two, 'e_one': one,
                   'u0': states[0], 'u1': states[1], 'u2': states[2], 'u3': states[3]}
         if capture_diagnostics:
@@ -359,6 +398,8 @@ class ReliableDirectionalRepair(nn.Module):
                           directional_continuation=continuation,
                           c_bridge=bridge, c_one_side=one_side,
                           c_support=connection_support,
+                          g_positive=(positive_support if self.bridge_route else
+                                      torch.zeros_like(p0)),
                           delta_z_plus=delta_plus, delta_z_minus=delta_minus,
                           transported_visual=source_visual,
                           relation_balance=relation_balance,

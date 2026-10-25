@@ -59,7 +59,9 @@ def masks(result, mask, skeleton, threshold):
 def dynamics_with(model, result, weights, accept=None):
     states, _, _ = model.dynamics(result['visual'], result['u0'], result['q'],
                                   result['r'], result['b'],
-                                  result['a'] if accept is None else accept, weights)
+                                  result['a'] if accept is None else accept, weights,
+                                  transport_gate=(result['g_transport']
+                                                  if model.conditional_transport else None))
     z1, _ = compose_surface_logits(result['z0'], result['u0'], states[-1])
     return z1.sigmoid(), states[-1]
 
@@ -106,6 +108,8 @@ def gap_rows(result, mask, skeleton, threshold, case_name):
                'c_bridge': mean(result['c_bridge'], center),
                'c_one_side': mean(result['c_one_side'], center),
                'c_support': mean(result['c_support'], center),
+               'g_transport': mean(result['g_transport'], center),
+               'g_positive': mean(result['g_positive'], center),
                'delta_z_plus': mean(result['delta_z_plus'], center),
                'delta_z_minus': mean(result['delta_z_minus'], center),
                'b_minus_p0': mean(result['b'] - p0_work, center),
@@ -120,8 +124,15 @@ def gap_rows(result, mask, skeleton, threshold, case_name):
             row[f'u{step}_mean'] = mean(result[f'u{step}'], center)
             row[f'transport_delta{step}_signed'] = mean(
                 result['transport_delta'][:, step-1], center)
+            row[f'transport_delta{step}_abs'] = mean(
+                result['transport_delta'][:, step-1].abs(), center)
             row[f'proposal_delta{step}_signed'] = mean(
                 result['proposal_delta'][:, step-1], center)
+            row[f'proposal_delta{step}_abs'] = mean(
+                result['proposal_delta'][:, step-1].abs(), center)
+            row[f'alpha{step}'] = mean(result['alpha'][:, step-1], center)
+            row[f'beta{step}'] = mean(result['beta'][:, step-1], center)
+            row[f'v{step}'] = mean(result['source_available'][:, step-1], center)
             row[f'u{step}_recovered_fraction'] = mean(
                 (result[f'u{step}'] >= threshold).float(), center)
             row[f'u{step}_signed_change'] = mean(result[f'u{step}'] - p0_work, center)
@@ -141,7 +152,7 @@ def save_gap_visualization(output, row, sample, result, threshold):
     maps = {}
     for name in ('p0', 'p1', 'r', 'b', 'a', 'u0', 'u1', 'u2', 'u3',
                  'directional_visual_coverage', 'directional_continuation',
-                 'c_bridge', 'c_one_side', 'c_support',
+                 'c_bridge', 'c_one_side', 'c_support', 'g_transport', 'g_positive',
                  'delta_z_plus', 'delta_z_minus'):
         value = result[name][0, 0].detach().cpu().numpy()
         maps[name] = cv2.resize(value, (512, 512), interpolation=cv2.INTER_LINEAR)
@@ -224,20 +235,22 @@ def audit(args, model):
                    'c_bridge_mean': mean(result['c_bridge'], region),
                    'c_one_side_mean': mean(result['c_one_side'], region),
                    'c_support_mean': mean(result['c_support'], region),
+                   'g_transport_mean': mean(result['g_transport'], region),
+                   'g_positive_mean': mean(result['g_positive'], region),
                    'delta_z_plus_mean': mean(result['delta_z_plus'], region),
                    'delta_z_minus_mean': mean(result['delta_z_minus'], region),
                    'one_sided_mean': mean(result['e_one'].mean(1, keepdim=True), region),
                    'neighbor_minus_p0': mean(result['directional_neighbor'] -
                                              result['u0'], region),
                    'w_mass': mean(result['w'].sum(1, keepdim=True), region),
-                   'w_no_transport': mean(
-                       1. - result['w'].sum(1, keepdim=True), region),
+                   'w_no_transport': mean(1. - result['g_transport'], region),
                    'u3_minus_u0': mean(result['u3'] - result['u0'], region),
                    'fixed_ba_no_w_u3_abs': mean((result['u3'] - zero_u3).abs(), region)}
             row.update(quantiles(result['b'] - result['u0'], region, 'b_minus_p0'))
             row.update(quantiles(result['a'], region, 'a'))
             row.update(quantiles(result['c_bridge'], region, 'c_bridge'))
             row.update(quantiles(result['c_support'], region, 'c_support'))
+            row.update(quantiles(result['g_transport'], region, 'g_transport'))
             full_region = F.interpolate(region.float(), size=result['p1'].shape[-2:],
                                         mode='nearest').bool()
             row['p1_minus_p0_signed'] = mean(result['p1'] - result['p0'], full_region)
@@ -268,18 +281,22 @@ def audit(args, model):
                 row[f'beta{step+1}'] = mean(result['beta'][:, step], region)
                 row[f'gamma{step+1}'] = mean(result['gamma'][:, step], region)
                 row[f'v{step+1}'] = mean(result['source_available'][:, step], region)
+                row[f'source_mass{step+1}'] = mean(result['source_mass'][:, step], region)
                 row[f'm_minus_u{step}_abs'] = mean(
                     (result['m'][:, step] - previous).abs(), region)
                 for term in ('transport_delta', 'proposal_delta', 'anchor_delta'):
                     value = result[term][:, step]
                     row[f'{term}{step+1}_signed'] = mean(value, region)
                     row[f'{term}{step+1}_abs'] = mean(value.abs(), region)
+                    row.update(quantiles(value.abs(), region, f'{term}{step+1}_abs'))
                 row.update(quantiles(result['alpha'][:, step], region,
                                      f'alpha{step+1}'))
                 row.update(quantiles(result['beta'][:, step], region,
                                      f'beta{step+1}'))
                 row.update(quantiles(result['source_available'][:, step], region,
                                      f'v{step+1}'))
+                row.update(quantiles(result['source_mass'][:, step], region,
+                                     f'source_mass{step+1}'))
                 row[f'u{step+1}_minus_p0_abs'] = mean(
                     (result[f'u{step+1}'] - result['u0']).abs(), region)
             rows.append(row)
@@ -304,7 +321,9 @@ def audit(args, model):
                 writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(data)
-    report = {'checkpoint_version': ('v5_bridge_repair' if model.bridge_route else
+    report = {'checkpoint_version': ('v6_conditional_transport'
+                                     if model.conditional_transport else
+                                     'v5_bridge_repair' if model.bridge_route else
                                      'v2' if model.legacy_route else
                                      'v4_visual_transport' if model.visual_transport_route
                                      else 'v3'),
@@ -315,6 +334,9 @@ def audit(args, model):
               'recomputed_no_w_definition': 'mean |P1(W,B(W),A(W))-P1(W=0,B(0),A(0))|',
               'transport_delta_definition': 'alpha_k * (M_k - U_k), where alpha includes A and source availability',
               'proposal_delta_definition': 'beta_k * (B - U_k), where beta includes A and the 0.2 proposal scale',
+              'direction_definition': ('W is conditional softmax and no_transport=1-G_transport'
+                                       if model.conditional_transport else
+                                       'W is eight probabilities after nine-way no-transport softmax'),
               'region_summary': {name: summary([row for row in rows if row['region'] == name])
                                  for name in ('all', 'missing', 'reliable_road',
                                               'hard_background', 'isolated_new_fp')},

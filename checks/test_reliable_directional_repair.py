@@ -133,7 +133,8 @@ class DirectionalRepairTests(unittest.TestCase):
             self.assertGreater(float((changed['a'] - baseline['a']).abs().sum()), 0.)
             self.assertGreater(float(baseline['directional_visual_coverage'].sum()), 0.)
             previous = ReliableDirectionalRepair(Q3R3Repair(FakeBase()),
-                                                  bridge_route=False).eval()
+                                                  bridge_route=False,
+                                                  conditional_transport=False).eval()
             previous.visual_transport_route = False
             v3 = previous(image)
             v3_changed = previous(image, weights_override=v3['w'].roll(2, dims=1))
@@ -193,7 +194,8 @@ class DirectionalRepairTests(unittest.TestCase):
         self.assertGreater(float((result['p1'] - result['p0']).detach().abs().mean()), 0.)
         without_w, _, _ = model.dynamics(
             result['visual'], result['u0'], result['q'], result['r'],
-            result['b'], result['a'], torch.zeros_like(result['w']))
+            result['b'], result['a'], torch.zeros_like(result['w']),
+            transport_gate=result['g_transport'])
         self.assertGreater(float((without_w[-1] - result['u3']).detach().abs().mean()), 0.)
         no_w_z1, _ = compose_surface_logits(result['z0'], result['u0'], without_w[-1])
         self.assertGreater(float((no_w_z1.sigmoid() - result['p1']).abs().mean()), 0.)

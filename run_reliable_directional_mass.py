@@ -23,7 +23,7 @@ from run_q3_r3_mass import (DEFAULT_CHECKPOINT, PROTOCOL, full_dataset,
 from mass_protocol import sliding_positions
 
 
-VERSION = 'reliable_directional_dynamics_v5_bridge_repair'
+VERSION = 'reliable_directional_dynamics_v6_conditional_transport'
 MODULE_NAMES = ('visual', 'reliable_head', 'relations', 'proposal_head',
                 'accept_head', 'dynamics')
 THRESHOLDS = tuple(round(float(x), 2) for x in np.arange(.35, .751, .05))
@@ -35,7 +35,8 @@ def load_model(args):
     checkpoint_version = payload.get('version') if payload else VERSION
     readonly_versions = ('reliable_directional_dynamics_v2',
                          'reliable_directional_dynamics_v3',
-                         'reliable_directional_dynamics_v4_visual_transport')
+                         'reliable_directional_dynamics_v4_visual_transport',
+                         'reliable_directional_dynamics_v5_bridge_repair')
     if checkpoint_version != VERSION and not (
             args.mode in ('audit', 'val', 'test') and
             checkpoint_version in readonly_versions):
@@ -46,8 +47,10 @@ def load_model(args):
                                enable_stage2_local_propagation=False,
                                enable_gap_refinement=False, device=args.device)
     frozen = load_experiment(old_args)
+    bridge_versions = (VERSION, 'reliable_directional_dynamics_v5_bridge_repair')
     model = ReliableDirectionalRepair(frozen, width=args.width, steps=3,
-                                      bridge_route=checkpoint_version == VERSION).to(args.device)
+                                      bridge_route=checkpoint_version in bridge_versions,
+                                      conditional_transport=checkpoint_version == VERSION).to(args.device)
     inner = model.frozen.base.swin_unet
     if (inner.decoder_structure_blocks['2'].enable_local_propagation or
             inner.enable_gap_refinement or not inner.enable_highres_structure_stream or
@@ -72,7 +75,8 @@ def load_model(args):
             getattr(model, name).load_state_dict(payload['modules'][name], strict=True)
         model.legacy_route = checkpoint_version == 'reliable_directional_dynamics_v2'
         model.visual_transport_route = checkpoint_version in (
-            VERSION, 'reliable_directional_dynamics_v4_visual_transport')
+            VERSION, 'reliable_directional_dynamics_v5_bridge_repair',
+            'reliable_directional_dynamics_v4_visual_transport')
         print(f'[LOAD] strict modules version={checkpoint_version} '
               f'epoch={payload["epoch"]}', flush=True)
     frozen_count = sum(parameter.numel() for parameter in model.frozen.parameters())
@@ -118,6 +122,8 @@ def batch_summary(result, mask=None, skeleton=None, threshold=.6,
                 'b_minus_p0_mean_abs': float((result['b'] - result['u0']).abs().mean()),
                 'w_direction_means': result['w'].mean((0, 2, 3)).cpu().tolist(),
                 'w_sum_mean': float(result['w'].sum(1).mean()),
+                'g_transport_mean': float(result['g_transport'].mean()),
+                'no_transport_mean': float((1. - result['g_transport']).mean()),
                 'step_changes': [float((result[f'u{index}'] -
                                         result[f'u{index-1}']).abs().mean())
                                  for index in (1, 2, 3)],
@@ -232,13 +238,20 @@ def smoke(args, model):
         if not bool(torch.isfinite(value).all()) or bool((value < 0).any()) or bool((value > 1).any()):
             raise RuntimeError(f'Invalid probability in {key}')
     if bool((result['w'].sum(1) > 1.000001).any()):
-        raise RuntimeError('Directional weights have no reject/no-transport mass')
+        raise RuntimeError('Directional weights exceed unit mass')
+    if model.conditional_transport and not torch.allclose(
+            result['w'].sum(1), torch.ones_like(result['w'][:, 0]), atol=1e-5):
+        raise RuntimeError('Conditional direction weights are not normalized')
+    if not bool(((result['g_transport'] >= 0) &
+                 (result['g_transport'] <= 1)).all()):
+        raise RuntimeError('Invalid transport permission')
     if not bool((result['source_available'] >= 0).all()):
         raise RuntimeError('Invalid source availability')
     with torch.no_grad():
         without_w, _, _ = model.dynamics(
             result['visual'], result['u0'], result['q'], result['r'],
-            result['b'], result['a'], torch.zeros_like(result['w']))
+            result['b'], result['a'], torch.zeros_like(result['w']),
+            transport_gate=(result['g_transport'] if model.conditional_transport else None))
         w_effect = float((without_w[-1] - result['u3']).abs().mean())
         without_w_z1, _ = compose_surface_logits(result['z0'], result['u0'],
                                                   without_w[-1])
@@ -487,7 +500,8 @@ def evaluate_dynamics_regions(model, dataset, tiles, device, threshold,
                             missing_threshold=missing_threshold)
         no_direction, _, _ = model.dynamics(
             result['visual'], result['u0'], result['q'], result['r'], result['b'],
-            result['a'], torch.zeros_like(result['w']))
+            result['a'], torch.zeros_like(result['w']),
+            transport_gate=(result['g_transport'] if model.conditional_transport else None))
         no_direction_z1, _ = compose_surface_logits(result['z0'], result['u0'],
                                                      no_direction[-1])
         row['w_to_p1_mean_abs'] = float((result['p1'] - no_direction_z1.sigmoid()).abs().mean())
@@ -552,6 +566,7 @@ def train(args, model):
         sums = {'seg': 0., 'cont': 0., 'total': 0., 'r_mean': 0.,
                 'r_near_zero': 0., 'a_mean': 0., 'a_raw_mean': 0.,
                 'a_near_one': 0., 'b_minus_p0_mean_abs': 0., 'w_sum_mean': 0.,
+                'g_transport_mean': 0., 'no_transport_mean': 0.,
                 'u3_minus_p0_mean_abs': 0., 'p1_minus_p0_mean_abs': 0.,
                 'added_fraction': 0., 'removed_fraction': 0.}
         grad_sums = {name: 0. for name in MODULE_NAMES}
@@ -704,7 +719,9 @@ def save_visualizations(model, dataset, tiles, output, device, threshold, count=
                   ('R', color_map(work('r'))),
                   ('E_two', color_map(arr['e_two'].mean(0))),
                   ('E_one', color_map(arr['e_one'].mean(0))),
-                  ('W_sum', color_map(arr['w'].sum(0))),
+                  ('W / G', color_map(work('g_transport'))),
+                  ('C bridge', color_map(work('c_bridge'))),
+                  ('G positive', color_map(work('g_positive'))),
                   ('B', color_map(work('b'))), ('A raw', color_map(work('a_raw'))),
                   ('A', color_map(work('a'))),
                   ('U0', color_map(work('u0'))), ('U1', color_map(work('u1'))),
@@ -775,7 +792,8 @@ def evaluate(args, model):
         model, dataset, args.device, tuple(dict.fromkeys(thresholds)), args.max_images)
     report = reports[threshold]
     report['checkpoint_version'] = (
-        VERSION if model.bridge_route else
+        VERSION if model.conditional_transport else
+        'reliable_directional_dynamics_v5_bridge_repair' if model.bridge_route else
         'reliable_directional_dynamics_v2' if model.legacy_route else
         'reliable_directional_dynamics_v4_visual_transport'
         if model.visual_transport_route else 'reliable_directional_dynamics_v3')
