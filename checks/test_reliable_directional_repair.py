@@ -8,7 +8,8 @@ from networks.q3_r3_repair import Q3R3Repair
 from networks.reliable_directional_repair import (
     DirectionalDynamics, ReliableDirectionalRepair, compose_surface_logits,
     dynamic_losses, missed_skeleton_segments, shifted)
-from run_reliable_directional_mass import accept_floor_at_epoch, gap_lengths
+from run_reliable_directional_mass import (accept_floor_at_epoch, gap_lengths,
+                                           operating_comparison, select_matched_thresholds)
 
 
 class DirectionalRepairTests(unittest.TestCase):
@@ -26,6 +27,22 @@ class DirectionalRepairTests(unittest.TestCase):
         self.assertAlmostEqual(accept_floor_at_epoch(5), .15 * 5 / 9)
         self.assertEqual(accept_floor_at_epoch(10), 0.)
         self.assertEqual(accept_floor_at_epoch(20), 0.)
+
+    def test_matched_operating_points_use_validation_grid_only(self):
+        reports = {
+            .4: {'p0': {'recall': .8, 'tp': 80, 'fp': 20},
+                 'p1': {'recall': .9, 'tp': 90, 'fp': 30}},
+            .5: {'p0': {'recall': .7, 'tp': 70, 'fp': 10},
+                 'p1': {'recall': .8, 'tp': 80, 'fp': 20}},
+            .6: {'p0': {'recall': .6, 'tp': 60, 'fp': 5},
+                 'p1': {'recall': .7, 'tp': 70, 'fp': 10}}}
+        matched = select_matched_thresholds(reports, .5, .5)
+        self.assertEqual(matched['p0_matched_to_p1_recall']['p0_threshold'], .4)
+        self.assertEqual(matched['p1_matched_to_p0_foreground_area']['p1_threshold'], .6)
+        comparison = operating_comparison(reports, {
+            'p0_threshold': .5, 'threshold': .5,
+            'matched_operating_points': matched})
+        self.assertEqual(comparison['p0_matched_to_p1_recall']['recall_difference'], 0.)
 
     def test_continuity_paths_only_cover_missing_skeleton(self):
         skeleton = torch.zeros(1, 1, 32, 32)
@@ -96,13 +113,26 @@ class DirectionalRepairTests(unittest.TestCase):
         torch.manual_seed(37)
         model = ReliableDirectionalRepair(Q3R3Repair(FakeBase())).eval()
         image = torch.randn(1, 3, 32, 32)
+        with torch.enable_grad():
+            routed = model(image)
+            for output in ('b', 'a'):
+                gradient = torch.autograd.grad(
+                    routed[output].mean(), model.relations.direction_head.weight,
+                    retain_graph=True)[0]
+                self.assertGreater(float(gradient.abs().sum()), 0., output)
         with torch.no_grad():
             baseline = model(image)
             rotated = baseline['w'].roll(2, dims=1)
             changed = model(image, weights_override=rotated)
             self.assertGreater(float((changed['b'] - baseline['b']).abs().sum()), 0.)
             self.assertGreater(float((changed['a'] - baseline['a']).abs().sum()), 0.)
+            self.assertGreater(float(baseline['directional_visual_coverage'].sum()), 0.)
+            model.visual_transport_route = False
+            v3 = model(image)
+            v3_changed = model(image, weights_override=v3['w'].roll(2, dims=1))
+            self.assertGreater(float((v3_changed['b'] - v3['b']).abs().sum()), 0.)
             model.legacy_route = True
+            model.visual_transport_route = False
             legacy = model(image)
             legacy_changed = model(image, weights_override=legacy['w'].roll(2, dims=1))
             self.assertTrue(torch.allclose(legacy['b'], legacy_changed['b'], atol=1e-6))

@@ -93,15 +93,26 @@ def gap_rows(result, mask, skeleton, threshold, case_name):
             side[None, None] > 1.).to(flank_full.device), work_size)
         p0_work = result['u0']
         row = {'case': case_name, 'length': length, 'bin': path_length_bin(length),
+               'center_y': float(center_yx[0]), 'center_x': float(center_yx[1]),
                'flank_r': mean(result['r'], flank),
                'flank_r_side_1': mean(result['r'], negative),
                'flank_r_side_2': mean(result['r'], positive),
                'best_bilateral': mean(result['e_two'].amax(1, keepdim=True), center),
+               'best_w_axis': mean(result['w'].reshape(1, 4, 2, *work_size).sum(2)
+                                    .amax(1, keepdim=True), center),
                'directional_bilateral': mean(result['directional_bilateral'], center),
+               'visual_source_coverage': mean(result['directional_visual_coverage'], center),
+               'continuation': mean(result['directional_continuation'], center),
                'b_minus_p0': mean(result['b'] - p0_work, center),
+               'b_mean': mean(result['b'], center),
                'b_above_threshold_fraction': mean((result['b'] >= threshold).float(), center),
-               'a': mean(result['a'], center)}
+               'a': mean(result['a'], center),
+               'u0_mean': mean(p0_work, center)}
+        for direction_index in range(8):
+            row[f'w{direction_index}_mean'] = mean(
+                result['w'][:, direction_index:direction_index+1], center)
         for step in (1, 2, 3):
+            row[f'u{step}_mean'] = mean(result[f'u{step}'], center)
             row[f'u{step}_recovered_fraction'] = mean(
                 (result[f'u{step}'] >= threshold).float(), center)
             row[f'u{step}_signed_change'] = mean(result[f'u{step}'] - p0_work, center)
@@ -112,6 +123,54 @@ def gap_rows(result, mask, skeleton, threshold, case_name):
     return rows
 
 
+def save_gap_visualization(output, row, sample, result, threshold):
+    output.mkdir(parents=True, exist_ok=True)
+    y, x = int(row['center_y']), int(row['center_x'])
+    y0, x0 = max(y - 80, 0), max(x - 80, 0)
+    y1, x1 = min(y0 + 160, 512), min(x0 + 160, 512)
+    y0, x0 = max(y1 - 160, 0), max(x1 - 160, 0)
+    maps = {}
+    for name in ('p0', 'p1', 'r', 'b', 'a', 'u0', 'u1', 'u2', 'u3',
+                 'directional_visual_coverage', 'directional_continuation'):
+        value = result[name][0, 0].detach().cpu().numpy()
+        maps[name] = cv2.resize(value, (512, 512), interpolation=cv2.INTER_LINEAR)
+    w = result['w'][0].detach().cpu().numpy()
+    maps['w_max'] = cv2.resize(w.max(axis=0), (512, 512),
+                               interpolation=cv2.INTER_LINEAR)
+    maps['w_direction'] = cv2.resize(w.argmax(axis=0).astype(np.float32) / 7.,
+                                     (512, 512), interpolation=cv2.INTER_NEAREST)
+    gt = sample['mask'][0, y0:y1, x0:x1].numpy()
+    image = sample['image'][:, y0:y1, x0:x1].numpy().transpose(1, 2, 0)
+    image = np.uint8(np.clip((image * [.229, .224, .225] +
+                              [.485, .456, .406]) * 255, 0, 255))
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    skeleton = sample['skeleton'][0, y0:y1, x0:x1].numpy() > .5
+    p0 = maps['p0'][y0:y1, x0:x1]
+    missed = skeleton & ~(cv2.dilate((p0 >= threshold).astype(np.uint8),
+                                    np.ones((5, 5), np.uint8)) > 0)
+    image[missed] = (0, 0, 255)
+    panels = [('image / missed GT', image)]
+    for name, array in [('GT', gt), *maps.items()]:
+        crop = array[y0:y1, x0:x1] if name != 'GT' else array
+        colored = cv2.applyColorMap(np.uint8(np.clip(crop, 0, 1) * 255),
+                                     cv2.COLORMAP_TURBO)
+        panels.append((name, colored))
+    bitmaps = []
+    for name, bitmap in panels:
+        bitmap = cv2.resize(bitmap, (256, 256), interpolation=cv2.INTER_AREA)
+        cv2.putText(bitmap, name, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    .55, (255, 255, 255), 2)
+        bitmaps.append(bitmap)
+    while len(bitmaps) % 4:
+        bitmaps.append(np.zeros_like(bitmaps[0]))
+    rows = [np.concatenate(bitmaps[index:index+4], axis=1)
+            for index in range(0, len(bitmaps), 4)]
+    stem = f'{row["bin"]}_{row["case"]}_{y}_{x}'
+    cv2.imwrite(str(output / f'{stem}.png'), np.concatenate(rows, axis=0))
+    np.savez_compressed(output / f'{stem}.npz', w=w,
+                        **{key: value[y0:y1, x0:x1] for key, value in maps.items()})
+
+
 @torch.no_grad()
 def audit(args, model):
     model.eval()
@@ -119,7 +178,7 @@ def audit(args, model):
     threshold = args.audit_threshold
     reports, _, tiles, _ = evaluate_thresholds(
         model, dataset, args.device, (threshold,), args.max_images)
-    rows, gaps = [], []
+    rows, gaps, visualized_bins = [], [], set()
     for _, index, top, left in tiles:
         sample = dataset[index]
         image = sample['image'][None, :, top:top+512, left:left+512].to(args.device)
@@ -132,7 +191,7 @@ def audit(args, model):
         rotated_p1, _ = dynamics_with(model, result, rotated_w)
         constant_a = torch.full_like(result['a'], float(result['a'].mean()))
         constant_a_p1, _ = dynamics_with(model, result, result['w'], constant_a)
-        rotated_full = model(image, capture_diagnostics=True,
+        rotated_full = model(image, capture_diagnostics=False,
                              weights_override=rotated_w)
         for region_name, region in regions.items():
             row = {'case': sample['case_name'], 'region': region_name,
@@ -144,10 +203,17 @@ def audit(args, model):
                    'b_above_threshold_fraction': mean((result['b'] >= threshold).float(), region),
                    'a_above_half_fraction': mean((result['a'] >= .5).float(), region),
                    'bilateral_mean': mean(result['directional_bilateral'], region),
+                   'visual_source_coverage': mean(
+                       result['directional_visual_coverage'], region),
+                   'visual_source_agreement': mean(
+                       result['directional_visual_agreement'], region),
+                   'continuation_mean': mean(result['directional_continuation'], region),
                    'one_sided_mean': mean(result['e_one'].mean(1, keepdim=True), region),
                    'neighbor_minus_p0': mean(result['directional_neighbor'] -
                                              result['u0'], region),
                    'w_mass': mean(result['w'].sum(1, keepdim=True), region),
+                   'w_no_transport': mean(
+                       1. - result['w'].sum(1, keepdim=True), region),
                    'u3_minus_u0': mean(result['u3'] - result['u0'], region),
                    'fixed_ba_no_w_u3_abs': mean((result['u3'] - zero_u3).abs(), region)}
             row.update(quantiles(result['b'] - result['u0'], region, 'b_minus_p0'))
@@ -187,7 +253,17 @@ def audit(args, model):
                 row[f'u{step+1}_minus_p0_abs'] = mean(
                     (result[f'u{step+1}'] - result['u0']).abs(), region)
             rows.append(row)
-        gaps.extend(gap_rows(result, mask, skeleton, threshold, sample['case_name']))
+        tile_gaps = gap_rows(result, mask, skeleton, threshold, sample['case_name'])
+        gaps.extend(tile_gaps)
+        tile_sample = {'image': sample['image'][:, top:top+512, left:left+512],
+                       'mask': sample['mask'][:, top:top+512, left:left+512],
+                       'skeleton': sample['skeleton'][:, top:top+512, left:left+512]}
+        for row in tile_gaps:
+            if row['bin'] not in visualized_bins:
+                save_gap_visualization(args.output_dir / 'gap_visuals', row, tile_sample,
+                                       result,
+                                       threshold)
+                visualized_bins.add(row['bin'])
         print(f'[AUDIT] {len(rows)//5}/{len(tiles)} tiles; gaps={len(gaps)}', flush=True)
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -198,7 +274,9 @@ def audit(args, model):
                 writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(data)
-    report = {'checkpoint_version': 'v2' if model.legacy_route else 'v3',
+    report = {'checkpoint_version': ('v2' if model.legacy_route else
+                                     'v4_visual_transport' if model.visual_transport_route
+                                     else 'v3'),
               'split': 'val', 'threshold': threshold,
               'full_image_comparison': reports[threshold],
               'sample_rule': 'one P0-gap-rich 512 tile per validation image',

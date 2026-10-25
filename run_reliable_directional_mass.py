@@ -23,7 +23,7 @@ from run_q3_r3_mass import (DEFAULT_CHECKPOINT, PROTOCOL, full_dataset,
 from mass_protocol import sliding_positions
 
 
-VERSION = 'reliable_directional_dynamics_v3'
+VERSION = 'reliable_directional_dynamics_v4_visual_transport'
 MODULE_NAMES = ('visual', 'reliable_head', 'relations', 'proposal_head',
                 'accept_head', 'dynamics')
 THRESHOLDS = tuple(round(float(x), 2) for x in np.arange(.35, .751, .05))
@@ -45,9 +45,11 @@ def load_model(args):
     if args.dynamic_checkpoint:
         payload = torch.load(args.dynamic_checkpoint, map_location='cpu', weights_only=False)
         checkpoint_version = payload.get('version')
+        readonly_versions = ('reliable_directional_dynamics_v2',
+                             'reliable_directional_dynamics_v3')
         if checkpoint_version != VERSION and not (
                 args.mode in ('audit', 'val', 'test') and
-                checkpoint_version == 'reliable_directional_dynamics_v2'):
+                checkpoint_version in readonly_versions):
             raise ValueError('Wrong directional dynamics checkpoint version')
         expected = {'base_checkpoint': str(args.base_checkpoint.resolve()),
                     'q3_checkpoint': str(args.q3_checkpoint.resolve()),
@@ -64,7 +66,9 @@ def load_model(args):
         for name in MODULE_NAMES:
             getattr(model, name).load_state_dict(payload['modules'][name], strict=True)
         model.legacy_route = checkpoint_version == 'reliable_directional_dynamics_v2'
-        print(f'[LOAD] strict new modules epoch={payload["epoch"]}', flush=True)
+        model.visual_transport_route = checkpoint_version == VERSION
+        print(f'[LOAD] strict modules version={checkpoint_version} '
+              f'epoch={payload["epoch"]}', flush=True)
     frozen_count = sum(parameter.numel() for parameter in model.frozen.parameters())
     new_count = sum(parameter.numel() for parameter in model.parameters()
                     if parameter.requires_grad)
@@ -338,6 +342,44 @@ def selection_score(metrics, diagnostics, images):
             .05 * metrics['apls_bidirectional_approx'] -
             .001 * metrics['short_pred_components'] -
             .01 * diagnostics['background_bridge_proxy'] / max(images, 1))
+
+
+def foreground_area(metrics):
+    return metrics['tp'] + metrics['fp']
+
+
+def select_matched_thresholds(reports, p0_threshold, p1_threshold):
+    selected = {}
+    for label, extractor in (('recall', lambda item: item['recall']),
+                             ('foreground_area', foreground_area)):
+        for source, target, target_threshold in (
+                ('p0', 'p1', p1_threshold), ('p1', 'p0', p0_threshold)):
+            target_value = extractor(reports[target_threshold][target])
+            match = min(reports, key=lambda value: (
+                abs(extractor(reports[value][source]) - target_value), value))
+            selected[f'{source}_matched_to_{target}_{label}'] = {
+                'p0_threshold': match if source == 'p0' else target_threshold,
+                'p1_threshold': match if source == 'p1' else target_threshold,
+                'selected_on': 'val', 'match_metric': label}
+    return selected
+
+
+def operating_comparison(reports, selection):
+    pairs = {'own_val_thresholds': {'p0_threshold': selection['p0_threshold'],
+                                    'p1_threshold': selection['threshold']},
+             **selection['matched_operating_points']}
+    comparison = {}
+    for name, pair in pairs.items():
+        p0 = reports[float(pair['p0_threshold'])]['p0']
+        p1 = reports[float(pair['p1_threshold'])]['p1']
+        comparison[name] = {
+            'p0_threshold': float(pair['p0_threshold']),
+            'p1_threshold': float(pair['p1_threshold']),
+            'p0': p0, 'p1': p1,
+            'recall_difference': p1['recall'] - p0['recall'],
+            'foreground_area_difference': foreground_area(p1) - foreground_area(p0),
+            'note': 'Thresholds selected on val; matching is approximate on a 0.05 grid.'}
+    return comparison
 
 
 @torch.no_grad()
@@ -697,6 +739,8 @@ def evaluate(args, model):
                          reports[p0_threshold]['p0'], {'background_bridge_proxy': 0},
                          reports[p0_threshold]['images']),
                      'selection_score': reports[threshold]['selection_score'],
+                     'matched_operating_points': select_matched_thresholds(
+                         reports, p0_threshold, threshold),
                      'dynamic_checkpoint': str(args.dynamic_checkpoint.resolve()),
                      'base_checkpoint': str(args.base_checkpoint.resolve()),
                      'q3_checkpoint': str(args.q3_checkpoint.resolve()),
@@ -714,14 +758,16 @@ def evaluate(args, model):
             raise ValueError('Test requires the matching validation threshold selection')
         threshold = float(selection['threshold'])
         p0_threshold = float(selection['p0_threshold'])
-    if args.mode == 'val':
-        p0_threshold = float(selection['p0_threshold'])
+    thresholds = (threshold, p0_threshold, *(
+        value[key] for value in selection['matched_operating_points'].values()
+        for key in ('p0_threshold', 'p1_threshold')))
     reports, details, tiles, elapsed = evaluate_thresholds(
-        model, dataset, args.device, tuple(dict.fromkeys((threshold, p0_threshold))),
-        args.max_images)
+        model, dataset, args.device, tuple(dict.fromkeys(thresholds)), args.max_images)
     report = reports[threshold]
     report['checkpoint_version'] = ('reliable_directional_dynamics_v2'
-                                    if model.legacy_route else VERSION)
+                                    if model.legacy_route else
+                                    VERSION if model.visual_transport_route else
+                                    'reliable_directional_dynamics_v3')
     report['fair_comparison'] = {
         'selection_split': 'val',
         'p0_threshold': p0_threshold,
@@ -729,6 +775,7 @@ def evaluate(args, model):
         'p0_at_own_val_threshold': reports[p0_threshold]['p0'],
         'p1_at_own_val_threshold': reports[threshold]['p1'],
         'note': 'Fixed-threshold paired diagnostics remain in p0/p1/paired above.'}
+    report['operating_point_comparison'] = operating_comparison(reports, selection)
     report['evaluation_seconds'] = elapsed
     report['version'] = report['checkpoint_version']
     report['evaluation_tool_version'] = VERSION

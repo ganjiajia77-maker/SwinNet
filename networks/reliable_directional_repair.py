@@ -32,6 +32,27 @@ def shifted(value, dy, dx):
     return padded[..., pad + dy:pad + dy + height, pad + dx:pad + dx + width]
 
 
+def directional_visual_sources(visual, reliable, weights, scale_logits):
+    """Gather reliable visual context in W-selected directions and radii."""
+    mass = torch.zeros_like(reliable)
+    numerator = torch.zeros_like(visual)
+    for axis_index, (dy, dx) in enumerate(AXES):
+        scales = scale_logits[axis_index].softmax(dim=0)
+        for radius_index, radius in enumerate(RADII):
+            for side_index, sign in enumerate((-1, 1)):
+                direction_index = axis_index * 2 + side_index
+                source = (weights[:, direction_index:direction_index+1] *
+                          scales[radius_index] *
+                          shifted(reliable, sign * radius * dy, sign * radius * dx))
+                mass = mass + source
+                numerator = numerator + source * shifted(
+                    visual, sign * radius * dy, sign * radius * dx)
+    source_visual = numerator / mass.clamp_min(1e-6)
+    coverage = mass.clamp(0., 1.)
+    agreement = F.cosine_similarity(visual, source_visual, dim=1).unsqueeze(1)
+    return source_visual, coverage, agreement.clamp(-1., 1.)
+
+
 class VisualProjection(nn.Module):
     def __init__(self, in_channels, width):
         super().__init__()
@@ -188,6 +209,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.steps = steps
         self.accept_floor = 0.
         self.legacy_route = False
+        self.visual_transport_route = True
 
     def set_accept_floor(self, value):
         if not 0. <= value < 1.:
@@ -222,17 +244,30 @@ class ReliableDirectionalRepair(nn.Module):
         weight_sum = weights.sum(1, keepdim=True)
         bilateral = (weights * two.repeat_interleave(2, dim=1)).sum(1, keepdim=True) / (
             weight_sum + 1e-6)
+        if self.visual_transport_route or capture_diagnostics:
+            source_visual, visual_coverage, visual_agreement = directional_visual_sources(
+                visual, reliable, weights, self.relations.scale_logits)
+        else:
+            source_visual = visual
+            visual_coverage = torch.zeros_like(p0)
+            visual_agreement = torch.zeros_like(p0)
+        visual_input = (visual + visual_coverage * (source_visual - visual)
+                        if self.visual_transport_route else visual)
+        continuation = (bilateral * visual_coverage *
+                        (.5 + .5 * visual_agreement.clamp_min(0.)))
+        proposal_evidence = continuation if self.visual_transport_route else bilateral
         directional_neighbor = sum(
             weights[:, index:index+1] * shifted(p0, dy, dx)
             for index, (dy, dx) in enumerate(DIRECTIONS)) / (weight_sum + 1e-6)
-        relation_balance = (bilateral - one_mean) / (bilateral + one_mean + .05)
-        proposal_features = torch.cat((visual, p0, q, reliable, two_mean,
+        relation_balance = (proposal_evidence - one_mean) / (
+            proposal_evidence + one_mean + .05)
+        proposal_features = torch.cat((visual_input, p0, q, reliable, two_mean,
                                         one_mean, weight_sum if self.legacy_route else bilateral,
                                         two.amax(1, keepdim=True)), dim=1)
         proposal_delta = self.proposal_head(proposal_features)
         p0_logit = torch.logit(p0.clamp(1e-5, 1. - 1e-5))
         if not self.legacy_route:
-            candidate = p0 + bilateral * (directional_neighbor - p0)
+            candidate = p0 + proposal_evidence * (directional_neighbor - p0)
             proposal_delta = proposal_delta + (
                 torch.logit(candidate.clamp(1e-5, 1. - 1e-5)) - p0_logit)
         proposal = (p0_logit + proposal_delta).sigmoid()
@@ -259,6 +294,10 @@ class ReliableDirectionalRepair(nn.Module):
                           delta_logit=delta_logit, visual=visual,
                           directional_bilateral=bilateral,
                           directional_neighbor=directional_neighbor,
+                          directional_visual_coverage=visual_coverage,
+                          directional_visual_agreement=visual_agreement,
+                          directional_continuation=continuation,
+                          transported_visual=source_visual,
                           relation_balance=relation_balance,
                           **dynamics_output[3])
         return result
