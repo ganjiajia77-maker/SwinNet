@@ -10,19 +10,22 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from evaluation.road_comparison.road_metrics import image_metrics, prepare_target, summarize
-from networks.reliable_directional_repair import ReliableDirectionalRepair, dynamic_losses
+from networks.reliable_directional_repair import (ReliableDirectionalRepair,
+                                                  compose_surface_logits,
+                                                  dynamic_losses)
 from run_q3_r3_mass import (DEFAULT_CHECKPOINT, PROTOCOL, full_dataset,
                             load_experiment, stitch_three)
 from mass_protocol import sliding_positions
 
 
-VERSION = 'reliable_directional_dynamics_v1'
+VERSION = 'reliable_directional_dynamics_v2'
 MODULE_NAMES = ('visual', 'reliable_head', 'relations', 'proposal_head',
-                'accept_head', 'dynamics', 'detail_projection', 'detail_head')
+                'accept_head', 'dynamics')
 THRESHOLDS = tuple(round(float(x), 2) for x in np.arange(.35, .751, .05))
 
 
@@ -45,7 +48,12 @@ def load_model(args):
             raise ValueError('Wrong directional dynamics checkpoint version')
         expected = {'base_checkpoint': str(args.base_checkpoint.resolve()),
                     'q3_checkpoint': str(args.q3_checkpoint.resolve()),
-                    'width': args.width, 'steps': 3}
+                    'width': args.width, 'steps': 3,
+                    'accept_floor_initial': args.accept_floor_initial,
+                    'accept_floor_anneal_epochs': args.accept_floor_anneal_epochs,
+                    'missing_threshold': args.missing_threshold,
+                    'lambda_bg': args.lambda_bg,
+                    'lambda_cont': args.lambda_cont}
         mismatches = {key: (payload.get(key), value) for key, value in expected.items()
                       if payload.get(key) != value}
         if mismatches or set(payload.get('modules', {})) != set(MODULE_NAMES):
@@ -65,6 +73,10 @@ def save_checkpoint(model, path, args, epoch, selection=None, optimizer=None):
                'base_checkpoint': str(args.base_checkpoint.resolve()),
                'q3_checkpoint': str(args.q3_checkpoint.resolve()),
                'width': args.width, 'steps': 3, 'selection': selection,
+               'accept_floor_initial': args.accept_floor_initial,
+               'accept_floor_anneal_epochs': args.accept_floor_anneal_epochs,
+               'missing_threshold': args.missing_threshold,
+               'lambda_bg': args.lambda_bg, 'lambda_cont': args.lambda_cont,
                'modules': {name: getattr(model, name).state_dict() for name in MODULE_NAMES}}
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
@@ -79,12 +91,14 @@ def gradient_norm(module):
     return float(torch.stack(squared).sum().sqrt()) if squared else 0.
 
 
-def batch_summary(result, threshold=.6):
+def batch_summary(result, mask=None, skeleton=None, threshold=.6,
+                  missing_threshold=.45):
     with torch.no_grad():
         p0, p1 = result['p0'], result['p1']
-        return {'r_mean': float(result['r'].mean()),
+        summary = {'r_mean': float(result['r'].mean()),
                 'r_near_zero': float((result['r'] < .01).float().mean()),
                 'a_mean': float(result['a'].mean()),
+                'a_raw_mean': float(result['a_raw'].mean()),
                 'a_near_one': float((result['a'] > .99).float().mean()),
                 'b_minus_p0_mean_abs': float((result['b'] - result['u0']).abs().mean()),
                 'w_direction_means': result['w'].mean((0, 2, 3)).cpu().tolist(),
@@ -92,8 +106,60 @@ def batch_summary(result, threshold=.6):
                 'step_changes': [float((result[f'u{index}'] -
                                         result[f'u{index-1}']).abs().mean())
                                  for index in (1, 2, 3)],
+                'u3_minus_p0_mean_abs': float((result['u3'] - result['u0']).abs().mean()),
+                'p1_minus_p0_mean_abs': float((p1 - p0).abs().mean()),
                 'added_fraction': float(((p1 >= threshold) & (p0 < threshold)).float().mean()),
                 'removed_fraction': float(((p1 < threshold) & (p0 >= threshold)).float().mean())}
+        if mask is not None and skeleton is not None:
+            near_p0 = F.max_pool2d(p0, 5, stride=1, padding=2)
+            missing = (skeleton > .5) & (near_p0 < missing_threshold)
+            size = result['a'].shape[-2:]
+            missing_work = F.adaptive_max_pool2d(
+                missing.float(), size) > 0
+            background_work = ((result['q'] > .5) &
+                               (F.interpolate(mask, size=size, mode='nearest') < .5))
+            for name, region in (('missing', missing_work),
+                                 ('hard_background', background_work)):
+                values = result['a_raw'][region]
+                summary[f'a_raw_{name}_pixels'] = int(values.numel())
+                for quantile, label in ((0.1, 'p10'), (0.5, 'p50'), (0.9, 'p90')):
+                    summary[f'a_raw_{name}_{label}'] = (
+                        float(torch.quantile(values.float(), quantile)) if values.numel() else None)
+                summary[f'a_raw_{name}_mean'] = (float(values.mean())
+                                                 if values.numel() else None)
+                effective = result['a'][region]
+                summary[f'a_{name}_mean'] = (float(effective.mean())
+                                              if effective.numel() else None)
+            delta = p1 - p0
+            summary['missing_signed_probability_delta'] = (
+                float(delta[missing].mean()) if missing.any() else None)
+            added = (p1 >= threshold) & (p0 < threshold)
+            summary['added_gt_pixels'] = int((added & (mask > .5)).sum())
+            summary['added_background_pixels'] = int((added & (mask < .5)).sum())
+        return summary
+
+
+def accept_floor_at_epoch(epoch, initial=.15, anneal_epochs=10):
+    if anneal_epochs <= 1:
+        return 0.
+    return initial * max(0., 1. - (epoch - 1) / (anneal_epochs - 1))
+
+
+def continuity_gradient_norms(model, continuity):
+    names = ('reliable_head', 'relations', 'proposal_head', 'accept_head', 'dynamics')
+    grouped = {name: tuple(getattr(model, name).parameters()) for name in names}
+    parameters = [parameter for group in grouped.values() for parameter in group]
+    gradients = torch.autograd.grad(continuity, parameters, retain_graph=True,
+                                    allow_unused=True)
+    result = {}
+    offset = 0
+    for name, group in grouped.items():
+        selected = gradients[offset:offset + len(group)]
+        squares = [gradient.detach().float().square().sum() for gradient in selected
+                   if gradient is not None]
+        result[name] = float(torch.stack(squares).sum().sqrt()) if squares else 0.
+        offset += len(group)
+    return result
 
 
 def smoke(args, model):
@@ -104,6 +170,7 @@ def smoke(args, model):
     mask = sample['mask'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
     skeleton = sample['skeleton'][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
     model.train()
+    model.set_accept_floor(args.accept_floor_initial)
     if args.device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(args.device)
     inner = model.frozen.base.swin_unet
@@ -126,21 +193,24 @@ def smoke(args, model):
     if any(calls[name] for name in ('local', 'gap', 'p2')) or calls['h3_surface_fusion'] != 1:
         raise RuntimeError(f'Unexpected frozen base path calls: {calls}')
     loss, terms = dynamic_losses(result, mask, skeleton,
-                                 lambda_bg=args.lambda_bg, lambda_cont=args.lambda_cont)
+                                 lambda_bg=args.lambda_bg, lambda_cont=args.lambda_cont,
+                                 missing_threshold=args.missing_threshold,
+                                 return_live_terms=True)
     if not bool(torch.isfinite(loss)):
         raise RuntimeError('Non-finite smoke loss')
+    cont_gradients = continuity_gradient_norms(model, terms['cont_live'])
     loss.backward()
     if args.device.type == 'cuda':
         torch.cuda.synchronize(args.device)
     gradients = {name: gradient_norm(getattr(model, name)) for name in MODULE_NAMES}
     required_gradients = ('visual', 'reliable_head', 'relations', 'proposal_head',
-                          'accept_head', 'dynamics', 'detail_head')
+                          'accept_head', 'dynamics')
     if any(gradients[name] <= 0 or not np.isfinite(gradients[name])
            for name in required_gradients):
         raise RuntimeError(f'New repair module has zero/nonfinite gradient: {gradients}')
     if any(parameter.grad is not None for parameter in model.frozen.parameters()):
         raise RuntimeError('Frozen encoder/Q3 received gradients')
-    for key in ('r', 'w', 'b', 'a', 'u0', 'u1', 'u2', 'u3', 'p1'):
+    for key in ('r', 'w', 'b', 'a_raw', 'a', 'u0', 'u1', 'u2', 'u3', 'p1'):
         value = result[key]
         if not bool(torch.isfinite(value).all()) or bool((value < 0).any()) or bool((value > 1).any()):
             raise RuntimeError(f'Invalid probability in {key}')
@@ -153,18 +223,52 @@ def smoke(args, model):
             result['visual'], result['u0'], result['q'], result['r'],
             result['b'], result['a'], torch.zeros_like(result['w']))
         w_effect = float((without_w[-1] - result['u3']).abs().mean())
+        without_w_z1, _ = compose_surface_logits(result['z0'], result['u0'],
+                                                  without_w[-1])
+        w_to_surface = float((without_w_z1.sigmoid() - result['p1']).abs().mean())
+        identity_z1, _ = compose_surface_logits(result['z0'], result['u0'],
+                                                 result['u0'])
+        identity_error = float((identity_z1 - result['z0']).abs().max())
+        identity_probability_error = float((identity_z1.sigmoid() - result['p0']).abs().max())
     w_gradient = gradient_norm(model.relations.direction_head)
-    if w_gradient <= 0 or w_effect <= 0:
-        raise RuntimeError(f'W does not affect U3: gradient={w_gradient}, effect={w_effect}')
+    if w_gradient <= 0 or w_effect <= 0 or w_to_surface <= 0:
+        raise RuntimeError(f'W does not reach P1: gradient={w_gradient}, '
+                           f'U3_effect={w_effect}, P1_effect={w_to_surface}')
+    if identity_error > 1e-7 or identity_probability_error > 1e-7:
+        raise RuntimeError('Unchanged working-grid state must preserve the frozen surface')
+    update_mean = float((result['u3'] - result['u0']).abs().mean())
+    surface_change_mean = float((result['p1'] - result['p0']).abs().mean())
+    if update_mean <= 1e-8 or surface_change_mean <= 1e-8:
+        raise RuntimeError(f'Dynamics did not change Surface: U3={update_mean}, '
+                           f'P1={surface_change_mean}')
+    forward_backward_seconds = time.perf_counter() - start
+    model.eval()
+    with torch.no_grad():
+        inference = model(image[:1])
+    if not torch.equal(inference['a'], inference['a_raw']):
+        raise RuntimeError('The training-only accept floor leaked into inference')
     report = {'shapes': {key: list(result[key].shape) for key in
-                         ('z0', 'q', 'r', 'w', 'b', 'a', 'u0', 'u1', 'u2', 'u3', 'p1')},
+                         ('z0', 'q', 'r', 'w', 'b', 'a_raw', 'a',
+                          'u0', 'u1', 'u2', 'u3', 'p1')},
               'loss': float(loss), 'seg': float(terms['seg']),
-              'cont': float(terms['cont']), 'gt_paths': terms['paths'],
-              'gradient_norms': gradients, 'initial': batch_summary(result),
+              'cont': float(terms['cont']), 'weighted_cont': float(args.lambda_cont * terms['cont']),
+              'missing_segments': terms['missing_segments'], 'gt_paths': terms['paths'],
+              'path_soft_min_mean': terms['path_soft_min_mean'],
+              'gradient_norms': gradients,
+              'initial': batch_summary(result, mask, skeleton,
+                                       threshold=args.missing_threshold,
+                                       missing_threshold=args.missing_threshold),
+              'continuity_gradients': cont_gradients,
               'w_head_gradient_norm': w_gradient, 'w_to_u3_mean_abs': w_effect,
+              'w_to_p1_mean_abs': w_to_surface,
+              'identity_logit_max_error': identity_error,
+              'identity_probability_max_error': identity_probability_error,
+              'u3_change_mean_abs': update_mean,
+              'p1_change_mean_abs': surface_change_mean,
+              'inference_accept_floor': 0.,
               'peak_cuda_mib': (torch.cuda.max_memory_allocated(args.device) / 2**20
                                 if args.device.type == 'cuda' else None),
-              'batch_forward_backward_seconds': time.perf_counter() - start,
+              'batch_forward_backward_seconds': forward_backward_seconds,
               'frozen_gradient_count': 0,
               'frozen_base_calls': calls,
               'old_stage2_propagation_enabled': False, 'old_gap_enabled': False,
@@ -258,6 +362,8 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
             by_length, bridges = gap_lengths(p0, p1, prepared['skeleton'], gt)
             eligible = sum(values['eligible'] for values in by_length.values())
             closed = sum(values['closed'] for values in by_length.values())
+            missing_center = prepared['skeleton'] & ~(cv2.dilate(
+                p0.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
             data['paired'].append({'case_id': sample['case_name'],
                                    'eligible_p0_gaps': eligible, 'closed_p0_gaps': closed,
                                    'background_bridge_proxy': bridges,
@@ -265,6 +371,9 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
                                    'added_background_pixels': int((p1 & ~p0 & ~gt).sum()),
                                    'removed_gt_pixels': int((p0 & ~p1 & gt).sum()),
                                    'removed_background_pixels': int((p0 & ~p1 & ~gt).sum()),
+                                   'gap_center_signed_probability_change': (
+                                       float((p1_prob - p0_prob)[missing_center].mean())
+                                       if missing_center.any() else None),
                                    'probability_change_mean': float(np.abs(p1_prob-p0_prob).mean())})
             for name, values in by_length.items():
                 data['bins'][name]['eligible'] += values['eligible']
@@ -287,6 +396,13 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
                    'removed_gt_pixels', 'removed_background_pixels')}
         paired['gap_closure_rate_proxy'] = (paired['closed_p0_gaps'] /
                                              max(paired['eligible_p0_gaps'], 1))
+        paired['added_gt_to_background_ratio'] = (
+            paired['added_gt_pixels'] / max(paired['added_background_pixels'], 1))
+        gap_changes = [item['gap_center_signed_probability_change']
+                       for item in data['paired']
+                       if item['gap_center_signed_probability_change'] is not None]
+        paired['gap_center_signed_probability_change_mean'] = (
+            float(np.mean(gap_changes)) if gap_changes else None)
         paired['probability_change_mean'] = float(np.mean(
             [item['probability_change_mean'] for item in data['paired']]))
         bins = {name: {**counts, 'closure_rate_proxy':
@@ -300,6 +416,37 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
                               'metric_note': 'Raster APLS approximation; gap closure and '
                                              'background bridge are diagnostic proxies.'}
     return reports, storage, sorted(reference_tiles, reverse=True), time.perf_counter() - start
+
+
+@torch.no_grad()
+def evaluate_dynamics_regions(model, dataset, tiles, device, threshold,
+                              missing_threshold=.45):
+    model.eval()
+    rows = []
+    for _, index, top, left in tiles:
+        sample = dataset[index]
+        image = sample['image'][None, :, top:top+512, left:left+512].to(device)
+        mask = sample['mask'][None, :, top:top+512, left:left+512].to(device)
+        skeleton = sample['skeleton'][None, :, top:top+512, left:left+512].to(device)
+        result = model(image, capture_diagnostics=True)
+        row = batch_summary(result, mask, skeleton, threshold,
+                            missing_threshold=missing_threshold)
+        no_direction, _, _ = model.dynamics(
+            result['visual'], result['u0'], result['q'], result['r'], result['b'],
+            result['a'], torch.zeros_like(result['w']))
+        no_direction_z1, _ = compose_surface_logits(result['z0'], result['u0'],
+                                                     no_direction[-1])
+        row['w_to_p1_mean_abs'] = float((result['p1'] - no_direction_z1.sigmoid()).abs().mean())
+        rows.append(row)
+    names = ('a_raw_missing_mean', 'a_raw_hard_background_mean',
+             'a_missing_mean', 'a_hard_background_mean',
+             'missing_signed_probability_delta', 'u3_minus_p0_mean_abs',
+             'p1_minus_p0_mean_abs', 'w_to_p1_mean_abs')
+    report = {'sampled_tiles': len(rows), 'accept_floor_inference': 0.}
+    for name in names:
+        values = [row[name] for row in rows if row[name] is not None]
+        report[name] = float(np.mean(values)) if values else None
+    return report
 
 
 def write_rows(path, rows):
@@ -344,17 +491,25 @@ def train(args, model):
     np.random.seed(args.seed)
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
+        accept_floor = accept_floor_at_epoch(epoch, args.accept_floor_initial,
+                                             args.accept_floor_anneal_epochs)
+        model.set_accept_floor(accept_floor)
         dataset.set_epoch(epoch)
         sums = {'seg': 0., 'cont': 0., 'total': 0., 'r_mean': 0.,
-                'r_near_zero': 0., 'a_mean': 0., 'a_near_one': 0.,
-                'b_minus_p0_mean_abs': 0., 'w_sum_mean': 0.,
+                'r_near_zero': 0., 'a_mean': 0., 'a_raw_mean': 0.,
+                'a_near_one': 0., 'b_minus_p0_mean_abs': 0., 'w_sum_mean': 0.,
+                'u3_minus_p0_mean_abs': 0., 'p1_minus_p0_mean_abs': 0.,
                 'added_fraction': 0., 'removed_fraction': 0.}
         grad_sums = {name: 0. for name in MODULE_NAMES}
+        cont_grad_sums = {name: 0. for name in
+                          ('reliable_head', 'relations', 'proposal_head',
+                           'accept_head', 'dynamics')}
+        missing_segments_total = paths_total = 0
         w_gradient_sum = 0.
         direction_sums = np.zeros(8, dtype=np.float64)
         step_sums = [0., 0., 0.]
         start = time.perf_counter()
-        for batch in loader:
+        for batch_index, batch in enumerate(loader, start=1):
             image = batch['image'].to(args.device, non_blocking=True)
             mask = batch['mask'].to(args.device, non_blocking=True)
             skeleton = batch['skeleton'].to(args.device, non_blocking=True)
@@ -362,15 +517,58 @@ def train(args, model):
             result = model(image)
             loss, terms = dynamic_losses(result, mask, skeleton,
                                          lambda_bg=args.lambda_bg,
-                                         lambda_cont=args.lambda_cont)
+                                         lambda_cont=args.lambda_cont,
+                                         missing_threshold=args.missing_threshold,
+                                         return_live_terms=True)
             if not bool(torch.isfinite(loss)):
                 raise RuntimeError(f'Nonfinite loss at epoch {epoch}')
+            cont_gradients = continuity_gradient_norms(model, terms['cont_live'])
             loss.backward()
             for name in MODULE_NAMES:
                 grad_sums[name] += gradient_norm(getattr(model, name))
             w_gradient_sum += gradient_norm(model.relations.direction_head)
             optimizer.step()
-            snapshot = batch_summary(result)
+            snapshot = batch_summary(result, mask, skeleton,
+                                     threshold=args.missing_threshold,
+                                     missing_threshold=args.missing_threshold)
+            missing_segments_total += terms['missing_segments']
+            paths_total += terms['paths']
+            for name, value in cont_gradients.items():
+                cont_grad_sums[name] += value
+            batch_report = {'epoch': epoch, 'batch': batch_index,
+                            'accept_floor': accept_floor,
+                            'loss_total': float(loss), 'L_seg': float(terms['seg']),
+                            'L_cont': float(terms['cont']),
+                            'weighted_L_cont': float(args.lambda_cont * terms['cont']),
+                            'missing_segments': terms['missing_segments'],
+                            'paths': terms['paths'],
+                            'path_soft_min_mean': terms['path_soft_min_mean'],
+                            'path_soft_min_p10': terms['path_soft_min_p10'],
+                            'path_soft_min_p50': terms['path_soft_min_p50'],
+                            'path_soft_min_p90': terms['path_soft_min_p90'],
+                            'L_cont_gradients': cont_gradients,
+                            'a_raw_mean': snapshot['a_raw_mean'],
+                            'a_raw_missing_pixels': snapshot['a_raw_missing_pixels'],
+                            'a_raw_missing_mean': snapshot['a_raw_missing_mean'],
+                            'a_raw_missing_p10': snapshot['a_raw_missing_p10'],
+                            'a_raw_missing_p50': snapshot['a_raw_missing_p50'],
+                            'a_raw_missing_p90': snapshot['a_raw_missing_p90'],
+                            'a_missing_mean': snapshot['a_missing_mean'],
+                            'a_raw_hard_background_pixels':
+                                snapshot['a_raw_hard_background_pixels'],
+                            'a_raw_hard_background_mean': snapshot['a_raw_hard_background_mean'],
+                            'a_raw_hard_background_p10': snapshot['a_raw_hard_background_p10'],
+                            'a_raw_hard_background_p50': snapshot['a_raw_hard_background_p50'],
+                            'a_raw_hard_background_p90': snapshot['a_raw_hard_background_p90'],
+                            'a_hard_background_mean': snapshot['a_hard_background_mean'],
+                            'missing_signed_probability_delta':
+                                snapshot['missing_signed_probability_delta'],
+                            'u3_minus_p0_mean_abs': snapshot['u3_minus_p0_mean_abs'],
+                            'p1_minus_p0_mean_abs': snapshot['p1_minus_p0_mean_abs']}
+            batch_report['added_gt_pixels'] = snapshot['added_gt_pixels']
+            batch_report['added_background_pixels'] = snapshot['added_background_pixels']
+            with (args.output_dir / 'batch_metrics.jsonl').open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(batch_report) + '\n')
             for name in sums:
                 sums[name] += (float(loss) if name == 'total'
                                else float(terms[name]) if name in terms else snapshot[name])
@@ -379,6 +577,11 @@ def train(args, model):
             direction_sums += np.asarray(snapshot['w_direction_means'])
         count = len(loader)
         report = {'epoch': epoch, **{key: value/count for key, value in sums.items()},
+                  'accept_floor': accept_floor,
+                  'missing_segments': missing_segments_total,
+                  'continuity_paths': paths_total,
+                  'weighted_L_cont': args.lambda_cont * sums['cont'] / count,
+                  'L_cont_gradients': {key: value/count for key, value in cont_grad_sums.items()},
                   'gradients': {key: value/count for key, value in grad_sums.items()},
                   'w_head_gradient': w_gradient_sum/count,
                   'w_direction_means': (direction_sums/count).tolist(),
@@ -390,10 +593,14 @@ def train(args, model):
         save_checkpoint(model, args.output_dir / 'last.pth', args, epoch,
                         best_score, optimizer)
         if epoch % args.val_interval == 0 or epoch == args.epochs:
-            reports, _, _, elapsed = evaluate_thresholds(
-                model, full_dataset(args.root_path, 'val'), args.device,
+            val_dataset = full_dataset(args.root_path, 'val')
+            reports, _, tiles, elapsed = evaluate_thresholds(
+                model, val_dataset, args.device,
                 (.6,), args.max_images)
             evaluation = reports[.6]
+            evaluation['dynamics_regions'] = evaluate_dynamics_regions(
+                model, val_dataset, tiles, args.device, .6,
+                missing_threshold=args.missing_threshold)
             score = evaluation['selection_score']
             evaluation['epoch'] = epoch
             evaluation['eval_seconds'] = elapsed
@@ -443,7 +650,8 @@ def save_visualizations(model, dataset, tiles, output, device, threshold, count=
                   ('E_two', color_map(arr['e_two'].mean(0))),
                   ('E_one', color_map(arr['e_one'].mean(0))),
                   ('W_sum', color_map(arr['w'].sum(0))),
-                  ('B', color_map(work('b'))), ('A', color_map(work('a'))),
+                  ('B', color_map(work('b'))), ('A raw', color_map(work('a_raw'))),
+                  ('A', color_map(work('a'))),
                   ('U0', color_map(work('u0'))), ('U1', color_map(work('u1'))),
                   ('U2', color_map(work('u2'))), ('U3', color_map(work('u3'))),
                   ('P1', color_map(p1)),
@@ -504,6 +712,9 @@ def evaluate(args, model):
     report['q3_checkpoint'] = str(args.q3_checkpoint.resolve())
     report['checkpoint'] = str(args.dynamic_checkpoint.resolve())
     report['protocol'] = PROTOCOL
+    report['dynamics_regions'] = evaluate_dynamics_regions(
+        model, dataset, tiles, args.device, threshold,
+        missing_threshold=args.missing_threshold)
     write_evaluation(args.output_dir / args.mode, report, details[threshold])
     if args.mode == 'val' and args.max_images == 0:
         save_visualizations(model, dataset, tiles, args.output_dir / 'val' / 'dynamics',
@@ -520,7 +731,7 @@ def main():
     parser.add_argument('--q3_checkpoint', type=Path, required=True)
     parser.add_argument('--dynamic_checkpoint', type=Path)
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--epochs', type=int, default=40)
+    parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--val_interval', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=4)
@@ -528,13 +739,19 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--lambda_bg', type=float, default=1.)
     parser.add_argument('--lambda_cont', type=float, default=.2)
+    parser.add_argument('--accept_floor_initial', type=float, default=.15)
+    parser.add_argument('--accept_floor_anneal_epochs', type=int, default=10)
+    parser.add_argument('--missing_threshold', type=float, default=.45)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--max_images', type=int, default=0)
-    parser.add_argument('--visualizations', type=int, default=4)
+    parser.add_argument('--visualizations', type=int, default=8)
     args = parser.parse_args()
     if (args.width % 8 or args.width < 8 or args.batch_size < 1 or args.epochs < 1 or
             args.val_interval < 1 or args.lambda_bg < 0 or args.lambda_cont < 0 or
-            args.max_images < 0 or args.visualizations < 0):
+            args.max_images < 0 or args.visualizations < 0 or
+            not 0 <= args.accept_floor_initial < 1 or
+            args.accept_floor_anneal_epochs < 1 or
+            not 0 < args.missing_threshold < 1):
         parser.error('Invalid model, training, or evaluation configuration')
     if args.mode in ('resume', 'val', 'test') and not args.dynamic_checkpoint:
         parser.error('--dynamic_checkpoint is required for resume/val/test')

@@ -14,6 +14,16 @@ RADII = (1, 2, 4, 8, 16)
 DIRECTIONS = tuple(offset for dy, dx in AXES for offset in ((-dy, -dx), (dy, dx)))
 
 
+def compose_surface_logits(z0_full, p0_work, updated_work, eps=1e-5):
+    if p0_work.shape != updated_work.shape:
+        raise ValueError('The initial and updated working grids must match')
+    delta = (torch.logit(updated_work.clamp(eps, 1. - eps)) -
+             torch.logit(p0_work.clamp(eps, 1. - eps)))
+    delta_full = F.interpolate(delta, size=z0_full.shape[-2:], mode='bilinear',
+                               align_corners=False)
+    return z0_full + delta_full, delta
+
+
 def shifted(value, dy, dx):
     """Read at p+(dy,dx), returning zeros outside the image."""
     pad = max(abs(dy), abs(dx))
@@ -162,15 +172,16 @@ class ReliableDirectionalRepair(nn.Module):
         self.accept_head = nn.Sequential(nn.Conv2d(width + 8, width, 3, padding=1),
                                          nn.GELU(), nn.Conv2d(width, 1, 1))
         nn.init.zeros_(self.accept_head[-1].weight)
-        nn.init.constant_(self.accept_head[-1].bias, -2.)
+        nn.init.constant_(self.accept_head[-1].bias, -1.)
         self.dynamics = DirectionalDynamics(width, steps)
-        self.detail_projection = nn.Conv2d(width, 8, 1)
-        self.detail_head = nn.Sequential(nn.Conv2d(11, 8, 3, padding=1), nn.GELU(),
-                                         nn.Conv2d(8, 1, 1))
-        nn.init.zeros_(self.detail_head[-1].weight)
-        nn.init.zeros_(self.detail_head[-1].bias)
         self.width = width
         self.steps = steps
+        self.accept_floor = 0.
+
+    def set_accept_floor(self, value):
+        if not 0. <= value < 1.:
+            raise ValueError('The training accept floor must be in [0, 1)')
+        self.accept_floor = float(value)
 
     def train(self, mode=True):
         super().train(mode)
@@ -199,48 +210,43 @@ class ReliableDirectionalRepair(nn.Module):
         proposal_delta = self.proposal_head(proposal_features)
         proposal = (torch.logit(p0.clamp(1e-5, 1. - 1e-5)) + proposal_delta).sigmoid()
         accept_features = torch.cat((proposal_features, proposal), dim=1)
-        accept = self.accept_head(accept_features).sigmoid()
+        accept_raw = self.accept_head(accept_features).sigmoid()
+        floor = self.accept_floor if self.training else 0.
+        accept = floor + (1. - floor) * accept_raw
         states, masses, available = self.dynamics(
             visual, p0, q, reliable, proposal, accept, weights)
-        full_size = z0.shape[-2:]
-        up = lambda value: F.interpolate(value, size=full_size, mode='bilinear',
-                                         align_corners=False)
-        u3_full, accept_full = up(states[-1]), up(accept)
-        detail = self.detail_head(torch.cat((up(self.detail_projection(visual)),
-                                            u3_full, accept_full, p0_full), dim=1))
-        detail = .5 * torch.tanh(detail)
-        refined = (torch.logit(u3_full.clamp(1e-5, 1. - 1e-5)) + detail).sigmoid()
-        p1 = (1. - accept_full) * p0_full + accept_full * refined
-        z1 = torch.logit(p1.clamp(1e-6, 1. - 1e-6))
+        z1, delta_logit = compose_surface_logits(z0, p0, states[-1])
+        p1 = z1.sigmoid()
         result = {'z0': z0, 'z1': z1, 'p0': p0_full, 'p1': p1,
                   'q': q, 'r': reliable, 'w': weights, 'b': proposal,
-                  'a': accept, 'e_two': two, 'e_one': one,
+                  'a': accept, 'a_raw': accept_raw, 'e_two': two, 'e_one': one,
                   'u0': states[0], 'u1': states[1], 'u2': states[2], 'u3': states[3]}
         if capture_diagnostics:
             result.update(source_mass=torch.stack(masses, dim=1),
                           source_available=torch.stack(available, dim=1),
-                          detail=detail, visual=visual)
+                          delta_logit=delta_logit, visual=visual)
         return result
 
-def gt_branch_segments(skeleton, min_pixels=4):
-    """Split GT centerlines at junctions into connected branch proxies."""
+@torch.no_grad()
+def missed_skeleton_segments(skeleton, p0, threshold=.45, min_pixels=3):
+    """Find continuous GT centerline pieces missing from the frozen surface."""
+    nearby = F.max_pool2d(p0.detach(), 5, stride=1, padding=2)
+    missing = ((skeleton > .5) & (nearby < threshold)).cpu().numpy()[:, 0]
     result = []
-    for image in skeleton[:, 0].detach().cpu().numpy() > .5:
-        degree = (cv2.filter2D(image.astype(np.uint8), cv2.CV_16S,
-                               np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT)
-                  - image.astype(np.int16))
-        branches = (image & (degree <= 2)).astype(np.uint8)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(branches, connectivity=8)
-        paths = []
+    for image in missing:
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            image.astype(np.uint8), connectivity=8)
+        pieces = []
         for index in range(1, count):
             if stats[index, cv2.CC_STAT_AREA] >= min_pixels:
-                paths.append(np.nonzero(labels == index))
-        result.append(paths)
+                pieces.append(np.nonzero(labels == index))
+        result.append(pieces)
     return result
 
 
 def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_cont=.2,
-                   temperature=15., max_paths_per_image=128):
+                   temperature=15., max_paths_per_image=128,
+                   missing_threshold=.45, return_live_terms=False):
     z1, p1, p0, q = result['z1'], result['p1'], result['p0'], result['q']
     if mask.shape != z1.shape or skeleton.shape != z1.shape:
         raise ValueError('Surface, mask and GT skeleton must share the final grid')
@@ -254,28 +260,37 @@ def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_cont=.2,
         p1.sum((1, 2, 3)) + mask.sum((1, 2, 3)) + 1.)
     segmentation = focal + .5 * dice.mean()
     tolerant = F.max_pool2d(p1, 3, stride=1, padding=1)
-    paths = gt_branch_segments(skeleton)
-    path_losses, path_weights = [], []
+    paths = missed_skeleton_segments(skeleton, p0, threshold=missing_threshold)
+    image_losses, soft_min_values = [], []
     for batch_index, image_paths in enumerate(paths):
-        difficulty = []
-        for ys, xs in image_paths:
+        # Select the hardest missing pieces using only the frozen prediction.
+        p0_image = p0[batch_index, 0].detach().cpu().numpy()
+        ranked = sorted(image_paths,
+                        key=lambda piece: float(p0_image[piece].mean()))
+        segment_losses = []
+        for ys, xs in ranked[:max_paths_per_image]:
             y = torch.as_tensor(ys, device=z1.device)
             x = torch.as_tensor(xs, device=z1.device)
-            weight = (.1 + (1. - p0[batch_index, 0, y, x].detach()).mean())
-            difficulty.append((weight, y, x))
-        difficulty.sort(key=lambda item: float(item[0]), reverse=True)
-        for weight, y, x in difficulty[:max_paths_per_image]:
             values = tolerant[batch_index, 0, y, x]
             soft_min = -(torch.logsumexp(-temperature * values, dim=0) -
                          math.log(values.numel())) / temperature
-            path_losses.append(.05 * F.softplus((.75 - soft_min) / .05))
-            path_weights.append(weight)
-    if path_losses:
-        joined_weights = torch.stack(path_weights)
-        continuity = (torch.stack(path_losses) * joined_weights).sum() / joined_weights.sum()
-    else:
-        continuity = z1.sum() * 0.
+            segment_losses.append(.05 * F.softplus((.75 - soft_min) / .05))
+            soft_min_values.append(soft_min.detach())
+        if segment_losses:
+            image_losses.append(torch.stack(segment_losses).mean())
+    continuity = (torch.stack(image_losses).mean() if image_losses
+                  else z1.sum() * 0.)
     total = segmentation + lambda_cont * continuity
-    return total, {'seg': segmentation.detach(), 'cont': continuity.detach(),
-                   'focal': focal.detach(), 'dice': dice.mean().detach(),
-                   'paths': len(path_losses)}
+    soft_values = (torch.stack(soft_min_values).float().cpu().numpy()
+                   if soft_min_values else np.empty(0, dtype=np.float32))
+    terms = {'seg': segmentation.detach(), 'cont': continuity.detach(),
+             'focal': focal.detach(), 'dice': dice.mean().detach(),
+             'missing_segments': sum(map(len, paths)),
+             'paths': len(soft_min_values),
+             'path_soft_min_mean': float(soft_values.mean()) if soft_values.size else None,
+             'path_soft_min_p10': float(np.percentile(soft_values, 10)) if soft_values.size else None,
+             'path_soft_min_p50': float(np.median(soft_values)) if soft_values.size else None,
+             'path_soft_min_p90': float(np.percentile(soft_values, 90)) if soft_values.size else None}
+    if return_live_terms:
+        terms['cont_live'] = continuity
+    return total, terms

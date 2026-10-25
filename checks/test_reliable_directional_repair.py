@@ -6,11 +6,57 @@ import torch
 from checks.test_q3_r3_repair import FakeBase
 from networks.q3_r3_repair import Q3R3Repair
 from networks.reliable_directional_repair import (
-    DirectionalDynamics, ReliableDirectionalRepair, dynamic_losses, shifted)
-from run_reliable_directional_mass import gap_lengths
+    DirectionalDynamics, ReliableDirectionalRepair, compose_surface_logits,
+    dynamic_losses, missed_skeleton_segments, shifted)
+from run_reliable_directional_mass import accept_floor_at_epoch, gap_lengths
 
 
 class DirectionalRepairTests(unittest.TestCase):
+    def test_logit_update_is_identity_for_unchanged_working_grid(self):
+        z0 = torch.randn(1, 1, 32, 32)
+        p0_work = torch.sigmoid(torch.randn(1, 1, 8, 8))
+        unchanged, delta = compose_surface_logits(z0, p0_work, p0_work)
+        self.assertTrue(torch.equal(unchanged, z0))
+        self.assertTrue(bool((delta == 0).all()))
+        updated, _ = compose_surface_logits(z0, p0_work, (p0_work + .1).clamp_max(1.))
+        self.assertGreater(float((updated.sigmoid() - z0.sigmoid()).abs().mean()), .01)
+
+    def test_accept_floor_anneals_to_zero(self):
+        self.assertAlmostEqual(accept_floor_at_epoch(1), .15)
+        self.assertAlmostEqual(accept_floor_at_epoch(5), .15 * 5 / 9)
+        self.assertEqual(accept_floor_at_epoch(10), 0.)
+        self.assertEqual(accept_floor_at_epoch(20), 0.)
+
+    def test_continuity_paths_only_cover_missing_skeleton(self):
+        skeleton = torch.zeros(1, 1, 32, 32)
+        skeleton[0, 0, 16, 3:29] = 1.
+        p0 = torch.zeros_like(skeleton)
+        p0[0, 0, 16, 3:11] = 1.
+        p0[0, 0, 16, 21:29] = 1.
+        paths = missed_skeleton_segments(skeleton, p0)
+        self.assertEqual(len(paths[0]), 1)
+        self.assertGreaterEqual(len(paths[0][0][0]), 3)
+        self.assertTrue(all(12 <= x <= 19 for x in paths[0][0][1]))
+
+    def test_missing_path_continuity_reaches_direction_weights(self):
+        torch.manual_seed(31)
+        model = ReliableDirectionalRepair(Q3R3Repair(FakeBase())).train()
+        model.set_accept_floor(.15)
+        result = model(torch.randn(1, 3, 32, 32))
+        result['p0'] = torch.zeros_like(result['p0'])
+        skeleton = torch.zeros_like(result['p0'])
+        skeleton[0, 0, 16, 4:28] = 1.
+        loss, terms = dynamic_losses(result, skeleton, skeleton,
+                                     return_live_terms=True)
+        self.assertTrue(bool(torch.isfinite(loss)))
+        self.assertEqual(terms['missing_segments'], 1)
+        self.assertEqual(terms['paths'], 1)
+        self.assertTrue(np.isfinite(terms['path_soft_min_mean']))
+        direction_grad = torch.autograd.grad(
+            terms['cont_live'], model.relations.direction_head.weight,
+            retain_graph=True)[0]
+        self.assertGreater(float(direction_grad.abs().sum()), 0.)
+
     def test_shift_has_no_wraparound(self):
         tensor = torch.zeros(1, 1, 8, 8)
         tensor[0, 0, 0, 0] = 1.
@@ -45,6 +91,7 @@ class DirectionalRepairTests(unittest.TestCase):
         old = Q3R3Repair(FakeBase())
         model = ReliableDirectionalRepair(old)
         model.train()
+        model.set_accept_floor(.15)
         image = torch.randn(2, 3, 32, 32)
         mask = (torch.rand(2, 1, 32, 32) > .5).float()
         skeleton = (torch.rand(2, 1, 32, 32) > .8).float()
@@ -56,22 +103,31 @@ class DirectionalRepairTests(unittest.TestCase):
             self.assertGreaterEqual(float(result[key].detach().min()), 0., key)
             self.assertLessEqual(float(result[key].detach().max()), 1., key)
         self.assertTrue(bool((result['w'].sum(1) <= 1.000001).all()))
-        self.assertLess(float((result['p1'] - result['p0']).detach().abs().mean()), .02)
+        self.assertTrue(torch.allclose(result['a'],
+            .15 + .85 * result['a_raw'], atol=1e-6))
+        self.assertGreater(float((result['p1'] - result['p0']).detach().abs().mean()), 0.)
         without_w, _, _ = model.dynamics(
             result['visual'], result['u0'], result['q'], result['r'],
             result['b'], result['a'], torch.zeros_like(result['w']))
         self.assertGreater(float((without_w[-1] - result['u3']).detach().abs().mean()), 0.)
+        no_w_z1, _ = compose_surface_logits(result['z0'], result['u0'], without_w[-1])
+        self.assertGreater(float((no_w_z1.sigmoid() - result['p1']).abs().mean()), 0.)
         loss, stats = dynamic_losses(result, mask, skeleton)
         self.assertTrue(bool(torch.isfinite(loss)))
         self.assertGreaterEqual(stats['paths'], 0)
+        self.assertTrue(torch.allclose(loss, stats['seg'] + .2 * stats['cont'], atol=1e-6))
         loss.backward()
         self.assertTrue(all(p.grad is None for p in model.frozen.parameters()))
         for name in ('reliable_head', 'relations', 'proposal_head', 'accept_head',
-                     'dynamics', 'detail_head'):
+                     'dynamics'):
             module = getattr(model, name)
             total = sum(float(p.grad.abs().sum()) for p in module.parameters()
                         if p.grad is not None)
             self.assertGreater(total, 0., name)
+        model.eval()
+        with torch.no_grad():
+            inference = model(image)
+        self.assertTrue(torch.equal(inference['a'], inference['a_raw']))
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is unavailable')
     def test_cuda_512_batch_two_forward_backward(self):
