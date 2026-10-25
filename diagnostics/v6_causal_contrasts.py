@@ -1189,11 +1189,28 @@ def matched_ranking(rows, score_name):
 
 
 def run(args):
+    if not args.root_path.is_dir():
+        raise FileNotFoundError(
+            f"Validation dataset directory not found: {args.root_path}"
+        )
+    if not args.dynamic_checkpoint.is_file():
+        raise FileNotFoundError(
+            "Dynamic checkpoint must be an existing file; got "
+            f"{args.dynamic_checkpoint}. Check that V6_CKPT is set to the full best.pth path."
+        )
     payload = torch.load(
         args.dynamic_checkpoint, map_location="cpu", weights_only=False
     )
     args.base_checkpoint = args.base_checkpoint or Path(payload["base_checkpoint"])
     args.q3_checkpoint = args.q3_checkpoint or Path(payload["q3_checkpoint"])
+    for name, checkpoint in (
+        ("base", args.base_checkpoint),
+        ("Q3", args.q3_checkpoint),
+    ):
+        if not checkpoint.is_file():
+            raise FileNotFoundError(
+                f"{name} checkpoint from dynamic checkpoint metadata is missing: {checkpoint}"
+            )
     config = SimpleNamespace(
         mode="audit",
         base_checkpoint=args.base_checkpoint.resolve(),
@@ -1762,6 +1779,13 @@ def main():
     args = parser.parse_args()
     if args.images < 1 or not 0 < args.threshold < 1:
         parser.error("images must be positive and threshold must be between 0 and 1")
+    if not args.root_path.is_dir():
+        parser.error(f"validation dataset directory does not exist: {args.root_path}")
+    if not args.dynamic_checkpoint.is_file():
+        parser.error(
+            "--dynamic_checkpoint must point to an existing checkpoint file; "
+            f"got {args.dynamic_checkpoint}"
+        )
     run(args)
 
 
