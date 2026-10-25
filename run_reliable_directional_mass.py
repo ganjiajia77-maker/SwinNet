@@ -23,34 +23,37 @@ from run_q3_r3_mass import (DEFAULT_CHECKPOINT, PROTOCOL, full_dataset,
 from mass_protocol import sliding_positions
 
 
-VERSION = 'reliable_directional_dynamics_v4_visual_transport'
+VERSION = 'reliable_directional_dynamics_v5_bridge_repair'
 MODULE_NAMES = ('visual', 'reliable_head', 'relations', 'proposal_head',
                 'accept_head', 'dynamics')
 THRESHOLDS = tuple(round(float(x), 2) for x in np.arange(.35, .751, .05))
 
 
 def load_model(args):
+    payload = (torch.load(args.dynamic_checkpoint, map_location='cpu', weights_only=False)
+               if args.dynamic_checkpoint else None)
+    checkpoint_version = payload.get('version') if payload else VERSION
+    readonly_versions = ('reliable_directional_dynamics_v2',
+                         'reliable_directional_dynamics_v3',
+                         'reliable_directional_dynamics_v4_visual_transport')
+    if checkpoint_version != VERSION and not (
+            args.mode in ('audit', 'val', 'test') and
+            checkpoint_version in readonly_versions):
+        raise ValueError('Wrong directional dynamics checkpoint version')
     old_args = SimpleNamespace(base_checkpoint=args.base_checkpoint.resolve(),
                                repair_checkpoint=args.q3_checkpoint.resolve(),
                                init_repair_checkpoint=None, eta_plus=.5, eta_minus=.5,
                                enable_stage2_local_propagation=False,
                                enable_gap_refinement=False, device=args.device)
     frozen = load_experiment(old_args)
-    model = ReliableDirectionalRepair(frozen, width=args.width, steps=3).to(args.device)
+    model = ReliableDirectionalRepair(frozen, width=args.width, steps=3,
+                                      bridge_route=checkpoint_version == VERSION).to(args.device)
     inner = model.frozen.base.swin_unet
     if (inner.decoder_structure_blocks['2'].enable_local_propagation or
             inner.enable_gap_refinement or not inner.enable_highres_structure_stream or
             not inner.enable_h3_surface_fusion):
         raise RuntimeError('Frozen structure routing does not match this experiment')
-    if args.dynamic_checkpoint:
-        payload = torch.load(args.dynamic_checkpoint, map_location='cpu', weights_only=False)
-        checkpoint_version = payload.get('version')
-        readonly_versions = ('reliable_directional_dynamics_v2',
-                             'reliable_directional_dynamics_v3')
-        if checkpoint_version != VERSION and not (
-                args.mode in ('audit', 'val', 'test') and
-                checkpoint_version in readonly_versions):
-            raise ValueError('Wrong directional dynamics checkpoint version')
+    if payload:
         expected = {'base_checkpoint': str(args.base_checkpoint.resolve()),
                     'q3_checkpoint': str(args.q3_checkpoint.resolve()),
                     'width': args.width, 'steps': 3,
@@ -59,6 +62,8 @@ def load_model(args):
                     'missing_threshold': args.missing_threshold,
                     'lambda_bg': args.lambda_bg,
                     'lambda_cont': args.lambda_cont}
+        if checkpoint_version == VERSION:
+            expected['lambda_missing'] = args.lambda_missing
         mismatches = {key: (payload.get(key), value) for key, value in expected.items()
                       if payload.get(key) != value}
         if mismatches or set(payload.get('modules', {})) != set(MODULE_NAMES):
@@ -66,7 +71,8 @@ def load_model(args):
         for name in MODULE_NAMES:
             getattr(model, name).load_state_dict(payload['modules'][name], strict=True)
         model.legacy_route = checkpoint_version == 'reliable_directional_dynamics_v2'
-        model.visual_transport_route = checkpoint_version == VERSION
+        model.visual_transport_route = checkpoint_version in (
+            VERSION, 'reliable_directional_dynamics_v4_visual_transport')
         print(f'[LOAD] strict modules version={checkpoint_version} '
               f'epoch={payload["epoch"]}', flush=True)
     frozen_count = sum(parameter.numel() for parameter in model.frozen.parameters())
@@ -84,7 +90,8 @@ def save_checkpoint(model, path, args, epoch, selection=None, optimizer=None):
                'accept_floor_initial': args.accept_floor_initial,
                'accept_floor_anneal_epochs': args.accept_floor_anneal_epochs,
                'missing_threshold': args.missing_threshold,
-               'lambda_bg': args.lambda_bg, 'lambda_cont': args.lambda_cont,
+               'lambda_bg': args.lambda_bg, 'lambda_missing': args.lambda_missing,
+               'lambda_cont': args.lambda_cont,
                'modules': {name: getattr(model, name).state_dict() for name in MODULE_NAMES}}
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
@@ -201,7 +208,9 @@ def smoke(args, model):
     if any(calls[name] for name in ('local', 'gap', 'p2')) or calls['h3_surface_fusion'] != 1:
         raise RuntimeError(f'Unexpected frozen base path calls: {calls}')
     loss, terms = dynamic_losses(result, mask, skeleton,
-                                 lambda_bg=args.lambda_bg, lambda_cont=args.lambda_cont,
+                                 lambda_bg=args.lambda_bg,
+                                 lambda_missing=args.lambda_missing,
+                                 lambda_cont=args.lambda_cont,
                                  missing_threshold=args.missing_threshold,
                                  return_live_terms=True)
     if not bool(torch.isfinite(loss)):
@@ -562,6 +571,7 @@ def train(args, model):
             result = model(image)
             loss, terms = dynamic_losses(result, mask, skeleton,
                                          lambda_bg=args.lambda_bg,
+                                         lambda_missing=args.lambda_missing,
                                          lambda_cont=args.lambda_cont,
                                          missing_threshold=args.missing_threshold,
                                          return_live_terms=True)
@@ -764,10 +774,11 @@ def evaluate(args, model):
     reports, details, tiles, elapsed = evaluate_thresholds(
         model, dataset, args.device, tuple(dict.fromkeys(thresholds)), args.max_images)
     report = reports[threshold]
-    report['checkpoint_version'] = ('reliable_directional_dynamics_v2'
-                                    if model.legacy_route else
-                                    VERSION if model.visual_transport_route else
-                                    'reliable_directional_dynamics_v3')
+    report['checkpoint_version'] = (
+        VERSION if model.bridge_route else
+        'reliable_directional_dynamics_v2' if model.legacy_route else
+        'reliable_directional_dynamics_v4_visual_transport'
+        if model.visual_transport_route else 'reliable_directional_dynamics_v3')
     report['fair_comparison'] = {
         'selection_split': 'val',
         'p0_threshold': p0_threshold,
@@ -809,6 +820,7 @@ def main():
     parser.add_argument('--width', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--lambda_bg', type=float, default=1.)
+    parser.add_argument('--lambda_missing', type=float, default=2.)
     parser.add_argument('--lambda_cont', type=float, default=.2)
     parser.add_argument('--accept_floor_initial', type=float, default=.15)
     parser.add_argument('--accept_floor_anneal_epochs', type=int, default=10)
@@ -819,7 +831,8 @@ def main():
     parser.add_argument('--audit_threshold', type=float, default=.45)
     args = parser.parse_args()
     if (args.width % 8 or args.width < 8 or args.batch_size < 1 or args.epochs < 1 or
-            args.val_interval < 1 or args.lambda_bg < 0 or args.lambda_cont < 0 or
+            args.val_interval < 1 or args.lambda_bg < 0 or
+            args.lambda_missing < 0 or args.lambda_cont < 0 or
             args.max_images < 0 or args.visualizations < 0 or
             not 0 <= args.accept_floor_initial < 1 or
             args.accept_floor_anneal_epochs < 1 or

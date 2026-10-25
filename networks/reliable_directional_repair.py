@@ -69,8 +69,9 @@ class VisualProjection(nn.Module):
 
 
 class DirectionRelations(nn.Module):
-    def __init__(self, width):
+    def __init__(self, width, bridge_route=False):
         super().__init__()
+        self.bridge_route = bridge_route
         self.semantic = nn.Conv2d(width, 1, 3, padding=1)
         self.tangent = nn.Conv2d(width, 4, 3, padding=1)
         self.pair = nn.Sequential(nn.Conv2d(16, 16, 1), nn.GELU(),
@@ -100,24 +101,54 @@ class DirectionRelations(nn.Module):
                 p_minus, p_plus = shifted(p0, my, mx), shifted(p0, py, px)
                 v_minus, v_plus = shifted(ones, my, mx), shifted(ones, py, px)
                 mid = max(radius // 2, 1)
-                evidence = torch.cat((
-                    (f_minus * f_plus).sum(1, keepdim=True),
-                    (normalized * f_minus).sum(1, keepdim=True),
-                    (normalized * f_plus).sum(1, keepdim=True),
-                    r_minus, r_plus, p_minus, p_plus, semantic,
-                    shifted(semantic, -mid * dy, -mid * dx),
-                    shifted(semantic, mid * dy, mid * dx),
-                    shifted(tangent[:, axis_index:axis_index+1], my, mx),
-                    shifted(tangent[:, axis_index:axis_index+1], py, px),
-                    torch.exp(-2. * torch.abs(shifted(road_width, my, mx) -
-                                                 shifted(road_width, py, px))),
-                    v_minus, v_plus,
-                    torch.full_like(p0, radius / RADII[-1])), dim=1)
+                semantic_minus = shifted(semantic, -mid * dy, -mid * dx)
+                semantic_plus = shifted(semantic, mid * dy, mid * dx)
+                tangent_axis = tangent[:, axis_index:axis_index+1]
+                tangent_minus = shifted(tangent_axis, my, mx)
+                tangent_plus = shifted(tangent_axis, py, px)
+                width_compatible = torch.exp(-2. * torch.abs(
+                    shifted(road_width, my, mx) - shifted(road_width, py, px)))
+                radius_feature = torch.full_like(p0, radius / RADII[-1])
+                if self.bridge_route:
+                    corridor_match = .5 * (
+                        (f_minus * shifted(normalized, -mid * dy, -mid * dx))
+                        .sum(1, keepdim=True) +
+                        (f_plus * shifted(normalized, mid * dy, mid * dx))
+                        .sum(1, keepdim=True))
+                    evidence = torch.cat((
+                        (f_minus * f_plus).sum(1, keepdim=True),
+                        (normalized * f_minus).sum(1, keepdim=True),
+                        (normalized * f_plus).sum(1, keepdim=True),
+                        corridor_match, r_minus, r_plus,
+                        .5 * (p_minus + p_plus), semantic,
+                        semantic_minus, semantic_plus,
+                        tangent_minus, tangent_plus,
+                        tangent_minus * tangent_plus, width_compatible,
+                        v_minus * v_plus, radius_feature), dim=1)
+                else:
+                    evidence = torch.cat((
+                        (f_minus * f_plus).sum(1, keepdim=True),
+                        (normalized * f_minus).sum(1, keepdim=True),
+                        (normalized * f_plus).sum(1, keepdim=True),
+                        r_minus, r_plus, p_minus, p_plus, semantic,
+                        semantic_minus, semantic_plus,
+                        tangent_minus, tangent_plus, width_compatible,
+                        v_minus, v_plus, radius_feature), dim=1)
                 relation = self.pair(evidence).sigmoid()
-                two = relation[:, 0:1] * r_minus * r_plus * v_minus * v_plus
-                one_minus = (.25 * relation[:, 1:2] * r_minus * v_minus *
+                if self.bridge_route:
+                    tangent_support = .5 + .5 * tangent_minus * tangent_plus
+                    corridor_support = .5 + .5 * torch.minimum(
+                        semantic, torch.minimum(semantic_minus, semantic_plus))
+                    two = (relation[:, 0:1] * torch.minimum(r_minus, r_plus) *
+                           tangent_support * corridor_support * width_compatible *
+                           v_minus * v_plus)
+                    one_scale = .2
+                else:
+                    two = relation[:, 0:1] * r_minus * r_plus * v_minus * v_plus
+                    one_scale = .25
+                one_minus = (one_scale * relation[:, 1:2] * r_minus * v_minus *
                              (1. - r_plus * v_plus))
-                one_plus = (.25 * relation[:, 2:3] * r_plus * v_plus *
+                one_plus = (one_scale * relation[:, 2:3] * r_plus * v_plus *
                             (1. - r_minus * v_minus))
                 scores.append(torch.cat((two, one_minus, one_plus), dim=1))
             scale_weight = self.scale_logits[axis_index].softmax(dim=0)
@@ -149,7 +180,9 @@ class DirectionalDynamics(nn.Module):
                 capture_diagnostics=False):
         state = p0
         states, masses, availabilities = [state], [], []
-        diagnostics = {key: [] for key in ('alpha', 'beta', 'gamma', 'stay', 'm')}
+        diagnostics = {key: [] for key in (
+            'alpha', 'beta', 'gamma', 'stay', 'm',
+            'transport_delta', 'proposal_delta', 'anchor_delta')}
         for _ in range(self.steps):
             support = reliable + (1. - reliable) * accept * state
             mass = torch.zeros_like(state)
@@ -169,7 +202,10 @@ class DirectionalDynamics(nn.Module):
             if capture_diagnostics:
                 for key, value in (('alpha', transport), ('beta', propose),
                                    ('gamma', anchor), ('stay', stay),
-                                   ('m', propagated)):
+                                   ('m', propagated),
+                                   ('transport_delta', transport * (propagated - state)),
+                                   ('proposal_delta', propose * (proposal - state)),
+                                   ('anchor_delta', anchor * (p0 - state))):
                     diagnostics[key].append(value)
             state = stay * state + transport * propagated + propose * proposal + anchor * p0
             states.append(state)
@@ -182,7 +218,7 @@ class DirectionalDynamics(nn.Module):
 
 
 class ReliableDirectionalRepair(nn.Module):
-    def __init__(self, frozen_q3, width=32, steps=3):
+    def __init__(self, frozen_q3, width=32, steps=3, bridge_route=True):
         super().__init__()
         self.frozen = frozen_q3.requires_grad_(False)
         self.frozen.q_only = True
@@ -195,12 +231,17 @@ class ReliableDirectionalRepair(nn.Module):
                                            nn.GELU(), nn.Conv2d(width, 1, 1))
         nn.init.zeros_(self.reliable_head[-1].weight)
         nn.init.constant_(self.reliable_head[-1].bias, 1.5)
-        self.relations = DirectionRelations(width)
-        self.proposal_head = nn.Sequential(nn.Conv2d(width + 7, width, 3, padding=1),
-                                           nn.GELU(), nn.Conv2d(width, 1, 1))
+        self.relations = DirectionRelations(width, bridge_route=bridge_route)
+        proposal_channels = (2 * width + 7) if bridge_route else (width + 7)
+        self.proposal_head = nn.Sequential(nn.Conv2d(proposal_channels, width, 3, padding=1),
+                                           nn.GELU(), nn.Conv2d(width, 2 if bridge_route else 1, 1))
         nn.init.zeros_(self.proposal_head[-1].weight)
-        nn.init.zeros_(self.proposal_head[-1].bias)
-        self.accept_head = nn.Sequential(nn.Conv2d(width + 8, width, 3, padding=1),
+        with torch.no_grad():
+            if bridge_route:
+                self.proposal_head[-1].bias.copy_(torch.tensor([-6., -7.]))
+            else:
+                self.proposal_head[-1].bias.zero_()
+        self.accept_head = nn.Sequential(nn.Conv2d(proposal_channels + 1, width, 3, padding=1),
                                          nn.GELU(), nn.Conv2d(width, 1, 1))
         nn.init.zeros_(self.accept_head[-1].weight)
         nn.init.constant_(self.accept_head[-1].bias, -1.)
@@ -210,6 +251,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.accept_floor = 0.
         self.legacy_route = False
         self.visual_transport_route = True
+        self.bridge_route = bridge_route
 
     def set_accept_floor(self, value):
         if not 0. <= value < 1.:
@@ -244,6 +286,9 @@ class ReliableDirectionalRepair(nn.Module):
         weight_sum = weights.sum(1, keepdim=True)
         bilateral = (weights * two.repeat_interleave(2, dim=1)).sum(1, keepdim=True) / (
             weight_sum + 1e-6)
+        bridge = (weights * two.repeat_interleave(2, dim=1)).sum(1, keepdim=True)
+        one_side = (weights * one.repeat_interleave(2, dim=1)).sum(1, keepdim=True)
+        connection_support = (bridge + .25 * one_side).clamp(0., 1.)
         if self.visual_transport_route or capture_diagnostics:
             source_visual, visual_coverage, visual_agreement = directional_visual_sources(
                 visual, reliable, weights, self.relations.scale_logits)
@@ -259,19 +304,34 @@ class ReliableDirectionalRepair(nn.Module):
         directional_neighbor = sum(
             weights[:, index:index+1] * shifted(p0, dy, dx)
             for index, (dy, dx) in enumerate(DIRECTIONS)) / (weight_sum + 1e-6)
-        relation_balance = (proposal_evidence - one_mean) / (
-            proposal_evidence + one_mean + .05)
-        proposal_features = torch.cat((visual_input, p0, q, reliable, two_mean,
-                                        one_mean, weight_sum if self.legacy_route else bilateral,
-                                        two.amax(1, keepdim=True)), dim=1)
-        proposal_delta = self.proposal_head(proposal_features)
         p0_logit = torch.logit(p0.clamp(1e-5, 1. - 1e-5))
-        if not self.legacy_route:
-            candidate = p0 + proposal_evidence * (directional_neighbor - p0)
-            proposal_delta = proposal_delta + (
-                torch.logit(candidate.clamp(1e-5, 1. - 1e-5)) - p0_logit)
-        proposal = (p0_logit + proposal_delta).sigmoid()
-        accept_features = torch.cat((proposal_features, proposal), dim=1)
+        if self.bridge_route:
+            proposal_features = torch.cat((
+                visual, visual_coverage * source_visual,
+                p0, q, reliable, bridge, one_side, connection_support,
+                visual_coverage), dim=1)
+            proposal_raw = self.proposal_head(proposal_features)
+            delta_plus = 8. * proposal_raw[:, :1].sigmoid()
+            delta_minus = 4. * proposal_raw[:, 1:2].sigmoid()
+            proposal = (p0_logit + connection_support * delta_plus - delta_minus).sigmoid()
+            accept_features = torch.cat((proposal_features, proposal - p0), dim=1)
+            relation_balance = (bridge - one_side) / (bridge + one_side + .05)
+            continuation = connection_support
+        else:
+            proposal_features = torch.cat((visual_input, p0, q, reliable, two_mean,
+                                            one_mean, weight_sum if self.legacy_route else bilateral,
+                                            two.amax(1, keepdim=True)), dim=1)
+            proposal_delta = self.proposal_head(proposal_features)
+            if not self.legacy_route:
+                candidate = p0 + proposal_evidence * (directional_neighbor - p0)
+                proposal_delta = proposal_delta + (
+                    torch.logit(candidate.clamp(1e-5, 1. - 1e-5)) - p0_logit)
+            proposal = (p0_logit + proposal_delta).sigmoid()
+            accept_features = torch.cat((proposal_features, proposal), dim=1)
+            relation_balance = (proposal_evidence - one_mean) / (
+                proposal_evidence + one_mean + .05)
+            delta_plus = torch.zeros_like(p0)
+            delta_minus = torch.zeros_like(p0)
         accept_logit = self.accept_head(accept_features)
         if not self.legacy_route:
             accept_logit = accept_logit + relation_balance
@@ -297,6 +357,9 @@ class ReliableDirectionalRepair(nn.Module):
                           directional_visual_coverage=visual_coverage,
                           directional_visual_agreement=visual_agreement,
                           directional_continuation=continuation,
+                          c_bridge=bridge, c_one_side=one_side,
+                          c_support=connection_support,
+                          delta_z_plus=delta_plus, delta_z_minus=delta_minus,
                           transported_visual=source_visual,
                           relation_balance=relation_balance,
                           **dynamics_output[3])
@@ -319,7 +382,7 @@ def missed_skeleton_segments(skeleton, p0, threshold=.45, min_pixels=3):
     return result
 
 
-def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_cont=.2,
+def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_missing=2., lambda_cont=.2,
                    temperature=15., max_paths_per_image=128,
                    missing_threshold=.45, return_live_terms=False):
     z1, p1, p0, q = result['z1'], result['p1'], result['p0'], result['q']
@@ -327,7 +390,11 @@ def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_cont=.2,
         raise ValueError('Surface, mask and GT skeleton must share the final grid')
     q_full = F.interpolate(q.detach(), size=z1.shape[-2:], mode='bilinear',
                            align_corners=False)
-    weights = 1. + lambda_bg * (1. - mask) * q_full
+    missed_center = (skeleton > .5) & (
+        F.max_pool2d(p0.detach(), 5, stride=1, padding=2) < missing_threshold)
+    missed_band = F.max_pool2d(missed_center.float(), 5, stride=1, padding=2)
+    weights = (1. + lambda_bg * (1. - mask) * q_full +
+               lambda_missing * mask * missed_band)
     bce = F.binary_cross_entropy_with_logits(z1, mask, reduction='none')
     pt = torch.exp(-bce)
     focal = (.75 * (1. - pt).square() * bce * weights).sum() / weights.sum().clamp_min(1.)
@@ -360,6 +427,8 @@ def dynamic_losses(result, mask, skeleton, lambda_bg=1., lambda_cont=.2,
                    if soft_min_values else np.empty(0, dtype=np.float32))
     terms = {'seg': segmentation.detach(), 'cont': continuity.detach(),
              'focal': focal.detach(), 'dice': dice.mean().detach(),
+             'missing_weighted_pixels': int(((mask > .5) & (missed_band > 0)).sum()),
+             'hard_background_weighted_pixels': int(((mask < .5) & (q_full > .5)).sum()),
              'missing_segments': sum(map(len, paths)),
              'paths': len(soft_min_values),
              'path_soft_min_mean': float(soft_values.mean()) if soft_values.size else None,

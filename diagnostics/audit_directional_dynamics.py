@@ -103,6 +103,11 @@ def gap_rows(result, mask, skeleton, threshold, case_name):
                'directional_bilateral': mean(result['directional_bilateral'], center),
                'visual_source_coverage': mean(result['directional_visual_coverage'], center),
                'continuation': mean(result['directional_continuation'], center),
+               'c_bridge': mean(result['c_bridge'], center),
+               'c_one_side': mean(result['c_one_side'], center),
+               'c_support': mean(result['c_support'], center),
+               'delta_z_plus': mean(result['delta_z_plus'], center),
+               'delta_z_minus': mean(result['delta_z_minus'], center),
                'b_minus_p0': mean(result['b'] - p0_work, center),
                'b_mean': mean(result['b'], center),
                'b_above_threshold_fraction': mean((result['b'] >= threshold).float(), center),
@@ -113,6 +118,10 @@ def gap_rows(result, mask, skeleton, threshold, case_name):
                 result['w'][:, direction_index:direction_index+1], center)
         for step in (1, 2, 3):
             row[f'u{step}_mean'] = mean(result[f'u{step}'], center)
+            row[f'transport_delta{step}_signed'] = mean(
+                result['transport_delta'][:, step-1], center)
+            row[f'proposal_delta{step}_signed'] = mean(
+                result['proposal_delta'][:, step-1], center)
             row[f'u{step}_recovered_fraction'] = mean(
                 (result[f'u{step}'] >= threshold).float(), center)
             row[f'u{step}_signed_change'] = mean(result[f'u{step}'] - p0_work, center)
@@ -131,7 +140,9 @@ def save_gap_visualization(output, row, sample, result, threshold):
     y0, x0 = max(y1 - 160, 0), max(x1 - 160, 0)
     maps = {}
     for name in ('p0', 'p1', 'r', 'b', 'a', 'u0', 'u1', 'u2', 'u3',
-                 'directional_visual_coverage', 'directional_continuation'):
+                 'directional_visual_coverage', 'directional_continuation',
+                 'c_bridge', 'c_one_side', 'c_support',
+                 'delta_z_plus', 'delta_z_minus'):
         value = result[name][0, 0].detach().cpu().numpy()
         maps[name] = cv2.resize(value, (512, 512), interpolation=cv2.INTER_LINEAR)
     w = result['w'][0].detach().cpu().numpy()
@@ -191,6 +202,8 @@ def audit(args, model):
         rotated_p1, _ = dynamics_with(model, result, rotated_w)
         constant_a = torch.full_like(result['a'], float(result['a'].mean()))
         constant_a_p1, _ = dynamics_with(model, result, result['w'], constant_a)
+        no_w_full = model(image, capture_diagnostics=False,
+                          weights_override=torch.zeros_like(result['w']))
         rotated_full = model(image, capture_diagnostics=False,
                              weights_override=rotated_w)
         for region_name, region in regions.items():
@@ -208,6 +221,11 @@ def audit(args, model):
                    'visual_source_agreement': mean(
                        result['directional_visual_agreement'], region),
                    'continuation_mean': mean(result['directional_continuation'], region),
+                   'c_bridge_mean': mean(result['c_bridge'], region),
+                   'c_one_side_mean': mean(result['c_one_side'], region),
+                   'c_support_mean': mean(result['c_support'], region),
+                   'delta_z_plus_mean': mean(result['delta_z_plus'], region),
+                   'delta_z_minus_mean': mean(result['delta_z_minus'], region),
                    'one_sided_mean': mean(result['e_one'].mean(1, keepdim=True), region),
                    'neighbor_minus_p0': mean(result['directional_neighbor'] -
                                              result['u0'], region),
@@ -218,6 +236,8 @@ def audit(args, model):
                    'fixed_ba_no_w_u3_abs': mean((result['u3'] - zero_u3).abs(), region)}
             row.update(quantiles(result['b'] - result['u0'], region, 'b_minus_p0'))
             row.update(quantiles(result['a'], region, 'a'))
+            row.update(quantiles(result['c_bridge'], region, 'c_bridge'))
+            row.update(quantiles(result['c_support'], region, 'c_support'))
             full_region = F.interpolate(region.float(), size=result['p1'].shape[-2:],
                                         mode='nearest').bool()
             row['p1_minus_p0_signed'] = mean(result['p1'] - result['p0'], full_region)
@@ -227,12 +247,18 @@ def audit(args, model):
                 (result['p1'] - rotated_p1).abs(), full_region)
             row['recomputed_ba_rotated_w_p1_abs'] = mean(
                 (result['p1'] - rotated_full['p1']).abs(), full_region)
+            row['recomputed_ba_no_w_p1_abs'] = mean(
+                (result['p1'] - no_w_full['p1']).abs(), full_region)
             row['constant_a_p1_signed'] = mean(
                 constant_a_p1 - result['p1'], full_region)
             row['recomputed_b_rotated_w_abs'] = mean(
                 (result['b'] - rotated_full['b']).abs(), region)
             row['recomputed_a_rotated_w_abs'] = mean(
                 (result['a'] - rotated_full['a']).abs(), region)
+            row['recomputed_b_no_w_abs'] = mean(
+                (result['b'] - no_w_full['b']).abs(), region)
+            row['recomputed_a_no_w_abs'] = mean(
+                (result['a'] - no_w_full['a']).abs(), region)
             for direction in range(8):
                 row[f'w{direction}_mean'] = mean(result['w'][:, direction:direction+1],
                                                  region)
@@ -244,6 +270,10 @@ def audit(args, model):
                 row[f'v{step+1}'] = mean(result['source_available'][:, step], region)
                 row[f'm_minus_u{step}_abs'] = mean(
                     (result['m'][:, step] - previous).abs(), region)
+                for term in ('transport_delta', 'proposal_delta', 'anchor_delta'):
+                    value = result[term][:, step]
+                    row[f'{term}{step+1}_signed'] = mean(value, region)
+                    row[f'{term}{step+1}_abs'] = mean(value.abs(), region)
                 row.update(quantiles(result['alpha'][:, step], region,
                                      f'alpha{step+1}'))
                 row.update(quantiles(result['beta'][:, step], region,
@@ -274,13 +304,17 @@ def audit(args, model):
                 writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(data)
-    report = {'checkpoint_version': ('v2' if model.legacy_route else
+    report = {'checkpoint_version': ('v5_bridge_repair' if model.bridge_route else
+                                     'v2' if model.legacy_route else
                                      'v4_visual_transport' if model.visual_transport_route
                                      else 'v3'),
               'split': 'val', 'threshold': threshold,
               'full_image_comparison': reports[threshold],
               'sample_rule': 'one P0-gap-rich 512 tile per validation image',
               'w_to_p1_definition': 'mean |P1(W,B,A,R)-P1(W=0,B,A,R fixed)|',
+              'recomputed_no_w_definition': 'mean |P1(W,B(W),A(W))-P1(W=0,B(0),A(0))|',
+              'transport_delta_definition': 'alpha_k * (M_k - U_k), where alpha includes A and source availability',
+              'proposal_delta_definition': 'beta_k * (B - U_k), where beta includes A and the 0.2 proposal scale',
               'region_summary': {name: summary([row for row in rows if row['region'] == name])
                                  for name in ('all', 'missing', 'reliable_road',
                                               'hard_background', 'isolated_new_fp')},

@@ -107,6 +107,11 @@ class DirectionalRepairTests(unittest.TestCase):
                              detail['beta'][:, step] * p0 +
                              detail['gamma'][:, step] * p0)
             self.assertTrue(torch.allclose(states[step+1], reconstructed, atol=1e-6))
+            delta = (detail['transport_delta'][:, step] +
+                     detail['proposal_delta'][:, step] +
+                     detail['anchor_delta'][:, step])
+            self.assertTrue(torch.allclose(states[step+1] - states[step], delta,
+                                           atol=1e-6))
             self.assertTrue(bool((available[step] <= 1).all()))
 
     def test_direction_reroute_changes_proposal_and_accept_only_in_v3(self):
@@ -121,22 +126,39 @@ class DirectionalRepairTests(unittest.TestCase):
                     retain_graph=True)[0]
                 self.assertGreater(float(gradient.abs().sum()), 0., output)
         with torch.no_grad():
-            baseline = model(image)
+            baseline = model(image, capture_diagnostics=True)
             rotated = baseline['w'].roll(2, dims=1)
             changed = model(image, weights_override=rotated)
             self.assertGreater(float((changed['b'] - baseline['b']).abs().sum()), 0.)
             self.assertGreater(float((changed['a'] - baseline['a']).abs().sum()), 0.)
             self.assertGreater(float(baseline['directional_visual_coverage'].sum()), 0.)
-            model.visual_transport_route = False
-            v3 = model(image)
-            v3_changed = model(image, weights_override=v3['w'].roll(2, dims=1))
+            previous = ReliableDirectionalRepair(Q3R3Repair(FakeBase()),
+                                                  bridge_route=False).eval()
+            previous.visual_transport_route = False
+            v3 = previous(image)
+            v3_changed = previous(image, weights_override=v3['w'].roll(2, dims=1))
             self.assertGreater(float((v3_changed['b'] - v3['b']).abs().sum()), 0.)
-            model.legacy_route = True
-            model.visual_transport_route = False
-            legacy = model(image)
-            legacy_changed = model(image, weights_override=legacy['w'].roll(2, dims=1))
+            previous.legacy_route = True
+            legacy = previous(image)
+            legacy_changed = previous(image, weights_override=legacy['w'].roll(2, dims=1))
             self.assertTrue(torch.allclose(legacy['b'], legacy_changed['b'], atol=1e-6))
             self.assertTrue(torch.allclose(legacy['a'], legacy_changed['a'], atol=1e-6))
+
+    def test_bridge_route_bounds_and_w_conditioned_proposal(self):
+        torch.manual_seed(42)
+        model = ReliableDirectionalRepair(Q3R3Repair(FakeBase())).eval()
+        image = torch.randn(1, 3, 32, 32)
+        result = model(image, capture_diagnostics=True)
+        self.assertTrue(bool((result['c_support'] >= 0).all()))
+        self.assertTrue(bool((result['c_support'] <= 1).all()))
+        self.assertTrue(bool((result['delta_z_plus'] >= 0).all()))
+        self.assertTrue(bool((result['delta_z_plus'] <= 8).all()))
+        self.assertTrue(bool((result['delta_z_minus'] >= 0).all()))
+        self.assertTrue(bool((result['delta_z_minus'] <= 4).all()))
+        zero_w = model(image, weights_override=torch.zeros_like(result['w']))
+        self.assertGreater(float((result['b'] - zero_w['b']).abs().sum()), 0.)
+        self.assertGreater(float((result['a'] - zero_w['a']).abs().sum()), 0.)
+        self.assertGreater(float((result['p1'] - zero_w['p1']).abs().sum()), 0.)
 
     def test_length_binned_gap_closure_uses_fixed_p0(self):
         ground = np.zeros((64, 64), dtype=bool)
