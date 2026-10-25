@@ -89,7 +89,7 @@ shift B, and rotate W without changing saved weights. One training batch checks
 loss terms, gradients, and an optimizer step in memory only.
 
 ```bash
-python -u diagnostics/diagnose_reliable_directional_dynamics.py \
+python -u -m diagnostics.diagnose_reliable_directional_dynamics \
   --root_path "$DATA" --base_checkpoint "$BASE" --q3_checkpoint "$Q3" \
   --dynamic_checkpoint "$RUN_DIR/best.pth" \
   --output_json "$RUN_DIR/reliable_directional_failure_audit.json" \
