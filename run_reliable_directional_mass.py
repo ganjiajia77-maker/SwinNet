@@ -381,15 +381,14 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
             for name, values in by_length.items():
                 data['bins'][name]['eligible'] += values['eligible']
                 data['bins'][name]['closed'] += values['closed']
-        if len(thresholds) == 1:
-            threshold = thresholds[0]
-            missing = prepared['skeleton'] & ~(cv2.dilate(
-                (p0_prob >= threshold).astype(np.uint8),
-                np.ones((5, 5), np.uint8)) > 0)
-            positions = sliding_positions(1500, 512, 256)
-            best_tile = max(((int(missing[y:y+512, x:x+512].sum()), y, x)
-                             for y in positions for x in positions))
-            reference_tiles.append((best_tile[0], index, best_tile[1], best_tile[2]))
+        reference_threshold = thresholds[0]
+        missing = prepared['skeleton'] & ~(cv2.dilate(
+            (p0_prob >= reference_threshold).astype(np.uint8),
+            np.ones((5, 5), np.uint8)) > 0)
+        positions = sliding_positions(1500, 512, 256)
+        best_tile = max(((int(missing[y:y+512, x:x+512].sum()), y, x)
+                         for y in positions for x in positions))
+        reference_tiles.append((best_tile[0], index, best_tile[1], best_tile[2]))
         print(f'[EVAL] {index + 1}/{limit}', flush=True)
     reports = {}
     for threshold, data in storage.items():
@@ -688,7 +687,14 @@ def evaluate(args, model):
         reports, _, _, elapsed = evaluate_thresholds(
             model, dataset, args.device, THRESHOLDS, args.max_images)
         threshold = max(reports, key=lambda value: reports[value]['selection_score'])
+        p0_threshold = max(reports, key=lambda value: selection_score(
+            reports[value]['p0'], {'background_bridge_proxy': 0},
+            reports[value]['images']))
         selection = {'selected_on': 'val', 'threshold': threshold,
+                     'p0_threshold': p0_threshold,
+                     'p0_selection_score': selection_score(
+                         reports[p0_threshold]['p0'], {'background_bridge_proxy': 0},
+                         reports[p0_threshold]['images']),
                      'selection_score': reports[threshold]['selection_score'],
                      'dynamic_checkpoint': str(args.dynamic_checkpoint.resolve()),
                      'base_checkpoint': str(args.base_checkpoint.resolve()),
@@ -706,9 +712,20 @@ def evaluate(args, model):
                 selection['q3_checkpoint'] != str(args.q3_checkpoint.resolve())):
             raise ValueError('Test requires the matching validation threshold selection')
         threshold = float(selection['threshold'])
+        p0_threshold = float(selection['p0_threshold'])
+    if args.mode == 'val':
+        p0_threshold = float(selection['p0_threshold'])
     reports, details, tiles, elapsed = evaluate_thresholds(
-        model, dataset, args.device, (threshold,), args.max_images)
+        model, dataset, args.device, tuple(dict.fromkeys((threshold, p0_threshold))),
+        args.max_images)
     report = reports[threshold]
+    report['fair_comparison'] = {
+        'selection_split': 'val',
+        'p0_threshold': p0_threshold,
+        'p1_threshold': threshold,
+        'p0_at_own_val_threshold': reports[p0_threshold]['p0'],
+        'p1_at_own_val_threshold': reports[threshold]['p1'],
+        'note': 'Fixed-threshold paired diagnostics remain in p0/p1/paired above.'}
     report['evaluation_seconds'] = elapsed
     report['version'] = VERSION
     report['base_checkpoint'] = str(args.base_checkpoint.resolve())
