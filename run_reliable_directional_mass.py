@@ -23,34 +23,52 @@ from run_q3_r3_mass import (DEFAULT_CHECKPOINT, PROTOCOL, full_dataset,
 from mass_protocol import sliding_positions
 
 
-VERSION = 'reliable_directional_dynamics_v6_conditional_transport'
+V6_VERSION = 'reliable_directional_dynamics_v6_conditional_transport'
+V7_VERSION = 'reliable_directional_dynamics_v7_continuity_transport'
+VERSION = V6_VERSION
 MODULE_NAMES = ('visual', 'reliable_head', 'relations', 'proposal_head',
                 'accept_head', 'dynamics')
 THRESHOLDS = tuple(round(float(x), 2) for x in np.arange(.35, .751, .05))
 
 
 def load_model(args):
-    payload = (torch.load(args.dynamic_checkpoint, map_location='cpu', weights_only=False)
-               if args.dynamic_checkpoint else None)
-    checkpoint_version = payload.get('version') if payload else VERSION
+    source_checkpoint = (args.dynamic_checkpoint or
+                         getattr(args, 'init_dynamic_checkpoint', None))
+    payload = (torch.load(source_checkpoint, map_location='cpu', weights_only=False)
+               if source_checkpoint else None)
+    if payload:
+        checkpoint_version = payload.get('version')
+    else:
+        checkpoint_version = (V7_VERSION if args.transport_gate_mode == 'v7'
+                              else V6_VERSION)
     readonly_versions = ('reliable_directional_dynamics_v2',
                          'reliable_directional_dynamics_v3',
                          'reliable_directional_dynamics_v4_visual_transport',
                          'reliable_directional_dynamics_v5_bridge_repair')
-    if checkpoint_version != VERSION and not (
+    supported_versions = (V6_VERSION, V7_VERSION)
+    if checkpoint_version not in supported_versions and not (
             args.mode in ('audit', 'val', 'test') and
             checkpoint_version in readonly_versions):
         raise ValueError('Wrong directional dynamics checkpoint version')
+    if args.mode == 'train' and getattr(args, 'init_dynamic_checkpoint', None):
+        if checkpoint_version != V6_VERSION or args.transport_gate_mode != 'v7':
+            raise ValueError('v7 initialization requires a v6 checkpoint and v7 gate mode')
+        active_gate_mode = 'v7'
+    elif checkpoint_version == V7_VERSION:
+        active_gate_mode = 'v7'
+    else:
+        active_gate_mode = 'v6'
     old_args = SimpleNamespace(base_checkpoint=args.base_checkpoint.resolve(),
                                repair_checkpoint=args.q3_checkpoint.resolve(),
                                init_repair_checkpoint=None, eta_plus=.5, eta_minus=.5,
                                enable_stage2_local_propagation=False,
                                enable_gap_refinement=False, device=args.device)
     frozen = load_experiment(old_args)
-    bridge_versions = (VERSION, 'reliable_directional_dynamics_v5_bridge_repair')
+    bridge_versions = (*supported_versions, 'reliable_directional_dynamics_v5_bridge_repair')
     model = ReliableDirectionalRepair(frozen, width=args.width, steps=3,
                                       bridge_route=checkpoint_version in bridge_versions,
-                                      conditional_transport=checkpoint_version == VERSION).to(args.device)
+                                      conditional_transport=checkpoint_version in supported_versions,
+                                      transport_gate_mode=active_gate_mode).to(args.device)
     inner = model.frozen.base.swin_unet
     if (inner.decoder_structure_blocks['2'].enable_local_propagation or
             inner.enable_gap_refinement or not inner.enable_highres_structure_stream or
@@ -65,7 +83,7 @@ def load_model(args):
                     'missing_threshold': args.missing_threshold,
                     'lambda_bg': args.lambda_bg,
                     'lambda_cont': args.lambda_cont}
-        if checkpoint_version == VERSION:
+        if checkpoint_version in supported_versions:
             expected['lambda_missing'] = args.lambda_missing
         mismatches = {key: (payload.get(key), value) for key, value in expected.items()
                       if payload.get(key) != value}
@@ -75,7 +93,7 @@ def load_model(args):
             getattr(model, name).load_state_dict(payload['modules'][name], strict=True)
         model.legacy_route = checkpoint_version == 'reliable_directional_dynamics_v2'
         model.visual_transport_route = checkpoint_version in (
-            VERSION, 'reliable_directional_dynamics_v5_bridge_repair',
+            *supported_versions, 'reliable_directional_dynamics_v5_bridge_repair',
             'reliable_directional_dynamics_v4_visual_transport')
         print(f'[LOAD] strict modules version={checkpoint_version} '
               f'epoch={payload["epoch"]}', flush=True)
@@ -87,7 +105,9 @@ def load_model(args):
 
 
 def save_checkpoint(model, path, args, epoch, selection=None, optimizer=None):
-    payload = {'version': VERSION, 'epoch': epoch,
+    checkpoint_version = V7_VERSION if model.transport_gate_mode == 'v7' else V6_VERSION
+    payload = {'version': checkpoint_version,
+               'transport_gate_mode': model.transport_gate_mode, 'epoch': epoch,
                'base_checkpoint': str(args.base_checkpoint.resolve()),
                'q3_checkpoint': str(args.q3_checkpoint.resolve()),
                'width': args.width, 'steps': 3, 'selection': selection,
@@ -791,12 +811,17 @@ def evaluate(args, model):
     reports, details, tiles, elapsed = evaluate_thresholds(
         model, dataset, args.device, tuple(dict.fromkeys(thresholds)), args.max_images)
     report = reports[threshold]
-    report['checkpoint_version'] = (
-        VERSION if model.conditional_transport else
-        'reliable_directional_dynamics_v5_bridge_repair' if model.bridge_route else
-        'reliable_directional_dynamics_v2' if model.legacy_route else
-        'reliable_directional_dynamics_v4_visual_transport'
-        if model.visual_transport_route else 'reliable_directional_dynamics_v3')
+    if model.conditional_transport:
+        report['checkpoint_version'] = (
+            V7_VERSION if model.transport_gate_mode == 'v7' else V6_VERSION)
+    elif model.bridge_route:
+        report['checkpoint_version'] = 'reliable_directional_dynamics_v5_bridge_repair'
+    elif model.legacy_route:
+        report['checkpoint_version'] = 'reliable_directional_dynamics_v2'
+    elif model.visual_transport_route:
+        report['checkpoint_version'] = 'reliable_directional_dynamics_v4_visual_transport'
+    else:
+        report['checkpoint_version'] = 'reliable_directional_dynamics_v3'
     report['fair_comparison'] = {
         'selection_split': 'val',
         'p0_threshold': p0_threshold,
@@ -807,7 +832,8 @@ def evaluate(args, model):
     report['operating_point_comparison'] = operating_comparison(reports, selection)
     report['evaluation_seconds'] = elapsed
     report['version'] = report['checkpoint_version']
-    report['evaluation_tool_version'] = VERSION
+    report['evaluation_tool_version'] = (
+        V7_VERSION if model.transport_gate_mode == 'v7' else V6_VERSION)
     report['base_checkpoint'] = str(args.base_checkpoint.resolve())
     report['q3_checkpoint'] = str(args.q3_checkpoint.resolve())
     report['checkpoint'] = str(args.dynamic_checkpoint.resolve())
@@ -828,8 +854,11 @@ def main():
     parser.add_argument('--root_path', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--base_checkpoint', type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument('--q3_checkpoint', type=Path, required=True)
+    parser.add_argument('--q3_checkpoint', type=Path)
     parser.add_argument('--dynamic_checkpoint', type=Path)
+    parser.add_argument('--init_dynamic_checkpoint', type=Path,
+                        help='Initialize a new gate experiment from a v6 checkpoint')
+    parser.add_argument('--transport_gate_mode', choices=('v6', 'v7'), default='v6')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--val_interval', type=int, default=5)
@@ -848,6 +877,29 @@ def main():
     parser.add_argument('--visualizations', type=int, default=8)
     parser.add_argument('--audit_threshold', type=float, default=.45)
     args = parser.parse_args()
+    if args.mode == 'train' and args.init_dynamic_checkpoint:
+        if args.transport_gate_mode != 'v7' or args.dynamic_checkpoint:
+            parser.error('v6 initialization requires train --transport_gate_mode v7')
+        if not args.init_dynamic_checkpoint.is_file():
+            parser.error(f'v6 initialization checkpoint not found: {args.init_dynamic_checkpoint}')
+        init_payload = torch.load(args.init_dynamic_checkpoint, map_location='cpu',
+                                  weights_only=False)
+        if init_payload.get('version') != V6_VERSION:
+            parser.error('--init_dynamic_checkpoint must be a v6 checkpoint')
+        args.base_checkpoint = Path(init_payload['base_checkpoint'])
+        args.q3_checkpoint = Path(init_payload['q3_checkpoint'])
+        args.width = int(init_payload['width'])
+        args.accept_floor_initial = float(init_payload['accept_floor_initial'])
+        args.accept_floor_anneal_epochs = int(
+            init_payload['accept_floor_anneal_epochs'])
+        args.missing_threshold = float(init_payload['missing_threshold'])
+        args.lambda_bg = float(init_payload['lambda_bg'])
+        args.lambda_cont = float(init_payload['lambda_cont'])
+        args.lambda_missing = float(init_payload.get('lambda_missing', 2.))
+    elif args.q3_checkpoint is None:
+        parser.error('--q3_checkpoint is required unless initializing from a v6 checkpoint')
+    if args.mode != 'train' and args.init_dynamic_checkpoint:
+        parser.error('--init_dynamic_checkpoint is only valid for a new train run')
     if (args.width % 8 or args.width < 8 or args.batch_size < 1 or args.epochs < 1 or
             args.val_interval < 1 or args.lambda_bg < 0 or
             args.lambda_missing < 0 or args.lambda_cont < 0 or

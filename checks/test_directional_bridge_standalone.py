@@ -106,6 +106,23 @@ class BridgeRouteTests(unittest.TestCase):
         self.assertGreater(float(result['source_available'].mean()), 0.)
         self.assertTrue(bool(torch.isfinite(result['transport_delta']).all()))
 
+    def test_v7_changes_gate_evidence_without_changing_w_or_parameters(self):
+        torch.manual_seed(151)
+        v6 = ReliableDirectionalRepair(FrozenConditions(),
+                                       transport_gate_mode='v6').eval()
+        v7 = ReliableDirectionalRepair(FrozenConditions(),
+                                       transport_gate_mode='v7').eval()
+        v7.load_state_dict(v6.state_dict(), strict=True)
+        image = torch.randn(1, 3, 40, 40)
+        with torch.no_grad():
+            result_v6 = v6(image, capture_diagnostics=True)
+            result_v7 = v7(image, capture_diagnostics=True)
+        self.assertTrue(torch.equal(result_v6['w'], result_v7['w']))
+        self.assertTrue(torch.equal(result_v6['b'], result_v7['b']))
+        self.assertTrue(torch.equal(result_v6['a'], result_v7['a']))
+        self.assertFalse(torch.allclose(result_v6['g_transport'],
+                                        result_v7['g_transport']))
+
     def test_no_reliable_source_closes_permission(self):
         torch.manual_seed(16)
         model = ReliableDirectionalRepair(FrozenConditions()).eval()

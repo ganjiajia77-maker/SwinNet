@@ -69,10 +69,14 @@ class VisualProjection(nn.Module):
 
 
 class DirectionRelations(nn.Module):
-    def __init__(self, width, bridge_route=False, conditional_transport=False):
+    def __init__(self, width, bridge_route=False, conditional_transport=False,
+                 transport_gate_mode='v6'):
         super().__init__()
         self.bridge_route = bridge_route
         self.conditional_transport = conditional_transport
+        if transport_gate_mode not in ('v6', 'v7'):
+            raise ValueError(f'Unsupported transport gate mode: {transport_gate_mode}')
+        self.transport_gate_mode = transport_gate_mode
         self.semantic = nn.Conv2d(width, 1, 3, padding=1)
         self.tangent = nn.Conv2d(width, 4, 3, padding=1)
         self.pair = nn.Sequential(nn.Conv2d(16, 16, 1), nn.GELU(),
@@ -92,7 +96,8 @@ class DirectionRelations(nn.Module):
         tangent = self.tangent(visual).sigmoid()
         road_width = F.avg_pool2d(p0, 3, stride=1, padding=1)
         ones = torch.ones_like(p0)
-        direction_evidence, two_maps, one_maps = [], [], []
+        direction_evidence, one_direction_evidence = [], []
+        two_maps, one_maps = [], []
         for axis_index, (dy, dx) in enumerate(AXES):
             scores = []
             for radius in RADII:
@@ -163,12 +168,23 @@ class DirectionRelations(nn.Module):
             two_maps.append(two)
             one_maps.append(one_minus + one_plus)
             direction_evidence.extend((two + one_minus, two + one_plus))
+            one_direction_evidence.extend((one_minus, one_plus))
         directional = torch.cat(direction_evidence, dim=1)
         logits = self.direction_head(torch.cat((visual, directional), dim=1))
         if self.conditional_transport:
             direction_logits = logits[:, 1:] + torch.log(directional + .05)
             weights = direction_logits.softmax(dim=1)
-            source_evidence = directional.amax(dim=1, keepdim=True)
+            if self.transport_gate_mode == 'v7':
+                # Reuse learned multi-radius C_bridge and one-side relations.
+                # The relation head already reads endpoint and corridor visual features.
+                bridge_by_direction = torch.cat(
+                    [value.repeat_interleave(2, dim=1) for value in two_maps], dim=1
+                )
+                one_by_direction = torch.cat(one_direction_evidence, dim=1)
+                path_evidence = bridge_by_direction + one_by_direction
+                source_evidence = (weights * path_evidence).sum(dim=1, keepdim=True)
+            else:
+                source_evidence = directional.amax(dim=1, keepdim=True)
             transport_gate = torch.sigmoid(
                 logits[:, :1] + torch.log(source_evidence.clamp_min(1e-6)))
             return weights, torch.cat(two_maps, dim=1), torch.cat(one_maps, dim=1), transport_gate
@@ -242,7 +258,7 @@ class DirectionalDynamics(nn.Module):
 
 class ReliableDirectionalRepair(nn.Module):
     def __init__(self, frozen_q3, width=32, steps=3, bridge_route=True,
-                 conditional_transport=True):
+                 conditional_transport=True, transport_gate_mode='v6'):
         super().__init__()
         if conditional_transport and not bridge_route:
             raise ValueError('Conditional transport requires bridge evidence')
@@ -257,8 +273,10 @@ class ReliableDirectionalRepair(nn.Module):
                                            nn.GELU(), nn.Conv2d(width, 1, 1))
         nn.init.zeros_(self.reliable_head[-1].weight)
         nn.init.constant_(self.reliable_head[-1].bias, 1.5)
-        self.relations = DirectionRelations(width, bridge_route=bridge_route,
-                                            conditional_transport=conditional_transport)
+        self.relations = DirectionRelations(
+            width, bridge_route=bridge_route,
+            conditional_transport=conditional_transport,
+            transport_gate_mode=transport_gate_mode)
         proposal_channels = (2 * width + 7) if bridge_route else (width + 7)
         self.proposal_head = nn.Sequential(nn.Conv2d(proposal_channels, width, 3, padding=1),
                                            nn.GELU(), nn.Conv2d(width, 2 if bridge_route else 1, 1))
@@ -280,6 +298,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.visual_transport_route = True
         self.bridge_route = bridge_route
         self.conditional_transport = conditional_transport
+        self.transport_gate_mode = transport_gate_mode
 
     def set_accept_floor(self, value):
         if not 0. <= value < 1.:
