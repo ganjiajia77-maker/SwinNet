@@ -122,6 +122,9 @@ class BridgeRouteTests(unittest.TestCase):
         self.assertTrue(torch.equal(result_v6['a'], result_v7['a']))
         self.assertFalse(torch.allclose(result_v6['g_transport'],
                                         result_v7['g_transport']))
+        self.assertTrue(torch.equal(result_v7['gate_source_evidence'],
+                                    result_v7['path_continuity_evidence']))
+        self.assertTrue(bool(torch.isfinite(result_v6['path_continuity_evidence']).all()))
 
     def test_no_reliable_source_closes_permission(self):
         torch.manual_seed(16)
