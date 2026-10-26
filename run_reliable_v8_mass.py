@@ -28,8 +28,10 @@ def load_experiment(args):
     source = torch.load(v7_path, map_location='cpu', weights_only=False)
     if source.get('version') != V7_VERSION:
         raise ValueError('The initialization checkpoint must be trained v7')
-    base, q3 = (Path(source[key]).resolve()
-                for key in ('base_checkpoint', 'q3_checkpoint'))
+    base = Path(getattr(args, 'base_checkpoint_override', None) or
+                source['base_checkpoint']).resolve()
+    q3 = Path(getattr(args, 'q3_checkpoint_override', None) or
+              source['q3_checkpoint']).resolve()
     if not base.is_file() or not q3.is_file():
         raise FileNotFoundError(f'Missing frozen model checkpoints: {base}, {q3}')
     config = SimpleNamespace(
@@ -39,7 +41,9 @@ def load_experiment(args):
         accept_floor_anneal_epochs=source['accept_floor_anneal_epochs'],
         missing_threshold=source['missing_threshold'], lambda_bg=source['lambda_bg'],
         lambda_missing=source['lambda_missing'], lambda_cont=source['lambda_cont'],
-        transport_gate_mode='v7')
+        transport_gate_mode='v7', allow_checkpoint_source_override=(
+            getattr(args, 'base_checkpoint_override', None) is not None or
+            getattr(args, 'q3_checkpoint_override', None) is not None))
     model = load_v7(config)
     stage = model.frozen.base.swin_unet.decoder_structure_blocks['3']
     decoder_channels = stage.structure_branch[0].block[0].in_channels

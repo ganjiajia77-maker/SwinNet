@@ -25,7 +25,7 @@ from diagnostics.compare_v6_v7_matched import (  # noqa: E402
 )
 from evaluation.road_comparison.road_metrics import prepare_target  # noqa: E402
 from mass_protocol import blend_weight, sliding_positions  # noqa: E402
-from networks.reliable_directional_repair import dynamic_losses  # noqa: E402
+from networks.reliable_directional_repair import DIRECTIONS, dynamic_losses  # noqa: E402
 from run_q3_r3_mass import PROTOCOL, full_dataset  # noqa: E402
 from run_reliable_directional_mass import evaluate_thresholds  # noqa: E402
 from run_reliable_v8_mass import load_experiment  # noqa: E402
@@ -95,104 +95,247 @@ def _fit_logistic(train_x, train_y, test_x, steps=250, lr=.25):
 def _grouped_probe(train_rows, val_rows, output):
     if not train_rows or not val_rows:
         return {'note': 'Train-fit/validation-eval probe needs matched candidates in both splits.'}
-    x_groups = {
-        'structure': ('p0', 'q', 's2', 'c2', 'd2', 'r', 'w'),
-        'structure_plus_H': ('p0', 'q', 's2', 'c2', 'd2', 'r', 'w', 'highres'),
-        'structure_plus_H3': ('p0', 'q', 's2', 'c2', 'd2', 'r', 'w', 'decoder'),
-        'structure_plus_H_H3': ('p0', 'q', 's2', 'c2', 'd2', 'r', 'w', 'highres', 'decoder'),
-        'plus_bilateral_relation': ('p0', 'q', 's2', 'c2', 'd2', 'r', 'w',
-                                    'highres', 'decoder', 'relation', 'coverage'),
-        'plus_v8_projected_H_H3': ('p0', 'q', 's2', 'c2', 'd2', 'r', 'w',
-                                   'highres_projected', 'decoder_projected',
-                                   'relation', 'coverage'),
-    }
+    x_groups = ('structure', 'structure_plus_H', 'structure_plus_H3',
+                'structure_plus_H_H3', 'plus_bilateral_relation')
     train_y = np.asarray([r['label'] for r in train_rows], dtype=np.int8)
     val_y = np.asarray([r['label'] for r in val_rows], dtype=np.int8)
     report, csv_rows = {}, []
-    for model_name, names in x_groups.items():
-        train_x = np.stack([
-            np.concatenate([np.asarray(row[key]).ravel() for key in names])
-            for row in train_rows]).astype(np.float32)
-        val_x = np.stack([
-            np.concatenate([np.asarray(row[key]).ravel() for key in names])
-            for row in val_rows]).astype(np.float32)
+    for model_name in x_groups:
+        train_x = np.stack([np.asarray(row[model_name]).ravel()
+                            for row in train_rows]).astype(np.float32)
+        val_x = np.stack([np.asarray(row[model_name]).ravel()
+                          for row in val_rows]).astype(np.float32)
         if len(np.unique(train_y)) < 2 or len(np.unique(val_y)) < 2:
-            report[model_name] = {'features': list(names),
+            report[model_name] = {'features': model_name,
                                   'note': 'Both classes are required in train and val candidates.'}
             continue
         scores = _fit_logistic(train_x, train_y, val_x)
         report[model_name] = {
-            'features': list(names), 'fit_split': 'train', 'evaluation_split': 'val',
+            'features': model_name, 'candidate_unit': 'GT missing-road connection pair',
+            'fit_split': 'train', 'evaluation_split': 'val',
             'train_images': len({row['image'] for row in train_rows}),
             'val_images': len({row['image'] for row in val_rows}),
             'train_candidates_per_class': int(min(train_y.sum(), (1-train_y).sum())),
             **_probe_metrics(val_y, scores),
         }
-        for row, score in zip(val_rows, scores):
+        for candidate_index, (row, score) in enumerate(zip(val_rows, scores)):
             csv_rows.append({'feature_set': model_name, 'image': row['image'],
-                             'split': 'val', 'label': int(row['label']),
+                             'split': 'val', 'candidate_id': candidate_index,
+                             'candidate_unit': 'GT missing-road connection pair',
+                             'label': int(row['label']),
+                             'pair_span_pixels': row['length'],
+                             'gap_length_pixels': row['gap_length'],
+                             'direction_index': row['direction'],
                              'score': float(score)})
     write_csv(output / 'feature_probe_oof_scores.csv', csv_rows)
     return report
 
 
-def _feature_rows(image_id, maps, gt, p0_threshold, max_per_class=1800):
-    """Build matched positive/matched hard-negative pixels on the common work grid."""
+def _sample_feature(feature, y, x):
+    feature = np.asarray(feature)
+    if feature.ndim == 2:
+        return np.asarray([feature[y, x]], dtype=np.float32)
+    return feature[:, y, x].astype(np.float32, copy=False)
+
+
+def _pair_feature_rows(image_id, maps, gt, p0_threshold, max_per_class=256):
+    """Build path-level positive gaps and hard-background connection candidates."""
     from evaluation.road_comparison.road_metrics import skeletonize
 
-    for key in ('p0', 'q', 's2', 'r', 'coverage'):
-        if maps[key].ndim == 3:
-            maps[key] = maps[key][0]
-    h, w = maps['p0'].shape
-    gt_work = cv2.resize(gt.astype(np.float32), (w, h), interpolation=cv2.INTER_AREA)
-    p0 = maps['p0']
-    p0_full = maps.get('p0_full')
-    if p0_full is None:
-        raise KeyError('Exact stitched p0_full is required for candidate construction')
-    p0_native = p0_full[0] if p0_full.ndim == 3 else p0_full
-    p0_near = cv2.dilate((p0_native >= p0_threshold).astype(np.uint8),
-                         np.ones((5, 5), np.uint8)) > 0
-    missing_native = skeletonize(gt) & ~p0_near
-    missing = cv2.resize(missing_native.astype(np.uint8), (w, h),
-                         interpolation=cv2.INTER_AREA) > 0
-    positive = missing & (gt_work > .05)
-    hard = (gt_work < .05) & (maps['q'] > .5)
-    quality = {'image': str(image_id), 'eligible_positive': int(positive.sum()),
-               'eligible_hard_background': int(hard.sum()),
-               'matched_per_class': 0, 'matched_strata': 0}
-    if not positive.any() or not hard.any():
-        return [], quality
-    distance = cv2.distanceTransform((~(gt_work > .05)).astype(np.uint8),
-                                     cv2.DIST_L2, 3)
-    pbin = np.digitize(p0, [0.05, .15, .3, .45, .6, .8])
-    dbin = np.digitize(distance, [2, 5, 10, 20])
-    strata = pbin * 5 + dbin
-    rng = np.random.default_rng(1701 + int(image_id))
-    rows = []
-    valid_strata = [s for s in np.unique(strata[positive])
-                    if np.any(hard & (strata == s))]
-    per_stratum = max(1, max_per_class // max(len(valid_strata), 1))
-    for stratum in valid_strata:
-        pos = np.flatnonzero(positive & (strata == stratum))
-        neg = np.flatnonzero(hard & (strata == stratum))
-        count = min(len(pos), len(neg), per_stratum)
-        if count == 0:
+    p0_full = np.asarray(maps['p0_full'])
+    p0_work, q_work, reliable = maps['p0'], maps['q'], maps['r']
+    work_h, work_w = p0_work.shape
+    gt_native = gt.astype(bool)
+    gt_work = cv2.resize(gt_native.astype(np.float32), (work_w, work_h),
+                         interpolation=cv2.INTER_AREA)
+    p0_binary = p0_full >= p0_threshold
+    p0_near = cv2.dilate(p0_binary.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    gt_skeleton = skeletonize(gt_native)
+    missing = gt_skeleton & ~p0_near
+    distance_to_p0 = cv2.distanceTransform(
+        (~(p0_work >= p0_threshold)).astype(np.uint8), cv2.DIST_L2, 3)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        missing.astype(np.uint8), connectivity=8)
+    source_mask = p0_binary & gt_native
+    positives = []
+
+    def work_xy(y_native, x_native):
+        return (int(np.clip(round(y_native * work_h / gt_native.shape[0]), 0, work_h - 1)),
+                int(np.clip(round(x_native * work_w / gt_native.shape[1]), 0, work_w - 1)))
+
+    def flank(point, axis, sign):
+        py, px = point
+        candidates = []
+        for distance in range(3, 33, 2):
+            ty = py + sign * axis[0] * distance
+            tx = px + sign * axis[1] * distance
+            radius = 6
+            y0, y1 = max(0, int(ty) - radius), min(gt_native.shape[0], int(ty) + radius + 1)
+            x0, x1 = max(0, int(tx) - radius), min(gt_native.shape[1], int(tx) + radius + 1)
+            local = source_mask[y0:y1, x0:x1]
+            yy, xx = np.where(local)
+            if yy.size:
+                yy, xx = yy + y0, xx + x0
+                distance2 = (yy - ty) ** 2 + (xx - tx) ** 2
+                index = int(distance2.argmin())
+                candidates.append((float(distance2[index]), int(yy[index]), int(xx[index])))
+                break
+        return (candidates[0][1], candidates[0][2]) if candidates else None
+
+    positive_quality = {'components': 0, 'with_two_predicted_flanks': 0,
+                        'without_two_flanks': 0}
+    for component in range(1, count):
+        if stats[component, cv2.CC_STAT_AREA] < 3:
             continue
-        quality['matched_per_class'] += count
-        quality['matched_strata'] += 1
-        pos, neg = rng.choice(pos, count, replace=False), rng.choice(neg, count, replace=False)
-        for label, indices in ((1, pos), (0, neg)):
-            yy, xx = np.unravel_index(indices, (h, w))
-            for y, x in zip(yy, xx):
-                rows.append({'image': str(image_id), 'label': label,
-                             'p0': np.asarray([p0[y, x]]), 'q': np.asarray([maps['q'][y, x]]),
-                             's2': np.asarray([maps['s2'][y, x]]),
-                             'c2': maps['c2'][:, y, x], 'd2': maps['d2'][:, y, x],
-                             'r': np.asarray([maps['r'][y, x]]), 'w': maps['w'][:, y, x],
-                             'highres': maps['highres'][:, y, x],
-                             'decoder': maps['decoder'][:, y, x],
-                             'relation': maps['relation'][:, y, x],
-                             'coverage': np.asarray([maps['coverage'][y, x]])})
+        yy, xx = np.where(labels == component)
+        coords = np.stack((yy, xx), axis=1).astype(np.float64)
+        centered = coords - coords.mean(0)
+        _, vectors = np.linalg.eigh(centered.T @ centered)
+        axis = vectors[:, -1]
+        if axis[1] < 0:
+            axis = -axis
+        projection = centered @ axis
+        left_point = coords[int(projection.argmin())]
+        right_point = coords[int(projection.argmax())]
+        left_flank = flank(left_point, axis, -1.)
+        right_flank = flank(right_point, axis, 1.)
+        positive_quality['components'] += 1
+        if left_flank is None or right_flank is None:
+            positive_quality['without_two_flanks'] += 1
+            continue
+        positive_quality['with_two_predicted_flanks'] += 1
+        center_native = ((left_point + right_point) * .5)
+        cy, cx = work_xy(*center_native)
+        ly, lx = work_xy(*left_flank)
+        ry, rx = work_xy(*right_flank)
+        vector = np.asarray([right_flank[0] - left_flank[0],
+                             right_flank[1] - left_flank[1]], dtype=np.float64)
+        vector /= max(np.linalg.norm(vector), 1e-8)
+        direction = max(range(len(DIRECTIONS)), key=lambda i:
+                        (-vector[0] * DIRECTIONS[i][0] -
+                         vector[1] * DIRECTIONS[i][1]) / np.hypot(*DIRECTIONS[i]))
+        length = float(np.linalg.norm(np.asarray(right_flank) - np.asarray(left_flank)))
+        gap_length = float(projection.max() - projection.min() + 1.)
+        positives.append({'label': 1, 'image': str(image_id), 'center': (cy, cx),
+                          'left': (ly, lx), 'right': (ry, rx),
+                          'direction': direction, 'length': length,
+                          'gap_length': gap_length,
+                          'p0': float(p0_work[cy, cx]), 'q': float(q_work[cy, cx]),
+                          'distance': float(distance_to_p0[cy, cx])})
+
+    # Negatives are plausible two-sided proposals in Q3-high, GT-background areas.
+    q_high = q_work > .5
+    hard_centers = np.argwhere(q_high & (gt_work < .05) & (p0_work < .8))
+    rng = np.random.default_rng(811 + int(image_id))
+    if len(hard_centers) > max_per_class * 12:
+        hard_centers = hard_centers[rng.choice(len(hard_centers), max_per_class * 12,
+                                               replace=False)]
+    negatives = []
+    offsets = tuple((int(dy), int(dx)) for dy, dx in DIRECTIONS)
+    for cy, cx in hard_centers:
+        best = None
+        for direction, (dy, dx) in enumerate(offsets):
+            for radius in (2, 4, 8, 16):
+                y1, x1 = int(cy + dy * radius), int(cx + dx * radius)
+                y2, x2 = int(cy - dy * radius), int(cx - dx * radius)
+                if not (0 <= y1 < work_h and 0 <= x1 < work_w and
+                        0 <= y2 < work_h and 0 <= x2 < work_w):
+                    continue
+                support = min(float(reliable[y1, x1]), float(reliable[y2, x2]))
+                if best is None or support > best[0]:
+                    best = (support, direction, radius, (y1, x1), (y2, x2))
+        if best is None or best[0] < .15:
+            continue
+        _, direction, radius, left, right = best
+        negatives.append({'label': 0, 'image': str(image_id),
+                          'center': (int(cy), int(cx)), 'left': left, 'right': right,
+                          'direction': direction, 'length': float(2 * radius *
+                                                                  np.hypot(dy, dx) *
+                                                                  gt_native.shape[0] / work_h),
+                          'gap_length': float(2 * radius * np.hypot(dy, dx) *
+                                              gt_native.shape[0] / work_h),
+                          'p0': float(p0_work[cy, cx]), 'q': float(q_work[cy, cx]),
+                          'distance': float(distance_to_p0[cy, cx])})
+
+    def strata(candidate):
+        return (int(np.digitize(candidate['p0'], [.05, .15, .3, .45, .6, .8])),
+                int(np.digitize(candidate['q'], [.6, .75, .9])),
+                int(np.digitize(candidate['distance'], [2, 5, 10, 20])),
+                int(np.digitize(candidate['gap_length'], [7, 15, 31])),
+                candidate['direction'] // 2)
+
+    pos_by, neg_by = {}, {}
+    for candidate in positives:
+        pos_by.setdefault(strata(candidate), []).append(candidate)
+    for candidate in negatives:
+        neg_by.setdefault(strata(candidate), []).append(candidate)
+    matched_pos, matched_neg = [], []
+    for key in sorted(set(pos_by) & set(neg_by)):
+        pos, neg = pos_by[key], neg_by[key]
+        n = min(len(pos), len(neg), max_per_class // max(len(set(pos_by) & set(neg_by)), 1))
+        if n:
+            matched_pos.extend(pos[int(i)] for i in rng.choice(len(pos), n, replace=False))
+            matched_neg.extend(neg[int(i)] for i in rng.choice(len(neg), n, replace=False))
+
+    def vector_at(key, point):
+        return _sample_feature(maps[key], *point)
+
+    rows = []
+    matched = matched_pos + matched_neg
+    for candidate in matched:
+        cy, cx = candidate['center']
+        left, right = candidate['left'], candidate['right']
+        direction = candidate['direction']
+        opposite = direction ^ 1
+        center_structure = np.concatenate([
+            _sample_feature(maps[key], cy, cx) for key in
+            ('p0', 'q', 's2', 'c2', 'd2', 'r', 'w')])
+        h_center, h_left, h_right = (vector_at('highres', point)
+                                     for point in ((cy, cx), left, right))
+        h3_center, h3_left, h3_right = (vector_at('decoder', point)
+                                        for point in ((cy, cx), left, right))
+        direction_relation = maps.get('direction_relation')
+        relation_width = maps['relation'].shape[0]
+        rel = (_sample_feature(direction_relation[
+            direction * relation_width:(direction + 1) * relation_width], cy, cx)
+               if direction_relation is not None else np.zeros(1, np.float32))
+        rel_opp = (_sample_feature(direction_relation[
+            opposite * relation_width:(opposite + 1) * relation_width], cy, cx)
+                   if direction_relation is not None else np.zeros(1, np.float32))
+        direction_pair_raw = maps.get('direction_pair_raw')
+        raw_rel = (_sample_feature(direction_pair_raw[
+            direction * relation_width:(direction + 1) * relation_width], cy, cx)
+                   if direction_pair_raw is not None else np.zeros(1, np.float32))
+        raw_rel_opp = (_sample_feature(direction_pair_raw[
+            opposite * relation_width:(opposite + 1) * relation_width], cy, cx)
+                       if direction_pair_raw is not None else np.zeros(1, np.float32))
+        relation_geom = np.asarray([candidate['length'] / 64.,
+                                    DIRECTIONS[direction][0],
+                                    DIRECTIONS[direction][1]], dtype=np.float32)
+        bilateral = np.concatenate((
+            h_left, h_right, np.abs(h_left - h_right), h_left * h_right,
+            h3_left, h3_right, np.abs(h3_left - h3_right), h3_left * h3_right,
+            raw_rel, raw_rel_opp, rel, rel_opp,
+            _sample_feature(maps['w'], cy, cx),
+            np.asarray([maps['coverage'][cy, cx]], np.float32), relation_geom))
+        rows.append({'image': candidate['image'], 'label': candidate['label'],
+                     'structure': center_structure,
+                     'structure_plus_H': np.concatenate((center_structure, h_center)),
+                     'structure_plus_H3': np.concatenate((center_structure, h3_center)),
+                     'structure_plus_H_H3': np.concatenate((center_structure, h_center, h3_center)),
+                     'plus_bilateral_relation': np.concatenate((center_structure, bilateral)),
+                     'length': candidate['length'], 'gap_length': candidate['gap_length'],
+                     'direction': direction})
+    quality = {
+        'image': str(image_id), 'positive_gap_components': positive_quality['components'],
+        'positive_with_two_predicted_flanks': positive_quality['with_two_predicted_flanks'],
+        'positive_without_two_flanks': positive_quality['without_two_flanks'],
+        'eligible_negative_background_candidates': len(hard_centers),
+        'negative_with_two_reliable_sources': len(negatives),
+        'matched_per_class': len(matched_pos),
+        'matched_pairs': len(matched_pos),
+        'matched_strata': len(set(strata(c) for c in matched_pos)),
+    }
     return rows, quality
 
 
@@ -202,6 +345,7 @@ def _stitch_work_maps(model, image, device):
     full_weight = blend_weight(512, device)
     names = ('p0', 'q', 'r', 'a', 'b', 'w', 's2', 'c2', 'd2', 'highres', 'decoder',
              'highres_projected', 'decoder_projected', 'relation', 'coverage',
+             'direction_relation', 'direction_pair_raw',
              'g7', 'g8', 'delta_g', 'p1', 'p7',
              'proposal_raw_plus', 'proposal_raw_minus',
              'alpha_1', 'alpha_2', 'alpha_3', 'beta_1', 'beta_2', 'beta_3',
@@ -251,6 +395,8 @@ def _stitch_work_maps(model, image, device):
                 'highres_projected': relation['highres_projected'],
                 'decoder_projected': relation['decoder_projected'],
                 'relation': relation['relation_embedding'],
+                'direction_relation': relation['per_direction_relation'].flatten(1, 2),
+                'direction_pair_raw': relation['per_direction_pair_raw'].flatten(1, 2),
                 'coverage': out['gate_source_coverage'],
                 'g7': out['g_v7'], 'g8': out['g_transport'],
                 'delta_g': out['delta_g_logit'],
@@ -434,6 +580,10 @@ def main():
     parser.add_argument('--root_path', type=Path, required=True)
     parser.add_argument('--v7_checkpoint', type=Path, required=True)
     parser.add_argument('--v8_checkpoint', type=Path, required=True)
+    parser.add_argument('--base_checkpoint', type=Path,
+                        help='Optional recovered copy of the exact frozen base checkpoint')
+    parser.add_argument('--q3_checkpoint', type=Path,
+                        help='Optional recovered copy of the exact frozen Q3/R3 checkpoint')
     parser.add_argument('--v7_selection', type=Path, required=True)
     parser.add_argument('--v8_selection', type=Path, required=True)
     parser.add_argument('--relation_mode', choices=('local', 'bilateral', 'directional', 'full'), default='full')
@@ -448,6 +598,15 @@ def main():
         parser.error('--probe_train_images must be zero (all train images) or positive')
     if not args.v7_checkpoint.is_file() or not args.v8_checkpoint.is_file():
         parser.error('Both v7 and v8 checkpoint paths must be files')
+    v7_payload = torch.load(args.v7_checkpoint, map_location='cpu', weights_only=False)
+    base_path = args.base_checkpoint or Path(v7_payload['base_checkpoint'])
+    q3_path = args.q3_checkpoint or Path(v7_payload['q3_checkpoint'])
+    missing_sources = [str(path) for path in (base_path, q3_path) if not path.is_file()]
+    if missing_sources:
+        parser.error('Frozen inference weights are required and were not found: ' +
+                     ', '.join(missing_sources) +
+                     '. Recover the exact files or pass their recovered paths with '
+                     '--base_checkpoint/--q3_checkpoint; v7/v8 files do not embed them.')
     selection7 = json.loads(args.v7_selection.read_text(encoding='utf-8'))
     selection8 = json.loads(args.v8_selection.read_text(encoding='utf-8'))
     if selection7.get('selected_on') != 'val' or selection8.get('selected_on') != 'val':
@@ -459,7 +618,9 @@ def main():
     if selection8.get('v8_checkpoint') != str(args.v8_checkpoint.resolve()):
         parser.error('v8 selection does not belong to the supplied v8 checkpoint')
     config = SimpleNamespace(v7_checkpoint=args.v7_checkpoint, v8_checkpoint=args.v8_checkpoint,
-                             relation_mode=args.relation_mode, device=args.device)
+                             relation_mode=args.relation_mode, device=args.device,
+                             base_checkpoint_override=args.base_checkpoint,
+                             q3_checkpoint_override=args.q3_checkpoint)
     model, v7_payload = load_experiment(config)
     model.eval()
     dataset = full_dataset(args.root_path, 'val')
@@ -518,7 +679,7 @@ def main():
                         **{k: maps[k][0] if maps[k].ndim == 3 and maps[k].shape[0] == 1
                            else maps[k]
                            for k in record_keys}})
-        probe_rows, quality = _feature_rows(
+        probe_rows, quality = _pair_feature_rows(
             index, maps, sample['mask'][0].numpy() > .5, tau)
         probes.extend(probe_rows)
         candidate_quality.append(quality)
@@ -588,7 +749,7 @@ def main():
     for train_index in train_indices:
         sample = train_dataset[int(train_index)]
         maps = _stitch_work_maps(model, sample['image'][None].to(args.device), args.device)
-        rows, quality = _feature_rows(
+        rows, quality = _pair_feature_rows(
             int(train_index), maps, sample['mask'][0].numpy() > .5, tau)
         train_probes.extend(rows)
         train_candidate_quality.append(quality)
@@ -601,16 +762,20 @@ def main():
         'train_images_with_matched_rows': sum(q['matched_per_class'] > 0
                                                for q in train_candidate_quality),
         'images_with_matched_rows': sum(q['matched_per_class'] > 0 for q in candidate_quality),
-        'train_eligible_positive_total': sum(q['eligible_positive']
+        'train_positive_gap_components': sum(q['positive_gap_components']
                                               for q in train_candidate_quality),
-        'train_eligible_hard_background_total': sum(q['eligible_hard_background']
+        'train_positive_with_two_flanks': sum(q['positive_with_two_predicted_flanks']
+                                               for q in train_candidate_quality),
+        'train_negative_with_two_sources': sum(q['negative_with_two_reliable_sources']
                                                      for q in train_candidate_quality),
-        'train_matched_per_class_total': sum(q['matched_per_class']
+        'train_matched_pair_total': sum(q['matched_pairs']
                                               for q in train_candidate_quality),
-        'eligible_positive_total': sum(q['eligible_positive'] for q in candidate_quality),
-        'eligible_hard_background_total': sum(q['eligible_hard_background'] for q in candidate_quality),
-        'matched_per_class_total': sum(q['matched_per_class'] for q in candidate_quality),
-        'matched_pair_total': 2 * sum(q['matched_per_class'] for q in candidate_quality),
+        'positive_gap_components': sum(q['positive_gap_components'] for q in candidate_quality),
+        'positive_with_two_flanks': sum(q['positive_with_two_predicted_flanks']
+                                        for q in candidate_quality),
+        'negative_with_two_sources': sum(q['negative_with_two_reliable_sources']
+                                         for q in candidate_quality),
+        'matched_pair_total': sum(q['matched_pairs'] for q in candidate_quality),
         'matched_strata_total': sum(q['matched_strata'] for q in candidate_quality),
         'train_per_image': train_candidate_quality,
         'per_image': candidate_quality,
@@ -713,6 +878,10 @@ def main():
         'split': 'val', 'images': limit, 'v7_threshold': tau,
         'v8_selection_threshold_file': selection8.get('threshold'),
         'v8_recomputed_selection_threshold': best, 'selection_score_formula': score_function,
+        'frozen_checkpoint_paths_used': {'base': str(base_path.resolve()),
+                                         'q3': str(q3_path.resolve()),
+                                         'overrides_supplied': bool(args.base_checkpoint or
+                                                                    args.q3_checkpoint)},
         'threshold_0.55': score055, 'selected_threshold_report': threshold_reports[best],
         'v7_vs_v8_feature_probe': probes_report,
         'relation_gate_interventions': intervention_effects,
@@ -722,9 +891,10 @@ def main():
         'relation_encoder_gradients': gradient_report,
         'answers_to_requested_four_questions': answers,
         'notes': [
-            'Candidate classifier uses matched positive missing GT skeleton and Q3-high GT-background pixels, stratified by P0 probability and distance to GT roads.',
+            'Primary probe unit is a path-level connection pair: missed GT skeleton segment with two P0/GT road flanks versus Q3-high GT-background candidate with two reliable R sources.',
+            'Pair candidates are matched within image by P0, Q3, distance to existing P0 roads, gap length, and undirected axis; matching yield is reported per image.',
             'Feature probes are fit only on matched train candidates and evaluated only on matched val candidates; no test split is opened.',
-            'Feature groups use raw S2/C2/D2/R/W and projected H/H3 plus bilateral relation embedding.',
+            'Feature groups use S2/C2/D2/R/W, H/H3 center and flank features, raw per-direction relation embeddings, and W-weighted embeddings.',
             'Threshold scoring follows current validation selector; gap closure is diagnostic and is not a term in selection_score.',
             'Counterfactuals are inference-only and not deployable metrics.'
         ]}

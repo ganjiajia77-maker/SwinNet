@@ -83,6 +83,9 @@ def load_model(args):
                     'missing_threshold': args.missing_threshold,
                     'lambda_bg': args.lambda_bg,
                     'lambda_cont': args.lambda_cont}
+        if getattr(args, 'allow_checkpoint_source_override', False):
+            expected.pop('base_checkpoint')
+            expected.pop('q3_checkpoint')
         if checkpoint_version in supported_versions:
             expected['lambda_missing'] = args.lambda_missing
         mismatches = {key: (payload.get(key), value) for key, value in expected.items()

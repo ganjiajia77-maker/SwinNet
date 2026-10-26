@@ -255,6 +255,7 @@ class MultiScaleGateRelation(nn.Module):
         elif intervention not in (None, 'mask_relations') and not intervention.startswith('drop_dir_'):
             raise ValueError(f'Unknown relation intervention: {intervention}')
         per_direction = []
+        per_direction_raw = []
         if mode != 'local':
             feature = center + context
             for axis, (dy, dx) in enumerate(AXES):
@@ -286,6 +287,7 @@ class MultiScaleGateRelation(nn.Module):
                     pair = self.pair(torch.cat((center, left, right,
                                                 (left-right).abs(), left*right,
                                                 geometry), dim=1))
+                    per_direction_raw.append(pair)
                     if intervention == 'mask_relations':
                         pair = torch.zeros_like(pair)
                     direction_index = 2 * axis + side
@@ -307,6 +309,9 @@ class MultiScaleGateRelation(nn.Module):
                 'relation_embedding': relation,
                 'per_direction_relation': torch.stack(per_direction, dim=1)
                 if per_direction else relation.new_zeros(
+                    (relation.shape[0], 0, *relation.shape[1:])),
+                'per_direction_pair_raw': torch.stack(per_direction_raw, dim=1)
+                if per_direction_raw else relation.new_zeros(
                     (relation.shape[0], 0, *relation.shape[1:])),
                 'relation_weights': relation_weights,
             }
