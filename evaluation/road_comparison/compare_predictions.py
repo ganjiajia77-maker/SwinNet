@@ -4,6 +4,8 @@ import argparse
 import csv
 import hashlib
 import json
+import multiprocessing
+import os
 from pathlib import Path
 import platform
 import re
@@ -20,6 +22,15 @@ from road_metrics import (DEFAULT_PROTOCOL, confusion, image_metrics, prepare_ta
 
 
 EXTENSIONS = {".png", ".tif", ".tiff", ".bmp", ".npy"}
+METRIC_SOURCE_FILES = (
+    "compare_predictions.py", "road_metrics.py", "official_graph_metrics.py",
+    "vendor/sat2graph/graph.py", "vendor/sat2graph/topo.py",
+    "vendor/sat2graph/main.upstream.py.txt",
+    "vendor/sat2graph/graph.upstream.py.txt", "vendor/sat2graph/topo.upstream.py.txt",
+    "vendor/cosmiq/apls.upstream.py.txt", "vendor/cosmiq/apls_utils.upstream.py.txt",
+    "vendor/metrics_delin/toolong_tooshort_metric.upstream.py.txt",
+    "vendor/metrics_delin/utils.upstream.py.txt",
+)
 
 # Existing validation sweeps selected thresholds by pixel IoU only. Their
 # selections remain usable when the topology protocol is upgraded.
@@ -142,7 +153,8 @@ def validate_manifest(manifest):
     overrides = dict(manifest.get("protocol", {}))
     adjustable = {"image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius",
                   "apls_control_spacing_px", "apls_min_path_px", "tlts_n_paths",
-                  "tlts_max_node_dist_px", "tlts_length_tolerance", "tlts_seed"}
+                  "tlts_max_node_dist_px", "tlts_length_tolerance", "tlts_seed",
+                  "topo_seed_density_deg", "topo_step_deg"}
     if set(overrides) - adjustable:
         raise ValueError(f"Unsupported protocol settings: {set(overrides) - adjustable}")
     if "apls_max_nodes" in overrides:
@@ -153,7 +165,8 @@ def validate_manifest(manifest):
         value = protocol[key]
         if not isinstance(value, int) or value < (2 if key == "legacy_apls_max_nodes_ignored" else 1):
             raise ValueError(f"Invalid {key}: {value}")
-    for key in ("apls_snap_radius", "apls_control_spacing_px", "apls_min_path_px"):
+    for key in ("apls_snap_radius", "apls_control_spacing_px", "apls_min_path_px",
+                "topo_seed_density_deg", "topo_step_deg"):
         if not np.isfinite(protocol[key]) or protocol[key] <= 0:
             raise ValueError(f"{key} must be finite and positive")
     if not np.isfinite(protocol["tlts_max_node_dist_px"]) or protocol["tlts_max_node_dist_px"] < 3:
@@ -254,7 +267,58 @@ def import_declared_selection(manifest, base, protocol):
     return selection
 
 
-def evaluate(manifest, base, protocol, split, selection, output, progress):
+def metric_source_hashes():
+    return {
+        name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+        for name in METRIC_SOURCE_FILES
+    }
+
+
+def input_signature(paths):
+    signature = hashlib.sha256()
+    for path in paths:
+        path = Path(path)
+        signature.update(str(path.resolve()).encode("utf-8") + b"\0")
+        signature.update(hashlib.sha256(path.read_bytes()).digest())
+    return signature.hexdigest()
+
+
+def evaluate_case(job):
+    case, label_path, model_paths, protocol, partial_path, run_id = job
+    partial_path = Path(partial_path)
+    paths = [label_path, *(path for _, path in model_paths)]
+    source_hash = input_signature(paths)
+    if partial_path.is_file():
+        saved = json.loads(partial_path.read_text(encoding="utf-8"))
+        if (saved.get("run_id") != run_id or saved.get("case_id") != case or
+                saved.get("input_sha256") != source_hash or
+                set(saved.get("rows", {})) != {name for name, _ in model_paths}):
+            raise ValueError(f"Partial result does not match current inputs: {partial_path}")
+        return saved, True
+
+    target = read_binary(Path(label_path), protocol["image_size"],
+                         allow_replicated_rgb=True)
+    started = time.perf_counter()
+    prepared = prepare_target(target, protocol)
+    gt_seconds = time.perf_counter() - started
+    print(f"[TIMING] {case} GT_graph={gt_seconds:.1f}s", flush=True)
+    rows = {}
+    for name, path in model_paths:
+        pred = read_binary(Path(path), protocol["image_size"])
+        rows[name] = {"case_id": case, **image_metrics(
+            pred, prepared, protocol, timing_label=f"{case} {name}")}
+    result = {
+        "case_id": case, "run_id": run_id, "input_sha256": source_hash,
+        "timing_gt_graph_seconds": gt_seconds, "rows": rows,
+    }
+    temporary = partial_path.with_name(partial_path.name + f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(result, allow_nan=False) + "\n", encoding="utf-8")
+    os.replace(temporary, partial_path)
+    return result, False
+
+
+def evaluate(manifest, base, protocol, split, selection, output, progress,
+             workers=1, resume=False):
     if not compatible_selection(selection, protocol):
         raise ValueError("Selection must originate from val with this metric protocol or verified v1 protocol")
     labels = label_index(resolve_path(manifest["data_root"], base), split)
@@ -269,60 +333,83 @@ def evaluate(manifest, base, protocol, split, selection, output, progress):
             raise ValueError(f"Need exactly one {split} mask directory at val-selected threshold "
                              f"{selected['threshold']} for {model['name']}; cannot rethreshold binary PNG")
         models.append((model, prediction_index(matches[0], base, labels), selected))
+
+    source_hashes = metric_source_hashes()
+    run_state = {
+        "split": split, "case_ids_sha256": digest(sorted(labels)),
+        "manifest_sha256": digest(manifest), "selection_sha256": digest(selection),
+        "protocol_sha256": digest(protocol), "metric_implementation_sha256": source_hashes,
+    }
+    run_id = digest(run_state)
+    state_path = output / "run_state.json"
+    if state_path.exists():
+        if not resume:
+            raise ValueError(f"Existing run requires --resume: {output}")
+        if json.loads(state_path.read_text(encoding="utf-8")) != run_state:
+            raise ValueError("Existing run has different inputs, protocol, or implementation")
+    else:
+        if any(path.name != "imported_val_selection.json" for path in output.iterdir()):
+            raise ValueError(f"Output directory has files but no run_state.json: {output}")
+        write_json(state_path, run_state)
+    partial_dir = output / "partial"
+    partial_dir.mkdir(exist_ok=True)
+
+    jobs = []
+    for case, label_path in sorted(labels.items()):
+        paths = [(model["name"], str(predictions[case]))
+                 for model, predictions, _ in models]
+        partial_name = hashlib.sha256(case.encode("utf-8")).hexdigest() + ".json"
+        jobs.append((case, str(label_path), paths, protocol,
+                     str(partial_dir / partial_name), run_id))
+
     rows_by_model = {model["name"]: [] for model, _, _ in models}
-    streams = []
-    writers = {}
+    completed = {}
     started = time.perf_counter()
-    content_hashes = {"gt": hashlib.sha256(), **{m["name"]: hashlib.sha256() for m, _, _ in models}}
-    try:
-        for model, _, _ in models:
-            stream = (output / f"{model['name']}_{split}_per_image.csv").open(
-                "w", newline="", encoding="utf-8",
-            )
-            streams.append(stream)
-            writers[model["name"]] = (stream, None)
-        for i, (case, path) in enumerate(sorted(labels.items()), 1):
-            if i == 1 or i % progress == 0:
-                print(f"[{split}] starting image {i}/{len(labels)}: {case}", flush=True)
-            target = read_binary(path, protocol["image_size"], allow_replicated_rgb=True)
-            content_hashes["gt"].update(case.encode() + b"\0" + np.packbits(target).tobytes())
-            prepared = prepare_target(target, protocol)
-            for model, predictions, _ in models:
-                name = model["name"]
-                pred = read_binary(predictions[case], protocol["image_size"])
-                content_hashes[name].update(case.encode() + b"\0" + np.packbits(pred).tobytes())
-                row = {"case_id": case, **image_metrics(pred, prepared, protocol)}
-                rows_by_model[name].append(row)
-                stream, writer = writers[name]
-                if writer is None:
-                    writer = csv.DictWriter(stream, fieldnames=list(row))
-                    writer.writeheader()
-                    writers[name] = (stream, writer)
-                writer.writerow(row)
-                stream.flush()
-            if i == 1 or i % progress == 0 or i == len(labels):
-                elapsed = time.perf_counter() - started
-                print(f"[{split}] done {i}/{len(labels)}; {elapsed:.1f}s; "
-                      f"ETA {elapsed / i * (len(labels) - i):.1f}s", flush=True)
-    finally:
-        for stream in streams:
-            stream.close()
+    if workers == 1:
+        results = map(evaluate_case, jobs)
+        for i, (result, cached) in enumerate(results, 1):
+            completed[result["case_id"]] = result
+            if i == 1 or i % progress == 0 or i == len(jobs):
+                print(f"[{split}] {i}/{len(jobs)} {result['case_id']} "
+                      f"{'cached' if cached else 'computed'}; "
+                      f"elapsed={time.perf_counter() - started:.1f}s", flush=True)
+    else:
+        pool = multiprocessing.Pool(processes=workers)
+        try:
+            for i, (result, cached) in enumerate(pool.imap(evaluate_case, jobs), 1):
+                completed[result["case_id"]] = result
+                if i == 1 or i % progress == 0 or i == len(jobs):
+                    print(f"[{split}] {i}/{len(jobs)} {result['case_id']} "
+                          f"{'cached' if cached else 'computed'}; "
+                          f"elapsed={time.perf_counter() - started:.1f}s", flush=True)
+        except BaseException:
+            pool.terminate()
+            raise
+        else:
+            pool.close()
+        finally:
+            pool.join()
+
+    content_hashes = {"gt": hashlib.sha256(), **{m["name"]: hashlib.sha256()
+                                                for m, _, _ in models}}
+    for case, path in sorted(labels.items()):
+        target = read_binary(path, protocol["image_size"], allow_replicated_rgb=True)
+        content_hashes["gt"].update(case.encode() + b"\0" + np.packbits(target).tobytes())
+        for model, predictions, _ in models:
+            name = model["name"]
+            pred = read_binary(predictions[case], protocol["image_size"])
+            content_hashes[name].update(case.encode() + b"\0" + np.packbits(pred).tobytes())
+            rows_by_model[name].append(completed[case]["rows"][name])
+    for name, rows in rows_by_model.items():
+        write_csv(output / f"{name}_{split}_per_image.csv", rows)
+
     summaries = []
     for model, _, selected in models:
         summaries.append({"name": model["name"], "threshold": selected["threshold"],
                           **summarize(rows_by_model[model["name"]])})
     report = {
         "split": split, "protocol": protocol, "threshold_selection": selection,
-        "metric_implementation_sha256": {
-            name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-            for name in ("compare_predictions.py", "road_metrics.py", "official_graph_metrics.py",
-                         "vendor/sat2graph/graph.py", "vendor/sat2graph/topo.py",
-                         "vendor/sat2graph/main.upstream.py.txt",
-                         "vendor/sat2graph/graph.upstream.py.txt", "vendor/sat2graph/topo.upstream.py.txt",
-                         "vendor/cosmiq/apls.upstream.py.txt", "vendor/cosmiq/apls_utils.upstream.py.txt",
-                         "vendor/metrics_delin/toolong_tooshort_metric.upstream.py.txt",
-                         "vendor/metrics_delin/utils.upstream.py.txt")
-        },
+        "metric_implementation_sha256": source_hashes,
         "case_ids": sorted(labels), "case_ids_sha256": digest(sorted(labels)),
         "binary_content_sha256": {key: value.hexdigest() for key, value in content_hashes.items()},
         "provenance": {m["name"]: m["provenance"] for m, _, _ in models},
@@ -331,6 +418,9 @@ def evaluate(manifest, base, protocol, split, selection, output, progress):
                         "networkx": networkx.__version__, "shapely": shapely.__version__},
         "summaries": summaries,
         "metric_runtime_seconds": time.perf_counter() - started,
+        "workers": workers, "resumable_state_sha256": run_id,
+        "timing_gt_graph_seconds_total": sum(
+            completed[case]["timing_gt_graph_seconds"] for case in labels),
         "timing_note": "CPU mask evaluation only; no model inference timing can be obtained from PNG",
     }
     write_json(output / f"{split}_report.json", report)
@@ -352,9 +442,17 @@ def main():
                         help="on val, select threshold and write scores without computing topology")
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--progress_every", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Independent image processes; each process evaluates every model")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue matching partial image results in output_dir")
     args = parser.parse_args()
     if args.progress_every < 1:
         parser.error("--progress_every must be positive")
+    if args.workers < 1:
+        parser.error("--workers must be positive")
+    if args.resume and (args.split != "test" or args.select_threshold_only):
+        parser.error("--resume is for test topology evaluation")
     if args.selection and args.import_val_selection:
         parser.error("Choose --selection or --import_val_selection, not both")
     if args.split == "val" and (args.selection or args.import_val_selection):
@@ -367,7 +465,8 @@ def main():
     base = args.manifest.resolve().parent
     protocol = validate_manifest(manifest)
     # Do not overwrite an earlier report, especially an interrupted partial run.
-    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+    if (args.output_dir.exists() and any(args.output_dir.iterdir()) and
+            not args.resume):
         parser.error("output_dir is not empty; use a new directory")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.split == "val":
@@ -380,7 +479,8 @@ def main():
         write_json(args.output_dir / "imported_val_selection.json", selection)
     else:
         selection = json.loads(args.selection.read_text(encoding="utf-8-sig"))
-    evaluate(manifest, base, protocol, args.split, selection, args.output_dir, args.progress_every)
+    evaluate(manifest, base, protocol, args.split, selection, args.output_dir,
+             args.progress_every, workers=args.workers, resume=args.resume)
 
 
 if __name__ == "__main__":

@@ -2,21 +2,24 @@
 
 import cv2
 import numpy as np
+import time
 from scipy.sparse import csr_matrix
 
 from official_graph_metrics import graph_scores, prepare_official_graph
 
 
-METRIC_VERSION = "road-mask-v4.0-official-tlts"
+METRIC_VERSION = "road-mask-v5.0-official-sparse"
 DEFAULT_PROTOCOL = {
     "metric_version": METRIC_VERSION,
     "image_size": 1024,
     "short_area_threshold": 20,
     "legacy_apls_max_nodes_ignored": 64,
     "apls_snap_radius": 5.0,
-    "apls_control_spacing_px": 50.0,
+    "apls_control_spacing_px": 100.0,
     "apls_min_path_px": 10.0,
-    "tlts_n_paths": 1000,
+    "tlts_n_paths": 200,
+    "topo_seed_density_deg": 0.00100,
+    "topo_step_deg": 0.00010,
     "tlts_max_node_dist_px": 25.0,
     "tlts_length_tolerance": 0.05,
     "tlts_seed": 1234,
@@ -30,7 +33,7 @@ DEFAULT_PROTOCOL = {
     "topo_source": "Sat2Graph 7ca4a345a2ceae4c62c120661608a60e9e962be4",
     "apls_source": "CosmiQ/apls 4a78807cafde62b773e3a1190177526853c61207",
     "tlts_source": "lcit/metrics_delin 30f1ad9ccc901e63770f39a80b0e1ec6bbfb34d9",
-    "topo_settings": "official main.py: density 0.00050, step 0.00005, threshold 0.00010, radius 0.00150 or 0.00300 degrees",
+    "topo_settings": "Sat2Graph functions: configurable seed density and walk step; threshold 0.00010, radius 0.00150 or 0.00300 degrees",
     "tlts_protocol": "authors' toolong_tooshort: independent random GT paths; 25-pixel endpoint match; 5-percent length tolerance",
     "tlts_seed_rule": "sha256(GT skeleton points + base seed), first four bytes; same GT paths for all models",
     "postprocessing": "none; use supplied binary masks without resizing",
@@ -130,7 +133,8 @@ def segmentation(counts):
             "precision": ratio(tp, tp + fp), "recall": ratio(tp, tp + fn)}
 
 
-def image_metrics(pred, prepared, protocol):
+def image_metrics(pred, prepared, protocol, timing_label=None):
+    started = time.perf_counter()
     target, gt_skeleton = prepared["mask"], prepared["skeleton"]
     pred_skeleton = skeletonize(pred)
     pred_stats = component_stats(pred, protocol["short_area_threshold"])
@@ -139,9 +143,17 @@ def image_metrics(pred, prepared, protocol):
     gap_stats = component_stats(missing, 2)
     topo_precision = ratio((pred_skeleton & target).sum(), pred_skeleton.sum())
     topo_recall = ratio((gt_skeleton & pred).sum(), gt_skeleton.sum())
+    cldice_seconds = time.perf_counter() - started
+    if timing_label:
+        print(f"[TIMING] {timing_label} clDice_mask={cldice_seconds:.1f}s", flush=True)
+    graph_started = time.perf_counter()
     pred_points, pred_pixel_graph = skeleton_graph(pred_skeleton)
     pred_graph = prepare_official_graph(pred_points, pred_pixel_graph, id_offset=1_000_000_000)
-    graph_result = graph_scores(prepared["graph"], pred_graph, protocol)
+    preparation_seconds = time.perf_counter() - graph_started
+    if timing_label:
+        print(f"[TIMING] {timing_label} pred_graph={preparation_seconds:.1f}s", flush=True)
+    graph_result = graph_scores(prepared["graph"], pred_graph, protocol,
+                                timing_label=timing_label)
     row = confusion(pred, target)
     row.update({
         "cldice_precision": topo_precision, "cldice_recall": topo_recall,
@@ -157,6 +169,9 @@ def image_metrics(pred, prepared, protocol):
         "gap_components": gap_stats["count"], "max_gap_pixels": gap_stats["max_area"],
     })
     row.update(graph_result)
+    row["timing_cldice_mask_seconds"] = cldice_seconds
+    row["timing_pred_graph_seconds"] = preparation_seconds
+    row["timing_total_seconds"] = time.perf_counter() - started
     return row
 
 

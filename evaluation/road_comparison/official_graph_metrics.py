@@ -251,7 +251,7 @@ def _official_tlts(gt, pred, protocol):
     return tuple(map(float, values))
 
 
-def _sat_topo_score(gt, pred):
+def _sat_topo_score(gt, pred, protocol):
     if len(gt["points"]) == 0 and len(pred["points"]) == 0:
         return 1.0, 1.0, 0
     if len(gt["points"]) == 0 or len(pred["points"]) == 0:
@@ -266,7 +266,8 @@ def _sat_topo_score(gt, pred):
     ground.region = proposal.region = region
     with redirect_stdout(_NullWriter()):
         seeds = sat_topo.TOPOGenerateStartingPoints(
-            ground, region=region, image="NULL", check=False, direction=False)
+            ground, density=protocol["topo_seed_density_deg"], region=region,
+            image="NULL", check=False, direction=False)
         if not seeds:
             return 0.0, 0.0, 0
         pairs = sat_topo.TOPOGeneratePairs(
@@ -276,7 +277,8 @@ def _sat_topo_score(gt, pred):
         radius = 0.00150 if 41.0 - min_lat < 0.01000 else 0.00300
         with tempfile.TemporaryDirectory() as temp:
             result = sat_topo.TOPOWithPairs(
-                proposal, ground, pairs, seeds, r=radius, step=0.00005,
+                proposal, ground, pairs, seeds, r=radius,
+                step=protocol["topo_step_deg"],
                 threshold=0.00010, outputfile=str(Path(temp) / "topo.txt"),
                 one2oneMatching=True, metaData=None)
     precision, matched_recall = sat_topo.topoAvg(result)
@@ -317,11 +319,23 @@ def _official_apls(gt, pred, protocol):
     return float(total), float(forward), float(reverse), counts
 
 
-def graph_scores(gt, pred, protocol):
-    precision, recall, seeds = _sat_topo_score(gt, pred)
+def graph_scores(gt, pred, protocol, timing_label=None):
+    started = time.perf_counter()
+    precision, recall, seeds = _sat_topo_score(gt, pred, protocol)
+    topo_seconds = time.perf_counter() - started
+    if timing_label:
+        print(f"[TIMING] {timing_label} TOPO={topo_seconds:.1f}s seeds={seeds}", flush=True)
+    started = time.perf_counter()
     apls_total, apls_forward, apls_reverse, pairs = _official_apls(gt, pred, protocol)
+    apls_seconds = time.perf_counter() - started
+    if timing_label:
+        print(f"[TIMING] {timing_label} APLS={apls_seconds:.1f}s", flush=True)
+    started = time.perf_counter()
     tlts_correct, tlts_too_long, tlts_too_short, tlts_infeasible = _official_tlts(
         gt, pred, protocol)
+    tlts_seconds = time.perf_counter() - started
+    if timing_label:
+        print(f"[TIMING] {timing_label} TLTS={tlts_seconds:.1f}s", flush=True)
     topo_f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
         "topo_precision": precision, "topo_recall": recall, "topo_f1": topo_f1,
@@ -331,4 +345,7 @@ def graph_scores(gt, pred, protocol):
         "apls_gt_pairs": pairs["gt"], "apls_pred_pairs": pairs["pred"],
         "tlts_correct": tlts_correct, "tlts_too_long": tlts_too_long,
         "tlts_too_short": tlts_too_short, "tlts_infeasible": tlts_infeasible,
+        "timing_topo_seconds": topo_seconds,
+        "timing_apls_seconds": apls_seconds,
+        "timing_tlts_seconds": tlts_seconds,
     }
