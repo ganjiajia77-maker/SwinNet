@@ -1,9 +1,11 @@
-# Original H0 on Massachusetts Roads
+# H0 without direction task on Massachusetts Roads
 
 Base architecture: `599a410de8d341850e1810417307e4b3bbdfc82d`.
-The 14 model, loss, and direction-target files in `BASE_MODEL_SHA256.json` are
-byte-for-byte identical to that commit. This package changes data handling,
-training/evaluation entry points, and the unified metric adapter.
+This ablation starts from that H0 package and removes the decoder direction
+head, its forward computation, the D2-to-decoder attention input, and direction
+loss. Skeleton and connectivity tasks remain. The remaining H0 model/loss files
+are recorded in `BASE_MODEL_SHA256.json` so the server package can verify its
+source contents.
 
 ## Fixed experiment
 
@@ -21,7 +23,8 @@ training/evaluation entry points, and the unified metric adapter.
 - Training validation every 5 epochs; step-based trend validation disabled.
 - ImageNet SwinV2 Tiny window8/256 pretraining; no data1 checkpoint warm start.
 - Original H0 learning rates: pretrained 5e-5 -> 5e-6, new 2e-4 -> 1e-5,
-  warmup 10 epochs. Original H0 skeleton/connectivity/direction/surface losses.
+  warmup 10 epochs. Skeleton, connectivity, and surface losses remain; direction
+  loss is disabled. C's eight directional channels and class weights remain.
 
 Required dataset layout:
 
@@ -46,7 +49,7 @@ conda activate swinunet
 
 DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
 OUT=/home/gjj/SwinNet-h0-mass/model_out
-RUN="mass_h0_599a410_random512_fp32_80e_bs2_$(date +%Y%m%d_%H%M%S)"
+RUN="mass_h0_no_direction_random512_fp32_80e_bs2_$(date +%Y%m%d_%H%M%S)"
 printf '%s\n' "$RUN" > mass_run_name.txt
 
 python -u mass_h0.py train --gpu 2 \

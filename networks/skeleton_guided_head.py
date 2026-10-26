@@ -704,10 +704,6 @@ class DecoderStructureRefinement(nn.Module):
         self.skeleton_head = SkeletonSpatialHead(channels)
         self.connectivity_context = ConnectivityContextBlock(channels)
         self.connectivity_head = PairwiseConnectivityHead(channels, connectivity_channels)
-        self.direction_head = nn.Sequential(
-            ConvBNReLU(channels, channels),
-            nn.Conv2d(channels, 2, kernel_size=1),
-        )
         self.structure_gate = nn.Sequential(
             nn.Conv2d(channels + 2, fusion_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
@@ -837,7 +833,6 @@ class DecoderStructureRefinement(nn.Module):
         if connectivity_override is not None:
             runtime_connectivity_skeleton = connectivity_override
 
-        direction_logits = self.direction_head(structure_feat)
         connectivity_feat = self.connectivity_context(structure_feat)
         connectivity_logits = self.connectivity_head(
             connectivity_feat,
@@ -928,7 +923,7 @@ class DecoderStructureRefinement(nn.Module):
             out,
             skeleton_logits,
             connectivity_logits,
-            direction_logits,
+            None,
             structure_gate,
             diagnostics,
         )

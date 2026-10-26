@@ -1916,14 +1916,6 @@ class SwinTransformerSys(nn.Module):
             device=device,
             dtype=dtype,
         )
-        direction_logits = torch.zeros(
-            batch,
-            2,
-            height,
-            width,
-            device=device,
-            dtype=dtype,
-        )
         structure_gate = torch.zeros(
             batch,
             1,
@@ -1932,7 +1924,7 @@ class SwinTransformerSys(nn.Module):
             device=device,
             dtype=dtype,
         )
-        return skeleton_logits, connectivity_logits, direction_logits, structure_gate, None
+        return skeleton_logits, connectivity_logits, None, structure_gate, None
 
     def _build_stage3_global_context(self, bottleneck_tokens, target_hw):
         batch, length, channels = bottleneck_tokens.shape
@@ -2218,7 +2210,7 @@ class SwinTransformerSys(nn.Module):
                         x,
                         decoder_skeleton_prob=skeleton_used,
                         decoder_connectivity_prob=connectivity_used,
-                        decoder_direction_prob=direction_0,
+                        decoder_direction_prob=None,
                     )
                 output_scale = 2 ** max(2 - inx, 0)
                 output_height = self.patches_resolution[0] // output_scale

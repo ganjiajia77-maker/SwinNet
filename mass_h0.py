@@ -46,7 +46,7 @@ def train_command(args):
             '--stage_skeleton_loss_factor', '1.0', '--stage_skeleton_only_loss_factor', '1.0',
             '--stage2_skeleton_gradient_ratio', '0.5', '--stage3_skeleton_gradient_ratio', '0.5',
             '--stage3_gate_topology_gradient_ratio', '0.0', '--skeleton_pos_weight', '2.0',
-            '--highres_structure_skeleton_weight', '0.0', '--stage_direction_factor', '0.2',
+            '--highres_structure_skeleton_weight', '0.0', '--stage_direction_factor', '0.0',
             '--stage_connectivity_factor', '3.0', '--road_attention_weight', '0.0',
             '--masked_connectivity_center_experiment', '--connectivity_pos_weight', '2.0',
             '--connectivity_focal_gamma', '1.5', '--edge_contrastive_margin', '0.1',
@@ -169,7 +169,7 @@ def main():
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or 'mass_h0_599a410_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.run_name = args.run_name or 'mass_h0_no_direction_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
             parser.error(f'Fresh run directory already exists: {run_dir}')
