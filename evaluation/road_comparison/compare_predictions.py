@@ -19,6 +19,7 @@ import shapely
 
 from road_metrics import (DEFAULT_PROTOCOL, confusion, image_metrics, prepare_target,
                           segmentation, summarize)
+from official_graph_metrics import prepare_apls_reference
 
 
 EXTENSIONS = {".png", ".tif", ".tiff", ".bmp", ".npy"}
@@ -159,13 +160,17 @@ def validate_manifest(manifest):
         raise ValueError(f"Unsupported protocol settings: {set(overrides) - adjustable}")
     if "apls_max_nodes" in overrides:
         protocol["legacy_apls_max_nodes_ignored"] = overrides.pop("apls_max_nodes")
+    if "apls_control_spacing_px" in overrides:
+        protocol["legacy_apls_control_spacing_px_ignored"] = overrides.pop(
+            "apls_control_spacing_px")
     protocol.update(overrides)
     for key in ("image_size", "short_area_threshold", "legacy_apls_max_nodes_ignored",
                 "tlts_n_paths"):
         value = protocol[key]
         if not isinstance(value, int) or value < (2 if key == "legacy_apls_max_nodes_ignored" else 1):
             raise ValueError(f"Invalid {key}: {value}")
-    for key in ("apls_snap_radius", "apls_control_spacing_px", "apls_min_path_px",
+    for key in ("apls_snap_radius", "legacy_apls_control_spacing_px_ignored",
+                "apls_min_path_px",
                 "topo_seed_density_deg", "topo_step_deg"):
         if not np.isfinite(protocol[key]) or protocol[key] <= 0:
             raise ValueError(f"{key} must be finite and positive")
@@ -302,6 +307,12 @@ def evaluate_case(job):
     prepared = prepare_target(target, protocol)
     gt_seconds = time.perf_counter() - started
     print(f"[TIMING] {case} GT_graph={gt_seconds:.1f}s", flush=True)
+    started = time.perf_counter()
+    apls_reference = prepare_apls_reference(prepared["graph"])
+    apls_gt_seconds = time.perf_counter() - started
+    print(f"[TIMING] {case} APLS_GT_NATIVE={apls_gt_seconds:.1f}s "
+          f"controls={len(apls_reference['controls'])} reused_for={len(model_paths)}_models",
+          flush=True)
     rows = {}
     for name, path in model_paths:
         pred = read_binary(Path(path), protocol["image_size"])
@@ -309,7 +320,8 @@ def evaluate_case(job):
             pred, prepared, protocol, timing_label=f"{case} {name}")}
     result = {
         "case_id": case, "run_id": run_id, "input_sha256": source_hash,
-        "timing_gt_graph_seconds": gt_seconds, "rows": rows,
+        "timing_gt_graph_seconds": gt_seconds,
+        "timing_apls_gt_native_seconds": apls_gt_seconds, "rows": rows,
     }
     temporary = partial_path.with_name(partial_path.name + f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(result, allow_nan=False) + "\n", encoding="utf-8")

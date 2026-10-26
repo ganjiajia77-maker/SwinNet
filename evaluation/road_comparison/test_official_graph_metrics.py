@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -61,20 +62,56 @@ class OfficialGraphMetricsTest(unittest.TestCase):
         self.assertEqual(again["apls_bidirectional"], whole["apls_bidirectional"])
         self.assertEqual(again["apls_gt_pairs"], whole["apls_gt_pairs"])
 
-    def test_apls_controls_are_not_capped_at_64(self):
-        from official_graph_metrics import _official_apls, prepare_official_graph
+    def test_apls_uses_original_graph_nodes_and_reuses_gt_paths(self):
+        from official_graph_metrics import (_official_apls, prepare_apls_reference,
+                                            prepare_official_graph)
 
         mask = np.zeros((16, 900), dtype=bool)
         mask[8, 10:890] = True
         points, pixel = skeleton_graph(mask)
         ground = prepare_official_graph(points, pixel)
         proposed = prepare_official_graph(points, pixel, id_offset=1_000_000_000)
-        protocol = dict(DEFAULT_PROTOCOL, apls_control_spacing_px=10.0)
-        total, forward, reverse, pairs = _official_apls(ground, proposed, protocol)
-        self.assertGreater(pairs["gt"], 64 * 63)
+        original_nodes = ground["compact"].number_of_nodes()
+        reference = prepare_apls_reference(ground)
+        total, forward, reverse, pairs, _ = _official_apls(ground, proposed, DEFAULT_PROTOCOL)
+        self.assertIs(prepare_apls_reference(ground), reference)
+        self.assertEqual(pairs["gt_controls"], original_nodes)
+        self.assertEqual(pairs["pred_controls"], proposed["compact"].number_of_nodes())
+        self.assertEqual(original_nodes, 2)
+        self.assertEqual(pairs["gt"], 2)
         self.assertAlmostEqual(total, 1.0)
         self.assertAlmostEqual(forward, 1.0)
         self.assertAlmostEqual(reverse, 1.0)
+
+    def test_node_only_apls_matches_pinned_reference_without_midpoints(self):
+        from contextlib import redirect_stdout
+        from official_graph_metrics import (_NullWriter, _official_apls,
+                                            prepare_official_graph)
+
+        line = np.zeros((24, 120), dtype=bool)
+        line[12, 8:112] = True
+        broken = line.copy()
+        broken[12, 54:61] = False
+        gt_points, gt_pixel = skeleton_graph(line)
+        pred_points, pred_pixel = skeleton_graph(broken)
+        ground = prepare_official_graph(gt_points, gt_pixel)
+        proposed = prepare_official_graph(pred_points, pred_pixel,
+                                          id_offset=1_000_000_000)
+        apls = _cosmiq()
+        with patch.object(apls, "create_graph_midpoints",
+                          side_effect=lambda graph, **kwargs: (graph, [], [])):
+            with redirect_stdout(_NullWriter()):
+                result = apls.make_graphs(
+                    ground["compact"].copy(), proposed["compact"].copy(),
+                    weight="length", max_snap_dist=DEFAULT_PROTOCOL["apls_snap_radius"],
+                    allow_renaming=True)
+                expected = apls.compute_apls_metric(
+                    result[6], result[7], result[8], result[9],
+                    result[4], result[5],
+                    min_path_length=DEFAULT_PROTOCOL["apls_min_path_px"])
+        actual = _official_apls(ground, proposed, DEFAULT_PROTOCOL)
+        for expected_score, actual_score in zip(expected, actual[:3]):
+            self.assertAlmostEqual(expected_score, actual_score, places=10)
 
     def test_previous_validation_threshold_selection_is_usable(self):
         selection = {"schema": 2, "selected_on": "val", "protocol_hash": digest({}),

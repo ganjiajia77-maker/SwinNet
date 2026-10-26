@@ -8,14 +8,15 @@ from scipy.sparse import csr_matrix
 from official_graph_metrics import graph_scores, prepare_official_graph
 
 
-METRIC_VERSION = "road-mask-v5.0-official-sparse"
+METRIC_VERSION = "road-mask-v6.0-official-node-apls"
 DEFAULT_PROTOCOL = {
     "metric_version": METRIC_VERSION,
     "image_size": 1024,
     "short_area_threshold": 20,
     "legacy_apls_max_nodes_ignored": 64,
     "apls_snap_radius": 5.0,
-    "apls_control_spacing_px": 100.0,
+    "apls_control_mode": "original_graph_nodes_only",
+    "legacy_apls_control_spacing_px_ignored": 100.0,
     "apls_min_path_px": 10.0,
     "tlts_n_paths": 200,
     "topo_seed_density_deg": 0.00100,
@@ -26,6 +27,7 @@ DEFAULT_PROTOCOL = {
     "connectivity": 8,
     "skeleton": "numpy_zhang_suen_zero_padded",
     "snap_rule": "official CosmiQ nearest-edge projection and control-point insertion",
+    "apls_protocol": "all original compact-graph nodes are controls; no edge midpoints; GT native paths reused across models; only control-to-control prime paths computed",
     "segmentation_aggregation": "global TP/FP/FN",
     "topology_aggregation": "per-image mean of Sat2Graph TOPO, CosmiQ APLS and metrics_delin TLTS outputs",
     "graph_protocol": "raster skeleton to 8-neighbor graph; exact degree-two chain contraction for APLS",

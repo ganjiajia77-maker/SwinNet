@@ -285,19 +285,72 @@ def _sat_topo_score(gt, pred, protocol):
     return float(precision), float(matched_recall * len(result) / len(seeds)), len(seeds)
 
 
+def _apls_native_graph(graph):
+    """Apply the same edge cleanup and travel-time preparation as make_graphs."""
+    apls = _cosmiq()
+    with redirect_stdout(_NullWriter()):
+        cleaned = apls.create_edge_linestrings(graph.copy().to_undirected())
+        return apls.add_travel_time(cleaned.copy())
+
+
+def _apls_controls(graph):
+    return [[node, graph.nodes[node]["x"], graph.nodes[node]["y"]]
+            for node in graph.nodes()]
+
+
+def prepare_apls_reference(gt):
+    """Compute original-node GT paths once and reuse them for every prediction."""
+    if "apls_reference" not in gt:
+        graph = _apls_native_graph(gt["compact"])
+        gt["apls_reference"] = {
+            "controls": _apls_controls(graph),
+            "paths": dict(nx.shortest_path_length(graph, weight="length")),
+        }
+    return gt["apls_reference"]
+
+
+def _apls_control_paths(graph, controls):
+    """Only retain paths that the pinned scorer reads between control nodes."""
+    control_ids = {point[0] for point in controls}
+    return {
+        node: {target: distance for target, distance in
+               nx.single_source_dijkstra_path_length(graph, node, weight="length").items()
+               if target in control_ids}
+        for node in control_ids if node in graph
+    }
+
+
 def _official_apls(gt, pred, protocol):
     apls = _cosmiq()
     counts = {"gt": 0, "pred": 0}
+    timing = {}
+    reference = prepare_apls_reference(gt)
     with redirect_stdout(_NullWriter()):
-        prepared = apls.make_graphs(
-            gt["compact"].copy(), pred["compact"].copy(), weight="length",
-            linestring_delta=protocol["apls_control_spacing_px"],
-            is_curved_eps=-1, max_snap_dist=protocol["apls_snap_radius"],
-            allow_renaming=True)
-        if prepared is None:
-            raise RuntimeError("Official CosmiQ make_graphs returned no graph tuple")
-        (_, _, _, _, controls_gt, controls_pred,
-         paths_gt, paths_pred, paths_gt_prime, paths_pred_prime) = prepared
+        started = time.perf_counter()
+        pred_graph = _apls_native_graph(pred["compact"])
+        controls_pred = _apls_controls(pred_graph)
+        paths_pred = dict(nx.shortest_path_length(pred_graph, weight="length"))
+        timing["pred_native"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        pred_prime, _, _ = apls.insert_control_points(
+            pred_graph.copy(), reference["controls"],
+            max_distance_meters=protocol["apls_snap_radius"],
+            allow_renaming=True, verbose=False)
+        gt_prime, _, _ = apls.insert_control_points(
+            gt["compact"].copy(), controls_pred,
+            max_distance_meters=protocol["apls_snap_radius"],
+            allow_renaming=True, verbose=False)
+        pred_prime = apls.add_travel_time(pred_prime.copy())
+        gt_prime = apls.add_travel_time(gt_prime.copy())
+        timing["control_insert"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        paths_pred_prime = _apls_control_paths(pred_prime, reference["controls"])
+        paths_gt_prime = _apls_control_paths(gt_prime, controls_pred)
+        timing["prime_paths"] = time.perf_counter() - started
+
+        started = time.perf_counter()
         captures = []
         official_path = apls.path_sim_metric
 
@@ -309,14 +362,18 @@ def _official_apls(gt, pred, protocol):
         apls.path_sim_metric = capture
         try:
             total, forward, reverse = apls.compute_apls_metric(
-                paths_gt, paths_pred, paths_gt_prime, paths_pred_prime,
-                controls_gt, controls_pred, min_path_length=protocol["apls_min_path_px"])
+                reference["paths"], paths_pred, paths_gt_prime, paths_pred_prime,
+                reference["controls"], controls_pred,
+                min_path_length=protocol["apls_min_path_px"])
         finally:
             apls.path_sim_metric = official_path
+        timing["score"] = time.perf_counter() - started
     if captures:
         for direction, captured in zip(("gt", "pred"), captures):
             counts[direction] = len(captured[2])
-    return float(total), float(forward), float(reverse), counts
+    counts["gt_controls"] = len(reference["controls"])
+    counts["pred_controls"] = len(controls_pred)
+    return float(total), float(forward), float(reverse), counts, timing
 
 
 def graph_scores(gt, pred, protocol, timing_label=None):
@@ -326,10 +383,16 @@ def graph_scores(gt, pred, protocol, timing_label=None):
     if timing_label:
         print(f"[TIMING] {timing_label} TOPO={topo_seconds:.1f}s seeds={seeds}", flush=True)
     started = time.perf_counter()
-    apls_total, apls_forward, apls_reverse, pairs = _official_apls(gt, pred, protocol)
+    apls_total, apls_forward, apls_reverse, pairs, apls_timing = _official_apls(
+        gt, pred, protocol)
     apls_seconds = time.perf_counter() - started
     if timing_label:
-        print(f"[TIMING] {timing_label} APLS={apls_seconds:.1f}s", flush=True)
+        print(f"[TIMING] {timing_label} APLS={apls_seconds:.1f}s "
+              f"controls_gt={pairs['gt_controls']} controls_pred={pairs['pred_controls']} "
+              f"pred_native={apls_timing['pred_native']:.1f}s "
+              f"insert={apls_timing['control_insert']:.1f}s "
+              f"prime_paths={apls_timing['prime_paths']:.1f}s "
+              f"score={apls_timing['score']:.1f}s", flush=True)
     started = time.perf_counter()
     tlts_correct, tlts_too_long, tlts_too_short, tlts_infeasible = _official_tlts(
         gt, pred, protocol)
@@ -343,9 +406,15 @@ def graph_scores(gt, pred, protocol, timing_label=None):
         "apls_gt_to_pred": apls_forward, "apls_pred_to_gt": apls_reverse,
         "apls_bidirectional": apls_total,
         "apls_gt_pairs": pairs["gt"], "apls_pred_pairs": pairs["pred"],
+        "apls_gt_controls": pairs["gt_controls"],
+        "apls_pred_controls": pairs["pred_controls"],
         "tlts_correct": tlts_correct, "tlts_too_long": tlts_too_long,
         "tlts_too_short": tlts_too_short, "tlts_infeasible": tlts_infeasible,
         "timing_topo_seconds": topo_seconds,
         "timing_apls_seconds": apls_seconds,
+        "timing_apls_pred_native_seconds": apls_timing["pred_native"],
+        "timing_apls_control_insert_seconds": apls_timing["control_insert"],
+        "timing_apls_prime_paths_seconds": apls_timing["prime_paths"],
+        "timing_apls_score_seconds": apls_timing["score"],
         "timing_tlts_seconds": tlts_seconds,
     }
