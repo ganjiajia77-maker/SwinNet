@@ -433,6 +433,11 @@ def evaluate(manifest, base, protocol, split, selection, output, progress,
         "workers": workers, "resumable_state_sha256": run_id,
         "timing_gt_graph_seconds_total": sum(
             completed[case]["timing_gt_graph_seconds"] for case in labels),
+        "timing_apls_gt_native_seconds_total": sum(
+            completed[case]["timing_apls_gt_native_seconds"] for case in labels),
+        "timing_apls_models_seconds_total": sum(
+            completed[case]["rows"][name]["timing_apls_seconds"]
+            for case in labels for name in rows_by_model),
         "timing_note": "CPU mask evaluation only; no model inference timing can be obtained from PNG",
     }
     write_json(output / f"{split}_report.json", report)

@@ -147,6 +147,8 @@ class OfficialGraphMetricsTest(unittest.TestCase):
             report = evaluate(manifest, root, protocol, "test", selection, test_output, 1)
             self.assertEqual(report["summaries"][0]["threshold"], 0.3)
             self.assertEqual(report["summaries"][0]["apls_bidirectional"], 1.0)
+            self.assertIn("timing_apls_gt_native_seconds_total", report)
+            self.assertIn("timing_apls_models_seconds_total", report)
             self.assertTrue((test_output / "test_report.json").exists())
 
 
