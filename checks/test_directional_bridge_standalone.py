@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from networks.reliable_directional_repair import (DirectionalDynamics,
+                                                  MultiScaleGateRelation,
                                                   ReliableDirectionalRepair,
                                                   dynamic_losses)
 
@@ -34,6 +35,62 @@ class FrozenConditions(nn.Module):
 
 
 class BridgeRouteTests(unittest.TestCase):
+    def test_v8_zero_residual_preserves_v7_and_freezes_public_path(self):
+        torch.manual_seed(19)
+        model = ReliableDirectionalRepair(FrozenConditions(), transport_gate_mode='v7',
+                                          gate_relation_mode='full').eval()
+        model.requires_grad_(False)
+        model.gate_relation.requires_grad_(True)
+        image = torch.randn(1, 3, 32, 32)
+        with torch.no_grad():
+            v8 = model(image, capture_diagnostics=True)
+            relation = model.gate_relation
+            model.gate_relation = None
+            try:
+                v7 = model(image)
+            finally:
+                model.gate_relation = relation
+        self.assertTrue(torch.equal(v8['g_transport'], v7['g_transport']))
+        self.assertTrue(torch.equal(v8['p1'], v7['p1']))
+        with torch.no_grad():
+            model.gate_relation.delta[-1].bias.add_(.5)
+            changed = model(image)
+            model.gate_relation.delta[-1].bias.sub_(.5)
+        for key in ('r', 'w', 'b', 'a'):
+            self.assertTrue(torch.equal(changed[key], v7[key]), key)
+        self.assertGreater(float((changed['g_transport'] - v7['g_transport']).abs().max()), 0.)
+        self.assertGreater(float((changed['p1'] - v7['p1']).abs().max()), 0.)
+        self.assertEqual(v8['delta_g_logit'].shape, (1, 1, 8, 8))
+        self.assertEqual(v8['gate_source_coverage'].shape, (1, 1, 8, 8))
+        loss = model(image)['p1'].mean()
+        loss.backward()
+        self.assertGreater(float(model.gate_relation.delta[-1].weight.grad.abs().sum()), 0.)
+        self.assertTrue(all(p.grad is None for name, module in model.named_children()
+                            if name != 'gate_relation' for p in module.parameters()))
+
+    def test_v8_reliable_sampling_does_not_wrap_and_modes_are_finite(self):
+        relation = MultiScaleGateRelation(8, 12)
+        feature = torch.zeros(1, 32, 8, 8)
+        feature[..., 0, 0] = 1.
+        reliable = torch.zeros(1, 1, 8, 8)
+        reliable[..., 0, 0] = 1.
+        far, coverage = relation._source(feature, reliable, -1, 0)
+        self.assertEqual(float(coverage[..., 7, 0].max()), 0.)
+        self.assertEqual(float(far[..., 7, 0].abs().max()), 0.)
+        highres = torch.randn(1, 8, 8, 8)
+        decoder = torch.randn(1, 12, 8, 8)
+        p0 = torch.rand(1, 1, 8, 8)
+        q = torch.rand_like(p0)
+        w = torch.full((1, 8, 8, 8), .125)
+        two = torch.rand(1, 4, 8, 8)
+        one = torch.rand_like(two)
+        for mode in ('local', 'bilateral', 'directional', 'full'):
+            delta, cover = relation(highres, decoder, feature, p0, q,
+                                    reliable, w, two, one, mode)
+            self.assertTrue(torch.equal(delta, torch.zeros_like(delta)))
+            self.assertTrue(torch.isfinite(cover).all())
+            self.assertTrue(((cover >= 0) & (cover <= 1)).all())
+
     def test_forward_and_gradients(self):
         torch.manual_seed(12)
         model = ReliableDirectionalRepair(FrozenConditions()).train()

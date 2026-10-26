@@ -185,17 +185,92 @@ class DirectionRelations(nn.Module):
                 source_evidence = path_continuity
             else:
                 source_evidence = directional.amax(dim=1, keepdim=True)
-            transport_gate = torch.sigmoid(
-                logits[:, :1] + torch.log(source_evidence.clamp_min(1e-6)))
+            gate_logit = logits[:, :1] + torch.log(source_evidence.clamp_min(1e-6))
+            transport_gate = torch.sigmoid(gate_logit)
             if return_evidence:
                 return (weights, torch.cat(two_maps, dim=1),
                         torch.cat(one_maps, dim=1), transport_gate,
-                        source_evidence, path_continuity)
+                        source_evidence, path_continuity, gate_logit)
             return weights, torch.cat(two_maps, dim=1), torch.cat(one_maps, dim=1), transport_gate
         logits = torch.cat((logits[:, :1], logits[:, 1:] +
                             torch.log(directional + .05)), dim=1)
         weights = logits.softmax(dim=1)[:, 1:]
         return weights, torch.cat(two_maps, dim=1), torch.cat(one_maps, dim=1), None
+
+
+class MultiScaleGateRelation(nn.Module):
+    """R-conditioned bilateral semantic evidence for a residual transport gate."""
+
+    RADII = (2, 4, 8)
+
+    def __init__(self, highres_channels, decoder_channels, width=32):
+        super().__init__()
+        half = width // 2
+        self.highres_project = nn.Conv2d(highres_channels, half, 1)
+        self.decoder_project = nn.Conv2d(decoder_channels, half, 1)
+        self.local = nn.Sequential(nn.Conv2d(2 * width, width, 1), nn.GELU())
+        self.context = nn.Sequential(
+            nn.Conv2d(width, width, 3, padding=4, dilation=4, groups=width),
+            nn.Conv2d(width, width, 1), nn.GELU())
+        # The same relation network handles all eight signed directions.
+        self.pair = nn.Sequential(nn.Conv2d(5 * width + 8, width, 1), nn.GELU(),
+                                  nn.Conv2d(width, width, 1), nn.GELU())
+        self.delta = nn.Sequential(nn.Conv2d(3 * width + 3, width, 1), nn.GELU(),
+                                   nn.Conv2d(width, 1, 1))
+        nn.init.zeros_(self.delta[-1].weight)
+        nn.init.zeros_(self.delta[-1].bias)
+
+    @staticmethod
+    def _source(feature, reliable, dy, dx):
+        numerator = torch.zeros_like(feature)
+        mass = torch.zeros_like(reliable)
+        for radius in MultiScaleGateRelation.RADII:
+            confidence = shifted(reliable, radius * dy, radius * dx)
+            numerator = numerator + confidence * shifted(feature, radius * dy, radius * dx)
+            mass = mass + confidence
+        return numerator / mass.clamp_min(1e-5), mass / len(MultiScaleGateRelation.RADII)
+
+    def forward(self, highres, decoder, visual, p0, q, reliable, weights,
+                two, one, mode):
+        if mode not in ('local', 'bilateral', 'directional', 'full'):
+            raise ValueError(f'Unsupported gate relation mode: {mode}')
+        projected = torch.cat((self.highres_project(highres),
+                               self.decoder_project(decoder)), dim=1)
+        center = self.local(torch.cat((projected, visual), dim=1))
+        context = self.context(center) if mode == 'full' else torch.zeros_like(center)
+        relation = torch.zeros_like(center)
+        coverage = torch.zeros_like(p0)
+        if mode != 'local':
+            feature = center + context
+            for axis, (dy, dx) in enumerate(AXES):
+                minus, minus_coverage = self._source(feature, reliable, -dy, -dx)
+                plus, plus_coverage = self._source(feature, reliable, dy, dx)
+                for side in (0, 1):
+                    left, right = ((minus, plus) if side == 0 else (plus, minus))
+                    left_coverage, right_coverage = (
+                        (minus_coverage, plus_coverage) if side == 0
+                        else (plus_coverage, minus_coverage))
+                    if mode in ('directional', 'full'):
+                        axis_two = two[:, axis:axis+1]
+                        axis_one = one[:, axis:axis+1]
+                        direction = weights[:, 2*axis+side:2*axis+side+1]
+                        signed_dy = -dy if side == 0 else dy
+                        signed_dx = -dx if side == 0 else dx
+                    else:
+                        axis_two = axis_one = torch.zeros_like(p0)
+                        direction = torch.full_like(p0, 1. / len(DIRECTIONS))
+                        signed_dy = signed_dx = 0
+                    geometry = torch.cat((left_coverage, right_coverage,
+                                          axis_two, axis_one, p0, q,
+                                          torch.full_like(p0, float(signed_dy)),
+                                          torch.full_like(p0, float(signed_dx))), dim=1)
+                    pair = self.pair(torch.cat((center, left, right,
+                                                (left-right).abs(), left*right,
+                                                geometry), dim=1))
+                    relation = relation + direction * pair
+                    coverage = coverage + direction * (left_coverage + right_coverage) / 2
+        delta = self.delta(torch.cat((center, context, relation, p0, q, coverage), dim=1))
+        return delta, coverage
 
 
 class DirectionalDynamics(nn.Module):
@@ -262,10 +337,14 @@ class DirectionalDynamics(nn.Module):
 
 class ReliableDirectionalRepair(nn.Module):
     def __init__(self, frozen_q3, width=32, steps=3, bridge_route=True,
-                 conditional_transport=True, transport_gate_mode='v6'):
+                 conditional_transport=True, transport_gate_mode='v6',
+                 gate_relation_mode=None):
         super().__init__()
         if conditional_transport and not bridge_route:
             raise ValueError('Conditional transport requires bridge evidence')
+        if gate_relation_mode is not None and (
+                not conditional_transport or transport_gate_mode != 'v7'):
+            raise ValueError('The semantic gate relation requires the v7 transport gate')
         self.frozen = frozen_q3.requires_grad_(False)
         self.frozen.q_only = True
         self.frozen.eval()
@@ -281,6 +360,9 @@ class ReliableDirectionalRepair(nn.Module):
             width, bridge_route=bridge_route,
             conditional_transport=conditional_transport,
             transport_gate_mode=transport_gate_mode)
+        self.gate_relation_mode = gate_relation_mode
+        self.gate_relation = (MultiScaleGateRelation(highres_channels, stage_channels, width)
+                              if gate_relation_mode is not None else None)
         proposal_channels = (2 * width + 7) if bridge_route else (width + 7)
         self.proposal_head = nn.Sequential(nn.Conv2d(proposal_channels, width, 3, padding=1),
                                            nn.GELU(), nn.Conv2d(width, 2 if bridge_route else 1, 1))
@@ -321,8 +403,9 @@ class ReliableDirectionalRepair(nn.Module):
         z0, q = old['z0'].detach(), old['q'].detach()
         highres, decoder = old['highres_h'].detach(), old['stage3_h'].detach()
         size = highres.shape[-2:]
-        align = lambda value: F.interpolate(value, size=size, mode='bilinear',
-                                             align_corners=False)
+        def align(value):
+            return F.interpolate(value, size=size, mode='bilinear',
+                                 align_corners=False)
         decoder = align(decoder) if decoder.shape[-2:] != size else decoder
         visual = self.visual(highres, decoder)
         p0_full = z0.sigmoid()
@@ -334,12 +417,18 @@ class ReliableDirectionalRepair(nn.Module):
                 raise ValueError('The diagnostic R override must match the work grid')
             reliable = reliable_override
         relation_outputs = self.relations(
-            visual, p0, reliable, return_evidence=capture_diagnostics)
+            visual, p0, reliable,
+            return_evidence=capture_diagnostics or self.gate_relation is not None)
         weights, two, one, transport_gate = relation_outputs[:4]
         if weights_override is not None:
             if weights_override.shape != weights.shape:
                 raise ValueError('The diagnostic W override must retain eight directions')
             weights = weights_override
+        if self.gate_relation is not None:
+            delta_gate_logit, gate_source_coverage = self.gate_relation(
+                highres, decoder, visual, p0, q, reliable, weights, two, one,
+                self.gate_relation_mode)
+            transport_gate = torch.sigmoid(relation_outputs[6] + delta_gate_logit)
         two_mean, one_mean = two.mean(1, keepdim=True), one.mean(1, keepdim=True)
         weight_sum = weights.sum(1, keepdim=True)
         bilateral = (weights * two.repeat_interleave(2, dim=1)).sum(1, keepdim=True) / (
@@ -443,6 +532,10 @@ class ReliableDirectionalRepair(nn.Module):
             if self.conditional_transport:
                 result['gate_source_evidence'] = relation_outputs[4]
                 result['path_continuity_evidence'] = relation_outputs[5]
+            if self.gate_relation is not None:
+                result['g_v7'] = relation_outputs[3]
+                result['delta_g_logit'] = delta_gate_logit
+                result['gate_source_coverage'] = gate_source_coverage
         return result
 
 @torch.no_grad()
