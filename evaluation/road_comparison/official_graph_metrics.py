@@ -5,9 +5,11 @@ insertion, path scoring and local topology walking use upstream functions.
 """
 
 import ast
+import hashlib
 from contextlib import redirect_stdout
 from functools import lru_cache
 import math
+import random
 import os
 from pathlib import Path
 import tempfile
@@ -26,6 +28,7 @@ from vendor.sat2graph import topo as sat_topo
 
 
 VENDOR = Path(__file__).parent / "vendor" / "cosmiq"
+TLTS_VENDOR = Path(__file__).parent / "vendor" / "metrics_delin"
 
 
 class CompatibleMultiGraph(nx.MultiGraph):
@@ -69,6 +72,33 @@ def _cosmiq():
                      "get_closest_edge_from_G", "insert_point_into_G", "insert_control_points",
                      "create_graph_midpoints", "make_graphs", "single_path_metric",
                      "path_sim_metric", "compute_apls_metric"), module.__dict__)
+    return module
+
+
+@lru_cache(maxsize=1)
+def _tlts():
+    """Load the paper authors' TLTS function and its required helpers."""
+    import time as clock
+
+    utils = ModuleType("metrics_delin_tlts_utils")
+    utils.__dict__.update(np=np, nx=nx, random=random, time=clock)
+    _load_functions(TLTS_VENDOR / "utils.upstream.py.txt",
+                    ("is_empty", "interpolate_new_nodes", "oversampling_graph",
+                     "length_path", "find_closest", "uniform_node_sampling"), utils.__dict__)
+    # The released code targets NetworkX 1.x; its rare fallback passes a
+    # NodeView to np.random.choice. Adapt only that API call for NetworkX 3.x.
+    sampler = utils.uniform_node_sampling
+    source = (TLTS_VENDOR / "utils.upstream.py.txt").read_text(encoding="utf-8")
+    source = source.replace("np.random.choice(G.nodes())", "np.random.choice(list(G.nodes()))")
+    tree = ast.parse(source)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "uniform_node_sampling")
+    exec(compile(ast.Module(body=[node], type_ignores=[]), sampler.__code__.co_filename,
+                 "exec"), utils.__dict__)
+    module = ModuleType("metrics_delin_tlts_official")
+    module.__dict__.update(np=np, nx=nx, random=random, utils=utils)
+    _load_functions(TLTS_VENDOR / "toolong_tooshort_metric.upstream.py.txt",
+                    ("toolong_tooshort",), module.__dict__)
     return module
 
 
@@ -182,6 +212,45 @@ def prepare_official_graph(points, csr, id_offset=0):
             "compact": compact_graph(points, csr, id_offset)}
 
 
+def _tlts_graph(points, csr):
+    """Represent the exact eight-neighbour raster skeleton for official TLTS."""
+    graph = nx.Graph()
+    graph.add_nodes_from((int(i), {"pos": (float(x), float(y))})
+                         for i, (y, x) in enumerate(points))
+    for i in range(len(points)):
+        graph.add_edges_from((i, int(j)) for j in csr.indices[csr.indptr[i]:csr.indptr[i + 1]]
+                             if j > i)
+    graph.remove_nodes_from(list(nx.isolates(graph)))
+    return graph
+
+
+def _official_tlts(gt, pred, protocol):
+    reference = _tlts_graph(gt["points"], gt["csr"])
+    proposed = _tlts_graph(pred["points"], pred["csr"])
+    seed_bytes = hashlib.sha256(
+        np.asarray(gt["points"], dtype=np.int32).tobytes()
+        + int(protocol["tlts_seed"]).to_bytes(8, "little")
+    ).digest()
+    seed = int.from_bytes(seed_bytes[:4], "little")
+    # The upstream function seeds NumPy globally. Preserve both RNG states so
+    # repeat runs and model order do not affect its randomized path sampling.
+    numpy_state, python_state = np.random.get_state(), random.getstate()
+    try:
+        random.seed(seed)
+        with redirect_stdout(_NullWriter()):
+            values = _tlts().toolong_tooshort(
+                reference, proposed,
+                max_node_dist=protocol["tlts_max_node_dist_px"],
+                perc_length=protocol["tlts_length_tolerance"],
+                n_paths=protocol["tlts_n_paths"], seed=seed)
+    finally:
+        np.random.set_state(numpy_state)
+        random.setstate(python_state)
+    if len(values) != 4 or not np.isfinite(values).all() or not np.isclose(sum(values), 1.0):
+        raise RuntimeError(f"Official TLTS returned invalid path categories: {values}")
+    return tuple(map(float, values))
+
+
 def _sat_topo_score(gt, pred):
     if len(gt["points"]) == 0 and len(pred["points"]) == 0:
         return 1.0, 1.0, 0
@@ -216,7 +285,7 @@ def _sat_topo_score(gt, pred):
 
 def _official_apls(gt, pred, protocol):
     apls = _cosmiq()
-    counts = {"gt": 0, "pred": 0, "infeasible": 0, "unmatched": 0}
+    counts = {"gt": 0, "pred": 0}
     with redirect_stdout(_NullWriter()):
         prepared = apls.make_graphs(
             gt["compact"].copy(), pred["compact"].copy(), weight="length",
@@ -245,18 +314,14 @@ def _official_apls(gt, pred, protocol):
     if captures:
         for direction, captured in zip(("gt", "pred"), captures):
             counts[direction] = len(captured[2])
-        # TLTS-Infeasible uses the exact official GT control-point path set.
-        for start, end in captures[0][2]:
-            if (start not in paths_pred_prime or end not in paths_pred_prime[start]):
-                counts["infeasible"] += 1
-                if (start not in paths_pred_prime or end not in paths_pred_prime):
-                    counts["unmatched"] += 1
     return float(total), float(forward), float(reverse), counts
 
 
 def graph_scores(gt, pred, protocol):
     precision, recall, seeds = _sat_topo_score(gt, pred)
     apls_total, apls_forward, apls_reverse, pairs = _official_apls(gt, pred, protocol)
+    tlts_correct, tlts_too_long, tlts_too_short, tlts_infeasible = _official_tlts(
+        gt, pred, protocol)
     topo_f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
         "topo_precision": precision, "topo_recall": recall, "topo_f1": topo_f1,
@@ -264,8 +329,6 @@ def graph_scores(gt, pred, protocol):
         "apls_gt_to_pred": apls_forward, "apls_pred_to_gt": apls_reverse,
         "apls_bidirectional": apls_total,
         "apls_gt_pairs": pairs["gt"], "apls_pred_pairs": pairs["pred"],
-        "tlts_infeasible": pairs["infeasible"] / pairs["gt"] if pairs["gt"] else 0.0,
-        "tlts_infeasible_pairs": pairs["infeasible"],
-        "tlts_unmatched_pairs": pairs["unmatched"],
-        "tlts_disconnected_pairs": pairs["infeasible"] - pairs["unmatched"],
+        "tlts_correct": tlts_correct, "tlts_too_long": tlts_too_long,
+        "tlts_too_short": tlts_too_short, "tlts_infeasible": tlts_infeasible,
     }

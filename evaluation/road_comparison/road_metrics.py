@@ -7,7 +7,7 @@ from scipy.sparse import csr_matrix
 from official_graph_metrics import graph_scores, prepare_official_graph
 
 
-METRIC_VERSION = "road-mask-v3.0-official-graph-functions"
+METRIC_VERSION = "road-mask-v4.0-official-tlts"
 DEFAULT_PROTOCOL = {
     "metric_version": METRIC_VERSION,
     "image_size": 1024,
@@ -16,17 +16,23 @@ DEFAULT_PROTOCOL = {
     "apls_snap_radius": 5.0,
     "apls_control_spacing_px": 50.0,
     "apls_min_path_px": 10.0,
+    "tlts_n_paths": 1000,
+    "tlts_max_node_dist_px": 25.0,
+    "tlts_length_tolerance": 0.05,
+    "tlts_seed": 1234,
     "connectivity": 8,
     "skeleton": "numpy_zhang_suen_zero_padded",
     "snap_rule": "official CosmiQ nearest-edge projection and control-point insertion",
     "segmentation_aggregation": "global TP/FP/FN",
-    "topology_aggregation": "per-image mean of official Sat2Graph TOPO and CosmiQ APLS function outputs",
+    "topology_aggregation": "per-image mean of Sat2Graph TOPO, CosmiQ APLS and metrics_delin TLTS outputs",
     "graph_protocol": "raster skeleton to 8-neighbor graph; exact degree-two chain contraction for APLS",
     "graph_units": "mask pixels mapped to synthetic metres for Sat2Graph; not vector-GT benchmark scores",
     "topo_source": "Sat2Graph 7ca4a345a2ceae4c62c120661608a60e9e962be4",
     "apls_source": "CosmiQ/apls 4a78807cafde62b773e3a1190177526853c61207",
+    "tlts_source": "lcit/metrics_delin 30f1ad9ccc901e63770f39a80b0e1ec6bbfb34d9",
     "topo_settings": "official main.py: density 0.00050, step 0.00005, threshold 0.00010, radius 0.00150 or 0.00300 degrees",
-    "tlts_unmatched_rule": "GT paths from official APLS; unmatched or disconnected predicted route is infeasible",
+    "tlts_protocol": "authors' toolong_tooshort: independent random GT paths; 25-pixel endpoint match; 5-percent length tolerance",
+    "tlts_seed_rule": "sha256(GT skeleton points + base seed), first four bytes; same GT paths for all models",
     "postprocessing": "none; use supplied binary masks without resizing",
     "gt_encoding": "single-channel or identical-channel RGB binary mask; predictions single-channel",
 }

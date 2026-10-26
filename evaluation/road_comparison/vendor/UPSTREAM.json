@@ -17,5 +17,14 @@
     "apls_source_sha256": "7f42bff9391f56d9939db6689424d42aad44e40b89d6cb933b101ae3d5ae5a3a",
     "utils_source_sha256": "27a3270f1309ad49eb453b13c1b571abf5f9c913bf48c560c560ba9198d99319",
     "loader": "official_graph_metrics.py compiles the named original function bodies via AST; unrelated GDAL/plotting imports are omitted."
+  },
+  "metrics_delin_tlts": {
+    "repository": "https://github.com/lcit/metrics_delin",
+    "commit": "30f1ad9ccc901e63770f39a80b0e1ec6bbfb34d9",
+    "source": "path_based/toolong_tooshort_metric.py and utils.py",
+    "license": "metrics_delin/LICENSE (MIT)",
+    "tlts_source_sha256": "0338e6180e12560156bdb3d695a2cd5ee04d8da7399ac984c6b5da28fe14dced",
+    "utils_source_sha256": "463d7621ee13762c42b1e24c02948ffdcffcd7593bd32fc72f49b6647bc2ab52",
+    "loader": "Original function bodies loaded by AST; uniform_node_sampling NodeView fallback adapted for NetworkX 3, seeded per image."
   }
 }

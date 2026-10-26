@@ -141,19 +141,27 @@ def validate_manifest(manifest):
     protocol = dict(DEFAULT_PROTOCOL)
     overrides = dict(manifest.get("protocol", {}))
     adjustable = {"image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius",
-                  "apls_control_spacing_px", "apls_min_path_px"}
+                  "apls_control_spacing_px", "apls_min_path_px", "tlts_n_paths",
+                  "tlts_max_node_dist_px", "tlts_length_tolerance", "tlts_seed"}
     if set(overrides) - adjustable:
         raise ValueError(f"Unsupported protocol settings: {set(overrides) - adjustable}")
     if "apls_max_nodes" in overrides:
         protocol["legacy_apls_max_nodes_ignored"] = overrides.pop("apls_max_nodes")
     protocol.update(overrides)
-    for key in ("image_size", "short_area_threshold", "legacy_apls_max_nodes_ignored"):
+    for key in ("image_size", "short_area_threshold", "legacy_apls_max_nodes_ignored",
+                "tlts_n_paths"):
         value = protocol[key]
         if not isinstance(value, int) or value < (2 if key == "legacy_apls_max_nodes_ignored" else 1):
             raise ValueError(f"Invalid {key}: {value}")
     for key in ("apls_snap_radius", "apls_control_spacing_px", "apls_min_path_px"):
         if not np.isfinite(protocol[key]) or protocol[key] <= 0:
             raise ValueError(f"{key} must be finite and positive")
+    if not np.isfinite(protocol["tlts_max_node_dist_px"]) or protocol["tlts_max_node_dist_px"] < 3:
+        raise ValueError("tlts_max_node_dist_px must be at least 3 pixels")
+    if not np.isfinite(protocol["tlts_length_tolerance"]) or not 0 <= protocol["tlts_length_tolerance"] < 1:
+        raise ValueError("tlts_length_tolerance must be in [0, 1)")
+    if not isinstance(protocol["tlts_seed"], int) or not 0 <= protocol["tlts_seed"] < 2**64:
+        raise ValueError("tlts_seed must be a nonnegative 64-bit integer")
     names = [m["name"] for m in manifest["models"]]
     if not names or len(names) != len(set(names)):
         raise ValueError("Model names must be unique and nonempty")
@@ -311,7 +319,9 @@ def evaluate(manifest, base, protocol, split, selection, output, progress):
                          "vendor/sat2graph/graph.py", "vendor/sat2graph/topo.py",
                          "vendor/sat2graph/main.upstream.py.txt",
                          "vendor/sat2graph/graph.upstream.py.txt", "vendor/sat2graph/topo.upstream.py.txt",
-                         "vendor/cosmiq/apls.upstream.py.txt", "vendor/cosmiq/apls_utils.upstream.py.txt")
+                         "vendor/cosmiq/apls.upstream.py.txt", "vendor/cosmiq/apls_utils.upstream.py.txt",
+                         "vendor/metrics_delin/toolong_tooshort_metric.upstream.py.txt",
+                         "vendor/metrics_delin/utils.upstream.py.txt")
         },
         "case_ids": sorted(labels), "case_ids_sha256": digest(sorted(labels)),
         "binary_content_sha256": {key: value.hexdigest() for key, value in content_hashes.items()},
