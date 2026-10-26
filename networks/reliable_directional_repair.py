@@ -231,15 +231,30 @@ class MultiScaleGateRelation(nn.Module):
         return numerator / mass.clamp_min(1e-5), mass / len(MultiScaleGateRelation.RADII)
 
     def forward(self, highres, decoder, visual, p0, q, reliable, weights,
-                two, one, mode):
+                two, one, mode, intervention=None, capture_diagnostics=False):
         if mode not in ('local', 'bilateral', 'directional', 'full'):
             raise ValueError(f'Unsupported gate relation mode: {mode}')
-        projected = torch.cat((self.highres_project(highres),
-                               self.decoder_project(decoder)), dim=1)
+        highres_projected = self.highres_project(highres)
+        decoder_projected = self.decoder_project(decoder)
+        projected = torch.cat((highres_projected, decoder_projected), dim=1)
         center = self.local(torch.cat((projected, visual), dim=1))
         context = self.context(center) if mode == 'full' else torch.zeros_like(center)
         relation = torch.zeros_like(center)
         coverage = torch.zeros_like(p0)
+        relation_weights = weights
+        if intervention == 'uniform_w':
+            relation_weights = torch.full_like(weights, 1. / weights.shape[1])
+        elif intervention == 'rotate_w_90':
+            # Rotate the eight channels according to the module's signed direction order.
+            directions = DIRECTIONS
+            source = {(dy, dx): i for i, (dy, dx) in enumerate(directions)}
+            permutation = [source[(dx, -dy)] for dy, dx in directions]
+            relation_weights = weights[:, permutation]
+        elif intervention == 'shuffle_sources':
+            pass
+        elif intervention not in (None, 'mask_relations') and not intervention.startswith('drop_dir_'):
+            raise ValueError(f'Unknown relation intervention: {intervention}')
+        per_direction = []
         if mode != 'local':
             feature = center + context
             for axis, (dy, dx) in enumerate(AXES):
@@ -264,12 +279,38 @@ class MultiScaleGateRelation(nn.Module):
                                           axis_two, axis_one, p0, q,
                                           torch.full_like(p0, float(signed_dy)),
                                           torch.full_like(p0, float(signed_dx))), dim=1)
+                    if intervention == 'shuffle_sources':
+                        shift = max(1, left.shape[-2] * left.shape[-1] // 2)
+                        left = left.flatten(2).roll(shift, dims=2).reshape_as(left)
+                        right = right.flatten(2).roll(shift, dims=2).reshape_as(right)
                     pair = self.pair(torch.cat((center, left, right,
                                                 (left-right).abs(), left*right,
                                                 geometry), dim=1))
-                    relation = relation + direction * pair
+                    if intervention == 'mask_relations':
+                        pair = torch.zeros_like(pair)
+                    direction_index = 2 * axis + side
+                    if intervention == f'drop_dir_{direction_index}':
+                        direction = torch.zeros_like(direction)
+                    elif intervention == 'uniform_w' or intervention == 'rotate_w_90':
+                        direction = relation_weights[:, direction_index:direction_index+1]
+                    contribution = direction * pair
+                    per_direction.append(contribution)
+                    relation = relation + contribution
                     coverage = coverage + direction * (left_coverage + right_coverage) / 2
+        if intervention == 'mask_relations':
+            coverage = torch.zeros_like(coverage)
         delta = self.delta(torch.cat((center, context, relation, p0, q, coverage), dim=1))
+        if capture_diagnostics:
+            diagnostic = {
+                'center': center, 'highres_projected': highres_projected,
+                'decoder_projected': decoder_projected,
+                'relation_embedding': relation,
+                'per_direction_relation': torch.stack(per_direction, dim=1)
+                if per_direction else relation.new_zeros(
+                    (relation.shape[0], 0, *relation.shape[1:])),
+                'relation_weights': relation_weights,
+            }
+            return delta, coverage, diagnostic
         return delta, coverage
 
 
@@ -285,7 +326,8 @@ class DirectionalDynamics(nn.Module):
 
     def forward(self, visual, p0, q, reliable, proposal, accept, weights,
                 capture_diagnostics=False, transport_gate=None,
-                freeze_generated_sources=False):
+                freeze_generated_sources=False, disable_transport=False,
+                disable_proposal=False):
         state = p0
         states, masses, availabilities = [state], [], []
         diagnostics = {key: [] for key in (
@@ -315,6 +357,10 @@ class DirectionalDynamics(nn.Module):
                          if transport_gate is not None else
                          accept * coefficients[:, 1:2] * available)
             propose = .2 * accept * coefficients[:, 2:3]
+            if disable_transport:
+                transport = torch.zeros_like(transport)
+            if disable_proposal:
+                propose = torch.zeros_like(propose)
             anchor = coefficients[:, 3:4]
             stay = 1. - transport - propose - anchor
             if capture_diagnostics:
@@ -397,9 +443,14 @@ class ReliableDirectionalRepair(nn.Module):
         return self
 
     def forward(self, image, capture_diagnostics=False, weights_override=None,
-                freeze_generated_sources=False, reliable_override=None):
-        with torch.no_grad():
-            old = self.frozen(image, capture_diagnostics=True)
+                freeze_generated_sources=False, reliable_override=None,
+                gate_intervention=None, disable_transport=False,
+                disable_proposal=False, frozen_override=None):
+        if frozen_override is None:
+            with torch.no_grad():
+                old = self.frozen(image, capture_diagnostics=True)
+        else:
+            old = frozen_override
         z0, q = old['z0'].detach(), old['q'].detach()
         highres, decoder = old['highres_h'].detach(), old['stage3_h'].detach()
         size = highres.shape[-2:]
@@ -425,9 +476,12 @@ class ReliableDirectionalRepair(nn.Module):
                 raise ValueError('The diagnostic W override must retain eight directions')
             weights = weights_override
         if self.gate_relation is not None:
-            delta_gate_logit, gate_source_coverage = self.gate_relation(
+            gate_output = self.gate_relation(
                 highres, decoder, visual, p0, q, reliable, weights, two, one,
-                self.gate_relation_mode)
+                self.gate_relation_mode, intervention=gate_intervention,
+                capture_diagnostics=capture_diagnostics)
+            delta_gate_logit, gate_source_coverage = gate_output[:2]
+            gate_relation_diagnostics = gate_output[2] if capture_diagnostics else None
             transport_gate = torch.sigmoid(relation_outputs[6] + delta_gate_logit)
         two_mean, one_mean = two.mean(1, keepdim=True), one.mean(1, keepdim=True)
         weight_sum = weights.sum(1, keepdim=True)
@@ -500,7 +554,9 @@ class ReliableDirectionalRepair(nn.Module):
             visual, p0, q, reliable, proposal, accept, weights,
             capture_diagnostics=capture_diagnostics,
             transport_gate=transport_gate,
-            freeze_generated_sources=freeze_generated_sources)
+            freeze_generated_sources=freeze_generated_sources,
+            disable_transport=disable_transport,
+            disable_proposal=disable_proposal)
         states, masses, available = dynamics_output[:3]
         z1, delta_logit = compose_surface_logits(z0, p0, states[-1])
         p1 = z1.sigmoid()
@@ -529,6 +585,11 @@ class ReliableDirectionalRepair(nn.Module):
                           transported_visual=source_visual,
                           relation_balance=relation_balance,
                           **dynamics_output[3])
+            result.update(stage2_s=old['stage2_s'].detach(),
+                          stage2_c=old['stage2_c'].detach(),
+                          stage2_d=(old.get('stage2_d').detach()
+                                     if old.get('stage2_d') is not None else None),
+                          highres_h=highres, stage3_h=decoder)
             if self.conditional_transport:
                 result['gate_source_evidence'] = relation_outputs[4]
                 result['path_continuity_evidence'] = relation_outputs[5]
@@ -536,6 +597,7 @@ class ReliableDirectionalRepair(nn.Module):
                 result['g_v7'] = relation_outputs[3]
                 result['delta_g_logit'] = delta_gate_logit
                 result['gate_source_coverage'] = gate_source_coverage
+                result['gate_relation_diagnostics'] = gate_relation_diagnostics
         return result
 
 @torch.no_grad()
