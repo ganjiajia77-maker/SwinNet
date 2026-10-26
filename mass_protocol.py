@@ -9,7 +9,8 @@ SOURCE_SIZE = 1500
 TILE_SIZE = 512
 STRIDE = 256
 BASE_COMMIT = '599a410de8d341850e1810417307e4b3bbdfc82d'
-MODEL_NAME = 'h0_599a410_mass_random512_fp32_80e_bs2'
+ARCHITECTURE_ID = 'h0-shared-patchembed-structure-v1'
+MODEL_NAME = 'h0_shared_patch_mass_random512_fp32_80e_bs2'
 
 
 def blend_weight(size, device):

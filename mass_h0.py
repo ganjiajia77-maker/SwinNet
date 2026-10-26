@@ -11,7 +11,7 @@ import sys
 
 import torch
 
-from mass_protocol import BASE_COMMIT, MODEL_NAME, validate_training_args
+from mass_protocol import ARCHITECTURE_ID, BASE_COMMIT, MODEL_NAME, validate_training_args
 
 
 ROOT = Path(__file__).resolve().parent
@@ -64,7 +64,7 @@ def verify_base_model():
     changed = [name for name, digest in expected.items()
                if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest]
     if changed:
-        raise ValueError(f'Model/loss differs from original {BASE_COMMIT}: {changed}')
+        raise ValueError(f'Shared PatchEmbed H0 source hash mismatch: {changed}')
 
 
 def verify_checkpoint(path):
@@ -72,7 +72,9 @@ def verify_checkpoint(path):
     if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
         raise ValueError('Expected a checkpoint produced by this Massachusetts H0 training entry')
     if checkpoint.get('experiment_base_commit') != BASE_COMMIT:
-        raise ValueError('Checkpoint does not record the original 599a410 H0 architecture')
+        raise ValueError('Checkpoint does not record the 599a410 H0 base commit')
+    if checkpoint.get('experiment_architecture') != ARCHITECTURE_ID:
+        raise ValueError('Checkpoint architecture differs from shared PatchEmbed H0')
     validate_training_args(checkpoint.get('args', {}))
     if checkpoint.get('ema_state_dict') is not None:
         raise ValueError('This experiment requires raw weights without EMA')
@@ -109,7 +111,8 @@ def manifest(args, checkpoint_info, selection=None):
                          'apls_max_nodes': 64, 'apls_snap_radius': 5.0},
             'models': [{'name': MODEL_NAME, 'provenance': {
                 'checkpoint': str(args.model_path), 'checkpoint_epoch': checkpoint_info['epoch'],
-                'base_model_commit': BASE_COMMIT, 'checkpoint_args_verified': True,
+                'base_model_commit': BASE_COMMIT, 'architecture': ARCHITECTURE_ID,
+                'checkpoint_args_verified': True,
                 'training_crop': 'one random512 crop per native1500 image per epoch; shared epoch',
                 'training_precision': 'FP32', 'training_max_epochs': 80,
                 'micro_batch_size': 2, 'accumulation_steps': 1, 'weights': 'raw; no EMA',
@@ -169,7 +172,7 @@ def main():
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or 'mass_h0_599a410_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.run_name = args.run_name or 'mass_h0_shared_patch_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
             parser.error(f'Fresh run directory already exists: {run_dir}')

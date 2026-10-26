@@ -30,7 +30,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
-from mass_protocol import BASE_COMMIT, stitch_logits, validate_training_args
+from mass_protocol import ARCHITECTURE_ID, BASE_COMMIT, stitch_logits, validate_training_args
 
 
 def seed_worker(worker_id):
@@ -2185,6 +2185,7 @@ if __name__ == "__main__":
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
                 'experiment_base_commit': BASE_COMMIT,
+                'experiment_architecture': ARCHITECTURE_ID,
                 'experiment_protocol': 'h0-mass-native1500-random512-fp32-80e-bs2-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),
