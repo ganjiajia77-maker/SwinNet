@@ -8,14 +8,16 @@ from scipy.sparse import csr_matrix
 from official_graph_metrics import graph_scores, prepare_official_graph
 
 
-METRIC_VERSION = "road-mask-v6.0-official-node-apls"
+METRIC_VERSION = "road-mask-v7.0-node-apls-fast-sampled"
 DEFAULT_PROTOCOL = {
     "metric_version": METRIC_VERSION,
     "image_size": 1024,
     "short_area_threshold": 20,
     "legacy_apls_max_nodes_ignored": 64,
     "apls_snap_radius": 5.0,
-    "apls_control_mode": "original_graph_nodes_only",
+    "apls_control_mode": "original_graph_nodes_with_optional_deterministic_cap",
+    "apls_max_control_nodes": 500,
+    "apls_control_sampling_seed": 1234,
     "legacy_apls_control_spacing_px_ignored": 100.0,
     "apls_min_path_px": 10.0,
     "tlts_n_paths": 200,
@@ -27,7 +29,7 @@ DEFAULT_PROTOCOL = {
     "connectivity": 8,
     "skeleton": "numpy_zhang_suen_zero_padded",
     "snap_rule": "official CosmiQ nearest-edge projection and control-point insertion",
-    "apls_protocol": "all original compact-graph nodes are controls; no edge midpoints; GT native paths reused across models; only control-to-control prime paths computed",
+    "apls_protocol": "up to apls_max_control_nodes original compact-graph nodes per GT and prediction (0 means all); no edge midpoints; deterministic node sampling; GT native paths reused across models; only control-to-control paths computed",
     "segmentation_aggregation": "global TP/FP/FN",
     "topology_aggregation": "per-image mean of Sat2Graph TOPO, CosmiQ APLS and metrics_delin TLTS outputs",
     "graph_protocol": "raster skeleton to 8-neighbor graph; exact degree-two chain contraction for APLS",

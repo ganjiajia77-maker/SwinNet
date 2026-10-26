@@ -1,5 +1,8 @@
 # Node-only APLS evaluation (v6)
 
+This records the v6 protocol. The current v7 benchmark entry point is
+`benchmark_apls_fast.py`; see `FAST_SAMPLED_APLS_PROTOCOL.md` for its commands.
+
 The four-model H0 comparison uses the same binary masks, validation-selected
 thresholds, TOPO settings, TLTS settings, and clDice implementation as v5.
 APLS alone changes its control-point protocol:
@@ -30,15 +33,6 @@ GT and prediction control counts, prediction native paths, control insertion,
 matched paths, and scoring time. The four-model comparison continues to write
 per-image partial results and supports `--resume` in a new output directory.
 
-For an APLS-only before/after timing on one archived image:
-
-```bash
-python -u evaluation/road_comparison/benchmark_apls_node_only.py \
-  --manifest comparison.json --selection val_selection.json \
-  --case 10378780_15 \
-  --old_evaluator /path/to/v5/evaluation/road_comparison/official_graph_metrics.py
-```
-
-This benchmark times APLS after the masks have been loaded and converted to
-graphs. It does not include TOPO, TLTS, skeletonization, disk input, or the
-four-model process scheduler. To benchmark only v6, omit `--old_evaluator`.
+The v6 commit `b302334` retains its original v5-versus-v6 benchmark script.
+Use the v7 benchmark to compare v6 full controls, optimized full controls,
+and sampled controls on the same saved masks.

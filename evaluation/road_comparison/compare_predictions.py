@@ -154,6 +154,7 @@ def validate_manifest(manifest):
     overrides = dict(manifest.get("protocol", {}))
     adjustable = {"image_size", "short_area_threshold", "apls_max_nodes", "apls_snap_radius",
                   "apls_control_spacing_px", "apls_min_path_px", "tlts_n_paths",
+                  "apls_max_control_nodes", "apls_control_sampling_seed",
                   "tlts_max_node_dist_px", "tlts_length_tolerance", "tlts_seed",
                   "topo_seed_density_deg", "topo_step_deg"}
     if set(overrides) - adjustable:
@@ -169,6 +170,11 @@ def validate_manifest(manifest):
         value = protocol[key]
         if not isinstance(value, int) or value < (2 if key == "legacy_apls_max_nodes_ignored" else 1):
             raise ValueError(f"Invalid {key}: {value}")
+    if not isinstance(protocol["apls_max_control_nodes"], int) or protocol["apls_max_control_nodes"] < 0:
+        raise ValueError("apls_max_control_nodes must be a nonnegative integer")
+    if (not isinstance(protocol["apls_control_sampling_seed"], int) or
+            not 0 <= protocol["apls_control_sampling_seed"] < 2**64):
+        raise ValueError("apls_control_sampling_seed must be a nonnegative 64-bit integer")
     for key in ("apls_snap_radius", "legacy_apls_control_spacing_px_ignored",
                 "apls_min_path_px",
                 "topo_seed_density_deg", "topo_step_deg"):
@@ -308,7 +314,7 @@ def evaluate_case(job):
     gt_seconds = time.perf_counter() - started
     print(f"[TIMING] {case} GT_graph={gt_seconds:.1f}s", flush=True)
     started = time.perf_counter()
-    apls_reference = prepare_apls_reference(prepared["graph"])
+    apls_reference = prepare_apls_reference(prepared["graph"], protocol)
     apls_gt_seconds = time.perf_counter() - started
     print(f"[TIMING] {case} APLS_GT_NATIVE={apls_gt_seconds:.1f}s "
           f"controls={len(apls_reference['controls'])} reused_for={len(model_paths)}_models",

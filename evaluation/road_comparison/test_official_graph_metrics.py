@@ -8,13 +8,15 @@ import unittest
 from unittest.mock import patch
 
 import cv2
+import networkx as nx
 import numpy as np
 from scipy.sparse import csr_matrix
 
 from compare_predictions import (compatible_selection, digest, evaluate,
                                  select_validation, threshold_protocol_hash,
                                  validate_manifest)
-from official_graph_metrics import _cosmiq, compact_graph
+from official_graph_metrics import (_apls_controls, _cosmiq, compact_graph,
+                                    CompatibleMultiGraph)
 from road_metrics import DEFAULT_PROTOCOL, image_metrics, prepare_target, skeleton_graph
 
 
@@ -112,6 +114,77 @@ class OfficialGraphMetricsTest(unittest.TestCase):
         actual = _official_apls(ground, proposed, DEFAULT_PROTOCOL)
         for expected_score, actual_score in zip(expected, actual[:3]):
             self.assertAlmostEqual(expected_score, actual_score, places=10)
+
+    def test_indexed_edge_search_matches_upstream_edge_and_tie_order(self):
+        from shapely.geometry import LineString, Point
+
+        graph = CompatibleMultiGraph()
+        for node, x, y in ((0, 0, 0), (1, 1, 0), (2, 1, 1),
+                           (3, 0, 1), (4, 2, 0)):
+            graph.add_node(node, x=x, y=y)
+        for u, v in ((0, 1), (1, 2), (2, 3), (3, 0), (1, 4)):
+            graph.add_edge(u, v, geometry=LineString(
+                [(graph.nodes[u]["x"], graph.nodes[u]["y"]),
+                 (graph.nodes[v]["x"], graph.nodes[v]["y"])]))
+        apls = _cosmiq()
+        for trial in (graph, graph.copy(), nx.relabel_nodes(graph, {0: 10})):
+            for nearby in ({1}, {2, 3}, {1, 2, 4}):
+                for x, y in ((1, 0), (0.5, 0), (1, 0.5), (1.5, 0.1)):
+                    point = Point(x, y)
+                    expected = apls.original_get_closest_edge_from_G(
+                        trial, point, nearby_nodes_set=nearby)
+                    actual = apls.get_closest_edge_from_G(
+                        trial, point, nearby_nodes_set=nearby)
+                    self.assertEqual(actual[0], expected[0])
+                    self.assertEqual(actual[1], expected[1])
+                    self.assertEqual(actual[2], expected[2])
+
+    def test_control_sampling_is_deterministic_and_capped(self):
+        graph = CompatibleMultiGraph()
+        points = np.array([(node // 30, node % 30) for node in range(600)],
+                          dtype=np.int32)
+        for node, (y, x) in enumerate(points):
+            graph.add_node(node, x=float(x), y=float(y))
+        first = _apls_controls(graph, points, DEFAULT_PROTOCOL)
+        second = _apls_controls(graph, points, DEFAULT_PROTOCOL)
+        self.assertEqual(len(first), 500)
+        self.assertEqual(first, second)
+        all_nodes = _apls_controls(graph, points,
+                                   dict(DEFAULT_PROTOCOL, apls_max_control_nodes=0))
+        self.assertEqual(len(all_nodes), 600)
+        different = _apls_controls(
+            graph, points, dict(DEFAULT_PROTOCOL, apls_control_sampling_seed=1235))
+        self.assertNotEqual(first, different)
+
+    def test_indexed_insertion_preserves_large_graph_splits(self):
+        from contextlib import redirect_stdout
+        from official_graph_metrics import _NullWriter
+        from shapely.geometry import LineString
+
+        graph = CompatibleMultiGraph()
+        for node in range(1002):
+            graph.add_node(node, x=float(node), y=0.0)
+        for node in range(1001):
+            graph.add_edge(node, node + 1,
+                           geometry=LineString([(node, 0), (node + 1, 0)]),
+                           length=1.0, inferred_speed_mps=1.0)
+        controls = [[9_999, 100.0, 0.0]]
+        controls += [[10_000 + i, 100.5 + i * 100, 0.0] for i in range(8)]
+        apls = _cosmiq()
+        with redirect_stdout(_NullWriter()):
+            with patch.object(apls, "get_closest_edge_from_G",
+                              apls.original_get_closest_edge_from_G):
+                original, _, _ = apls.insert_control_points(
+                    graph.copy(), controls, max_distance_meters=5,
+                    allow_renaming=True, verbose=False)
+            indexed, _, _ = apls.insert_control_points(
+                graph.copy(), controls, max_distance_meters=5,
+                allow_renaming=True, verbose=False)
+        self.assertEqual(set(original.nodes), set(indexed.nodes))
+        def weighted_edges(value):
+            return sorted((min(u, v), max(u, v), data["length"])
+                          for u, v, data in value.edges(data=True))
+        self.assertEqual(weighted_edges(original), weighted_edges(indexed))
 
     def test_previous_validation_threshold_selection_is_usable(self):
         selection = {"schema": 2, "selected_on": "val", "protocol_hash": digest({}),

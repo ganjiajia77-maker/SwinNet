@@ -72,6 +72,14 @@ def _cosmiq():
                      "get_closest_edge_from_G", "insert_point_into_G", "insert_control_points",
                      "create_graph_midpoints", "make_graphs", "single_path_metric",
                      "path_sim_metric", "compute_apls_metric"), module.__dict__)
+    original_edge_search = module.get_closest_edge_from_G
+    module.original_get_closest_edge_from_G = original_edge_search
+
+    def indexed_edge_search(graph, point, nearby_nodes_set=set(), verbose=False):
+        return _indexed_closest_edge(graph, point, nearby_nodes_set,
+                                     original_edge_search, verbose=verbose)
+
+    module.get_closest_edge_from_G = indexed_edge_search
     return module
 
 
@@ -108,6 +116,50 @@ class _NullWriter:
 
     def flush(self):
         pass
+
+
+def _graph_node_ranks(graph):
+    """Track NetworkX node order as the upstream insertion grows a graph."""
+    ranks = getattr(graph, "_apls_node_ranks", None)
+    if ranks is None:
+        ranks = {node: i for i, node in enumerate(graph)}
+    elif len(ranks) + 1 == len(graph):
+        new_node = next(reversed(graph._node))
+        if new_node in ranks:
+            ranks = {node: i for i, node in enumerate(graph)}
+        else:
+            ranks[new_node] = len(ranks)
+    elif len(ranks) != len(graph):
+        ranks = {node: i for i, node in enumerate(graph)}
+    graph._apls_node_ranks = ranks
+    return ranks
+
+
+def _indexed_closest_edge(graph, point, nearby_nodes_set, original, verbose=False):
+    """Visit incident edges only, retaining upstream first-edge tie breaking."""
+    if not nearby_nodes_set:
+        return original(graph, point, nearby_nodes_set=nearby_nodes_set,
+                        verbose=verbose)
+    candidates = list(graph.edges(nearby_nodes_set, keys=True, data=True))
+    if not candidates:
+        return original(graph, point, nearby_nodes_set=nearby_nodes_set,
+                        verbose=verbose)
+    ranks = _graph_node_ranks(graph)
+    distances = [point.distance(data["geometry"]) for _, _, _, data in candidates]
+    minimum = min(distances)
+    winners = [i for i, distance in enumerate(distances) if distance == minimum]
+
+    def original_order(i):
+        u, v, key, _ = candidates[i]
+        first, second = (u, v) if ranks[u] <= ranks[v] else (v, u)
+        return (ranks[first], list(graph._adj[first]).index(second),
+                list(graph._adj[first][second]).index(key))
+
+    chosen = winners[0] if len(winners) == 1 else min(winners, key=original_order)
+    u, v, key, data = candidates[chosen]
+    if ranks[u] > ranks[v]:
+        u, v = v, u
+    return [u, v, key], minimum, data["geometry"]
 
 
 def _neighbors(csr):
@@ -293,20 +345,35 @@ def _apls_native_graph(graph):
         return apls.add_travel_time(cleaned.copy())
 
 
-def _apls_controls(graph):
+def _apls_controls(graph, points, protocol):
+    nodes = list(graph.nodes())
+    maximum = protocol.get("apls_max_control_nodes", 0)
+    if maximum and len(nodes) > maximum:
+        seed_bytes = hashlib.sha256(
+            np.asarray(points, dtype=np.int32).tobytes()
+            + int(protocol["apls_control_sampling_seed"]).to_bytes(8, "little")
+        ).digest()
+        rng = random.Random(int.from_bytes(seed_bytes[:8], "little"))
+        nodes = [nodes[i] for i in sorted(rng.sample(range(len(nodes)), maximum))]
     return [[node, graph.nodes[node]["x"], graph.nodes[node]["y"]]
-            for node in graph.nodes()]
+            for node in nodes]
 
 
-def prepare_apls_reference(gt):
+def prepare_apls_reference(gt, protocol=None):
     """Compute original-node GT paths once and reuse them for every prediction."""
-    if "apls_reference" not in gt:
+    protocol = protocol or {"apls_max_control_nodes": 0,
+                            "apls_control_sampling_seed": 1234}
+    key = (protocol["apls_max_control_nodes"],
+           protocol["apls_control_sampling_seed"])
+    cache = gt.setdefault("apls_references", {})
+    if key not in cache:
         graph = _apls_native_graph(gt["compact"])
-        gt["apls_reference"] = {
-            "controls": _apls_controls(graph),
-            "paths": dict(nx.shortest_path_length(graph, weight="length")),
+        controls = _apls_controls(graph, gt["points"], protocol)
+        cache[key] = {
+            "controls": controls,
+            "paths": _apls_control_paths(graph, controls),
         }
-    return gt["apls_reference"]
+    return cache[key]
 
 
 def _apls_control_paths(graph, controls):
@@ -324,12 +391,12 @@ def _official_apls(gt, pred, protocol):
     apls = _cosmiq()
     counts = {"gt": 0, "pred": 0}
     timing = {}
-    reference = prepare_apls_reference(gt)
+    reference = prepare_apls_reference(gt, protocol)
     with redirect_stdout(_NullWriter()):
         started = time.perf_counter()
         pred_graph = _apls_native_graph(pred["compact"])
-        controls_pred = _apls_controls(pred_graph)
-        paths_pred = dict(nx.shortest_path_length(pred_graph, weight="length"))
+        controls_pred = _apls_controls(pred_graph, pred["points"], protocol)
+        paths_pred = _apls_control_paths(pred_graph, controls_pred)
         timing["pred_native"] = time.perf_counter() - started
 
         started = time.perf_counter()
