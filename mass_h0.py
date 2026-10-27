@@ -21,12 +21,10 @@ CFG = ROOT / 'configs' / 'swin_tiny_patch4_window7_224_lite.yaml'
 
 def architecture_flags():
     return ['--structure_profile', 'stage23_boundary_0626',
-            '--stage_skeleton_mode', 'direct', '--enable_highres_structure_stream',
-            '--highres_structure_channels', '64', '--enable_h3_surface_fusion',
+            '--stage_skeleton_mode', 'direct', '--highres_structure_channels', '64',
+            '--enable_h3_surface_fusion',
             '--remove_stage2_pre_topology_source', '--highres_structure_fuse_stages', 'stage23',
-            '--highres_structure_fusion_mode', 'stage23', '--enable_global_topology',
-            '--global_topology_max_nodes', '32', '--global_topology_heads', '4',
-            '--global_topology_alpha_max', '0.05']
+            '--highres_structure_fusion_mode', 'stage23']
 
 
 def train_command(args):
@@ -64,7 +62,7 @@ def verify_base_model():
     changed = [name for name, digest in expected.items()
                if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest]
     if changed:
-        raise ValueError(f'Shared PatchEmbed H0 source hash mismatch: {changed}')
+        raise ValueError(f'No-CNN/no-H0 ablation source hash mismatch: {changed}')
 
 
 def verify_checkpoint(path):
@@ -172,7 +170,7 @@ def main():
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or 'mass_h0_shared_patch_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.run_name = args.run_name or 'mass_h0_no_cnn_no_h0_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
             parser.error(f'Fresh run directory already exists: {run_dir}')

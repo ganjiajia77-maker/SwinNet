@@ -1061,16 +1061,6 @@ class PatchEmbed(nn.Module):
 
         # Preserve official Swin names so patch_embed.proj weights load directly.
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.edge_stem = nn.Sequential(
-            nn.Conv2d(in_chans, 32, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, 32),
-            nn.GELU(),
-            nn.Conv2d(32, 32, kernel_size=3, padding=2, dilation=2, bias=False),
-            nn.GroupNorm(8, 32),
-            nn.GELU(),
-            nn.Conv2d(32, embed_dim, kernel_size=7, stride=patch_size, padding=3, bias=False),
-        )
-        self.edge_scale = nn.Parameter(torch.tensor(0.01))
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -1080,7 +1070,7 @@ class PatchEmbed(nn.Module):
         B, C, H, W = x.shape
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x) + self.edge_scale * self.edge_stem(x)
+        x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)  # B Ph*Pw C
         if self.norm is not None:
             x = self.norm(x)
@@ -1089,10 +1079,7 @@ class PatchEmbed(nn.Module):
     def flops(self):
         Ho, Wo = self.patches_resolution
         H, W = self.img_size
-        flops = Ho * Wo * self.embed_dim * self.in_chans * 4 * 4
-        flops += H * W * self.in_chans * 32 * 3 * 3
-        flops += H * W * 32 * 32 * 3 * 3
-        flops += Ho * Wo * 32 * self.embed_dim * 7 * 7
+        flops = Ho * Wo * self.embed_dim * self.in_chans * self.patch_size[0] * self.patch_size[1]
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
@@ -1509,24 +1496,30 @@ class SwinTransformerSys(nn.Module):
             if self.enable_highres_structure_stream
             else None
         )
-        self.highres_structure_skeleton_head = nn.Conv2d(
-            self.highres_structure_channels,
-            1,
-            kernel_size=1,
-            bias=True,
+        self.highres_structure_skeleton_head = (
+            nn.Conv2d(self.highres_structure_channels, 1, kernel_size=1, bias=True)
+            if self.enable_highres_structure_stream
+            else None
         )
-        self.highres_structure_fusion = nn.ModuleDict(
-            {
-                "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-                "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
-            }
+        self.highres_structure_fusion = (
+            nn.ModuleDict(
+                {
+                    "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
+                    "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
+                }
+            )
+            if self.enable_highres_structure_stream
+            else None
         )
-        self.structure_surface_correction_head = StructureSurfaceCorrectionHead(
-            self.highres_structure_channels,
+        self.structure_surface_correction_head = (
+            StructureSurfaceCorrectionHead(self.highres_structure_channels)
+            if self.enable_highres_structure_stream
+            else None
         )
         print(
-            "[INFO] High-res structure stream: {}, source=patch_embed_cnn, channels={}, fuse_stages={}, fusion_mode={}".format(
+            "[INFO] High-res structure stream: {}, source={}, channels={}, fuse_stages={}, fusion_mode={}".format(
                 "enabled" if self.enable_highres_structure_stream else "disabled",
+                "patch_embed" if self.enable_highres_structure_stream else "none",
                 self.highres_structure_channels,
                 self.highres_structure_fuse_stages,
                 self.highres_structure_fusion_mode,
@@ -1584,14 +1577,18 @@ class SwinTransformerSys(nn.Module):
             self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
                                           dim_scale=4, dim=embed_dim)
             if self.return_skeleton:
-                self.global_topology = KeypointGuidedGlobalTopology(
-                    channels=embed_dim,
-                    struct_channels=self.highres_structure_channels,
-                    max_nodes=global_topology_max_nodes,
-                    heads=global_topology_heads,
-                    alpha_max=global_topology_alpha_max,
-                    enabled=self.enable_global_topology,
-                    connectivity_channels=8,
+                self.global_topology = (
+                    KeypointGuidedGlobalTopology(
+                        channels=embed_dim,
+                        struct_channels=self.highres_structure_channels,
+                        max_nodes=global_topology_max_nodes,
+                        heads=global_topology_heads,
+                        alpha_max=global_topology_alpha_max,
+                        enabled=True,
+                        connectivity_channels=8,
+                    )
+                    if self.enable_global_topology
+                    else None
                 )
                 self.guided_head = SkeletonGuidedHead(
                     in_channels=embed_dim,

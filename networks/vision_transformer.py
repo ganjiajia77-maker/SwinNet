@@ -40,7 +40,11 @@ def get_topology_coefficients(model):
         "final_structure_enabled": bool(guided_head.enable_final_structure),
         "highres_structure_stream": {
             "enabled": bool(getattr(swin_unet, "enable_highres_structure_stream", False)),
-            "source": "prepatch",
+            "source": (
+                "patch_embed"
+                if bool(getattr(swin_unet, "enable_highres_structure_stream", False))
+                else "none"
+            ),
             "channels": int(getattr(swin_unet, "highres_structure_channels", 0)),
             "fuse_stages": getattr(swin_unet, "highres_structure_fuse_stages", "stage23"),
             "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),

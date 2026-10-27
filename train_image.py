@@ -2186,7 +2186,7 @@ if __name__ == "__main__":
             checkpoint = {
                 'experiment_base_commit': BASE_COMMIT,
                 'experiment_architecture': ARCHITECTURE_ID,
-                'experiment_protocol': 'h0-mass-native1500-random512-fp32-80e-bs2-v1',
+                'experiment_protocol': 'mass-native1500-random512-fp32-80e-bs2-no-cnn-no-h0-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),
