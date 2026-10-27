@@ -340,12 +340,13 @@ class DirectionalDynamics(nn.Module):
     def forward(self, visual, p0, q, reliable, proposal, accept, weights,
                 capture_diagnostics=False, transport_gate=None,
                 freeze_generated_sources=False, disable_transport=False,
-                disable_proposal=False):
+                disable_proposal=False, state_gate=None, base_gate_logit=None):
         state = p0
         states, masses, availabilities = [state], [], []
         diagnostics = {key: [] for key in (
             'alpha', 'beta', 'gamma', 'stay', 'm',
-            'transport_delta', 'proposal_delta', 'anchor_delta')}
+            'transport_delta', 'proposal_delta', 'anchor_delta',
+            'g_step', 'state_gate_delta', 'transport_rate')}
         for _ in range(self.steps):
             if freeze_generated_sources:
                 support = reliable
@@ -366,7 +367,15 @@ class DirectionalDynamics(nn.Module):
                                      state)
             coefficients = self.rates(torch.cat((visual, p0, q, reliable, proposal,
                                                  accept, state, available), dim=1)).softmax(dim=1)
-            transport = (coefficients[:, 1:2] * transport_gate
+            state_delta = torch.zeros_like(state)
+            step_gate = transport_gate
+            if state_gate is not None:
+                if base_gate_logit is None or transport_gate is None:
+                    raise ValueError('State gate requires the original v8 gate logit')
+                state_delta = state_gate(torch.cat((state, propagated - state,
+                    available, coefficients[:, 1:2], proposal - state, p0 - state), dim=1))
+                step_gate = torch.sigmoid(base_gate_logit + state_delta)
+            transport = (coefficients[:, 1:2] * step_gate
                          if transport_gate is not None else
                          accept * coefficients[:, 1:2] * available)
             propose = .2 * accept * coefficients[:, 2:3]
@@ -382,7 +391,10 @@ class DirectionalDynamics(nn.Module):
                                    ('m', propagated),
                                    ('transport_delta', transport * (propagated - state)),
                                    ('proposal_delta', propose * (proposal - state)),
-                                   ('anchor_delta', anchor * (p0 - state))):
+                                   ('anchor_delta', anchor * (p0 - state)),
+                                   ('g_step', step_gate if step_gate is not None else torch.zeros_like(state)),
+                                   ('state_gate_delta', state_delta),
+                                   ('transport_rate', coefficients[:, 1:2])):
                     diagnostics[key].append(value)
             state = stay * state + transport * propagated + propose * proposal + anchor * p0
             states.append(state)
@@ -422,6 +434,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.gate_relation_mode = gate_relation_mode
         self.gate_relation = (MultiScaleGateRelation(highres_channels, stage_channels, width)
                               if gate_relation_mode is not None else None)
+        self.state_gate = None
         proposal_channels = (2 * width + 7) if bridge_route else (width + 7)
         self.proposal_head = nn.Sequential(nn.Conv2d(proposal_channels, width, 3, padding=1),
                                            nn.GELU(), nn.Conv2d(width, 2 if bridge_route else 1, 1))
@@ -488,6 +501,7 @@ class ReliableDirectionalRepair(nn.Module):
             if weights_override.shape != weights.shape:
                 raise ValueError('The diagnostic W override must retain eight directions')
             weights = weights_override
+        base_gate_logit = None
         if self.gate_relation is not None:
             gate_output = self.gate_relation(
                 highres, decoder, visual, p0, q, reliable, weights, two, one,
@@ -495,7 +509,8 @@ class ReliableDirectionalRepair(nn.Module):
                 capture_diagnostics=capture_diagnostics)
             delta_gate_logit, gate_source_coverage = gate_output[:2]
             gate_relation_diagnostics = gate_output[2] if capture_diagnostics else None
-            transport_gate = torch.sigmoid(relation_outputs[6] + delta_gate_logit)
+            base_gate_logit = relation_outputs[6] + delta_gate_logit
+            transport_gate = torch.sigmoid(base_gate_logit)
         two_mean, one_mean = two.mean(1, keepdim=True), one.mean(1, keepdim=True)
         weight_sum = weights.sum(1, keepdim=True)
         bilateral = (weights * two.repeat_interleave(2, dim=1)).sum(1, keepdim=True) / (
@@ -569,7 +584,8 @@ class ReliableDirectionalRepair(nn.Module):
             transport_gate=transport_gate,
             freeze_generated_sources=freeze_generated_sources,
             disable_transport=disable_transport,
-            disable_proposal=disable_proposal)
+            disable_proposal=disable_proposal, state_gate=self.state_gate,
+            base_gate_logit=base_gate_logit)
         states, masses, available = dynamics_output[:3]
         z1, delta_logit = compose_surface_logits(z0, p0, states[-1])
         p1 = z1.sigmoid()

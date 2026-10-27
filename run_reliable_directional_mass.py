@@ -428,7 +428,8 @@ def operating_comparison(reports, selection):
 
 
 @torch.no_grad()
-def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
+def evaluate_thresholds(model, dataset, device, thresholds, max_images=0,
+                        reference_threshold=None):
     model.eval()
     limit = min(len(dataset), max_images or len(dataset))
     storage = {threshold: {'p0': [], 'p1': [], 'paired': [], 'bins':
@@ -446,22 +447,24 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
         for threshold in thresholds:
             data = storage[threshold]
             p0, p1 = p0_prob >= threshold, p1_prob >= threshold
+            reference_p0 = (p0 if reference_threshold is None else
+                            p0_prob >= reference_threshold)
             data['p0'].append({'case_id': sample['case_name'],
                                **image_metrics(p0, prepared, PROTOCOL)})
             data['p1'].append({'case_id': sample['case_name'],
                                **image_metrics(p1, prepared, PROTOCOL)})
-            by_length, bridges = gap_lengths(p0, p1, prepared['skeleton'], gt)
+            by_length, bridges = gap_lengths(reference_p0, p1, prepared['skeleton'], gt)
             eligible = sum(values['eligible'] for values in by_length.values())
             closed = sum(values['closed'] for values in by_length.values())
             missing_center = prepared['skeleton'] & ~(cv2.dilate(
-                p0.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
+                reference_p0.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
             data['paired'].append({'case_id': sample['case_name'],
                                    'eligible_p0_gaps': eligible, 'closed_p0_gaps': closed,
                                    'background_bridge_proxy': bridges,
-                                   'added_gt_pixels': int((p1 & ~p0 & gt).sum()),
-                                   'added_background_pixels': int((p1 & ~p0 & ~gt).sum()),
-                                   'removed_gt_pixels': int((p0 & ~p1 & gt).sum()),
-                                   'removed_background_pixels': int((p0 & ~p1 & ~gt).sum()),
+                                   'added_gt_pixels': int((p1 & ~reference_p0 & gt).sum()),
+                                   'added_background_pixels': int((p1 & ~reference_p0 & ~gt).sum()),
+                                   'removed_gt_pixels': int((reference_p0 & ~p1 & gt).sum()),
+                                   'removed_background_pixels': int((reference_p0 & ~p1 & ~gt).sum()),
                                    'gap_center_signed_probability_change': (
                                        float((p1_prob - p0_prob)[missing_center].mean())
                                        if missing_center.any() else None),
@@ -469,9 +472,9 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
             for name, values in by_length.items():
                 data['bins'][name]['eligible'] += values['eligible']
                 data['bins'][name]['closed'] += values['closed']
-        reference_threshold = thresholds[0]
+        tile_reference = thresholds[0] if reference_threshold is None else reference_threshold
         missing = prepared['skeleton'] & ~(cv2.dilate(
-            (p0_prob >= reference_threshold).astype(np.uint8),
+            (p0_prob >= tile_reference).astype(np.uint8),
             np.ones((5, 5), np.uint8)) > 0)
         positions = sliding_positions(1500, 512, 256)
         best_tile = max(((int(missing[y:y+512, x:x+512].sum()), y, x)
@@ -500,6 +503,7 @@ def evaluate_thresholds(model, dataset, device, thresholds, max_images=0):
                 for name, counts in data['bins'].items()}
         p0_summary, p1_summary = summarize(data['p0']), summarize(data['p1'])
         reports[threshold] = {'threshold': threshold, 'images': limit,
+                              'p0_reference_threshold': threshold if reference_threshold is None else reference_threshold,
                               'p0': p0_summary, 'p1': p1_summary,
                               'paired': paired, 'gap_by_length': bins,
                               'selection_score': selection_score(p1_summary, paired, limit),
