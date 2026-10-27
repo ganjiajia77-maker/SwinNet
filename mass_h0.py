@@ -24,7 +24,9 @@ def architecture_flags():
             '--stage_skeleton_mode', 'direct', '--highres_structure_channels', '64',
             '--enable_h3_surface_fusion',
             '--remove_stage2_pre_topology_source', '--highres_structure_fuse_stages', 'stage23',
-            '--highres_structure_fusion_mode', 'stage23']
+            '--highres_structure_fusion_mode', 'stage23', '--enable_global_topology',
+            '--global_topology_max_nodes', '32', '--global_topology_heads', '4',
+            '--global_topology_alpha_max', '0.05']
 
 
 def train_command(args):
@@ -170,7 +172,7 @@ def main():
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or 'mass_h0_no_cnn_no_h0_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.run_name = args.run_name or 'mass_h0_no_cnn_no_h0_global_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
             parser.error(f'Fresh run directory already exists: {run_dir}')

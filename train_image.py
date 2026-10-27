@@ -291,10 +291,6 @@ if args.freeze_post_refine_interaction_only:
     if not args.enable_highres_structure_stream:
         parser.error("--freeze_post_refine_interaction_only requires --enable_highres_structure_stream")
     args.enable_post_refine_structure_interaction = True
-if args.enable_global_topology and not args.enable_highres_structure_stream:
-    parser.error("--enable_global_topology requires --enable_highres_structure_stream")
-
-
 def get_final_loss_weights(args):
     if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
         weights = {
@@ -2186,7 +2182,7 @@ if __name__ == "__main__":
             checkpoint = {
                 'experiment_base_commit': BASE_COMMIT,
                 'experiment_architecture': ARCHITECTURE_ID,
-                'experiment_protocol': 'mass-native1500-random512-fp32-80e-bs2-no-cnn-no-h0-v1',
+                'experiment_protocol': 'mass-native1500-random512-fp32-80e-bs2-no-cnn-no-h0-global-on-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),

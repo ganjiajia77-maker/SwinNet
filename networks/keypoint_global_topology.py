@@ -312,12 +312,23 @@ class KeypointGuidedGlobalTopology(nn.Module):
         connectivity_feature=None,
     ):
         batch, channels, height, width = feature.shape
-        if not self.enable_global_topology or z_struct is None or surface_prob is None:
+        if not self.enable_global_topology or surface_prob is None:
             return feature
 
+        # H0-free ablations use the final decoder feature as the anchor/token
+        # source while keeping the same global topology attention pathway.
+        anchor_source = feature if z_struct is None else z_struct
+        anchor_map = self._prepare_token_map(
+            anchor_source,
+            batch,
+            (height, width),
+            self.struct_channels,
+            feature.dtype,
+            feature.device,
+        )
         with torch.no_grad():
             z_score = torch.linalg.vector_norm(
-                z_struct.detach().float(),
+                anchor_map.detach().float(),
                 dim=1,
                 keepdim=True,
             )
@@ -341,7 +352,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
             coords, valid, scores, candidate_count = self._extract_fps_anchors(anchor_score)
 
         sampled_struct = self._sample_features_at_anchor_coords(
-            z_struct.to(dtype=feature.dtype),
+            anchor_map,
             coords,
             anchor_hw=(height, width),
         )

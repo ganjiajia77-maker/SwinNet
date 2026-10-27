@@ -2308,17 +2308,17 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                if self.enable_global_topology and highres_skeleton_feat is not None:
+                if self.enable_global_topology:
                     surface_prob = self._surface_prior_for_global_topology(
                         x,
-                        highres_skeleton_feat,
+                        None,
                     )
                     connectivity_feature = self._latest_local_topology_features(
                         structure_outputs
                     )
                     x = self.global_topology.forward_feature_anchors(
                         x,
-                        highres_skeleton_feat,
+                        None,
                         surface_prob,
                         connectivity_feature=connectivity_feature,
                     )
