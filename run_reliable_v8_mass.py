@@ -19,7 +19,7 @@ from run_reliable_directional_mass import (
 )
 
 
-VERSION = 'reliable_directional_dynamics_v8_semantic_gate'
+VERSION = 'reliable_directional_dynamics_v8_source_available_gate'
 MODES = ('local', 'bilateral', 'directional', 'full')
 
 
@@ -45,6 +45,8 @@ def load_experiment(args):
             getattr(args, 'base_checkpoint_override', None) is not None or
             getattr(args, 'q3_checkpoint_override', None) is not None))
     model = load_v7(config)
+    model.dynamics.transport_availability_power = float(
+        getattr(args, 'transport_availability_power', 1.))
     stage = model.frozen.base.swin_unet.decoder_structure_blocks['3']
     decoder_channels = stage.structure_branch[0].block[0].in_channels
     highres_channels = model.frozen.base.swin_unet.highres_structure_channels
@@ -55,7 +57,9 @@ def load_experiment(args):
     if args.v8_checkpoint:
         payload = torch.load(args.v8_checkpoint, map_location='cpu', weights_only=False)
         expected = {'version': VERSION, 'v7_checkpoint': str(v7_path),
-                    'relation_mode': args.relation_mode}
+                    'relation_mode': args.relation_mode,
+                    'transport_availability_power':
+                        model.dynamics.transport_availability_power}
         errors = {key: (payload.get(key), value) for key, value in expected.items()
                   if payload.get(key) != value}
         if errors:
@@ -73,6 +77,8 @@ def save(model, args, epoch, optimizer, best_score):
     payload = {'version': VERSION, 'epoch': epoch,
                'v7_checkpoint': str(args.v7_checkpoint.resolve()),
                'relation_mode': args.relation_mode,
+               'transport_availability_power':
+                   model.dynamics.transport_availability_power,
                'gate_relation': model.gate_relation.state_dict(),
                'optimizer': optimizer.state_dict(), 'best_score': best_score}
     target = args.output_dir / 'last.pth'
@@ -237,6 +243,8 @@ def train(args, model):
                 torch.save({'version': VERSION, 'epoch': epoch,
                             'v7_checkpoint': str(args.v7_checkpoint.resolve()),
                             'relation_mode': args.relation_mode,
+                            'transport_availability_power':
+                                model.dynamics.transport_availability_power,
                             'gate_relation': model.gate_relation.state_dict(),
                             'best_score': best_score}, temp)
                 temp.replace(target)
@@ -284,6 +292,8 @@ def main():
     parser.add_argument('--v7_checkpoint', type=Path, required=True)
     parser.add_argument('--v8_checkpoint', type=Path)
     parser.add_argument('--relation_mode', choices=MODES, required=True)
+    parser.add_argument('--transport_availability_power', type=float, default=1.0,
+                        help='Exponent on V_k in alpha_k; 0 keeps the original v8 rule')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--val_interval', type=int, default=5)

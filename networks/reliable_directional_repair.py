@@ -340,7 +340,7 @@ class DirectionalDynamics(nn.Module):
     def forward(self, visual, p0, q, reliable, proposal, accept, weights,
                 capture_diagnostics=False, transport_gate=None,
                 freeze_generated_sources=False, disable_transport=False,
-                disable_proposal=False):
+                disable_proposal=False, transport_availability_power=0.):
         state = p0
         states, masses, availabilities = [state], [], []
         diagnostics = {key: [] for key in (
@@ -366,9 +366,16 @@ class DirectionalDynamics(nn.Module):
                                      state)
             coefficients = self.rates(torch.cat((visual, p0, q, reliable, proposal,
                                                  accept, state, available), dim=1)).softmax(dim=1)
-            transport = (coefficients[:, 1:2] * transport_gate
-                         if transport_gate is not None else
-                         accept * coefficients[:, 1:2] * available)
+            if transport_gate is not None:
+                # Keep the learned gate and direction distribution intact, but
+                # require actual reliable-source coverage for transport.
+                availability = (available.clamp_min(0.).pow(
+                    float(transport_availability_power))
+                    if transport_availability_power > 0. else
+                    torch.ones_like(available))
+                transport = (coefficients[:, 1:2] * transport_gate * availability)
+            else:
+                transport = accept * coefficients[:, 1:2] * available
             propose = .2 * accept * coefficients[:, 2:3]
             if disable_transport:
                 transport = torch.zeros_like(transport)
@@ -444,6 +451,7 @@ class ReliableDirectionalRepair(nn.Module):
         self.bridge_route = bridge_route
         self.conditional_transport = conditional_transport
         self.transport_gate_mode = transport_gate_mode
+        self.transport_availability_power = 0.
 
     def set_accept_floor(self, value):
         if not 0. <= value < 1.:
@@ -569,7 +577,8 @@ class ReliableDirectionalRepair(nn.Module):
             transport_gate=transport_gate,
             freeze_generated_sources=freeze_generated_sources,
             disable_transport=disable_transport,
-            disable_proposal=disable_proposal)
+            disable_proposal=disable_proposal,
+            transport_availability_power=self.dynamics.transport_availability_power)
         states, masses, available = dynamics_output[:3]
         z1, delta_logit = compose_surface_logits(z0, p0, states[-1])
         p1 = z1.sigmoid()
