@@ -48,7 +48,7 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _training_history(run_dir):
+def _training_history(run_dir, extra_logs=()):
     history = []
     path = run_dir / 'epoch_metrics.jsonl'
     if path.is_file():
@@ -58,7 +58,9 @@ def _training_history(run_dir):
     validation = {}
     pattern = re.compile(r'\[VAL\] epoch=(\d+) score=([\d.eE+-]+) IoU=([\d.eE+-]+)')
     searched = []
-    log_paths = sorted(set(run_dir.glob('*.log')) | set(run_dir.glob('*log*.txt')))
+    log_paths = sorted(set(run_dir.glob('*.log')) | set(run_dir.glob('*log*.txt')) |
+                       {Path(path).expanduser() for path in extra_logs
+                        if Path(path).expanduser().is_file()})
     for path in log_paths:
         searched.append(str(path))
         with path.open(encoding='utf-8', errors='replace') as handle:
@@ -79,6 +81,212 @@ def _training_history(run_dir):
                                      'per-epoch DeltaG maps or relation gradients.')}
 
 
+def _file_info(path):
+    path = Path(path).expanduser()
+    return {'path': str(path), 'exists': path.is_file(),
+            'size_bytes': path.stat().st_size if path.is_file() else None}
+
+
+def _dependency_report(checkpoint, v7_override=None, base_override=None,
+                       q3_override=None):
+    v7_path = Path(v7_override or checkpoint.get('v7_checkpoint', '')).expanduser()
+    result = {'v7': _file_info(v7_path), 'base': None, 'q3': None,
+              'metadata_read': False}
+    if not v7_path.is_file():
+        return result
+    try:
+        v7 = torch.load(v7_path, map_location='cpu', weights_only=False)
+    except Exception as exc:  # Report a corrupt/incompatible file instead of hiding it.
+        result['metadata_error'] = f'{type(exc).__name__}: {exc}'
+        return result
+    result['metadata_read'] = True
+    for name, override in (('base', base_override), ('q3', q3_override)):
+        saved = v7.get(f'{name}_checkpoint', '')
+        path = Path(override or saved).expanduser() if (override or saved) else Path()
+        result[name] = _file_info(path) if str(path) != '.' else {
+            'path': None, 'exists': False, 'size_bytes': None}
+        result[name]['path_from'] = 'override' if override else 'v7 metadata'
+    return result
+
+
+def _best_last_drift(run_dir, checkpoint):
+    last_path = run_dir / 'last.pth'
+    if not last_path.is_file():
+        return {'available': False, 'reason': 'last.pth not found'}
+    try:
+        last = torch.load(last_path, map_location='cpu', weights_only=False)
+        best_state = checkpoint.get('gate_relation', {})
+        last_state = last.get('gate_relation', {})
+        shared = sorted(set(best_state) & set(last_state))
+        rows = []
+        for name in shared:
+            best_value, last_value = best_state[name], last_state[name]
+            if not (torch.is_tensor(best_value) and torch.is_tensor(last_value)):
+                continue
+            if best_value.shape != last_value.shape:
+                rows.append({'name': name, 'shape_mismatch': True,
+                             'best_shape': list(best_value.shape),
+                             'last_shape': list(last_value.shape)})
+                continue
+            delta = last_value.detach().float() - best_value.detach().float()
+            rows.append({'name': name, 'shape': list(best_value.shape),
+                         'best_l2': float(best_value.detach().float().norm()),
+                         'last_l2': float(last_value.detach().float().norm()),
+                         'last_minus_best_l2': float(delta.norm()),
+                         'last_minus_best_mean_abs': float(delta.abs().mean()),
+                         'last_minus_best_max_abs': float(delta.abs().max())})
+        return {'available': True, 'last_epoch': last.get('epoch'),
+                'best_epoch': checkpoint.get('epoch'),
+                'last_has_optimizer': 'optimizer' in last,
+                'shared_tensor_count': len(rows), 'parameters': rows,
+                'interpretation': ('Best-vs-last drift only; this does not measure change '
+                                   'from initialization or prove feature use.')}
+    except Exception as exc:
+        return {'available': False, 'reason': f'{type(exc).__name__}: {exc}'}
+
+
+def _prediction_inventory(roots, max_files=1000):
+    allowed = {'.npy', '.npz', '.png', '.tif', '.tiff'}
+    candidates, searched = [], []
+    for root in roots:
+        root = Path(root).expanduser()
+        searched.append({'path': str(root), 'exists': root.exists()})
+        if not root.exists():
+            continue
+        for path in root.rglob('*'):
+            if not path.is_file() or path.suffix.lower() not in allowed:
+                continue
+            name = str(path.relative_to(root)).lower()
+            relevant = any(token in name for token in
+                           ('v7', 'v8', 'p0', 'p1', 'prob', 'pred', 'mask',
+                            'surface', 'prediction'))
+            if not relevant:
+                continue
+            item = {'path': str(path), 'size_bytes': path.stat().st_size,
+                    'suffix': path.suffix.lower()}
+            try:
+                if path.suffix.lower() == '.npy':
+                    array = np.load(path, mmap_mode='r', allow_pickle=False)
+                    item['shape'] = list(array.shape)
+                    item['dtype'] = str(array.dtype)
+                    stride = max(1, int(np.ceil(array.size / 100000)))
+                    sample = np.asarray(array.reshape(-1)[::stride])
+                    item['sampled_value_range'] = [float(np.nanmin(sample)),
+                                                   float(np.nanmax(sample))]
+                elif path.suffix.lower() == '.npz':
+                    with np.load(path, allow_pickle=False) as archive:
+                        item['keys'] = list(archive.files)
+                        item['arrays'] = {key: {'shape': list(archive[key].shape),
+                                                'dtype': str(archive[key].dtype)}
+                                          for key in archive.files[:32]}
+                elif path.suffix.lower() == '.png':
+                    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                    if image is not None:
+                        item['shape'] = list(image.shape)
+                        item['dtype'] = str(image.dtype)
+                        item['value_range'] = [int(image.min()), int(image.max())]
+                else:
+                    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                    if image is not None:
+                        item['shape'] = list(image.shape)
+                        item['dtype'] = str(image.dtype)
+                        item['value_range'] = [int(image.min()), int(image.max())]
+            except Exception as exc:
+                item['read_error'] = f'{type(exc).__name__}: {exc}'
+            candidates.append(item)
+            if len(candidates) >= max_files:
+                return {'searched_roots': searched, 'truncated': True,
+                        'candidate_count': len(candidates), 'candidates': candidates}
+    return {'searched_roots': searched, 'truncated': False,
+            'candidate_count': len(candidates), 'candidates': candidates}
+
+
+def _extra_saved_results(run_dir, roots):
+    result = {'threshold_curves': [], 'paired_reports': [], 'per_image_tables': []}
+    seen = set()
+    for root in [run_dir, *[Path(path).expanduser() for path in roots]]:
+        if not root.exists():
+            continue
+        for path in root.rglob('*'):
+            if not path.is_file():
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            lowered = path.name.lower()
+            if path.suffix.lower() == '.csv' and any(
+                    key in lowered for key in ('threshold', 'comparison', 'per_image')):
+                bucket = ('threshold_curves' if 'threshold' in lowered else
+                          'per_image_tables' if 'per_image' in lowered else 'paired_reports')
+                result[bucket].append(_file_info(path))
+            elif path.suffix.lower() == '.json' and any(
+                    key in lowered for key in ('comparison', 'matched_selection')):
+                result['paired_reports'].append(_file_info(path))
+    return result
+
+
+def _saved_evaluation_reports(roots):
+    reports, curves = [], []
+    seen = set()
+    names = {'summary.json', 'val_selection.json', 'matched_selection.json',
+             'v7_comparison.json', 'val_comparison.json'}
+    for root in roots:
+        root = Path(root).expanduser()
+        if not root.exists():
+            continue
+        for path in root.rglob('*.json'):
+            if path.name.lower() not in names or str(path.resolve()) in seen:
+                continue
+            seen.add(str(path.resolve()))
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception as exc:
+                reports.append({'path': str(path),
+                                'read_error': f'{type(exc).__name__}: {exc}'})
+                continue
+            compact = {'path': str(path), 'keys': sorted(payload)}
+            if path.name == 'summary.json':
+                compact.update({key: payload.get(key) for key in
+                                ('threshold', 'images', 'selection_score', 'p0', 'p1',
+                                 'paired', 'gap_by_length') if key in payload})
+            elif path.name == 'matched_selection.json':
+                compact.update({key: payload.get(key) for key in
+                                ('split', 'points', 'residuals', 'v7_checkpoint',
+                                 'v8_checkpoint', 'relation_mode') if key in payload})
+            else:
+                compact.update({key: payload.get(key) for key in
+                                ('threshold', 'selected_on', 'selection_score',
+                                 'v7_checkpoint', 'v8_checkpoint', 'dynamic_checkpoint')
+                                if key in payload})
+            reports.append(compact)
+        for path in root.rglob('*.csv'):
+            if 'threshold' not in path.name.lower():
+                continue
+            try:
+                with path.open(newline='', encoding='utf-8-sig') as handle:
+                    rows = list(csv.DictReader(handle))
+                if not rows:
+                    continue
+                score_rows = [row for row in rows if row.get('selection_score') not in
+                              (None, '')]
+                best = (max(score_rows, key=lambda row: float(row['selection_score']))
+                        if score_rows else None)
+                at = {}
+                for threshold in ('0.55', '0.69'):
+                    match = next((row for row in rows if row.get('threshold') and
+                                  abs(float(row['threshold']) - float(threshold)) < 1e-6), None)
+                    if match:
+                        at[threshold] = match
+                curves.append({'path': str(path), 'rows': len(rows),
+                               'best_by_saved_score': best,
+                               'rows_at_0.55_and_0.69': at})
+            except Exception as exc:
+                curves.append({'path': str(path),
+                               'read_error': f'{type(exc).__name__}: {exc}'})
+    return {'json_reports': reports, 'threshold_curves': curves}
+
+
 def _artifact_report(args, checkpoint, selection, original):
     state = checkpoint['gate_relation']
     parameters = {}
@@ -87,7 +295,7 @@ def _artifact_report(args, checkpoint, selection, original):
             data = value.detach().float()
             parameters[name] = {'shape': list(data.shape), 'finite': bool(torch.isfinite(data).all()),
                                 'l2': float(data.norm()), 'mean_abs': float(data.abs().mean())}
-    history = _training_history(args.run_dir)
+    history = _training_history(args.run_dir, args.log_file)
     for row in history['epochs']:
         if (int(row['epoch']) == int(checkpoint['epoch']) and
                 row['validation'] is None):
@@ -109,10 +317,18 @@ def _artifact_report(args, checkpoint, selection, original):
                               '0.60; the saved validation selection scans 0.35 through 0.75. '
                               'These are different operating points, not duplicate scores.'),
         'saved_validation': {
-            'images': original.get('images'), 'p1': original.get('p1'),
+            'images': original.get('images'), 'p0': original.get('p0'),
+            'p1': original.get('p1'),
             'paired': original.get('paired')},
         'gate_relation_parameters': parameters,
         'training_history': history,
+        'dependencies': _dependency_report(
+            checkpoint, args.v7_checkpoint, args.base_checkpoint, args.q3_checkpoint),
+        'best_last_parameter_drift': _best_last_drift(args.run_dir, checkpoint),
+        'prediction_inventory': _prediction_inventory(args.prediction_roots),
+        'additional_saved_results': _extra_saved_results(
+            args.run_dir, args.prediction_roots),
+        'saved_evaluation_reports': _saved_evaluation_reports(args.prediction_roots),
     }
 
 
@@ -455,6 +671,24 @@ def _markdown(report):
                     f"{row.get('L_cont')} | {val.get('selection_score_at_0.60')} | "
                     f"{val.get('iou_at_0.60')} |")
     rows.extend(['', report['training_history']['missing_history_note'], ''])
+    dependencies = report['dependencies']
+    rows.extend(['## Saved artifacts', '',
+                 f"V7 dependency: `{dependencies['v7']['path']}` "
+                 f"(exists={dependencies['v7']['exists']}); BASE exists="
+                 f"{(dependencies.get('base') or {}).get('exists')}; Q3 exists="
+                 f"{(dependencies.get('q3') or {}).get('exists')}.",
+                 f"Prediction-like files found under searched roots: "
+                 f"{report['prediction_inventory']['candidate_count']}.",
+                 f"Best/last checkpoint comparison available: "
+                 f"{report['best_last_parameter_drift']['available']}. This comparison "
+                 'does not measure movement from initialization or prove feature use.',
+                 'Threshold curves, paired reports and per-image CSV files found: '
+                 f"{len(report['additional_saved_results']['threshold_curves'])}, "
+                 f"{len(report['additional_saved_results']['paired_reports'])}, "
+                 f"{len(report['additional_saved_results']['per_image_tables'])}.",
+                 'The exact searched roots and candidate file names, shapes, and keys are '
+                 'listed in `v8_artifacts.json`. Saved summaries and matched operating points '
+                 'from the supplied V7/V8 roots are copied there as well.', ''])
     if 'forward' not in report:
         rows.append('Forward evidence unavailable: the saved v8 checkpoint contains only '
                     'gate_relation weights. The exact frozen model dependencies or cached '
@@ -511,11 +745,15 @@ def main():
     parser.add_argument('--v7_checkpoint', type=Path)
     parser.add_argument('--base_checkpoint', type=Path)
     parser.add_argument('--q3_checkpoint', type=Path)
+    parser.add_argument('--v7_run_dir', type=Path, action='append', default=[])
+    parser.add_argument('--prediction_root', type=Path, action='append', default=[])
+    parser.add_argument('--log_file', type=Path, action='append', default=[])
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--artifacts_only', action='store_true')
     args = parser.parse_args()
     args.run_dir = args.run_dir.resolve()
     args.v8_checkpoint = args.run_dir / 'best.pth'
+    args.prediction_roots = [args.run_dir, *args.v7_run_dir, *args.prediction_root]
     selection_file = args.run_dir / 'eval' / 'val_selection.json'
     summary_file = args.run_dir / 'eval' / 'val' / 'summary.json'
     for path in (args.v8_checkpoint, selection_file, summary_file):
