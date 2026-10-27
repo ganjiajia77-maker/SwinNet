@@ -8,13 +8,20 @@ the manifest. NPZ paths can select an array with `archive.npz#key`.
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from diagnostics.compare_v6_v7_matched import write_csv
-from evaluation.road_comparison.road_metrics import image_metrics, prepare_target, summarize
+from evaluation.road_comparison.road_metrics import (
+    image_metrics, prepare_target, segmentation, summarize,
+)
 from run_q3_r3_mass import PROTOCOL
 from run_reliable_directional_mass import gap_lengths, selection_score
 
@@ -154,6 +161,7 @@ def _evaluate(records, model_name, threshold, reference_threshold):
         prediction = row[model_name] >= threshold
         metric = {'case_id': row['case_id'],
                   **image_metrics(prediction, prepared, PROTOCOL)}
+        pixel_metrics = segmentation(metric)
         bins, bridges = gap_lengths(p0, prediction, prepared['skeleton'], gt)
         eligible = sum(value['eligible'] for value in bins.values())
         closed = sum(value['closed'] for value in bins.values())
@@ -191,7 +199,7 @@ def _evaluate(records, model_name, threshold, reference_threshold):
             bins_total[name]['closed'] += values['closed']
         per_image.append({'case_id': row['case_id'], 'threshold': threshold,
                           'tp': metric['tp'], 'fp': metric['fp'], 'fn': metric['fn'],
-                          'iou': metric['iou'], 'f1': metric['f1'],
+                          'iou': pixel_metrics['iou'], 'f1': pixel_metrics['f1'],
                           'cldice': metric['cldice'],
                           'apls_gt_to_pred_approx': metric['apls_gt_to_pred_approx'],
                           'apls_pred_to_gt_approx': metric['apls_pred_to_gt_approx'],
@@ -236,8 +244,10 @@ def main():
     parser.add_argument('--p0_reference_threshold', type=float,
                         help='Threshold for P0 reference gaps; defaults to v7_threshold')
     args = parser.parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=False)
+    if not args.manifest.is_file():
+        parser.error(f'Prediction manifest does not exist: {args.manifest}')
     records = _read_manifest(args.manifest.resolve())
+    args.output_dir.mkdir(parents=True, exist_ok=False)
     p0_threshold = (args.p0_reference_threshold if args.p0_reference_threshold is not None
                     else args.v7_threshold)
     target = _count_at(records, 'v7', args.v7_threshold)
