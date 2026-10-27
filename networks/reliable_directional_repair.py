@@ -234,6 +234,11 @@ class MultiScaleGateRelation(nn.Module):
                 two, one, mode, intervention=None, capture_diagnostics=False):
         if mode not in ('local', 'bilateral', 'directional', 'full'):
             raise ValueError(f'Unsupported gate relation mode: {mode}')
+        if intervention == 'shuffle_h_h3':
+            # Keep the v7 path fixed while removing spatial alignment from v8 inputs.
+            offset = max(1, highres.shape[-2] * highres.shape[-1] // 2)
+            highres = highres.flatten(2).roll(offset, dims=2).reshape_as(highres)
+            decoder = decoder.flatten(2).roll(offset, dims=2).reshape_as(decoder)
         highres_projected = self.highres_project(highres)
         decoder_projected = self.decoder_project(decoder)
         projected = torch.cat((highres_projected, decoder_projected), dim=1)
@@ -252,7 +257,8 @@ class MultiScaleGateRelation(nn.Module):
             relation_weights = weights[:, permutation]
         elif intervention == 'shuffle_sources':
             pass
-        elif intervention not in (None, 'mask_relations') and not intervention.startswith('drop_dir_'):
+        elif intervention not in (None, 'mask_relations', 'zero_delta',
+                                  'shuffle_h_h3') and not intervention.startswith('drop_dir_'):
             raise ValueError(f'Unknown relation intervention: {intervention}')
         per_direction = []
         per_direction_raw = []
@@ -302,6 +308,8 @@ class MultiScaleGateRelation(nn.Module):
         if intervention == 'mask_relations':
             coverage = torch.zeros_like(coverage)
         delta = self.delta(torch.cat((center, context, relation, p0, q, coverage), dim=1))
+        if intervention == 'zero_delta':
+            delta = torch.zeros_like(delta)
         if capture_diagnostics:
             diagnostic = {
                 'center': center, 'highres_projected': highres_projected,
@@ -600,6 +608,7 @@ class ReliableDirectionalRepair(nn.Module):
                 result['path_continuity_evidence'] = relation_outputs[5]
             if self.gate_relation is not None:
                 result['g_v7'] = relation_outputs[3]
+                result['g_v7_logit'] = relation_outputs[6]
                 result['delta_g_logit'] = delta_gate_logit
                 result['gate_source_coverage'] = gate_source_coverage
                 result['gate_relation_diagnostics'] = gate_relation_diagnostics

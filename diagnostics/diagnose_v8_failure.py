@@ -340,19 +340,24 @@ def _pair_feature_rows(image_id, maps, gt, p0_threshold, max_per_class=256):
 
 
 @torch.no_grad()
-def _stitch_work_maps(model, image, device):
+def _stitch_work_maps(model, image, device, minimal=False):
     positions = sliding_positions(1500, 512, 256)
     full_weight = blend_weight(512, device)
     names = ('p0', 'q', 'r', 'a', 'b', 'w', 's2', 'c2', 'd2', 'highres', 'decoder',
              'highres_projected', 'decoder_projected', 'relation', 'coverage',
              'direction_relation', 'direction_pair_raw',
-             'g7', 'g8', 'delta_g', 'p1', 'p7',
+             'g7', 'g7_logit', 'g8', 'g8_minus_g7', 'delta_g', 'p1', 'p7',
              'proposal_raw_plus', 'proposal_raw_minus',
              'alpha_1', 'alpha_2', 'alpha_3', 'beta_1', 'beta_2', 'beta_3',
              'gamma_1', 'gamma_2', 'gamma_3', 'transport_delta_1',
              'transport_delta_2', 'transport_delta_3', 'proposal_delta_1',
              'proposal_delta_2', 'proposal_delta_3', 'anchor_delta_1',
              'anchor_delta_2', 'anchor_delta_3', 'delta_z_plus', 'delta_z_minus')
+    if minimal:
+        names = tuple(name for name in names if name not in (
+            's2', 'c2', 'd2', 'highres', 'decoder', 'highres_projected',
+            'decoder_projected', 'relation', 'coverage', 'direction_relation',
+            'direction_pair_raw'))
     canvases = {}
     mass = weight = full_mass = None
     full_canvases = {}
@@ -398,7 +403,9 @@ def _stitch_work_maps(model, image, device):
                 'direction_relation': relation['per_direction_relation'].flatten(1, 2),
                 'direction_pair_raw': relation['per_direction_pair_raw'].flatten(1, 2),
                 'coverage': out['gate_source_coverage'],
-                'g7': out['g_v7'], 'g8': out['g_transport'],
+                'g7': out['g_v7'], 'g7_logit': out['g_v7_logit'],
+                'g8': out['g_transport'],
+                'g8_minus_g7': out['g_transport'] - out['g_v7'],
                 'delta_g': out['delta_g_logit'],
                 'p1': F.adaptive_avg_pool2d(out['p1'], (work_size, work_size)),
                 'p7': F.adaptive_avg_pool2d(v7_out['p1'], (work_size, work_size)),
@@ -459,10 +466,17 @@ def _region_rows(record, threshold):
     q = record['q_full']
     skeleton = prepared['skeleton']
     missing = skeleton & ~(cv2.dilate(p0.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
+    new_fp = p8 & ~p7 & ~gt
+    _, p8_components = cv2.connectedComponents(p8.astype(np.uint8), connectivity=8)
+    touches_old = np.unique(p8_components[cv2.dilate(
+        p7.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0])
+    isolated_new_fp = new_fp & ~np.isin(p8_components, touches_old)
     groups = {
         'recovered_gt': missing & p8 & ~p7,
         'unrecovered_gt': missing & ~p8 & ~p7,
         'hard_background': ~gt & (q > .5),
+        'isolated_new_fp': isolated_new_fp,
+        'false_bridge': bridge_mask(p0, p8, gt),
         'new_false_bridge': bridge_mask(p0, p8, gt) & ~bridge_mask(p0, p7, gt),
         'new_tp': p8 & ~p7 & gt,
         'new_fp': p8 & ~p7 & ~gt,
@@ -475,7 +489,8 @@ def _region_rows(record, threshold):
                                interpolation=cv2.INTER_AREA) > .25
         row = {'image': record['case'], 'region': name,
                'pixels_native': int(mask.sum()), 'pixels_workgrid': int(mask_work.sum())}
-        for key in ('g7', 'g8', 'delta_g', 'r', 'a', 'delta_z_plus', 'delta_z_minus',
+        for key in ('g7_logit', 'g7', 'delta_g', 'g8', 'g8_minus_g7',
+                    'r', 'a', 'delta_z_plus', 'delta_z_minus',
                     'proposal_raw_plus', 'proposal_raw_minus',
                     *(f'{name}_{step}' for name in
                       ('alpha', 'beta', 'gamma', 'transport_delta',
@@ -487,27 +502,40 @@ def _region_rows(record, threshold):
                 val = val.mean(0)
             arr = val[mask_work]
             row[f'{key}_mean'] = float(arr.mean()) if arr.size else None
+            row[f'{key}_p10'] = float(np.percentile(arr, 10)) if arr.size else None
+            row[f'{key}_p50'] = float(np.percentile(arr, 50)) if arr.size else None
             row[f'{key}_p90'] = float(np.percentile(arr, 90)) if arr.size else None
+            row[f'{key}_p99'] = float(np.percentile(arr, 99)) if arr.size else None
         b_delta = record['b'][mask_work] - record['p0'][mask_work]
         row['b_minus_p0_mean'] = float(b_delta.mean()) if b_delta.size else None
         for direction in range(record['w'].shape[0]):
-            row[f'w_direction_{direction}_mean'] = float(record['w'][direction][mask_work].mean())
-        w_values = np.clip(record['w'][:, mask_work], 1e-8, 1.)
-        w_norm = w_values / np.maximum(w_values.sum(0, keepdims=True), 1e-8)
-        entropy = -(w_norm * np.log(w_norm)).sum(0)
-        row['w_entropy_mean'] = float(entropy.mean())
-        row['w_max_direction_mean'] = float(w_norm.max(0).mean())
+            direction_values = record['w'][direction][mask_work]
+            row[f'w_direction_{direction}_mean'] = (float(direction_values.mean())
+                                                    if direction_values.size else None)
+        if mask_work.any():
+            w_values = np.clip(record['w'][:, mask_work], 1e-8, 1.)
+            w_norm = w_values / np.maximum(w_values.sum(0, keepdims=True), 1e-8)
+            entropy = -(w_norm * np.log(w_norm)).sum(0)
+            row['w_entropy_mean'] = float(entropy.mean())
+            row['w_max_direction_mean'] = float(w_norm.max(0).mean())
+        else:
+            row['w_entropy_mean'] = row['w_max_direction_mean'] = None
         if 'g7' in record:
-            row['g7_saturated_low'] = float((record['g7'][mask_work] < .001).mean())
-            row['g7_saturated_high'] = float((record['g7'][mask_work] > .999).mean())
-            row['g8_saturated_low'] = float((record['g8'][mask_work] < .001).mean())
-            row['g8_saturated_high'] = float((record['g8'][mask_work] > .999).mean())
+            row['g7_saturated_low'] = (float((record['g7'][mask_work] < .001).mean())
+                                       if mask_work.any() else None)
+            row['g7_saturated_high'] = (float((record['g7'][mask_work] > .999).mean())
+                                        if mask_work.any() else None)
+            row['g8_saturated_low'] = (float((record['g8'][mask_work] < .001).mean())
+                                       if mask_work.any() else None)
+            row['g8_saturated_high'] = (float((record['g8'][mask_work] > .999).mean())
+                                        if mask_work.any() else None)
         for key, limits in (('delta_z_plus', (7.9, 7.99, 7.999)),
                             ('delta_z_minus', (3.9, 3.99, 3.999))):
             if key in record:
                 values = record[key][mask_work]
                 for limit_value in limits:
-                    row[f'{key}_ge_{limit_value}'] = float((values >= limit_value).mean())
+                    row[f'{key}_ge_{limit_value}'] = (float((values >= limit_value).mean())
+                                                        if values.size else None)
         rows.append(row)
     return rows
 
