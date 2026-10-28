@@ -17,6 +17,7 @@ from compare_connectivity_topology_metrics import load_metric_model, parse_args 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from topology_direction_constants import CONNECTIVITY_DIRECTIONS
 from losses.road_losses import build_stage_skeleton_target, build_connectivity_target
+from h0_paired_changes import MODES, pixel_changes, fixed_gap_audit, gap_changes
 
 
 def shifted(a, dy, dx):
@@ -112,8 +113,14 @@ def main():
     p.add_argument('--threshold', type=float, required=True)
     p.add_argument('--max_images', type=int, default=0)
     p.add_argument('--gap_distance', type=int, default=16)
+    p.add_argument('--gap_context', type=int, default=32,
+                   help='native-pixel margin around each fixed GT skeleton gap')
+    p.add_argument('--min_gap_pixels', type=int, default=1)
+    p.add_argument('--gap_gt_tolerance', type=int, default=2)
     a = p.parse_args()
-    if not (0 < a.threshold < 1) or a.max_images < 0 or not 1 <= a.gap_distance <= 100:
+    if (not (0 < a.threshold < 1) or a.max_images < 0 or not 1 <= a.gap_distance <= 100
+            or not 0 <= a.gap_context <= 1000 or a.min_gap_pixels < 1
+            or not 0 <= a.gap_gt_tolerance <= 50):
         p.error('invalid threshold, max_images, or gap_distance')
     dst = Path(a.output_dir)
     if dst.exists() and any(dst.iterdir()):
@@ -136,7 +143,13 @@ def main():
                   'stage3_gamma1': float(capture.net.decoder_structure_blocks['3'].gamma1.detach().cpu()),
                   'alpha_global': float(capture.net.global_topology.alpha_global.detach().cpu())}
     names = dataset.image_files[:a.max_images] if a.max_images else dataset.image_files
+    if len({Path(name).stem for name in names}) != len(names):
+        raise ValueError('Image stems must be unique to save paired predictions')
     rows = []
+    change_rows, gap_rows, gap_inventory = [], [], []
+    prediction_dirs = {mode: dst/'predictions'/mode/'surface' for mode in MODES}
+    for directory in prediction_dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
     c_stats = {s: defaultdict(float) for s in ('2','3')}
     win = (1-torch.linspace(-1, 1, 512, device=device).abs()).clamp_min(.05)
     weight = torch.outer(win, win)[None, None]
@@ -190,7 +203,20 @@ def main():
                             canvases[key][:,:,y:y+512,x:x+512] += value*weight
                         denominator[:,:,y:y+512,x:x+512] += weight
                 maps = {k: (v/denominator.clamp_min(1e-8))[0].cpu().numpy() for k,v in canvases.items()}
-                pred = maps['logit_on'][0] >= np.log(a.threshold/(1-a.threshold))
+                cutoff = np.log(a.threshold/(1-a.threshold))
+                predictions = {mode: maps['logit_'+mode][0] >= cutoff for mode in MODES}
+                pred = predictions['on']
+                for mode, mask in predictions.items():
+                    target = prediction_dirs[mode]/(Path(name).stem+'_pred.png')
+                    if not cv2.imwrite(str(target), mask.astype(np.uint8)*255):
+                        raise IOError(f'Could not save prediction: {target}')
+                for row in pixel_changes(gt, skeleton, predictions):
+                    change_rows.append({'image': name, **row})
+                cases, inventory = fixed_gap_audit(skeleton, predictions, gt, a.gap_context,
+                                                   a.min_gap_pixels, a.gap_gt_tolerance)
+                for row in cases:
+                    gap_rows.append({'image': name, **row})
+                gap_inventory.append({'image': name, **inventory})
                 regions = region_masks(gt, skeleton, pred, a.gap_distance)
                 derived = {k:v[0] for k,v in maps.items() if v.shape[0] == 1}
                 derived['global_logit_delta'] = maps['logit_on'][0]-maps['logit_global_off'][0]
@@ -212,6 +238,15 @@ def main():
         raise RuntimeError('no images')
     with (dst/'per_image_regions.csv').open('w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
+    with (dst/'per_image_pixel_changes.csv').open('w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(change_rows[0])); w.writeheader(); w.writerows(change_rows)
+    with (dst/'per_image_gap_inventory.csv').open('w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(gap_inventory[0])); w.writeheader(); w.writerows(gap_inventory)
+    gap_fields = ['image','gap_id','x','y','width','height','gt_skeleton_pixels',
+                  'anchor_a_pixels','anchor_b_pixels'] + [mode+'_'+kind+'_connected'
+                  for mode in MODES for kind in ('global','local','local_gt_supported')]
+    with (dst/'fixed_gaps.csv').open('w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=gap_fields); w.writeheader(); w.writerows(gap_rows)
     summary = {'checkpoint':str(Path(a.model_path).resolve()), 'checkpoint_sha256':sha256(a.model_path),
                'split':a.split,'images':len(names),'threshold':a.threshold,'parameters':parameters,
                'protocol':'native1500, 512 windows stride256, tapered logit merge; region means pixel weighted',
@@ -220,7 +255,23 @@ def main():
                         'C target audit uses original stage max-pooled GT skeleton and 8-neighbor target at native stage resolution; tile borders excluded, overlapping windows counted repeatedly',
                         'H direct off disables stage2/3 direct H injection only; bidirectional exchange and global H remain',
                         'global_logit_delta and h_direct_logit_delta are paired forward interventions, not additive causal decompositions'],
-               'regions':{}}
+               'regions':{},
+               'paired_pixel_changes':{},
+               'fixed_gap_inventory':{k:sum(row[k] for row in gap_inventory)
+                                      for k in gap_inventory[0] if k != 'image'},
+               'fixed_gap_connectivity':gap_changes(gap_rows),
+               'fixed_gap_protocol':{'definition':'components of GT skeleton missed by at least one of the three modes; common GT skeleton predicted by all three provides anchors',
+                  'eligible':'exactly two 8-connected neighboring common anchor groups',
+                  'connectivity':'8-connected binary surface components; local crop is gap bounds plus context, global is full image',
+                  'local_context_px':a.gap_context,'min_gap_pixels':a.min_gap_pixels,
+                  'gt_support_tolerance_px':a.gap_gt_tolerance,
+                  'local_gt_supported':'local connection restricted to prediction pixels within GT road or its tolerance band',
+                  'limitations':'Predicted connections can travel over background or distant detours; connectivity alone does not establish a correct GT route. Junctions or other cases without exactly two anchors are excluded.'}}
+    for mode in MODES[1:]:
+        selected = [row for row in change_rows if row['reference'] == mode]
+        summary['paired_pixel_changes'][mode] = {
+            key:sum(row[key] for row in selected)
+            for key in selected[0] if key not in ('image','reference')}
     summary['connectivity_target_audit'] = {}
     for stage, stats in c_stats.items():
         result = dict(stats)
