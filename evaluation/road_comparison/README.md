@@ -1,5 +1,17 @@
 # Unified road evaluation: four topology metrics (v4)
 
+The standard displayed topology summary reports six fields: `cldice`, graph
+`topo_precision`, graph `topo_recall`, graph `topo_f1`, sampled
+`apls_bidirectional`, and `tlts_infeasible`. The graph precision and recall
+were already saved in comparison and per-image CSVs; they are now also printed
+in the console. Use `show_topology_summary.py path/to/test_comparison.csv` to
+read those six values from an existing result without rerunning evaluation.
+Each graph metric is averaged across images independently; the mean F1 need
+not equal the harmonic mean of the displayed mean precision and mean recall.
+The v7 sampling settings and overrides are documented in
+`FAST_SAMPLED_APLS_PROTOCOL.md` and in each run's `test_report.json`; the v4
+defaults described below do not describe every v7 run.
+
 This evaluator accepts saved native-resolution binary surface masks. The
 validation threshold remains selected by global IoU; topology runs only after
 selection. It does not retrain or re-infer any network.
