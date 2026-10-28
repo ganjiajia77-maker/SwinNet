@@ -21,6 +21,35 @@ from road_metrics import DEFAULT_PROTOCOL, image_metrics, prepare_target, skelet
 
 
 class OfficialGraphMetricsTest(unittest.TestCase):
+    def test_apls_kdtree_missing_neighbors_and_far_control_point(self):
+        from contextlib import redirect_stdout
+        from scipy.spatial import KDTree
+        from shapely.geometry import LineString
+        from official_graph_metrics import _NullWriter, _safe_query_kd_nearest
+
+        tree = KDTree(np.array([[0., 0.], [5., 0.], [3000., 0.]]))
+        ids = {0: 'a', 1: 'b', 2: 'c'}
+        self.assertEqual(_safe_query_kd_nearest(tree, ids, (0., 0.), 20, 10),
+                         (['a', 'b'], [0, 1], [0., 5.]))
+        self.assertEqual(_safe_query_kd_nearest(tree, ids, (1500., 0.), 20, 10),
+                         ([], [], []))
+        self.assertEqual(_safe_query_kd_nearest(tree, ids, (0., 0.), 1, 10),
+                         (['a'], [0], [0.]))
+
+        # More than 1000 nodes forces upstream's KD-tree insertion branch.
+        graph = CompatibleMultiGraph()
+        for i in range(1001):
+            graph.add_node(i, x=float(i)/10, y=0.)
+            if i:
+                geometry = LineString([((i-1)/10, 0), (i/10, 0)])
+                graph.add_edge(i-1, i, geometry=geometry, length=geometry.length)
+        with redirect_stdout(_NullWriter()):
+            result, _, _ = _cosmiq().insert_control_points(
+                graph, [[1000001, 3000., 3000.]], max_distance_meters=5.,
+                verbose=False)
+        self.assertEqual(result.number_of_nodes(), graph.number_of_nodes())
+        self.assertNotIn(1000001, result)
+
     def test_upstream_sources_match_pinned_checksums(self):
         vendor = Path(__file__).parent / "vendor"
         manifest = json.loads((vendor / "UPSTREAM.json").read_text(encoding="utf-8"))

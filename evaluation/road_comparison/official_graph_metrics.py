@@ -52,6 +52,23 @@ def _load_functions(path, names, namespace):
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
 
 
+def _safe_query_kd_nearest(kdtree, kd_idx_dic, point, n_neighbors=10,
+                           distance_upper_bound=1000, keep_point=True):
+    """Drop SciPy's missing-neighbor sentinel before resolving node IDs.
+
+    SciPy returns index tree.n and infinite distance for each unavailable
+    neighbor, including when fewer than k nodes fall inside the distance bound.
+    With no nearby nodes the upstream edge search falls back to all edges.
+    """
+    distances, indexes = kdtree.query(point, k=n_neighbors,
+                                     distance_upper_bound=distance_upper_bound)
+    valid = [(int(idx), float(distance)) for idx, distance in
+             zip(np.atleast_1d(indexes), np.atleast_1d(distances))
+             if np.isfinite(distance) and int(idx) in kd_idx_dic]
+    return ([kd_idx_dic[idx] for idx, _ in valid],
+            [idx for idx, _ in valid], [distance for _, distance in valid])
+
+
 @lru_cache(maxsize=1)
 def _cosmiq():
     import copy
@@ -62,6 +79,9 @@ def _cosmiq():
     _load_functions(VENDOR / "apls_utils.upstream.py.txt",
                     ("nodes_near_point", "G_to_kdtree", "_query_kd_nearest", "_query_kd_ball"),
                     utils.__dict__)
+    # Preserve the pinned upstream source; adapt its lookup to SciPy's
+    # out-of-range sentinel for neighbors outside the search radius.
+    utils._query_kd_nearest = _safe_query_kd_nearest
     module = ModuleType("apls_official_core")
     module.__dict__.update(nx=nx, np=np, scipy=scipy, shapely=shapely,
                            Point=Point, LineString=LineString, utm=utm,
