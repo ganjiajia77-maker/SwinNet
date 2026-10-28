@@ -220,6 +220,46 @@ class TestV9(unittest.TestCase):
             self.assertEqual(saved['epoch'], 2)
             self.assertEqual(saved['stage'], 'B')
 
+    def test_direct_loader_uses_only_base_and_q3(self):
+        with tempfile.TemporaryDirectory(prefix='.v9_direct_load_', dir=ROOT) as tmp:
+            root = Path(tmp); base = root/'base.pth'; q3_path = root/'q3.pth'
+            torch.save({'synthetic_frozen_model': True}, base)
+            torch.save({'repair_version': 'dual_recovery_v1', 'base_checkpoint': str(base)}, q3_path)
+            frozen = FrozenSource()
+            q3 = SimpleNamespace(load_experiment=lambda args: frozen)
+            args = SimpleNamespace(q3_checkpoint=q3_path, device=torch.device('cpu'))
+            with patch.dict(sys.modules, {'run_q3_r3_mass': q3}):
+                direct, source, identity = runner.load_direct(args)
+            self.assertEqual(source['lambda_cont'], .2)
+            self.assertNotIn('v7', identity); self.assertNotIn('v8', identity)
+            self.assertTrue(all(not p.requires_grad for p in direct.frozen.parameters()))
+            self.assertEqual(tuple(direct(self.image)['p1'].shape), (2, 1, 64, 64))
+
+    def test_direct_joint_training_skips_v8_stage0_and_previous_stages(self):
+        sample = {'image': self.image[0], 'mask': self.mask[0], 'skeleton': self.skeleton[0]}
+        class Dataset:
+            def __len__(self): return 2
+            def __getitem__(self, unused): return sample
+            def set_epoch(self, unused): pass
+        source = {'lambda_bg': 1., 'lambda_missing': 2., 'lambda_cont': .2, 'missing_threshold': .45}
+        identity = {'initialization': 'direct_random_downstream'}
+        with tempfile.TemporaryDirectory(prefix='.v9_direct_train_', dir=ROOT) as tmp:
+            root = Path(tmp)
+            (root/'smoke.json').write_text(json.dumps({'passed': True, 'identity': identity}))
+            args = SimpleNamespace(command='train', initialization='direct', output_dir=root,
+                root_path=ROOT, reference_threshold=.45, stage='D', previous_checkpoint=None,
+                dynamic_checkpoint=None, seed=1234, batch_size=2, num_workers=0,
+                device=torch.device('cpu'), epochs=1, val_interval=1, max_images=0)
+            q3 = SimpleNamespace(full_dataset=lambda *unused: [sample])
+            evaluation = SimpleNamespace(evaluate_thresholds=lambda *unused, **kwargs:
+                ({.6: {'selection_score': .5}}, None, None, None))
+            with patch.dict(sys.modules, {'run_q3_r3_mass': q3, 'run_reliable_directional_mass': evaluation}), \
+                 patch.object(runner, 'RoadSkeletonDataset', return_value=Dataset()):
+                runner.train(args, self.model, source, identity)
+            saved = torch.load(root/'stage_D/best.pth', weights_only=False)
+            self.assertEqual(saved['stage'], 'D')
+            self.assertFalse((root/'stage0.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

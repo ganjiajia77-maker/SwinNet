@@ -106,6 +106,8 @@ def preflight(args):
 
 
 def load_initial(args):
+    if getattr(args, 'initialization', 'v8') == 'direct':
+        return load_direct(args)
     from run_reliable_v8_mass import load_experiment as load_v8
     model, source = load_v8(args)
     model.state_gate = StateGate().to(args.device)
@@ -119,6 +121,37 @@ def load_initial(args):
     identity['code_sha256'] = {name: digest(root/name) for name in (
         'run_reliable_v9_mass.py', 'networks/reliable_directional_repair.py',
         'run_reliable_directional_mass.py')}
+    return model, source, identity
+
+
+def load_direct(args):
+    from types import SimpleNamespace
+    from run_q3_r3_mass import load_experiment as load_q3
+    from networks.reliable_directional_repair import ReliableDirectionalRepair
+    if args.q3_checkpoint is None or not args.q3_checkpoint.is_file():
+        raise ValueError('Direct V9 requires an existing --q3_checkpoint; /best.pth is not a valid run path')
+    q3_path = args.q3_checkpoint.resolve()
+    q3_state = torch.load(q3_path, map_location='cpu', weights_only=False)
+    if q3_state.get('repair_version') != 'dual_recovery_v1':
+        raise ValueError('Expected a dual-recovery Q3 checkpoint')
+    base_path = Path(q3_state['base_checkpoint']).resolve()
+    if not base_path.is_file():
+        raise ValueError(f'Q3 requires its exact frozen base: {base_path}')
+    frozen = load_q3(SimpleNamespace(base_checkpoint=base_path, repair_checkpoint=q3_path,
+        init_repair_checkpoint=None, eta_plus=.5, eta_minus=.5,
+        enable_stage2_local_propagation=False, enable_gap_refinement=False, device=args.device))
+    model = ReliableDirectionalRepair(frozen, width=32, steps=3,
+        bridge_route=True, conditional_transport=True, transport_gate_mode='v7',
+        gate_relation_mode='full').to(args.device)
+    model.state_gate = StateGate().to(args.device)
+    source = {'lambda_bg': 1., 'lambda_missing': 2., 'lambda_cont': .2, 'missing_threshold': .45}
+    root = Path(__file__).resolve().parent
+    identity = {'initialization': 'direct_random_downstream',
+        'baseline_label': 'new V9 experiment; not an ablation of trained V8',
+        'base': {'path': str(base_path), 'sha256': digest(base_path)},
+        'q3': {'path': str(q3_path), 'sha256': digest(q3_path)},
+        'code_sha256': {name: digest(root/name) for name in ('run_reliable_v9_mass.py',
+            'networks/reliable_directional_repair.py', 'run_reliable_directional_mass.py')}}
     return model, source, identity
 
 
@@ -251,7 +284,8 @@ def smoke(args, model, source, identity):
     report = {'identity': identity, 'batch_size': args.batch_size, 'phases': {}}
     start = time.perf_counter()
     try:
-        for stage in STAGE_MODULES:
+        stages = ('D',) if getattr(args, 'initialization', 'v8') == 'direct' else STAGE_MODULES
+        for stage in stages:
             for name in names:
                 getattr(model, name).load_state_dict(saved[name], strict=True)
             optimizer = configure(model, stage)
@@ -289,16 +323,21 @@ def smoke(args, model, source, identity):
 def train(args, model, source, identity):
     from run_q3_r3_mass import full_dataset
     from run_reliable_directional_mass import evaluate_thresholds
-    marker = json.loads((args.output_dir / 'stage0.json').read_text(encoding='utf-8'))
-    if (not marker.get('passed') or marker.get('identity') != identity or
-            marker.get('images') != len(full_dataset(args.root_path, 'val')) or
-            marker.get('root_path') != str(args.root_path.resolve()) or
-            marker.get('reference_threshold') != args.reference_threshold):
-        raise ValueError('A successful stage0 over the full validation set with identical checkpoints is required')
+    direct = getattr(args, 'initialization', 'v8') == 'direct'
+    if direct:
+        if args.stage != 'D' or args.previous_checkpoint:
+            raise ValueError('Direct initialization jointly trains stage D without an earlier stage checkpoint')
+    else:
+        marker = json.loads((args.output_dir / 'stage0.json').read_text(encoding='utf-8'))
+        if (not marker.get('passed') or marker.get('identity') != identity or
+                marker.get('images') != len(full_dataset(args.root_path, 'val')) or
+                marker.get('root_path') != str(args.root_path.resolve()) or
+                marker.get('reference_threshold') != args.reference_threshold):
+            raise ValueError('A successful stage0 over the full validation set with identical checkpoints is required')
     smoke_report = json.loads((args.output_dir / 'smoke.json').read_text(encoding='utf-8'))
     if not smoke_report.get('passed') or smoke_report.get('identity') != identity:
         raise ValueError('Successful real-batch B/C/D smoke checks are required')
-    prior = {'B': None, 'C': 'B', 'D': 'C'}[args.stage]
+    prior = None if direct else {'B': None, 'C': 'B', 'D': 'C'}[args.stage]
     training_config = {'root_path': str(args.root_path.resolve()), 'batch_size': args.batch_size,
         'seed': args.seed, 'reference_threshold': args.reference_threshold,
         **{name: source[name] for name in ('lambda_bg', 'lambda_missing', 'lambda_cont', 'missing_threshold')}}
@@ -499,6 +538,24 @@ def background_components(p0, p1, gt):
     return isolated, bridges
 
 
+def validate_direct(args, model, identity):
+    from run_q3_r3_mass import full_dataset
+    from run_reliable_directional_mass import evaluate_thresholds
+    if args.dynamic_checkpoint is None:
+        raise ValueError('val requires --dynamic_checkpoint from the direct V9 run')
+    restore_checkpoint(model, args.dynamic_checkpoint, identity, 'D')
+    thresholds = tuple(round(float(x), 2) for x in np.arange(.35, .751, .01))
+    reports, _, _, _ = evaluate_thresholds(model, full_dataset(args.root_path, 'val'),
+        args.device, thresholds, reference_threshold=args.reference_threshold)
+    selected = max(reports, key=lambda t: reports[t]['selection_score'])
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / 'direct_val_selection.json').write_text(json.dumps({
+        'selected_on': 'val', 'threshold': selected, 'identity': identity,
+        'checkpoint': str(args.dynamic_checkpoint.resolve()), 'report': reports[selected],
+        'threshold_curves': reports}, indent=2), encoding='utf-8')
+    print(json.dumps(reports[selected], indent=2), flush=True)
+
+
 @torch.no_grad()
 def audit(args, model, identity):
     from run_q3_r3_mass import full_dataset, stitch_three
@@ -578,11 +635,13 @@ def audit(args, model, identity):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=('preflight', 'stage0', 'smoke', 'train', 'resume', 'compare', 'audit'))
+    p.add_argument('command', choices=('preflight', 'stage0', 'smoke', 'train', 'resume', 'compare', 'audit', 'val'))
     p.add_argument('--root_path', type=Path, required=True)
     p.add_argument('--output_dir', type=Path, required=True)
-    p.add_argument('--v7_checkpoint', type=Path, required=True)
-    p.add_argument('--v8_checkpoint', type=Path, required=True)
+    p.add_argument('--initialization', choices=('v8', 'direct'), default='v8')
+    p.add_argument('--q3_checkpoint', type=Path)
+    p.add_argument('--v7_checkpoint', type=Path)
+    p.add_argument('--v8_checkpoint', type=Path)
     p.add_argument('--relation_mode', choices=('full',), default='full')
     p.add_argument('--baseline_label', choices=('original', 'rebuilt'), default='original')
     p.add_argument('--stage', choices=('B', 'C', 'D'))
@@ -602,7 +661,15 @@ def main():
     p.add_argument('--lr_gate_relation', type=float, default=5e-5)
     p.add_argument('--lr_rw_rates', type=float, default=1e-5)
     p.add_argument('--lr_visual_ba', type=float, default=5e-6)
+    p.add_argument('--direct_lr', type=float, default=1e-4)
     args = p.parse_args()
+    if args.initialization == 'v8' and (args.v7_checkpoint is None or args.v8_checkpoint is None):
+        p.error('v8 initialization requires --v7_checkpoint and --v8_checkpoint')
+    if args.initialization == 'direct':
+        if args.q3_checkpoint is None:
+            p.error('direct initialization requires --q3_checkpoint')
+        if args.command in ('stage0', 'compare', 'preflight') or args.audit_stage == 'A_v8' and args.command == 'audit':
+            p.error('Original V8 equivalence/comparison commands require v8 initialization; direct V9 is a separate experiment')
     if args.command in ('train', 'resume') and not args.stage:
         p.error('train requires --stage B, C or D')
     if args.command in ('train', 'resume', 'compare') and args.max_images:
@@ -615,6 +682,8 @@ def main():
     LR.update(state_gate=args.lr_state_gate, gate_relation=args.lr_gate_relation,
               reliable_head=args.lr_rw_rates, relations=args.lr_rw_rates, rates=args.lr_rw_rates,
               visual=args.lr_visual_ba, proposal_head=args.lr_visual_ba, accept_head=args.lr_visual_ba)
+    if args.initialization == 'direct':
+        LR.update({name: args.direct_lr for name in LR})
     if any(value <= 0 for value in LR.values()):
         p.error('Learning rates must be positive')
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -630,6 +699,10 @@ def main():
         train(args, model, source, identity)
     elif args.command == 'compare':
         compare(args, model, identity)
+    elif args.command == 'val':
+        if args.initialization != 'direct':
+            p.error('Use compare for staged v8-based validation')
+        validate_direct(args, model, identity)
     else:
         audit(args, model, identity)
 

@@ -34,6 +34,39 @@ common=(--root_path "$DATA" --output_dir "$V9_RUN" --v7_checkpoint "$V7_CKPT"
         --seed "${SEED:-1234}" --reference_threshold "${P0_REFERENCE_THRESHOLD:-0.45}")
 
 run() { python -u run_reliable_v9_mass.py "$1" "${common[@]}" "${@:2}"; }
+resolve_q3() {
+  Q3_CKPT=$(python - "$RESULTS" "${Q3_CKPT:-}" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+explicit = sys.argv[2].strip()
+if explicit and Path(explicit).is_file():
+    print(Path(explicit).resolve()); raise SystemExit(0)
+if explicit not in ('', '/best.pth'):
+    raise SystemExit(f'Q3_CKPT does not exist: {explicit}')
+marker = root/'rebuild_q3_r3_run.txt'
+recorded = marker.read_text().strip() if marker.is_file() else ''
+if recorded:
+    path = Path(recorded)/'best.pth'
+    if path.is_file():
+        print(path.resolve()); raise SystemExit(0)
+    raise SystemExit(f'Q3 run was recorded but has not saved best.pth yet: {path}')
+candidates = sorted(p.resolve() for p in root.glob('h0_q3_r3_dual_*/best.pth') if p.is_file())
+if len(candidates) == 1:
+    print(candidates[0]); raise SystemExit(0)
+if not candidates:
+    raise SystemExit('No saved Q3 checkpoint found. Wait for Q3 training to save best.pth, or set Q3_CKPT to its full path.')
+raise SystemExit('Multiple Q3 candidates found; set Q3_CKPT explicitly:\n' + '\n'.join(map(str, candidates)))
+PY
+  )
+  echo "Q3_CKPT=$Q3_CKPT"
+}
+run_direct() {
+  python -u run_reliable_v9_mass.py "$1" --initialization direct \
+    --root_path "$DATA" --output_dir "$V9_RUN" --q3_checkpoint "$Q3_CKPT" \
+    --device cuda --batch_size 2 --num_workers "${WORKERS:-4}" --seed "${SEED:-1234}" \
+    --reference_threshold "${P0_REFERENCE_THRESHOLD:-0.45}" --direct_lr "${DIRECT_LR:-1e-4}" "${@:2}"
+}
 train_stage() {
   local stage=$1
   local extra=()
@@ -58,7 +91,7 @@ audit_all() {
 
 case "$MODE" in
   bootstrap)
-    : "${Q3_CKPT:?Set Q3_CKPT to the newly trained dual-recovery best.pth}"
+    resolve_q3
     BASE_CKPT=$(python -c 'import torch,sys; print(torch.load(sys.argv[1],map_location="cpu",weights_only=False)["base_checkpoint"])' "$Q3_CKPT")
     [[ -s "$BASE_CKPT" && -s "$Q3_CKPT" ]] || { echo 'Missing the exact base referenced by Q3'; exit 1; }
     python -u run_reliable_directional_mass.py train --root_path "$DATA" \
@@ -78,6 +111,28 @@ root = Path(sys.argv[1]).resolve()
     'v7': str(root/'baseline_v7/best.pth'), 'v8': str(root/'baseline_v8/best.pth'),
     'label': 'rebuilt: v7 trained from scratch, v8 gate trained on that v7'}, indent=2))
 PY
+    ;;
+  direct)
+    resolve_q3
+    run_direct smoke
+    run_direct train --stage D --epochs "${EPOCHS:-20}" --val_interval 5
+    ;;
+  resume_direct)
+    resolve_q3
+    run_direct resume --stage D --epochs "${EPOCHS:-20}" --val_interval 5 \
+      --dynamic_checkpoint "$V9_RUN/stage_D/last.pth"
+    ;;
+  val_direct)
+    resolve_q3
+    run_direct val --dynamic_checkpoint "$V9_RUN/stage_D/best.pth"
+    ;;
+  audit_direct)
+    resolve_q3
+    threshold=${AUDIT_THRESHOLD:-0.6}
+    if [[ -f "$V9_RUN/direct_val_selection.json" ]]; then
+      threshold=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["threshold"])' "$V9_RUN/direct_val_selection.json")
+    fi
+    run_direct audit --audit_stage D --dynamic_checkpoint "$V9_RUN/stage_D/best.pth" --audit_threshold "$threshold"
     ;;
   preflight|stage0|smoke) run "$MODE" ;;
   b) train_stage B ;;
@@ -100,6 +155,6 @@ PY
     compare
     audit_all
     ;;
-  *) echo 'Usage: bootstrap | preflight | stage0 | smoke | b | c | d | resume_b/c/d | compare | audit | all'; exit 2 ;;
+  *) echo 'Usage: direct | resume_direct | val_direct | audit_direct | bootstrap | preflight | stage0 | smoke | b | c | d | resume_b/c/d | compare | audit | all'; exit 2 ;;
 esac
 echo "V9_RUN=$V9_RUN"

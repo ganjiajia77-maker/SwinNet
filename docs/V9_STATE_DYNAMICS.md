@@ -1,5 +1,30 @@
 # V9 state-aware staged dynamics
 
+## Direct V9 training
+
+`bash scripts/run_v9_mass.sh direct` skips V7/V8 training. It strictly loads a
+trained dual-recovery Q3 and its referenced frozen BASE, initializes all downstream
+V9 modules anew, and jointly trains visual/R/W/B/A/rates/gate_relation/state_gate.
+These newly initialized modules use a common 1e-4 learning rate (`DIRECT_LR` can
+override it). BASE/Q3 stay frozen. This is a new from-scratch downstream experiment,
+not the staged ablation of trained V8. Original V8 equivalence and A/B/C comparisons
+do not apply to this mode. Default 20 epochs is an exploratory training budget.
+
+The launcher checks the explicit Q3 path, then the recorded retraining directory,
+then a unique matching retrained dual-Q3 best.pth. An empty record or `/best.pth`
+is never passed blindly to torch.load. If Q3 has not saved a checkpoint, training
+stops with its expected path; direct mode still requires trained BASE/Q3 inputs.
+
+```bash
+export GPU=1
+export V9_RUN=/home/gjj/SwinNet-roadbias/model_out/h0_v9_direct_$(date +%Y%m%d_%H%M%S)
+unset Q3_CKPT  # resolve the recorded retraining checkpoint
+bash scripts/run_v9_mass.sh direct
+bash scripts/run_v9_mass.sh val_direct
+bash scripts/run_v9_mass.sh audit_direct
+# bash scripts/run_v9_mass.sh resume_direct
+```
+
 This branch starts from original V8 `cf87c33`. Its transport coefficient is still
 `alpha_k = rates_k[:,1] * sigmoid(old_gate_logit + relation_delta + state_delta_k)`.
 It does not include the separate V8 experiment multiplying alpha by V.
