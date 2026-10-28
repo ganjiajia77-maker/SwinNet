@@ -450,6 +450,7 @@ def evaluate(manifest, base, protocol, split, selection, output, progress,
     write_csv(output / f"{split}_comparison.csv", summaries)
     for row in summaries:
         print(f"{row['name']}: IoU={row['iou']:.6f} clDice={row['cldice']:.6f} "
+              f"TOPO_P={row['topo_precision']:.6f} TOPO_R={row['topo_recall']:.6f} "
               f"TOPO_F1={row['topo_f1']:.6f} APLS_graph={row['apls_bidirectional']:.6f} "
               f"TLTS_infeasible={row['tlts_infeasible']:.6f}", flush=True)
     return report
