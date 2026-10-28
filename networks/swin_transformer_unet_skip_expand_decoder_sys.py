@@ -2121,6 +2121,10 @@ class SwinTransformerSys(nn.Module):
                 x = torch.cat([x, skip_refined], -1)
                 x = self.concat_back_dim[inx](x)
 
+            if getattr(self, "surface_only", False):
+                x = layer_up(x)
+                continue
+
             decoder_structure_gate_enabled = (
                 self._decoder_structure_enabled(inx)
                 and isinstance(layer_up, BasicLayer_up)
@@ -2373,6 +2377,10 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
+                if getattr(self, "surface_only", False):
+                    surface_prob = self._surface_prior_for_global_topology(x, None)
+                    x = self.global_topology.forward_surface(x, surface_prob)
+                    return self.guided_head(x)
                 if self.enable_global_topology and highres_skeleton_feat is not None:
                     surface_prob = self._surface_prior_for_global_topology(
                         x,

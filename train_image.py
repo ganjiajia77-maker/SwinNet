@@ -30,6 +30,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
+from mass_protocol import BASE_COMMIT, stitch_logits, validate_training_args
 
 
 def seed_worker(worker_id):
@@ -290,46 +291,13 @@ if args.freeze_post_refine_interaction_only:
     if not args.enable_highres_structure_stream:
         parser.error("--freeze_post_refine_interaction_only requires --enable_highres_structure_stream")
     args.enable_post_refine_structure_interaction = True
-if args.enable_global_topology and not args.enable_highres_structure_stream:
-    parser.error("--enable_global_topology requires --enable_highres_structure_stream")
+if not args.enable_global_topology or args.enable_highres_structure_stream:
+    parser.error("This experiment requires --enable_global_topology and no H0 stream")
 
 
 def get_final_loss_weights(args):
-    if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626:
-        weights = {
-            "skeleton_weight": 0.0,
-            "connectivity_weight": 0.0,
-            "boundary_weight": 0.0,
-        }
-    elif args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE:
-        weights = {
-            "skeleton_weight": 0.0,
-            "connectivity_weight": 0.0,
-            "boundary_weight": 0.0,
-        }
-    else:
-        weights = {
-            "skeleton_weight": 0.02,
-            "connectivity_weight": 0.03,
-            "boundary_weight": 0.0,
-        }
-    if args.final_skeleton_weight is not None:
-        weights["skeleton_weight"] = float(args.final_skeleton_weight)
-    if args.final_connectivity_weight is not None:
-        if args.structure_profile in {
-            STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
-            STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
-        }:
-            print(
-                "[WARN] --final_connectivity_weight is ignored for stage23 profiles; "
-                "final connectivity is removed.",
-                flush=True,
-            )
-        else:
-            weights["connectivity_weight"] = float(args.final_connectivity_weight)
-    if args.boundary_weight is not None and float(args.boundary_weight) != 0.0:
-        print("[WARN] --boundary_weight is ignored because boundary auxiliary loss is disabled.")
-    return weights
+    return {"skeleton_weight": 0.0, "connectivity_weight": 0.0, "boundary_weight": 0.0}
+
 
 def get_graph_outputs_from_model(model):
     module = model.module if hasattr(model, "module") else model
@@ -342,8 +310,8 @@ def get_graph_outputs_from_model(model):
 
 
 def build_criterion(args, loss_weights, device):
-    stage2_weight = args.stage2_skeleton_weight
-    stage3_weight = args.stage3_skeleton_weight
+    stage2_weight = 0.0
+    stage3_weight = 0.0
     boundary_weight = 0.0
 
     return SurfaceStructureLoss(
@@ -360,11 +328,11 @@ def build_criterion(args, loss_weights, device):
             stage2_weight,
             stage3_weight,
         ),
-        road_attention_weight=args.road_attention_weight,
+        road_attention_weight=0.0,
         stage_connectivity_factor=args.stage_connectivity_factor,
         stage_direction_factor=args.stage_direction_factor,
         highres_structure_skeleton_weight=(
-            args.highres_structure_skeleton_weight
+            0.0
         ),
         use_legacy_stage_connectivity_loss=(
             args.structure_profile in {
@@ -372,7 +340,7 @@ def build_criterion(args, loss_weights, device):
                 STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
             }
         ),
-        use_masked_connectivity_center_experiment=args.masked_connectivity_center_experiment,
+        use_masked_connectivity_center_experiment=False,
         connectivity_pos_weight=args.connectivity_pos_weight,
         skeleton_pos_weight=args.skeleton_pos_weight,
         directional_pos_weight_cardinal=args.directional_pos_weight_cardinal,
@@ -406,136 +374,11 @@ def build_criterion(args, loss_weights, device):
 
 
 def format_training_config_lines(args, loss_weights):
-    lines = [
-        f"  结构配置: {args.structure_profile}",
-        f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:.3f} + 0.5*Dice",
-        f"  Training AMP: {args.amp_dtype}",
-        "  Decoder computation: dense Stage 2/3",
-            "  Stage skeleton mode: {}; pre-Stage2 topology source removed: {}".format(
-                args.stage_skeleton_mode,
-                args.remove_stage2_pre_topology_source,
-            ),
-            "  H3 -> final surface fusion: {}".format(
-                args.enable_h3_surface_fusion
-            ),
+    return [
+        "  H0 surface-only backbone + global interaction; A1/A2, H0, S/C/D disabled",
+        "  Global gate: lambda=0.2, max-pool 9x9; nodes=32, heads=4; surface loss only",
+        f"  Surface loss: focal BCE gamma={args.surface_focal_gamma:g} + 0.5 Dice",
     ]
-    if args.enable_highres_structure_stream:
-        lines.append(
-            "  Skeleton feature flow: z_struct -> H0 <-> G2 -> H1 <-> G3 -> H2"
-        )
-    if args.structure_profile in {
-        STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
-        STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
-    }:
-        lines.extend([
-            "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
-            (
-                "  Final head: surface branch + boundary residual + final skeleton auxiliary only; "
-                "final connectivity removed"
-                if args.structure_profile == STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE
-                else "  Final head: surface branch + boundary residual only; final skeleton/connectivity removed"
-            ),
-            "  Stage2 structure loss weight: {:.3f}".format(args.stage2_skeleton_weight),
-            "  Stage3 structure loss weight: {:.3f}".format(args.stage3_skeleton_weight),
-            "  Stage skeleton-only loss factor: {:.3f}".format(
-                args.stage_skeleton_only_loss_factor
-            ),
-            "  Stage skeleton target: Gaussian soft heatmap; skeleton BCE pos_weight={}".format(
-                args.skeleton_pos_weight
-            ),
-            "  Stage2/Stage3 skeleton gradient ratio: {:.3f}/{:.3f}".format(
-                args.stage2_skeleton_gradient_ratio,
-                args.stage3_skeleton_gradient_ratio,
-            ),
-            "  Stage3 gate topology gradient ratio: {:.3f}".format(
-                args.stage3_gate_topology_gradient_ratio
-            ),
-            "  Stage loss: 0.5*first guide prediction + 1.0*second refinement prediction; "
-            "skeleton BCE(dilated) + 0.3 Dice(hard) + {:.3f} direction-field cosine loss on skeleton; "
-            "{:.3f}*connectivity loss".format(
-                args.stage_direction_factor,
-                args.stage_connectivity_factor
-            ),
-            "  Stage skeleton-connectivity consistency: disabled",
-            "  Encoder road attention: A1/A2 priors active for residual PatchMerging and Stage3 road attention bias",
-            "  Encoder stage1 road prior: residual PatchMerging path",
-            "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
-            "  Global context gate strength: 0.03",
-            "  Decoder stage3 step0: removed; only post-upsampling refinement is active",
-            "  Decoder gate input: [decoder gate feature, Skeleton, Connectivity]",
-            "  Decoder gate: structure gate plus local+dilated semantic context; no direction-confidence input",
-            "  Connectivity directional positive weight: cardinal={:.3f}, diagonal={:.3f}".format(
-                args.directional_pos_weight_cardinal,
-                args.directional_pos_weight_diagonal,
-            ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance+connectivity, max_nodes={}, heads={}, alpha_max={:.3f}".format(
-                "enabled" if args.enable_global_topology else "disabled",
-                args.global_topology_max_nodes,
-                args.global_topology_heads,
-                args.global_topology_alpha_max,
-            ),
-        ])
-        if args.masked_connectivity_center_experiment:
-            lines.extend([
-                "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
-                f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}, edge_contrastive_margin={args.edge_contrastive_margin:.3f}",
-            ])
-    else:
-        lines.extend([
-            "  Decoder structure gates: restored 0621 stages 0/1/2/3",
-            "  Final structure-only topology refiner: "
-            f"eta_init={args.final_topology_eta_init}, eta_max=0.05, tau=4",
-            "  Localized gap repair: "
-            f"rho_init={args.final_gap_rho_init}, rho_max=0.05, detached M_gap",
-        ])
-    lines.extend([
-        "  Stage structure weights: "
-        f"stage2={args.stage2_skeleton_weight}, "
-        f"stage3={args.stage3_skeleton_weight}, "
-        f"stage2_grad_ratio={args.stage2_skeleton_gradient_ratio}, "
-        f"stage3_grad_ratio={args.stage3_skeleton_gradient_ratio}, "
-        f"stage3_gate_topology_grad_ratio={args.stage3_gate_topology_gradient_ratio}, "
-        f"final_skeleton_grad_ratio={args.final_skeleton_gradient_ratio}, "
-        f"connectivity_factor={args.stage_connectivity_factor}, "
-        f"direction_factor={args.stage_direction_factor}, "
-        f"road_attention={args.road_attention_weight}",
-        "  High-res structure stream: "
-        f"{'enabled' if args.enable_highres_structure_stream else 'disabled'}, "
-        f"channels={args.highres_structure_channels}, "
-        f"fuse_stages={args.highres_structure_fuse_stages}, "
-        f"fusion_mode={args.highres_structure_fusion_mode}, "
-        f"skeleton_weight={args.highres_structure_skeleton_weight}",
-        "  Surface loss: BCE + 0.5*Dice",
-        (
-            f"  Direct resize: {args.source_patch_size} -> {args.img_size}"
-            if args.direct_resize_train
-            else (
-                f"  Random native crops: {args.source_patch_size} -> "
-                f"{args.img_size}, crops/image={args.random_crops_per_image}"
-                if args.random_crop_train
-                else f"  Fixed overlap tiles: {args.source_patch_size} -> {args.img_size}, stride={args.overlap_stride}"
-            )
-        ),
-        f"  Minimum crop road pixels: {args.min_crop_road_pixels} (no tile filtering)",
-        f"  Random seed: {args.seed}",
-        f"  Train augmentation: {'enabled' if args.augment else 'disabled'}",
-        f"  EMA: {'enabled' if args.use_ema else 'disabled'}, decay={args.ema_decay}",
-        (
-            f"  Validation: fixed crop list ({args.val_crop_list}) -> global TP/FP/FN"
-            if args.val_crop_list
-            else
-            "  Validation: direct resized logits -> sigmoid -> one threshold"
-            if args.direct_resize_train
-            else "  Validation: stitch logits -> sigmoid -> one threshold -> global TP/FP/FN"
-        ),
-        f"  Validation interval: every {max(1, args.val_interval)} epoch(s), final epoch always",
-        "  Boundary auxiliary loss: disabled",
-        "  Final skeleton loss weight: {:.2f}".format(loss_weights["skeleton_weight"]),
-        "  Final connectivity loss weight: {:.2f}".format(loss_weights["connectivity_weight"]),
-        "  Edge loss: disabled",
-        "  Edge skip enhance: disabled",
-    ])
-    return lines
 
 
 def make_unique_dir(base_dir, run_name):
@@ -562,7 +405,7 @@ def inherit_resume_architecture_args(args):
     if not args.resume or not os.path.isfile(args.resume):
         return
     try:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     except Exception as exc:
         print(
             f"[WARN] Could not inspect resume checkpoint args before model build: {exc}",
@@ -940,10 +783,6 @@ def evaluate_overlap_full_images(
     surface_tp = surface_fp = surface_fn = 0
     skeleton_tp = skeleton_fp = skeleton_fn = 0
     image_count = 0
-    positions = RoadSkeletonDataset.sliding_positions
-    weight_1d = torch.linspace(-1.0, 1.0, steps=tile_size, device=device).abs()
-    weight_1d = (1.0 - weight_1d).clamp_min(0.1)
-    tile_weight = (weight_1d[:, None] * weight_1d[None, :]).view(1, 1, tile_size, tile_size)
 
     with torch.no_grad():
         for batch in loader:
@@ -956,35 +795,14 @@ def evaluate_overlap_full_images(
                 mask = full_masks[image_index:image_index + 1]
                 skeleton = full_skeletons[image_index:image_index + 1]
                 skeleton_dilate = full_skeletons_dilate[image_index:image_index + 1]
-                height, width = image.shape[-2:]
-                logit_canvas = torch.zeros((1, 1, height, width), device=device)
-                skeleton_logit_canvas = torch.zeros_like(logit_canvas)
-                weight_canvas = torch.zeros_like(logit_canvas)
-
-                for top in positions(height, tile_size, stride):
-                    for left in positions(width, tile_size, stride):
-                        tile = image[:, :, top:top + tile_size, left:left + tile_size]
-                        outputs = model(tile)
-                        surface_logits = outputs[0]
-                        skeleton_logits = outputs[2]
-                        tile_height, tile_width = surface_logits.shape[-2:]
-                        weight = tile_weight[:, :, :tile_height, :tile_width]
-                        logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += surface_logits * weight
-                        if skeleton_logits is not None:
-                            skeleton_logit_canvas[:, :, top:top + tile_height, left:left + tile_width] += skeleton_logits * weight
-                        weight_canvas[:, :, top:top + tile_height, left:left + tile_width] += weight
-
-                if weight_canvas.min().item() <= 0:
-                    raise RuntimeError("Overlap validation left uncovered pixels in the full-image canvas.")
-                full_logits = logit_canvas / weight_canvas.clamp_min(1e-8)
+                full_logits, full_skeleton_logits = stitch_logits(model, image, tile_size, stride)
                 surface_pred = (torch.sigmoid(full_logits) >= threshold).float()
                 mask_bin = (mask > 0.5).float()
                 surface_tp += int((surface_pred * mask_bin).sum().item())
                 surface_fp += int((surface_pred * (1.0 - mask_bin)).sum().item())
                 surface_fn += int(((1.0 - surface_pred) * mask_bin).sum().item())
 
-                if skeleton_logits is not None:
-                    full_skeleton_logits = skeleton_logit_canvas / weight_canvas.clamp_min(1e-8)
+                if full_skeleton_logits is not None:
                     if criterion is not None:
                         loss, _ = criterion(
                             full_logits,
@@ -1188,6 +1006,9 @@ if __name__ == "__main__":
     
     inherit_resume_architecture_args(args)
     apply_structure_profile_defaults(args)
+    validate_training_args(args)
+    print('[MASS PROTOCOL] native1500 -> one random512 crop/image/epoch; '
+          'val=512/256 sliding; 80 epochs; batch2; accumulation1; FP32; no EMA', flush=True)
 
     # 加载配置
     config = get_config(args)
@@ -1328,7 +1149,7 @@ if __name__ == "__main__":
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Warm-start checkpoint not found: {path}")
         print(f"[INFO] Warm-start loading compatible tensors from: {path}", flush=True)
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         checkpoint_state = checkpoint.get('model_state_dict', checkpoint)
         model_state = model.state_dict()
         compatible = {}
@@ -1450,7 +1271,7 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             checkpoint_state = checkpoint["model_state_dict"]
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -1732,7 +1553,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -2205,6 +2026,9 @@ if __name__ == "__main__":
 
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
+                'experiment_base_commit': BASE_COMMIT,
+                'experiment_variant': 'h0_surface_global_softgate_v1',
+                'experiment_protocol': 'h0-mass-native1500-random512-fp32-80e-bs2-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),
                 'training_model_state_dict': model.state_dict(),
@@ -2247,7 +2071,7 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location='cuda', weights_only=False)
         model.load_state_dict(best_checkpoint['model_state_dict'], strict=(args.bottleneck_type == 'global_local'))
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(

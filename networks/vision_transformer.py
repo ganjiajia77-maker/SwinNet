@@ -49,6 +49,9 @@ def get_topology_coefficients(model):
     }
 
     for stage in (2, 3):
+        if getattr(swin_unet, "surface_only", False):
+            coefficients[f"decoder_stage{stage}"] = {"gamma1": 0.0, "structure_enabled": False}
+            continue
         structure_block = swin_unet.decoder_structure_blocks[str(stage)]
         coefficients[f"decoder_stage{stage}"] = {
             "gamma1": float(structure_block.gamma1.detach().cpu()),
@@ -81,6 +84,8 @@ def apply_structure_profile_runtime(model):
     module = model.module if hasattr(model, "module") else model
     swin_unet = module.swin_unet
     guided_head = swin_unet.guided_head
+    if getattr(swin_unet, "surface_only", False):
+        return
     if guided_head.enable_final_structure:
         return
 
@@ -590,14 +595,16 @@ class SwinUnet(nn.Module):
                                 stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
                                 stage3_gate_topology_gradient_ratio=stage3_gate_topology_gradient_ratio,
                                 final_skeleton_gradient_ratio=final_skeleton_gradient_ratio,
-                                enable_highres_structure_stream=enable_highres_structure_stream,
+                                # Construct the original H0 first to preserve shared RNG initialization;
+                                # configure_surface_only then removes the H0 stream.
+                                enable_highres_structure_stream=True,
                                 highres_structure_channels=highres_structure_channels,
                                 highres_structure_fuse_stages=highres_structure_fuse_stages,
                                 highres_structure_fusion_mode=highres_structure_fusion_mode,
                                 enable_post_refine_structure_interaction=(
                                     enable_post_refine_structure_interaction
                                 ),
-                                enable_h3_surface_fusion=enable_h3_surface_fusion,
+                                enable_h3_surface_fusion=True,
                                 enable_global_topology=enable_global_topology,
                                 global_topology_max_nodes=global_topology_max_nodes,
                                  global_topology_heads=global_topology_heads,
@@ -606,6 +613,9 @@ class SwinUnet(nn.Module):
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
+        from .surface_only import configure_surface_only
+        configure_surface_only(self.swin_unet, global_topology_max_nodes,
+                               global_topology_heads, global_topology_alpha_max)
     def forward(
         self,
         x,
