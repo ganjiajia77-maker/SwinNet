@@ -21,6 +21,34 @@
 实际入口 smoke。仍不能冒充在服务器 Quadro/驱动环境上复现通过；服务器
 真实 checkpoint smoke 必须先成功，才继续正式训练。
 
+## GPU 占用与完整流程恢复
+
+一次服务器 OOM 显示另一进程占用约13.17GiB，当前训练进程约2.24GiB。
+这是共享GPU的可用显存不足，不能靠修改运输公式解释，也不应自动结束其他任务。
+
+launcher 现在先用 nvidia-smi 将用户指定的物理索引解析成 GPU UUID，
+再将 CUDA_VISIBLE_DEVICES 设为该 UUID。日志中的逻辑 cuda:0 因此可以
+明确对应物理GPU2。每个阶段开始前打印显存和同卡进程。
+默认空闲不足6144MiB时停止；这是保守预留阈值，不是实测峰值保证，也不是资源锁。
+进程列表查询失败时会明确记录，但不会静默改变所选GPU或终止占用进程。
+没有修改训练入口文件、模型/损失或 checkpoint 代码指纹，所以已有4020100
+训练权重保持严格恢复兼容。
+
+释放占用后，继续已有实验的完整流程：
+
+```bash
+export GPU=2
+export RUN_DIR=/home/gjj/SwinNet-roadbias/model_out/h0_v9_direct_20261028_135407
+export MS_ROOT="$(cat "$RUN_DIR/latest_multiscale_root.txt")"
+export EPOCHS=20
+bash scripts/run_v9_multiscale.sh continue_all
+```
+
+`continue_all` 先重新检查，再分别处理local和multiscale：有last则resume，
+无last且目录只有配置/日志时将整个目录备份后从原V9重新开始；有其他
+checkpoint但缺last时停止，避免静默忽略权重。最后依次扫阈值、验证诊断、
+测试、测试诊断。当前正在运行的同一实验不应重复启动。
+
 ## 实际结构
 
 保留原 V9 的 visual、P0、Q3、R、W、proposal B、accept A、gate_relation、

@@ -34,7 +34,16 @@ common=(--source_checkpoint "$SOURCE" --root_path "$DATA" --output_dir "$MS_ROOT
 if [[ -n ${SELECTOR_LR:-} ]]; then common+=(--selector_lr "$SELECTOR_LR"); fi
 echo "SOURCE=$SOURCE"
 echo "MS_ROOT=$MS_ROOT; GPU=${GPU:-2}; extra epochs per arm=${EPOCHS:-20}; loss=L_seg+0.2*L_cont"
+# UUID selection avoids ambiguity between NVML physical indices and CUDA's
+# default device ordering. Check before each phase; never kill occupying jobs.
+gpu_preflight() {
+  local uuid
+  uuid=$("$PY" scripts/v9_gpu_preflight.py --gpu "${GPU:-2}" \
+    --min_free_mib "${MIN_FREE_GPU_MIB:-6144}")
+  export CUDA_VISIBLE_DEVICES="$uuid"
+}
 run() {
+  gpu_preflight
   if [[ "$1" == smoke ]]; then
     # Synchronize only the preflight so any further CUDA failure reports the
     # actual operation and C++ stack. Formal training keeps asynchronous CUDA.
@@ -42,6 +51,26 @@ run() {
       "$PY" -u run_v9_multiscale.py "$1" "${common[@]}" "${@:2}"
   else
     "$PY" -u run_v9_multiscale.py "$1" "${common[@]}" "${@:2}"
+  fi
+}
+continue_arm() {
+  local mode=$1 directory="$MS_ROOT/$1"
+  if [[ -s "$directory/last.pth" ]]; then
+    echo "[CONTINUE] $mode from $directory/last.pth"
+    run resume --transport_mode "$mode"
+  else
+    if [[ -d "$directory" ]]; then
+      # A first-epoch OOM leaves experiment.json but no resumable weights.
+      # Preserve every file; do not silently discard a lone best/temporary save.
+      if [[ -n $(find "$directory" -type f \( -name '*.pth' -o -name '*.tmp' \) -print -quit) ]]; then
+        echo "Missing last.pth but checkpoint files exist in $directory; inspect before continuing." >&2
+        return 1
+      fi
+      local backup="${directory}_interrupted_no_checkpoint_$(date +%Y%m%d_%H%M%S_%N)"
+      mv -- "$directory" "$backup"
+      echo "[PRESERVED] incomplete $mode directory moved to $backup"
+    fi
+    run train --transport_mode "$mode"
   fi
 }
 case "$COMMAND" in
@@ -62,6 +91,15 @@ case "$COMMAND" in
     run train --transport_mode local; run train --transport_mode multiscale
     run sweep --transport_mode local; run sweep --transport_mode multiscale
     run audit --transport_mode multiscale --audit_split val
+    ;;
+  continue_all)
+    run smoke
+    continue_arm local; continue_arm multiscale
+    run sweep --transport_mode local; run sweep --transport_mode multiscale
+    run audit --transport_mode multiscale --audit_split val
+    run test --transport_mode local; run test --transport_mode multiscale
+    run audit --transport_mode multiscale --audit_split test
+    echo '[ALL COMPLETE] paired continuations, validation selection, test and audits'
     ;;
   *) echo "Unknown command: $COMMAND" >&2; exit 1 ;;
 esac

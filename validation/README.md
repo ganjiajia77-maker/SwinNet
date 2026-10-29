@@ -40,3 +40,20 @@ host uses PyTorch2.11/cu128, not the server's PyTorch2.6/cu118/Quadro driver.
 The precise server-side driver failure therefore remains unconfirmed until its
 real smoke rerun. New smoke runs synchronize CUDA and include C++ stacks if an
 error recurs; a failed smoke always stops the formal pipeline.
+
+## Occupied GPU follow-up
+
+`checks/test_v9_gpu_preflight.py` passes three stdlib-only tests: physical-index
+to UUID selection and same-card process filtering; an occupied-card stop without
+killing any process; rejection of missing/ambiguous GPU responses. The shell's
+syntax is checked with bash -n. No model, loss, data or training-runner file was
+changed in this follow-up, preserving existing checkpoint code fingerprints.
+The 6144MiB reserve check is an early occupancy guard, not an exclusive GPU lock
+or a guarantee of sufficient peak VRAM. Actual server occupancy must be resolved
+before continuing the interrupted experiment.
+
+`checks/test_v9_continue_shell.py` passes two additional real-Bash controller
+tests with a fake Python: it resumes local weights, preserves an incomplete
+multiscale directory, and executes all nine pipeline phases in order; a busy
+GPU exits before invoking model code or moving any interrupted output directory.
+These tests never start training or query/terminate a real GPU process.
