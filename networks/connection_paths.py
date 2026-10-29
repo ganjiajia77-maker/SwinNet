@@ -207,6 +207,7 @@ def label_paths(paths, gt_native, skeleton_native, p0_native, reference_threshol
     distance=cv2.distanceTransform((~sk).astype(np.uint8),cv2.DIST_L2,cv2.DIST_MASK_PRECISE)
     p0mask=p0_native>=reference_threshold
     missing=sk & ~(cv2.dilate(p0mask.astype(np.uint8),np.ones((5,5),np.uint8))>0)
+    near_missing=cv2.dilate(missing.astype(np.uint8),np.ones((5,5),np.uint8))>0
     count,gap_labels,gap_stats,_=cv2.connectedComponentsWithStats(missing.astype(np.uint8),connectivity=8)
     coverage={i:0. for i in range(1,count) if gap_stats[i,cv2.CC_STAT_AREA]>=3}
     all_geometry=coverage.copy()
@@ -233,7 +234,6 @@ def label_paths(paths, gt_native, skeleton_native, p0_native, reference_threshol
                     graph_cache[start]=dijkstra(graph,indices=start,directed=False,limit=max(20.,config.max_path_work*max(scale)*2.))
                 gt_length=float(graph_cache[start][end]); row['gt_graph_length_native']=gt_length if np.isfinite(gt_length) else None
                 plausible=start!=end and np.isfinite(gt_length) and gt_length<=max(6.,1.8*path['path_length_native'])
-                near_missing=cv2.dilate(missing.astype(np.uint8),np.ones((5,5),np.uint8))>0
                 if plausible and near>=.85 and background<=.2 and near_missing[py,px].any():
                     row.update(label=1,subtype='true_connection' if path['kind']=='pair' else 'true_extension',uncertainty=None)
                 elif background>=.25 and (not plausible or near<.5):
