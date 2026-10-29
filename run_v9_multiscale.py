@@ -2,13 +2,20 @@
 import argparse
 import csv
 import json
+import os
 import random
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
+# This entry point also supports direct Python invocation, bypassing the shell.
+# Set before importing torch; changing the environment after CUDA initialization
+# would not reliably change the allocator used by the running process.
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'backend:native,expandable_segments:False'
+os.environ['PYTORCH_ALLOC_CONF'] = os.environ['PYTORCH_CUDA_ALLOC_CONF']
 import torch
 from torch.utils.data import DataLoader
 
@@ -21,6 +28,23 @@ from networks.v9_multiscale_transport import install, transition, SOURCES
 VERSION = 'v9_multiscale_source_selector_v1'
 NAMES = (*v9.MODULE_NAMES, 'gate_relation', 'state_gate')
 ROOT = Path(__file__).resolve().parent
+
+
+def runtime_info(device):
+    info = {'torch': torch.__version__, 'compiled_cuda': torch.version.cuda,
+            'device': str(device), 'allocator_request': os.environ['PYTORCH_CUDA_ALLOC_CONF']}
+    if device.type == 'cuda':
+        info['gpu'] = torch.cuda.get_device_name(device)
+        info['allocator_backend'] = torch.cuda.memory.get_allocator_backend()
+        free, total = torch.cuda.mem_get_info(device)
+        info.update(free_cuda_mib=free/2**20, total_cuda_mib=total/2**20)
+        try:
+            info['nvidia_smi'] = subprocess.check_output(
+                ['nvidia-smi', '--query-gpu=index,name,driver_version', '--format=csv,noheader'],
+                text=True, timeout=5).strip()
+        except (OSError, subprocess.SubprocessError):
+            info['nvidia_smi'] = 'unavailable'
+    return info
 
 
 def write_json(path, value):
@@ -109,6 +133,7 @@ def configuration(args, payload):
         'checkpoint_selection_threshold': .60, 'threshold_grid': [.35, .75, .01],
         'protocol': 'FP32/no EMA; native1500 random512 x1; batch2/accum1; val/test512 stride256 weighted logits',
         'loss': 'original L_seg + 0.2 L_cont; no L_G or source relation loss',
+        'allocator': 'backend:native,expandable_segments:False',
         'code_sha256': {p: v9.digest(ROOT/p) for p in (
             'run_v9_multiscale.py', 'networks/v9_multiscale_transport.py',
             'networks/reliable_directional_repair.py', 'run_reliable_v9_mass.py')}}
@@ -292,34 +317,48 @@ def smoke(args, model, payload, config):
     batch = {key: sample[key][None].repeat(args.batch_size, 1, 1, 1).to(args.device)
              for key in ('image', 'mask', 'skeleton')}
     model.eval()
+    compare_keys = ('z1', 'u1', 'u2', 'u3', 'g_step', 'alpha')
     with torch.inference_mode():
-        before = model(batch['image'], capture_diagnostics=True)
+        before_full = model(batch['image'], capture_diagnostics=True)
+        before = {key: before_full[key].detach().cpu().clone() for key in compare_keys}
+        del before_full
     install(model, 'local', args.seed)
     with torch.inference_mode():
-        after = model(batch['image'], capture_diagnostics=True)
-    errors = {key: float((before[key]-after[key]).abs().max()) for key in ('z1', 'u1', 'u2', 'u3', 'g_step', 'alpha')}
+        after_full = model(batch['image'], capture_diagnostics=True)
+        errors = {key: float((before[key]-after_full[key].detach().cpu()).abs().max()) for key in compare_keys}
+        del before, after_full
     if any(errors.values()):
         raise RuntimeError(f'Local V9 equivalence failed: {errors}')
+    print('[SMOKE] original/local exact equivalence passed; comparison tensors released', flush=True)
     install(model, 'multiscale', args.seed)
     optimizer = configure(model, config['learning_rates'], config['selector_lr'])
     model.train(); model.dynamics.blend = 1.
     if args.device.type == 'cuda':
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(args.device)
     started = time.perf_counter(); norms = []
-    for _ in range(2):
+    for step in range(2):
         optimizer.zero_grad(set_to_none=True)
-        result = model(batch['image'], capture_diagnostics=True)
+        print(f'[SMOKE] multiscale step {step+1}/2 forward', flush=True)
+        # Smoke checks the loss and selector gradients, so diagnostic stacks are
+        # unnecessary here. Full diagnostic maps remain enabled in the audit.
+        result = model(batch['image'], capture_diagnostics=False)
+        if args.device.type == 'cuda':
+            torch.cuda.synchronize(args.device)
         loss, _ = loss_for(result, batch, config['training'])
         if not bool(torch.isfinite(loss)):
             raise RuntimeError('Nonfinite smoke loss')
         loss.backward(); check_gradients(model)
         norms.append(v9.grad_norm(model.dynamics.selector)); optimizer.step()
+        del result, loss
+        print(f'[SMOKE] multiscale step {step+1}/2 backward passed; selector_grad={norms[-1]:.6g}', flush=True)
     if not all(value > 0. for value in norms):
         raise RuntimeError(f'Selector has no useful gradient: {norms}')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_json(args.output_dir/'smoke.json', {'passed': True, 'local_exact_errors': errors,
         'source_sha256': v9.digest(args.source_checkpoint), 'batch_size': args.batch_size,
         'code_sha256': config['code_sha256'], 'training': config['training'],
+        'runtime': runtime_info(args.device),
         'selector_gradients': norms, 'seconds': time.perf_counter()-started,
         'peak_cuda_mib': torch.cuda.max_memory_allocated(args.device)/2**20 if args.device.type == 'cuda' else None})
     print('[SMOKE PASSED] strict actual checkpoint, local equivalence, actual multiscale forward/backward', flush=True)
@@ -344,6 +383,7 @@ def main():
     parser.add_argument('--min_effect', type=float, default=1e-5)
     parser.add_argument('--reference_set', type=Path)
     args = parser.parse_args(); args.device = torch.device(args.device)
+    print('[RUNTIME] '+json.dumps(runtime_info(args.device)), flush=True)
     if args.batch_size != 2 or args.epochs < 1 or args.transition_epochs < 0 or args.val_interval < 1:
         parser.error('Requires physical batch2, positive epochs/val_interval and nonnegative transition_epochs')
     if args.transition_epochs >= args.epochs:

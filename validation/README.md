@@ -22,3 +22,21 @@ peak VRAM or exact reproduction of the user's trained checkpoint. The server
 launcher requires its separate real-checkpoint/real-crop smoke before training.
 
 No formal training was started.
+
+## Allocator compatibility follow-up
+
+The original server failure was at a CUDA allocation during source scoring.
+We removed the forced expandable-segment allocator and reduced preflight live
+tensors. No network/scoring/dynamics/loss formulas were changed.
+
+The updated `checks/test_v9_multiscale.py` contains 9 checks and was additionally
+run with PyTorch 2.6.0+cpu (local `.codex_work/v9-cpu-deps`). The controller-only
+test stubs its external evaluation imports, avoiding an unrelated mismatch
+between this CPU torch and the host's newer compiled torchvision.
+
+`multiscale_cuda_allocator_fix.json` records a fresh CUDA run with the native
+allocator, both 512 batch sizes and the actual updated entry-point smoke. This
+host uses PyTorch2.11/cu128, not the server's PyTorch2.6/cu118/Quadro driver.
+The precise server-side driver failure therefore remains unconfirmed until its
+real smoke rerun. New smoke runs synchronize CUDA and include C++ stacks if an
+error recurs; a failed smoke always stops the formal pipeline.

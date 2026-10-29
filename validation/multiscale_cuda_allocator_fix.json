@@ -1,0 +1,77 @@
+{
+  "passed": true,
+  "torch": "2.11.0+cu128",
+  "device": "NVIDIA GeForce RTX 5070 Laptop GPU",
+  "results": [
+    {
+      "batch_size": 1,
+      "local_exact_logit_error": 0.0,
+      "steps": [
+        {
+          "loss": 0.6394804120063782,
+          "selector_grad_l2": 2.240112962681451e-06
+        },
+        {
+          "loss": 0.6394804120063782,
+          "selector_grad_l2": 2.2284746137302136e-06
+        }
+      ],
+      "seconds": 3.4635762999823783,
+      "peak_mib": 965.5751953125
+    },
+    {
+      "batch_size": 2,
+      "local_exact_logit_error": 0.0,
+      "steps": [
+        {
+          "loss": 0.6394143104553223,
+          "selector_grad_l2": 2.517569328119862e-06
+        },
+        {
+          "loss": 0.6394143104553223,
+          "selector_grad_l2": 2.5031222321558744e-06
+        }
+      ],
+      "seconds": 2.682537099986803,
+      "peak_mib": 1936.8671875
+    }
+  ],
+  "entrypoint_smoke": {
+    "passed": true,
+    "local_exact_errors": {
+      "z1": 0.0,
+      "u1": 0.0,
+      "u2": 0.0,
+      "u3": 0.0,
+      "g_step": 0.0,
+      "alpha": 0.0
+    },
+    "source_sha256": "9f13a213dd46e2c14f026569e01370c1d5b311fbdd8029335b75a45d227ccaa1",
+    "batch_size": 2,
+    "code_sha256": {},
+    "training": {
+      "lambda_bg": 1.0,
+      "lambda_missing": 2.0,
+      "lambda_cont": 0.2,
+      "missing_threshold": 0.45
+    },
+    "runtime": {
+      "torch": "2.11.0+cu128",
+      "compiled_cuda": "12.8",
+      "device": "cuda",
+      "allocator_request": "backend:native,expandable_segments:False",
+      "gpu": "NVIDIA GeForce RTX 5070 Laptop GPU",
+      "allocator_backend": "native",
+      "free_cuda_mib": 5185.0,
+      "total_cuda_mib": 8150.5625,
+      "nvidia_smi": "0, NVIDIA GeForce RTX 5070 Laptop GPU, 595.79"
+    },
+    "selector_gradients": [
+      1.6071277286755503e-06,
+      1.60063950715994e-06
+    ],
+    "seconds": 3.007602300000144,
+    "peak_cuda_mib": 1676.43896484375
+  },
+  "limit": "Synthetic frozen BASE/Q3 provider. Actual upstream weights/data require server smoke."
+}

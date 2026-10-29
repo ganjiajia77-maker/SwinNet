@@ -155,13 +155,43 @@ class MultiscaleTests(unittest.TestCase):
                 root_path=root, device=torch.device('cpu'), seed=1234, batch_size=2,
                 num_workers=0, epochs=2, transition_epochs=0, val_interval=1, source_checkpoint=source)
             model = install(original_model(), 'multiscale')
-            with patch.object(runner, 'dataset', return_value=SmallDataset()), \
-                 patch('run_q3_r3_mass.full_dataset', return_value=SmallDataset()), \
-                 patch('run_reliable_directional_mass.evaluate_thresholds', return_value=({.60: {'selection_score': .5}}, {}, [], 0.)):
+            # These controller checks need fake evaluation only, not a real
+            # torchvision/timm compiled against this particular torch version.
+            stubs = {'run_q3_r3_mass': SimpleNamespace(full_dataset=lambda *a: SmallDataset()),
+                     'run_reliable_directional_mass': SimpleNamespace(
+                         evaluate_thresholds=lambda *a, **k: ({.60: {'selection_score': .5}}, {}, [], 0.))}
+            with patch.object(runner, 'dataset', return_value=SmallDataset()), patch.dict(sys.modules, stubs):
                 runner.train(args, model, {'identity': {}}, config)
                 args.command = 'resume'
                 runner.train(args, model, {'identity': {}}, config)
                 self.assertEqual(len((root/'multiscale/train.jsonl').read_text().splitlines()), 2)
+
+    def test_actual_smoke_releases_comparisons_and_trains_without_diagnostic_stacks(self):
+        class CropDataset:
+            def set_epoch(self, epoch): pass
+            def __getitem__(self, index):
+                return {'image': torch.randn(3, 64, 64), 'mask': torch.zeros(1, 64, 64),
+                        'skeleton': torch.zeros(1, 64, 64)}
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory); source = root/'source.pth'; source.write_bytes(b'smoke-source')
+            args = SimpleNamespace(output_dir=root, device=torch.device('cpu'), batch_size=2,
+                                   seed=1234, source_checkpoint=source)
+            config = {'learning_rates': {name: 1e-4 for name in runner.v9.STAGE_MODULES['D']},
+                'selector_lr': 1e-4, 'code_sha256': {}, 'training': {'lambda_bg': 1.,
+                    'lambda_missing': 2., 'lambda_cont': .2, 'missing_threshold': .45}}
+            model = original_model()
+            captures = []
+            handle = model.register_forward_pre_hook(
+                lambda unused, arguments, kwargs: captures.append(kwargs.get('capture_diagnostics')), with_kwargs=True)
+            try:
+                with patch.object(runner, 'dataset', return_value=CropDataset()):
+                    runner.smoke(args, model, {}, config)
+            finally:
+                handle.remove()
+            self.assertEqual(captures, [True, True, False, False])
+            report = json.loads((root/'smoke.json').read_text())
+            self.assertTrue(report['passed'])
+            self.assertEqual(report['runtime']['allocator_request'], 'backend:native,expandable_segments:False')
 
 
 if __name__ == '__main__':

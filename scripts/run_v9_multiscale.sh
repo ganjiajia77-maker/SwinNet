@@ -6,7 +6,10 @@ PY=${PYTHON:-/home/gjj/miniconda3/envs/swinunet/bin/python}
 export CUDA_VISIBLE_DEVICES=${GPU:-2}
 export OPENCV_LOG_LEVEL=ERROR
 export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The server has an older driver. Do not force CUDA virtual-memory mappings.
+# Set both aliases, since newer torch prefers PYTORCH_ALLOC_CONF.
+export PYTORCH_CUDA_ALLOC_CONF=backend:native,expandable_segments:False
+export PYTORCH_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
 RUN_DIR=${RUN_DIR:-/home/gjj/SwinNet-roadbias/model_out/h0_v9_direct_20261028_135407}
 SOURCE=${SOURCE_CHECKPOINT:-$RUN_DIR/stage_D/best.pth}
 DATA=${DATA:-/home/gjj/Swin-Unet-main/Massachusetts/tiff}
@@ -31,7 +34,16 @@ common=(--source_checkpoint "$SOURCE" --root_path "$DATA" --output_dir "$MS_ROOT
 if [[ -n ${SELECTOR_LR:-} ]]; then common+=(--selector_lr "$SELECTOR_LR"); fi
 echo "SOURCE=$SOURCE"
 echo "MS_ROOT=$MS_ROOT; GPU=${GPU:-2}; extra epochs per arm=${EPOCHS:-20}; loss=L_seg+0.2*L_cont"
-run() { "$PY" -u run_v9_multiscale.py "$1" "${common[@]}" "${@:2}"; }
+run() {
+  if [[ "$1" == smoke ]]; then
+    # Synchronize only the preflight so any further CUDA failure reports the
+    # actual operation and C++ stack. Formal training keeps asynchronous CUDA.
+    CUDA_LAUNCH_BLOCKING=1 TORCH_SHOW_CPP_STACKTRACES=1 \
+      "$PY" -u run_v9_multiscale.py "$1" "${common[@]}" "${@:2}"
+  else
+    "$PY" -u run_v9_multiscale.py "$1" "${common[@]}" "${@:2}"
+  fi
+}
 case "$COMMAND" in
   smoke) run smoke ;;
   train_local|train_multiscale|resume_local|resume_multiscale|sweep_local|sweep_multiscale|test_local|test_multiscale)

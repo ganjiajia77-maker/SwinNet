@@ -4,6 +4,23 @@
 独立分支：`codex/v9-multiscale-source-selector`。
 未带入另一个工作树中尚未提交的 G-benefit 监督实验。
 
+## CUDA 运行兼容修正
+
+旧启动脚本强制 `expandable_segments:True`。服务器在来源选择器的张量
+分配处报告 `CUDA driver error: invalid argument`，这与驱动显存映射路径
+不兼容的可能性一致，但单独 Python 堆栈不足以证实具体驱动 API。
+现将 launcher 与 Python 入口均设为 `backend:native,expandable_segments:False`，
+避免继续强制 VMM 分配；不改变来源网络、运输公式、损失或物理 batch2。
+
+同时修正 smoke 显存占用：原/新局部输出只把六项比较张量保存到 CPU，
+逐份释放完整 GPU 诊断；训练检查不构造无用诊断堆叠，每步后释放输出。
+启动时记录 torch、编译 CUDA、GPU/驱动、allocator 与可用显存。
+只在 smoke 开启 CUDA 同步和 C++ 报错栈，正式训练保持异步执行。
+
+已补测 PyTorch2.6 CPU 的9项检查，以及本机 CUDA 的512/batch1、2与
+实际入口 smoke。仍不能冒充在服务器 Quadro/驱动环境上复现通过；服务器
+真实 checkpoint smoke 必须先成功，才继续正式训练。
+
 ## 实际结构
 
 保留原 V9 的 visual、P0、Q3、R、W、proposal B、accept A、gate_relation、

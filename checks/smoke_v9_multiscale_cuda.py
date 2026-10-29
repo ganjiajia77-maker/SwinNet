@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import sys
 import time
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -61,8 +64,27 @@ def main():
                         'peak_mib': torch.cuda.max_memory_allocated()/2**20})
         del model, optimizer, before, after, result, loss
         torch.cuda.empty_cache()
+    # Exercise the actual entry-point smoke too, including comparison release
+    # and capture_diagnostics=False during its training checks.
+    class CropDataset:
+        def set_epoch(self, epoch): pass
+        def __getitem__(self, index):
+            mask = torch.zeros(1, 512, 512); mask[:, 250:255, 20:490] = 1.
+            skeleton = torch.zeros_like(mask); skeleton[:, 252, 20:490] = 1.
+            return {'image': torch.randn(3, 512, 512), 'mask': mask, 'skeleton': skeleton}
+    with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+        root = Path(directory); source = root/'source.pth'; source.write_bytes(b'gpu-smoke')
+        smoke_args = SimpleNamespace(output_dir=root, source_checkpoint=source, device=torch.device('cuda'),
+                                     batch_size=2, seed=1234)
+        smoke_config = {'learning_rates': {name: 1e-4 for name in runner.v9.STAGE_MODULES['D']},
+            'selector_lr': 1e-4, 'code_sha256': {}, 'training': {'lambda_bg': 1.,
+                'lambda_missing': 2., 'lambda_cont': .2, 'missing_threshold': .45}}
+        with patch.object(runner, 'dataset', return_value=CropDataset()):
+            runner.smoke(smoke_args, original_model().cuda(), {}, smoke_config)
+        entry_smoke = json.loads((root/'smoke.json').read_text())
     runner.write_json(args.output, {'passed': True, 'torch': torch.__version__,
         'device': torch.cuda.get_device_name(), 'results': results,
+        'entrypoint_smoke': entry_smoke,
         'limit': 'Synthetic frozen BASE/Q3 provider. Actual upstream weights/data require server smoke.'})
     print(json.dumps(results, indent=2), flush=True)
 
