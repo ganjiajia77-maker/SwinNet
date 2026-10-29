@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "image_size": 1500,
+  "window_size": 512,
+  "stride": 256,
+  "windows_per_arm": 25,
+  "arms": [
+    "original",
+    "local",
+    "multiscale"
+  ],
+  "device": "cuda",
+  "original_p0_p1_confusion_counts_reproduced": true,
+  "strict_downstream_loads": true,
+  "limits": "Synthetic frozen provider and synthetic image; no Massachusetts accuracy claim."
+}

@@ -1,0 +1,40 @@
+{
+  "passed": true,
+  "torch": "2.11.0+cu128",
+  "device": "NVIDIA GeForce RTX 5070 Laptop GPU",
+  "results": [
+    {
+      "batch_size": 1,
+      "local_exact_logit_error": 0.0,
+      "steps": [
+        {
+          "loss": 0.6394804120063782,
+          "selector_grad_l2": 2.2401131900551263e-06
+        },
+        {
+          "loss": 0.6394804120063782,
+          "selector_grad_l2": 2.22847529585124e-06
+        }
+      ],
+      "seconds": 2.5619647999992594,
+      "peak_mib": 965.5751953125
+    },
+    {
+      "batch_size": 2,
+      "local_exact_logit_error": 0.0,
+      "steps": [
+        {
+          "loss": 0.6394143104553223,
+          "selector_grad_l2": 2.5175686459988356e-06
+        },
+        {
+          "loss": 0.6394143104553223,
+          "selector_grad_l2": 2.5031226869032253e-06
+        }
+      ],
+      "seconds": 1.7351112000178546,
+      "peak_mib": 1936.8671875
+    }
+  ],
+  "limit": "Synthetic frozen BASE/Q3 provider. Actual upstream weights/data require server smoke."
+}
