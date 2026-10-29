@@ -29,6 +29,17 @@ def _backtrack(start,end,predecessors):
     return points[::-1] if current==start else None
 
 
+def _junction_mask(skeleton):
+    """Crossing-number junctions; avoid counting a diagonal staircase as a branch."""
+    padded=np.pad(skeleton.astype(bool),1)
+    h,w=skeleton.shape
+    offsets=((-1,0),(-1,1),(0,1),(1,1),(1,0),(1,-1),(0,-1),(-1,-1))
+    ring=[padded[1+dy:1+dy+h,1+dx:1+dx+w] for dy,dx in offsets]
+    changes=np.zeros((h,w),np.uint8)
+    for i in range(8): changes+=(ring[i]!=ring[(i+1)%8]).astype(np.uint8)
+    return skeleton.astype(bool)&(changes>=6)
+
+
 def _matched_pairs(items,max_pairs,seed):
     """One-to-one, same-image matching on predicted length/source/P0/Q/distance."""
     rng=np.random.default_rng(seed)
@@ -71,15 +82,23 @@ def predicted_candidates(model,result,mask,skeleton,reference_threshold=.45,conf
         nodes,graph=skeleton_graph(sk); tree=cKDTree(nodes) if len(nodes) else None
         predecessors={}; chosen=[]
         missing=sk & ~(cv2.dilate((p0>=reference_threshold).astype(np.uint8),np.ones((5,5),np.uint8))>0)
+        junction_band=cv2.dilate(_junction_mask(sk).astype(np.uint8),np.ones((3,3),np.uint8))>0
         for path,label in zip(proposals,labels):
             stats['label_'+str(label['label'])]+=1; stats['subtype_'+str(label['subtype'])]+=1
             if label['label']<0: continue
             line=_native_line(path,gt.shape)
             if len(line)<2: stats['ignored_short']+=1; continue
+            scale=np.asarray((path['scale_y'],path['scale_x']))
+            ends=(np.stack((path['endpoint_a'],path['endpoint_b']))+.5)*scale-.5
+            distance_to_end=np.linalg.norm(line[:,None,:]-ends[None,:,:],axis=2).min(axis=1)
+            interior=distance_to_end>=2.*float(np.mean(scale))
+            if (junction_band[line[:,0],line[:,1]] & interior).any():
+                stats['ignored_ambiguous_junction']+=1; continue
+            if label['label']==0 and label['background_fraction']<.70:
+                stats['ignored_ambiguous_negative']+=1; continue
             points=line
             if label['label']==1:
                 if tree is None: stats['ignored_unaligned_positive']+=1; continue
-                scale=np.asarray((path['scale_y'],path['scale_x']))
                 endpoints=np.rint((np.stack((path['endpoint_a'],path['endpoint_b']))+.5)*scale-.5).astype(int)
                 _,indices=tree.query(endpoints); start,end=map(int,indices)
                 if start==end: stats['ignored_unaligned_positive']+=1; continue
@@ -99,10 +118,7 @@ def predicted_candidates(model,result,mask,skeleton,reference_threshold=.45,conf
             else:
                 # Positive endpoints are not forced to background: require GT background
                 # and stay away from both candidate ends by two work-grid cells.
-                scale=np.asarray((path['scale_y'],path['scale_x']))
-                ends=(np.stack((path['endpoint_a'],path['endpoint_b']))+.5)*scale-.5
-                distance=np.linalg.norm(line[:,None,:]-ends[None,:,:],axis=2).min(axis=1)
-                background=line[(~gt[line[:,0],line[:,1]]) & (distance>=2.*float(np.mean(scale)))]
+                background=line[(~gt[line[:,0],line[:,1]]) & interior]
                 if len(background)<3: stats['ignored_negative_without_confirmed_background']+=1; continue
             work=np.asarray(path['path_points']); q_mean=float(q[work[:,0],work[:,1]].mean())
             separation=float(np.linalg.norm((path['endpoint_a']-path['endpoint_b'])*

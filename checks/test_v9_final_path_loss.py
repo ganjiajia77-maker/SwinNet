@@ -14,7 +14,7 @@ from checks.test_v9_state_gate import model as base_model
 from checks.test_path_connection import candidate
 from networks.connection_paths import PathConfig
 from networks.v9_final_path_supervision import (soft_min_score,connection_loss,
-    weighted_connection,predicted_candidates,_matched_pairs)
+    weighted_connection,predicted_candidates,_matched_pairs,_junction_mask)
 import run_v9_final_path_loss as runner
 from path_connection_protocol import compare_cases
 from evaluation.road_comparison.road_metrics import DEFAULT_PROTOCOL
@@ -70,7 +70,7 @@ class FinalPathTests(unittest.TestCase):
         net=base_model().eval(); image=torch.randn(1,3,64,64)
         with torch.no_grad(): result=net(image,capture_diagnostics=True)
         gt=np.zeros((64,64),np.uint8); sk=np.zeros_like(gt)
-        gt[19:26,8:58]=1; gt[43:50,8:58]=1
+        gt[21:24,8:58]=1; gt[45:48,8:58]=1
         sk[22,8:58]=1; sk[46,8:58]=1
         p0=np.zeros((64,64),np.float32); p0[19:26,8:15]=.9; p0[19:26,50:58]=.9
         p0[43:50,8:58]=.9
@@ -155,6 +155,24 @@ class FinalPathTests(unittest.TestCase):
                 report=compare_cases(cases,['A_original','P0_surface','P1_path'],.45,0,Path(temp))
             self.assertEqual(report['P1_path']['same_threshold']['metrics']['iou'],1.)
             self.assertTrue((Path(temp)/'REPORT.md').is_file())
+
+    def test_junction_and_ambiguous_negative_are_not_forced_into_training(self):
+        skeleton=np.zeros((64,64),np.uint8)
+        skeleton[10:50,34]=1; skeleton[22,10:55]=1
+        self.assertTrue(_junction_mask(skeleton)[22,34])
+        net=base_model().eval()
+        with torch.no_grad(): result=net(torch.randn(1,3,64,64),capture_diagnostics=True)
+        path=candidate(a=(5,2),b=(5,13)); path['path_points']=np.asarray([(5,x) for x in range(2,14)],np.int32)
+        result['p0']=torch.zeros(1,1,64,64)
+        label={'label':0,'subtype':'lateral_bridge','background_fraction':.5}
+        with patch('networks.v9_final_path_supervision.generate_paths',return_value=([path],{'paths':1})), \
+             patch('networks.v9_final_path_supervision.label_paths',return_value=([label],[])):
+            paths,_,stats,_=predicted_candidates(net,result,torch.zeros(1,1,64,64),torch.from_numpy(skeleton)[None,None])
+        self.assertEqual(paths,[[]]); self.assertEqual(stats['ignored_ambiguous_junction'],1)
+        with patch('networks.v9_final_path_supervision.generate_paths',return_value=([path],{'paths':1})), \
+             patch('networks.v9_final_path_supervision.label_paths',return_value=([label],[])):
+            paths,_,stats,_=predicted_candidates(net,result,torch.zeros(1,1,64,64),torch.zeros(1,1,64,64))
+        self.assertEqual(paths,[[]]); self.assertEqual(stats['ignored_ambiguous_negative'],1)
 
     def test_training_saves_and_resumes_at_epoch_boundary(self):
         net=base_model(); net.v9_training_config={'synthetic':True}; identity={'synthetic':True}

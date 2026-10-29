@@ -13,7 +13,11 @@ curved work-grid paths without GT. Only afterwards does the training mask and
 skeleton label them using candidate-to-GT geometry, GT background and a
 bounded GT graph route. Connected endpoints alone are insufficient: long GT
 detours and background crossings can be negative shortcuts. Uncertain paths
-are ignored. A positive path is supervised on the **actual GT skeleton route**
+are ignored. A negative needs at least 70% confirmed GT background; paths
+passing through an interior skeleton junction are ignored because a binary
+mask cannot distinguish an overpass from a connected intersection. This
+conservative rule also excludes some legitimate junctions and is counted.
+A positive path is supervised on the **actual GT skeleton route**
 only after the candidate and GT path agree in both directions and cover a GT
 missing region; no straight line is imposed on a curved positive. Negative
 path samples are on the predicted candidate line, with GT-confirmed background
