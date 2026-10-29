@@ -105,6 +105,34 @@ def audit_candidates(candidates, labels, size, expected):
             if tuple(map(int, totals[key])) == expected]
 
 
+def add_explicit_candidate(found, experiments, labels, name, masks_path, selection_path):
+    if name not in experiments or found[name]:
+        return
+    original_selection = load(selection_path)
+    if original_selection.get('selected_on') != 'val':
+        raise ValueError(f'{name} selection is not from validation')
+    original_chosen = original_selection.get('models', {}).get(name)
+    expected_threshold = experiments[name][0]
+    if not isinstance(original_chosen, dict) or abs(float(original_chosen['threshold']) - expected_threshold) > 1e-12:
+        raise ValueError(f'{name} validation threshold does not match the recorded {expected_threshold}')
+    selection_sha = hashlib.sha256(selection_path.read_bytes()).hexdigest()
+    masks = masks_path.resolve()
+    model = {'name': name,
+             'provenance': {'checkpoint': None,
+                            'checkpoint_status': 'not verified from saved prediction',
+                            'validation_selection': str(selection_path.resolve()),
+                            'validation_selection_sha256': selection_sha,
+                            'original_selection_identity': original_chosen.get('identity'),
+                            'prediction_origin': 'user supplied saved binary masks'},
+             'predictions': {'val': [], 'test': [{'threshold': expected_threshold, 'path': str(masks)}]}}
+    chosen = copy.deepcopy(original_chosen)
+    chosen['original_identity'] = original_chosen.get('identity')
+    chosen['identity'] = model_identity(model)
+    index = prediction_index(model['predictions']['test'][0], masks, labels)
+    key = (str(masks), chosen['identity'])
+    found[name][key] = (None, selection_path.resolve(), model, chosen, masks, index)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dataset', choices=['mass', 'data1'], required=True)
@@ -116,6 +144,10 @@ def main():
                         help='Existing WeavingUnet binary surface directory')
     parser.add_argument('--weaving_selection', type=Path,
                         help='Original WeavingUnet validation selection JSON')
+    parser.add_argument('--swin_masks', type=Path,
+                        help='Existing original SwinUnet binary surface directory')
+    parser.add_argument('--swin_selection', type=Path,
+                        help='Original SwinUnet validation selection JSON')
     args = parser.parse_args()
     data_root = args.data_root.resolve()
     size, nimages = (1500, 49) if args.dataset == 'mass' else (1024, 1246)
@@ -128,35 +160,17 @@ def main():
         if unknown or len(args.models) != len(set(args.models)):
             parser.error(f'Unknown or repeated model names: {sorted(unknown)}')
         experiments = {name: experiments[name] for name in args.models}
-    if bool(args.weaving_masks) != bool(args.weaving_selection):
-        parser.error('Specify both --weaving_masks and --weaving_selection')
+    for label in ('weaving', 'swin'):
+        if bool(getattr(args, label + '_masks')) != bool(getattr(args, label + '_selection')):
+            parser.error(f'Specify both --{label}_masks and --{label}_selection')
     found = discover(args.search_root, data_root, size, experiments, labels)
     weaving = 'weavingunet_random512'
-    if args.weaving_masks and weaving in experiments and not found[weaving]:
-        original_selection = load(args.weaving_selection)
-        if original_selection.get('selected_on') != 'val':
-            raise ValueError('WeavingUnet selection is not from validation')
-        original_chosen = original_selection.get('models', {}).get(weaving)
-        if not isinstance(original_chosen, dict) or abs(float(original_chosen['threshold']) - 0.35) > 1e-12:
-            raise ValueError('WeavingUnet validation threshold is not the recorded 0.35')
-        selection_sha = hashlib.sha256(args.weaving_selection.read_bytes()).hexdigest()
-        masks = args.weaving_masks.resolve()
-        model = {'name': weaving,
-                 'provenance': {'checkpoint': None,
-                                'checkpoint_status': 'not verified from saved prediction',
-                                'validation_selection': str(args.weaving_selection.resolve()),
-                                'validation_selection_sha256': selection_sha,
-                                'original_selection_identity': original_chosen.get('identity'),
-                                'prediction_origin': 'user supplied saved binary masks'},
-                 'predictions': {'val': [], 'test': [{'threshold': 0.35, 'path': str(masks)}]}}
-        # Record the original identity and derive a new one for this explicitly
-        # reconstructed, checkpoint-unverified manifest.
-        chosen = copy.deepcopy(original_chosen)
-        chosen['original_identity'] = original_chosen.get('identity')
-        chosen['identity'] = model_identity(model)
-        index = prediction_index(model['predictions']['test'][0], masks, labels)
-        key = (str(masks), chosen['identity'])
-        found[weaving][key] = (None, args.weaving_selection.resolve(), model, chosen, masks, index)
+    for name, masks, selection_path in (
+        (weaving, args.weaving_masks, args.weaving_selection),
+        ('swin_unet_original_random512', args.swin_masks, args.swin_selection),
+    ):
+        if masks:
+            add_explicit_candidate(found, experiments, labels, name, masks, selection_path)
     missing = [name for name, candidates in found.items() if not candidates]
     if missing:
         raise ValueError('No validated manifest, validation selection and test masks for: ' + ', '.join(missing))
@@ -171,9 +185,7 @@ def main():
             raise ValueError(f'No predictions match the previously recorded TP/FP/FN for {name}')
         signatures = {(item[2]['provenance'].get('checkpoint'), pred_hash)
                       for item, pred_hash in matched}
-        if any(not checkpoint for checkpoint, _ in signatures) and not (
-            name == weaving and all(item[0] is None for item, _ in matched)
-        ):
+        if any(not checkpoint for checkpoint, _ in signatures) and not all(item[0] is None for item, _ in matched):
             raise ValueError(f'Matched {name} has no checkpoint in its provenance')
         if len(signatures) != 1:
             raise ValueError(f'Multiple checkpoints or different masks match {name}; inspect: '
