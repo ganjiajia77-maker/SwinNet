@@ -1,0 +1,54 @@
+{
+  "commit": "599a410de8d341850e1810417307e4b3bbdfc82d",
+  "changes": "Only absolute imports isolated in reference_h0_599a410; original network/loss code otherwise unchanged. training_contract functions AST-extracted verbatim in meaning.",
+  "files": {
+    "networks/vision_transformer.py": {
+      "original_sha256": "2b9149758f939cf5dee4ee8532396f4492847c3adf253ff2d05df25ea1bcb4ca",
+      "packaged_sha256": "2b9149758f939cf5dee4ee8532396f4492847c3adf253ff2d05df25ea1bcb4ca"
+    },
+    "losses/road_losses.py": {
+      "original_sha256": "a3780cd42f6ede6579a6c0a9e9ecd4e86ec64591137cf054cd8142827966bc3e",
+      "packaged_sha256": "69932fa76c55dfc01af2ea27d4a2272217decc0f3efb911ec53079bd0d857747"
+    },
+    "losses/cldice_loss.py": {
+      "original_sha256": "a466aabd475e1fb92ef66e795889752bb0f3d59575210bb98457cdcde9006fe9",
+      "packaged_sha256": "a466aabd475e1fb92ef66e795889752bb0f3d59575210bb98457cdcde9006fe9"
+    },
+    "direction_target_utils.py": {
+      "original_sha256": "8725931da3cd0edb4479c79d16e86a1331164f2dc2d6eef6202bf20b12ce2a76",
+      "packaged_sha256": "8725931da3cd0edb4479c79d16e86a1331164f2dc2d6eef6202bf20b12ce2a76"
+    },
+    "topology_direction_constants.py": {
+      "original_sha256": "d5ae0c32c5d4a8830995cff7cd0944b9c03ede523a1b85f84f52736248a8557a",
+      "packaged_sha256": "d5ae0c32c5d4a8830995cff7cd0944b9c03ede523a1b85f84f52736248a8557a"
+    },
+    "networks/swin_transformer_unet_skip_expand_decoder_sys.py": {
+      "original_sha256": "3091da739c680ed7d3122a12ec05393f946414e99e8204be7af572bec82bbec4",
+      "packaged_sha256": "7c899d88ca049006f12c2c40e536f1ee18089b1f6b72da977ff9fb126e6a37e0"
+    },
+    "networks/dca_fpn_lite.py": {
+      "original_sha256": "350d1ba7ccee8d8e7cd7a519776ecfde4c78f5a64dad795cdec4b17a53cbf55f",
+      "packaged_sha256": "350d1ba7ccee8d8e7cd7a519776ecfde4c78f5a64dad795cdec4b17a53cbf55f"
+    },
+    "networks/bottleneck_context_fusion.py": {
+      "original_sha256": "8f4645098d7eff5d7b72111a9445afa6d2df3ef0f11b260f69755350a79aa6e6",
+      "packaged_sha256": "8f4645098d7eff5d7b72111a9445afa6d2df3ef0f11b260f69755350a79aa6e6"
+    },
+    "networks/g2l2_bottleneck.py": {
+      "original_sha256": "e0432092bb88d96c0ca9ce8daf519c01a34b845c3ceeeb97488299c8ef1615fc",
+      "packaged_sha256": "e0432092bb88d96c0ca9ce8daf519c01a34b845c3ceeeb97488299c8ef1615fc"
+    },
+    "networks/keypoint_global_topology.py": {
+      "original_sha256": "f1d330b36bb4e0b6fe4091c0b771c351a9a622212d628c47955dc3b6efd09a5d",
+      "packaged_sha256": "f1d330b36bb4e0b6fe4091c0b771c351a9a622212d628c47955dc3b6efd09a5d"
+    },
+    "networks/road_attention_head.py": {
+      "original_sha256": "492501a598b8777022669982dda284b48d12df1fc465574529e77ac6ec2a4656",
+      "packaged_sha256": "492501a598b8777022669982dda284b48d12df1fc465574529e77ac6ec2a4656"
+    },
+    "networks/skeleton_guided_head.py": {
+      "original_sha256": "91f77358e3bb7d4645f8193c43e11fafa37942a521016ba17c4b191e88f30fca",
+      "packaged_sha256": "ad55c51a44c961a4c06ac4d62368c8729d7c9cc5683b43b39726e436a253e08c"
+    }
+  }
+}

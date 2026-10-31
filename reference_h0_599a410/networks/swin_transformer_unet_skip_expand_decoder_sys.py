@@ -1,0 +1,2463 @@
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+from einops import rearrange
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from .dca_fpn_lite import DCAFPNLite
+from .bottleneck_context_fusion import GlobalLocalContextFusion
+from .g2l2_bottleneck import G2L2Bottleneck
+from .keypoint_global_topology import KeypointGuidedGlobalTopology
+from .road_attention_head import RoadAttentionHead
+from reference_h0_599a410.losses.road_losses import build_connectivity_target
+from .skeleton_guided_head import (
+    DecoderStructureRefinement,
+    GlobalContextHead,
+    STAGE3_GLOBAL_CONTEXT_CHANNELS,
+    SkeletonGuidedHead,
+)
+
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+def pad_nhwc_to_window(x, window_size):
+    """Pad an NHWC feature map on its bottom/right edges to full windows."""
+    H, W = x.shape[1:3]
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h or pad_w:
+        x = F.pad(x.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h)).permute(0, 2, 3, 1)
+    return x, H + pad_h, W + pad_w
+
+
+class WindowAttention(nn.Module):
+    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+
+    Args:
+        dim (int): Number of input channels.
+        window_size (tuple[int]): The height and width of the window.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+    """
+
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # Wh, Ww
+        self.num_heads = num_heads
+        self.logit_scale = nn.Parameter(torch.log(10 * torch.ones((num_heads, 1, 1))) )
+        self.cpb_mlp = nn.Sequential(
+            nn.Linear(2, 512, bias=True), nn.ReLU(inplace=True),
+            nn.Linear(512, num_heads, bias=False),
+        )
+
+        relative_coords_h = torch.arange(-(window_size[0] - 1), window_size[0], dtype=torch.float32)
+        relative_coords_w = torch.arange(-(window_size[1] - 1), window_size[1], dtype=torch.float32)
+        relative_coords_table = torch.stack(torch.meshgrid(relative_coords_h, relative_coords_w, indexing="ij"), dim=-1).unsqueeze(0)
+        relative_coords_table[:, :, :, 0] /= max(window_size[0] - 1, 1)
+        relative_coords_table[:, :, :, 1] /= max(window_size[1] - 1, 1)
+        relative_coords_table = relative_coords_table * 8
+        relative_coords_table = torch.sign(relative_coords_table) * torch.log2(torch.abs(relative_coords_table) + 1.0) / 3.0
+        self.register_buffer("relative_coords_table", relative_coords_table)
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.q_bias = nn.Parameter(torch.zeros(dim)) if qkv_bias else None
+        self.v_bias = nn.Parameter(torch.zeros(dim)) if qkv_bias else None
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(
+        self,
+        x,
+        mask=None,
+        road_attention_bias=None,
+        structure_attention_bias=None,
+    ):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B_, N, C = x.shape
+        qkv_bias = None
+        if self.q_bias is not None:
+            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias), self.v_bias))
+        qkv = F.linear(x, self.qkv.weight, qkv_bias).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        qk_logits = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
+        qk_logits = qk_logits * torch.clamp(self.logit_scale, max=torch.log(torch.tensor(100.0, device=x.device))).exp()
+        relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
+        relative_position_bias = relative_position_bias_table[self.relative_position_index.view(-1)].view(N, N, -1)
+        relative_position_bias = 16 * torch.sigmoid(relative_position_bias.permute(2, 0, 1).contiguous())
+        attn = qk_logits + relative_position_bias.unsqueeze(0)
+        if road_attention_bias is not None:
+            if road_attention_bias.dim() == 3:
+                road_attention_bias = road_attention_bias.unsqueeze(1)
+            attn = attn + road_attention_bias
+        if structure_attention_bias is not None:
+            if structure_attention_bias.dim() == 3:
+                structure_attention_bias = structure_attention_bias.unsqueeze(1)
+            attn = attn + structure_attention_bias
+
+        if mask is not None:
+            if mask.shape[0] == B_:
+                # Sparse routing may select a different number of windows per
+                # image. In that case each selected window already carries its
+                # own shifted-window mask.
+                attn = attn + mask.unsqueeze(1)
+            else:
+                nW = mask.shape[0]
+                attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+
+    def flops(self, N):
+        # calculate flops for 1 window with token length of N
+        flops = 0
+        # qkv = self.qkv(x)
+        flops += N * self.dim * 3 * self.dim
+        # attn = (q @ k.transpose(-2, -1))
+        flops += self.num_heads * N * (self.dim // self.num_heads) * N
+        #  x = (attn @ v)
+        flops += self.num_heads * N * N * (self.dim // self.num_heads)
+        # x = self.proj(x)
+        flops += N * self.dim * self.dim
+        return flops
+
+
+# ============== Token ↔ Feature Map 转换函数 ==============
+def token_to_map(x, H, W):
+    """
+    将 token 格式转换为特征图格式
+    
+    Args:
+        x: [B, L, C] token 格式
+        H, W: 特征图的空间分辨率
+    
+    Returns:
+        [B, C, H, W] 特征图格式
+    """
+    B, L, C = x.shape
+    assert L == H * W, f"Token数量 {L} 不匹配 H×W={H}×{W}"
+    x = x.view(B, H, W, C)
+    x = x.permute(0, 3, 1, 2).contiguous()
+    return x
+
+
+def map_to_token(x):
+    """
+    将特征图格式转换为 token 格式
+    
+    Args:
+        x: [B, C, H, W] 特征图格式
+    
+    Returns:
+        [B, L, C] token 格式
+    """
+    B, C, H, W = x.shape
+    x = x.permute(0, 2, 3, 1).contiguous()
+    x = x.view(B, H * W, C)
+    return x
+
+
+def _largest_group_divisor(channels, candidates=(8, 4, 2, 1)):
+    for groups in candidates:
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class PrePatchStructureEncoder(nn.Module):
+    def __init__(self, struct_channels):
+        super().__init__()
+        self.down1 = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(16),
+                num_channels=16,
+            ),
+            nn.GELU(),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(
+                16,
+                32,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(32),
+                num_channels=32,
+            ),
+            nn.GELU(),
+        )
+        self.project = nn.Conv2d(32, struct_channels, kernel_size=1, bias=False)
+        bottleneck_channels = max(struct_channels // 4, 1)
+        self.refine = nn.Sequential(
+            nn.Conv2d(struct_channels, bottleneck_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(bottleneck_channels),
+                num_channels=bottleneck_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                bottleneck_channels,
+                bottleneck_channels,
+                kernel_size=3,
+                padding=1,
+                groups=bottleneck_channels,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(bottleneck_channels),
+                num_channels=bottleneck_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(bottleneck_channels, struct_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(
+                num_groups=_largest_group_divisor(struct_channels),
+                num_channels=struct_channels,
+            ),
+        )
+        self.act = nn.GELU()
+        self._shape_logged = False
+        self._init_weights()
+
+    def forward(self, x):
+        input_shape = tuple(x.shape)
+        intermediate_feature = self.down1(x)
+        z_struct = self.down2(intermediate_feature)
+        down2_shape = tuple(z_struct.shape)
+        z_struct = self.project(z_struct)
+        project_shape = tuple(z_struct.shape)
+        z_struct = self.act(self.refine(z_struct) + z_struct)
+        if not self._shape_logged:
+            print(
+                "[PrePatch Lite Structure] input={} after_down2={} projected={} z_struct={}".format(
+                    input_shape,
+                    down2_shape,
+                    project_shape,
+                    tuple(z_struct.shape),
+                ),
+                flush=True,
+            )
+            self._shape_logged = True
+        return z_struct
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.GroupNorm):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
+
+class HighResStructureFusion(nn.Module):
+    def __init__(self, feature_channels, struct_channels):
+        super().__init__()
+        self.project = nn.Sequential(
+            nn.Conv2d(struct_channels, feature_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.GELU(),
+        )
+        self.delta = nn.Sequential(
+            nn.Conv2d(feature_channels * 2, feature_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.GELU(),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=True),
+        )
+        self._init_weights()
+        nn.init.constant_(self.delta[-1].weight, 0)
+        nn.init.constant_(self.delta[-1].bias, 0)
+
+    def forward(self, feature_map, z_struct):
+        z = F.interpolate(
+            z_struct,
+            size=feature_map.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        z = self.project(z)
+        return feature_map + self.delta(torch.cat([feature_map, z], dim=1))
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
+
+class HighResSkeletonAdapter(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        hidden_channels = max(channels // 2, 16)
+        self.adapter = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_largest_group_divisor(hidden_channels), hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_largest_group_divisor(channels), channels),
+        )
+        nn.init.kaiming_normal_(self.adapter[0].weight, mode="fan_out", nonlinearity="relu")
+        nn.init.zeros_(self.adapter[3].weight)
+        nn.init.ones_(self.adapter[4].weight)
+        nn.init.zeros_(self.adapter[4].bias)
+
+    def forward(self, z_struct):
+        return z_struct + self.adapter(z_struct)
+
+
+class StructureSurfaceCorrectionHead(nn.Module):
+    def __init__(self, struct_channels, hidden_channels=32):
+        super().__init__()
+        mid_channels = 16
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(struct_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_largest_group_divisor(hidden_channels), hidden_channels),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(hidden_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_largest_group_divisor(mid_channels), mid_channels),
+            nn.GELU(),
+        )
+        self.out = nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True)
+        self._init_weights()
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, z_struct, target_hw):
+        x = self.conv1(z_struct)
+        x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
+        x = self.conv2(x)
+        return self.out(x)
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.GroupNorm):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
+
+class SwinTransformerBlock(nn.Module):
+    r""" Swin Transformer Block.
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resulotion.
+        num_heads (int): Number of attention heads.
+        window_size (int): Window size.
+        shift_size (int): Shift size for SW-MSA.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_road_bias=False,
+                 use_decoder_structure_bias=False):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        self.use_road_bias = bool(use_road_bias)
+        self.use_decoder_structure_bias = bool(use_decoder_structure_bias)
+        if min(self.input_resolution) <= self.window_size:
+            # if window size is larger than input resolution, we don't partition windows
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention(
+            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        if self.use_road_bias:
+            self.road_bias_scale_a1 = nn.Parameter(torch.tensor(0.0))
+            self.road_bias_scale_a2 = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.register_parameter("road_bias_scale_a1", None)
+            self.register_parameter("road_bias_scale_a2", None)
+        if self.use_decoder_structure_bias:
+            self.decoder_connectivity_bias_scale = nn.Parameter(torch.tensor(0.1))
+        else:
+            self.register_parameter("decoder_connectivity_bias_scale", None)
+        self._register_structure_bias_buffers()
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+        # Input sizes at successive Swin stages are not necessarily divisible by
+        # window=7. Build the shift mask after runtime padding in forward().
+        self.register_buffer("attn_mask", None)
+
+    def _get_attention_mask(self, H, W, device):
+        if self.shift_size == 0:
+            return None
+        img_mask = torch.zeros((1, H, W, 1), device=device)
+        h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in h_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+        mask_windows = window_partition(img_mask, self.window_size).view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        return attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
+
+    @staticmethod
+    def _pad_probability_map(x, H, W, Hp, Wp):
+        if x is None:
+            return None
+        if x.shape[-2:] != (H, W):
+            x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
+        if (Hp, Wp) != (H, W):
+            x = F.pad(x, (0, Wp - W, 0, Hp - H))
+        return x
+
+    def _pad_road_prior(self, road_prior, H, W, Hp, Wp):
+        if road_prior is None:
+            return None
+        if isinstance(road_prior, (tuple, list)):
+            return tuple(self._pad_road_prior(item, H, W, Hp, Wp) for item in road_prior)
+        return self._pad_probability_map(road_prior, H, W, Hp, Wp)
+
+    def _register_structure_bias_buffers(self):
+        coords_h = torch.arange(self.window_size)
+        coords_w = torch.arange(self.window_size)
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1).view(-1, 2)
+        delta = coords.unsqueeze(0) - coords.unsqueeze(1)
+        dy, dx = delta[..., 0], delta[..., 1]
+        target_dy, target_dx = -dy, -dx
+        direction = torch.zeros_like(dy, dtype=torch.long)
+        direction[(target_dy < 0) & (target_dx == 0)] = 0
+        direction[(target_dy < 0) & (target_dx > 0)] = 1
+        direction[(target_dy == 0) & (target_dx > 0)] = 2
+        direction[(target_dy > 0) & (target_dx > 0)] = 3
+        direction[(target_dy > 0) & (target_dx == 0)] = 4
+        direction[(target_dy > 0) & (target_dx < 0)] = 5
+        direction[(target_dy == 0) & (target_dx < 0)] = 6
+        direction[(target_dy < 0) & (target_dx < 0)] = 7
+        opposite = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.long)
+        distance = torch.maximum(dy.abs(), dx.abs()).float()
+        pair_axis = torch.stack(
+            (torch.cos(2 * torch.atan2(target_dy.float(), target_dx.float())),
+             torch.sin(2 * torch.atan2(target_dy.float(), target_dx.float()))), dim=-1
+        )
+        pair_axis[distance == 0] = 0
+        self.register_buffer("topology_direction_one_hot", F.one_hot(direction, 8).float(), persistent=False)
+        self.register_buffer("topology_opposite_direction_one_hot", F.one_hot(opposite[direction], 8).float(), persistent=False)
+        self.register_buffer("topology_pair_distance", distance, persistent=False)
+        self.register_buffer("topology_pair_unit_i_to_j", pair_axis, persistent=False)
+        self.register_buffer("topology_pair_unit_j_to_i", pair_axis, persistent=False)
+
+    def _road_prior_to_pair_bias(self, road_prior):
+        H, W = road_prior.shape[-2:]
+        if road_prior.dim() == 3:
+            road_prior = road_prior.unsqueeze(1)
+        if road_prior.shape[-2:] != (H, W):
+            road_prior = F.interpolate(
+                road_prior,
+                size=(H, W),
+                mode="bilinear",
+                align_corners=False,
+            )
+        road_prior = road_prior.permute(0, 2, 3, 1).contiguous()
+        if self.shift_size > 0:
+            road_prior = torch.roll(
+                road_prior,
+                shifts=(-self.shift_size, -self.shift_size),
+                dims=(1, 2),
+            )
+        road_windows = window_partition(
+            road_prior,
+            self.window_size,
+        ).view(-1, self.window_size * self.window_size, 1)
+        road_windows = road_windows.clamp(0.0, 1.0)
+        return road_windows * road_windows.transpose(1, 2)
+
+    def _build_road_attention_bias(self, road_prior):
+        if road_prior is None or not self.use_road_bias:
+            return None
+        if isinstance(road_prior, (tuple, list)):
+            road_priors = list(road_prior)
+        else:
+            road_priors = [road_prior]
+
+        bias = None
+        scales = (self.road_bias_scale_a1, self.road_bias_scale_a2)
+        for prior, scale in zip(road_priors, scales):
+            if prior is None:
+                continue
+            pair_bias = scale * self._road_prior_to_pair_bias(prior)
+            bias = pair_bias if bias is None else bias + pair_bias
+        return bias
+
+    @staticmethod
+    def _row_normalize_attention_graph(graph):
+        return graph / graph.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def _build_decoder_structure_attention_bias(
+        self,
+        skeleton_prob,
+        connectivity_prob,
+        direction_prob=None,
+    ):
+        if connectivity_prob is None or not self.use_decoder_structure_bias:
+            return None
+
+        connectivity = connectivity_prob.detach().permute(0, 2, 3, 1).contiguous()
+        direction = None
+        if direction_prob is not None:
+            direction = F.normalize(direction_prob.detach(), dim=1, eps=1e-6)
+            direction = direction.permute(0, 2, 3, 1).contiguous()
+        if self.shift_size > 0:
+            shifts = (-self.shift_size, -self.shift_size)
+            connectivity = torch.roll(connectivity, shifts=shifts, dims=(1, 2))
+            if direction is not None:
+                direction = torch.roll(direction, shifts=shifts, dims=(1, 2))
+
+        connectivity_windows = window_partition(
+            connectivity,
+            self.window_size,
+        ).view(-1, self.window_size * self.window_size, 8)
+        if direction is not None:
+            direction_windows = window_partition(
+                direction,
+                self.window_size,
+            ).view(-1, self.window_size * self.window_size, 2)
+            direction_forward = torch.einsum(
+                "bic,ijc->bij",
+                direction_windows,
+                self.topology_pair_unit_i_to_j,
+            ).abs()
+            direction_backward = torch.einsum(
+                "bjc,ijc->bij",
+                direction_windows,
+                self.topology_pair_unit_j_to_i,
+            ).abs()
+            direction_alignment = direction_forward * direction_backward
+        else:
+            direction_alignment = 1.0
+
+        conn_forward = torch.einsum(
+            "bik,ijk->bij",
+            connectivity_windows,
+            self.topology_direction_one_hot,
+        )
+        conn_backward = torch.einsum(
+            "bjk,ijk->bij",
+            connectivity_windows,
+            self.topology_opposite_direction_one_hot,
+        )
+        one_hop_mask = (self.topology_pair_distance == 1).to(
+            dtype=connectivity_windows.dtype
+        )
+        adjacency = (
+            0.5
+            * (conn_forward + conn_backward)
+            * one_hop_mask.unsqueeze(0)
+        )
+        adjacency = self._row_normalize_attention_graph(adjacency.clamp_min(0.0))
+        direction_soft_gate = 0.5 + 0.5 * direction_alignment
+        directional_adjacency = (
+            0.5
+            * (conn_forward + conn_backward)
+            * direction_soft_gate
+            * one_hop_mask.unsqueeze(0)
+        )
+        directional_adjacency = self._row_normalize_attention_graph(
+            directional_adjacency.clamp_min(0.0)
+        )
+        directional_adjacency_2 = self._row_normalize_attention_graph(
+            torch.bmm(directional_adjacency, directional_adjacency)
+        )
+        directional_adjacency_3 = self._row_normalize_attention_graph(
+            torch.bmm(directional_adjacency_2, directional_adjacency)
+        )
+
+        distance = self.topology_pair_distance.to(dtype=connectivity_windows.dtype)
+        distance_decay = 1.0 / (1.0 + 0.2 * distance)
+        connectivity_bias = (
+            adjacency
+            + 0.5 * directional_adjacency_2
+            + 0.25 * directional_adjacency_3
+        )
+        connectivity_bias = connectivity_bias * distance_decay.unsqueeze(0)
+        connectivity_bias = connectivity_bias.masked_fill(
+            self.topology_pair_distance.unsqueeze(0) == 0,
+            0.0,
+        )
+        connectivity_bias = self._row_normalize_attention_graph(
+            connectivity_bias.clamp_min(0.0)
+        )
+        return self.decoder_connectivity_bias_scale * connectivity_bias
+
+    def forward(
+        self,
+        x,
+        road_prior=None,
+        decoder_skeleton_prob=None,
+        decoder_connectivity_prob=None,
+        decoder_direction_prob=None,
+    ):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+
+        shortcut = x
+        x = x.view(B, H, W, C)
+        x, Hp, Wp = pad_nhwc_to_window(x, self.window_size)
+        attention_mask = self._get_attention_mask(Hp, Wp, x.device)
+
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+
+        # W-MSA/SW-MSA
+        road_attention_bias = self._build_road_attention_bias(
+            self._pad_road_prior(road_prior, H, W, Hp, Wp)
+        )
+        structure_attention_bias = self._build_decoder_structure_attention_bias(
+            self._pad_probability_map(decoder_skeleton_prob, H, W, Hp, Wp),
+            self._pad_probability_map(decoder_connectivity_prob, H, W, Hp, Wp),
+            self._pad_probability_map(decoder_direction_prob, H, W, Hp, Wp),
+        )
+        attn_windows = self.attn(
+            x_windows,
+            mask=attention_mask,
+            road_attention_bias=road_attention_bias,
+            structure_attention_bias=structure_attention_bias,
+        )
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        x = x[:, :H, :W, :].contiguous().view(B, H * W, C)
+
+        # FFN
+        # Swin-V2 post-norm residual formulation.
+        x = shortcut + self.drop_path(self.norm1(x))
+        x = x + self.drop_path(self.norm2(self.mlp(x)))
+
+        return x
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
+               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
+
+    def flops(self):
+        flops = 0
+        H, W = self.input_resolution
+        # norm1
+        flops += self.dim * H * W
+        # W-MSA/SW-MSA
+        nW = H * W / self.window_size / self.window_size
+        flops += nW * self.attn.flops(self.window_size * self.window_size)
+        # mlp
+        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
+        # norm2
+        flops += self.dim * H * W
+        return flops
+
+
+class PatchMerging(nn.Module):
+    r""" Patch Merging Layer.
+
+    Args:
+        input_resolution (tuple[int]): Resolution of input feature.
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(
+        self,
+        input_resolution,
+        dim,
+        norm_layer=nn.LayerNorm,
+        road_alpha_init=0.1,
+        road_attention_merge_mode="residual",
+    ):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.linear_reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.mlp_reduction = nn.Sequential(
+            nn.Linear(4 * dim, 2 * dim, bias=False),
+            nn.GELU(),
+            nn.Linear(2 * dim, 2 * dim, bias=False),
+        )
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+        self.road_alpha = nn.Parameter(torch.tensor(float(road_alpha_init)))
+        self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
+        if self.road_attention_merge_mode not in {"residual", "merge_attention"}:
+            raise ValueError(
+                "road_attention_merge_mode must be residual or merge_attention"
+            )
+        self.norm = norm_layer(4 * dim)
+
+    def compute_merge_score(self, feature, road_prior):
+        feature_norm = F.normalize(feature, dim=-1, eps=1e-6)
+        feature_score = torch.matmul(
+            feature_norm,
+            feature_norm.transpose(-1, -2),
+        )
+        road_score = road_prior * road_prior.transpose(-1, -2)
+        return feature_score + self.road_alpha * road_score
+
+    def _apply_road_merge_attention(self, patch_tokens, patch_road_prior):
+        merge_score = self.compute_merge_score(patch_tokens, patch_road_prior)
+        merge_weight = torch.softmax(merge_score, dim=-1)
+        return torch.matmul(merge_weight, patch_tokens)
+
+    def forward(self, x, road_attention=None):
+        """
+        x: B, H*W, C
+        """
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+
+        x = x.view(B, H, W, C)
+        if road_attention is not None:
+            if road_attention.dim() == 3:
+                road_attention = road_attention.unsqueeze(1)
+            assert road_attention.shape[-2:] == (H, W), (
+                "road attention size must match patch merge input resolution"
+            )
+            road_attention = road_attention.permute(0, 2, 3, 1).contiguous()
+            if self.road_attention_merge_mode == "residual":
+                x = x * (1.0 + self.road_alpha * road_attention)
+
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        if road_attention is not None and self.road_attention_merge_mode == "merge_attention":
+            a0 = road_attention[:, 0::2, 0::2, :]
+            a1 = road_attention[:, 1::2, 0::2, :]
+            a2 = road_attention[:, 0::2, 1::2, :]
+            a3 = road_attention[:, 1::2, 1::2, :]
+            patch_tokens = torch.stack([x0, x1, x2, x3], dim=-2)
+            patch_road_prior = torch.stack([a0, a1, a2, a3], dim=-2)
+            patch_tokens = self._apply_road_merge_attention(
+                patch_tokens,
+                patch_road_prior,
+            )
+            x0, x1, x2, x3 = patch_tokens.unbind(dim=-2)
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
+
+        x = self.norm(x)
+        x_linear = self.linear_reduction(x)
+        x_mlp = self.mlp_reduction(x)
+        x = x_linear + self.alpha * x_mlp
+
+        return x
+
+    def extra_repr(self) -> str:
+        return f"input_resolution={self.input_resolution}, dim={self.dim}"
+
+    def flops(self):
+        H, W = self.input_resolution
+        flops = H * W * self.dim
+        flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
+        flops += (H // 2) * (W // 2) * (4 * self.dim * 2 * self.dim + 2 * self.dim * 2 * self.dim)
+        return flops
+
+
+class PatchExpand(nn.Module):
+    def __init__(self, input_resolution, dim, dim_scale=2, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.expand = nn.Linear(dim, 2 * dim, bias=False) if dim_scale == 2 else nn.Identity()
+        self.norm = norm_layer(dim // dim_scale)
+
+    def forward(self, x):
+        """
+        x: B, H*W, C
+        """
+        H, W = self.input_resolution
+        x = self.expand(x)
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+
+        x = x.view(B, H, W, C)
+        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=2, p2=2, c=C // 4)
+        x = x.view(B, -1, C // 4)
+        x = self.norm(x)
+
+        return x
+
+
+class FinalPatchExpand_X4(nn.Module):
+    def __init__(self, input_resolution, dim, dim_scale=4, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.dim_scale = dim_scale
+        self.expand = nn.Linear(dim, 16 * dim, bias=False)
+        self.output_dim = dim
+        self.norm = norm_layer(self.output_dim)
+
+    def forward(self, x):
+        """
+        x: B, H*W, C
+        """
+        H, W = self.input_resolution
+        x = self.expand(x)
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+
+        x = x.view(B, H, W, C)
+        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c', p1=self.dim_scale, p2=self.dim_scale,
+                      c=C // (self.dim_scale ** 2))
+        x = x.view(B, -1, self.output_dim)
+        x = self.norm(x)
+
+        return x
+
+
+class BasicLayer(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        window_size (int): Local window size.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+    """
+
+    def __init__(self, dim, input_resolution, depth, num_heads, window_size,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
+                 road_attention_head=None, road_alpha_init=0.1, use_road_bias=False,
+                 road_attention_modulates_downsample=True,
+                 road_attention_merge_mode="residual"):
+
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+        self.use_checkpoint = use_checkpoint
+        self.road_attention_head = road_attention_head
+        self.last_road_attention = None
+        self.road_alpha_init = float(road_alpha_init)
+        self.use_road_bias = bool(use_road_bias)
+        self.road_attention_modulates_downsample = bool(road_attention_modulates_downsample)
+        self.road_attention_merge_mode = str(road_attention_merge_mode).lower()
+        self.last_pre_downsample = None
+
+        # build blocks
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
+                                 num_heads=num_heads, window_size=window_size,
+                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+                                 mlp_ratio=mlp_ratio,
+                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                 drop=drop, attn_drop=attn_drop,
+                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                                 norm_layer=norm_layer,
+                                 use_road_bias=self.use_road_bias)
+            for i in range(depth)])
+
+        # patch merging layer
+        if downsample is not None:
+            self.downsample = downsample(
+                input_resolution,
+                dim=dim,
+                norm_layer=norm_layer,
+                road_alpha_init=self.road_alpha_init,
+                road_attention_merge_mode=self.road_attention_merge_mode,
+            )
+        else:
+            self.downsample = None
+
+    def forward(self, x, road_prior=None):
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x, None, None, None, None, road_prior)
+            else:
+                x = blk(x, road_prior=road_prior)
+        self.last_road_attention = None
+        self.last_pre_downsample = x
+        if self.downsample is not None:
+            road_attention = None
+            if self.road_attention_head is not None:
+                H, W = self.input_resolution
+                x_map = token_to_map(x, H, W)
+                road_attention = self.road_attention_head(x_map)
+                self.last_road_attention = road_attention
+            x = self.downsample(
+                x,
+                road_attention=(
+                    road_attention
+                    if self.road_attention_modulates_downsample
+                    else None
+                ),
+            )
+        return x
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
+
+    def flops(self):
+        flops = 0
+        for blk in self.blocks:
+            flops += blk.flops()
+        if self.downsample is not None:
+            flops += self.downsample.flops()
+        return flops
+
+
+class BasicLayer_up(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        window_size (int): Local window size.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        upsample (nn.Module | None, optional): upsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+    """
+
+    def __init__(self, dim, input_resolution, depth, num_heads, window_size,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False,
+                 use_decoder_structure_bias=False):
+
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+        self.use_checkpoint = use_checkpoint
+        self.use_decoder_structure_bias = bool(use_decoder_structure_bias)
+        self.window_size = int(window_size)
+
+        # build blocks
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
+                                 num_heads=num_heads, window_size=window_size,
+                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+                                 mlp_ratio=mlp_ratio,
+                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                 drop=drop, attn_drop=attn_drop,
+                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                                 norm_layer=norm_layer,
+                                 use_decoder_structure_bias=self.use_decoder_structure_bias)
+            for i in range(depth)])
+
+        # patch merging layer
+        if upsample is not None:
+            self.upsample = PatchExpand(input_resolution, dim=dim, dim_scale=2, norm_layer=norm_layer)
+        else:
+            self.upsample = None
+    def forward(
+        self,
+        x,
+        decoder_skeleton_prob=None,
+        decoder_connectivity_prob=None,
+        decoder_direction_prob=None,
+    ):
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(
+                    lambda feature, dec_skeleton, dec_connectivity, dec_direction: blk(
+                        feature,
+                        decoder_skeleton_prob=dec_skeleton,
+                        decoder_connectivity_prob=dec_connectivity,
+                        decoder_direction_prob=dec_direction,
+                    ),
+                    x,
+                    decoder_skeleton_prob,
+                    decoder_connectivity_prob,
+                    decoder_direction_prob,
+                )
+            else:
+                x = blk(
+                    x,
+                    decoder_skeleton_prob=decoder_skeleton_prob,
+                    decoder_connectivity_prob=decoder_connectivity_prob,
+                    decoder_direction_prob=decoder_direction_prob,
+                )
+        if self.upsample is not None:
+            x = self.upsample(x)
+        return x
+
+
+class PatchEmbed(nn.Module):
+    r""" Image to Patch Embedding
+
+    Args:
+        img_size (int): Image size.  Default: 224.
+        patch_size (int): Patch token size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.patches_resolution = patches_resolution
+        self.num_patches = patches_resolution[0] * patches_resolution[1]
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        # Preserve official Swin names so patch_embed.proj weights load directly.
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.edge_stem = nn.Sequential(
+            nn.Conv2d(in_chans, 32, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.GELU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.GELU(),
+            nn.Conv2d(32, embed_dim, kernel_size=7, stride=patch_size, padding=3, bias=False),
+        )
+        self.edge_scale = nn.Parameter(torch.tensor(0.01))
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert H == self.img_size[0] and W == self.img_size[1], \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        x = self.proj(x) + self.edge_scale * self.edge_stem(x)
+        x = x.flatten(2).transpose(1, 2)  # B Ph*Pw C
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
+    def flops(self):
+        Ho, Wo = self.patches_resolution
+        H, W = self.img_size
+        flops = Ho * Wo * self.embed_dim * self.in_chans * 4 * 4
+        flops += H * W * self.in_chans * 32 * 3 * 3
+        flops += H * W * 32 * 32 * 3 * 3
+        flops += Ho * Wo * 32 * self.embed_dim * 7 * 7
+        if self.norm is not None:
+            flops += Ho * Wo * self.embed_dim
+        return flops
+
+
+class TopologyAttentionScale(nn.Module):
+    """Nonnegative topology coefficient without an extra attention block."""
+
+    def __init__(
+        self,
+        alpha_max=0.20,
+        alpha_init=0.02,
+        trainable=False,
+    ):
+        super().__init__()
+        self.alpha_max = float(alpha_max)
+        alpha_ratio = float(alpha_init) / self.alpha_max
+        if not 0.0 <= alpha_ratio < 1.0:
+            raise ValueError("alpha_init must be in [0, alpha_max)")
+        self.register_buffer(
+            "fixed_alpha",
+            torch.tensor(float(alpha_init)),
+        )
+        raw_alpha_init = (
+            torch.tensor(0.0)
+            if alpha_ratio == 0.0
+            else torch.logit(torch.tensor(alpha_ratio))
+        )
+        self.topology_alpha = nn.Parameter(
+            raw_alpha_init,
+            requires_grad=bool(trainable),
+        )
+
+    def effective_topology_alpha(self):
+        if not self.topology_alpha.requires_grad:
+            return self.fixed_alpha
+        return self.alpha_max * torch.sigmoid(self.topology_alpha)
+
+
+class SwinTransformerSys(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
+                 embed_dim=96, depths=[2, 2, 2, 2], num_heads=[3, 6, 12, 24],
+                 window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
+                 use_checkpoint=False, final_upsample="expand_first", return_skeleton=False,
+                 bottleneck_type="global_local", final_topology_eta_init=0.005,
+                 final_gap_rho_init=0.005,
+                 structure_profile="full",
+                 stage2_skeleton_gradient_ratio=0.5,
+                 stage3_skeleton_gradient_ratio=0.5,
+                 stage3_gate_topology_gradient_ratio=0.0,
+                 final_skeleton_gradient_ratio=0.0,
+                 enable_highres_structure_stream=False,
+                 highres_structure_channels=64,
+                 highres_structure_fuse_stages="stage23",
+                 highres_structure_fusion_mode="stage23",
+                 enable_post_refine_structure_interaction=False,
+                 enable_h3_surface_fusion=False,
+                 enable_global_topology=False,
+                 global_topology_max_nodes=32,
+                 global_topology_heads=4,
+                 global_topology_alpha_max=0.05,
+                 stage_skeleton_mode="prior_residual",
+                 stage_skeleton_bias_init="zero",
+                 stage_skeleton_positive_prior=0.05,
+                 remove_stage2_pre_topology_source=False,
+                  **kwargs):
+        super().__init__()
+
+        print(
+            "SwinTransformerSys expand initial----depths:{};drop_path_rate:{};num_classes:{}".format(
+                depths,
+                drop_path_rate,
+                num_classes,
+            )
+        )
+
+        self.num_classes = num_classes
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.ape = ape
+        self.patch_norm = patch_norm
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.num_features_up = int(embed_dim * 2)
+        self.mlp_ratio = mlp_ratio
+        self.final_upsample = final_upsample
+        self.return_skeleton = return_skeleton
+        self.bottleneck_type = bottleneck_type.lower()
+        self.structure_profile = structure_profile.lower()
+        if self.structure_profile not in {
+            "full",
+            "stage23_boundary_0626",
+            "stage23_boundary_0626_final_ske",
+        }:
+            raise ValueError(
+                "structure_profile must be one of: full, stage23_boundary_0626, "
+                "stage23_boundary_0626_final_ske"
+            )
+        self.use_stage3_global_context = (
+            self.structure_profile in {
+                "stage23_boundary_0626",
+                "stage23_boundary_0626_final_ske",
+            }
+        )
+        self.stage2_skeleton_gradient_ratio = float(stage2_skeleton_gradient_ratio)
+        self.stage3_skeleton_gradient_ratio = float(stage3_skeleton_gradient_ratio)
+        self.stage3_gate_topology_gradient_ratio = float(stage3_gate_topology_gradient_ratio)
+        self.final_skeleton_gradient_ratio = float(final_skeleton_gradient_ratio)
+        self.enable_highres_structure_stream = bool(enable_highres_structure_stream)
+        self.highres_structure_channels = int(highres_structure_channels)
+        self.enable_global_topology = bool(enable_global_topology)
+        self.stage_skeleton_mode = str(stage_skeleton_mode).lower()
+        if self.stage_skeleton_mode not in {"direct", "prior_residual"}:
+            raise ValueError("stage_skeleton_mode must be direct or prior_residual")
+        self.stage_skeleton_bias_init = str(stage_skeleton_bias_init).lower()
+        self.stage_skeleton_positive_prior = float(stage_skeleton_positive_prior)
+        if self.stage_skeleton_bias_init not in {"zero", "prior"}:
+            raise ValueError("stage_skeleton_bias_init must be zero or prior")
+        self.remove_stage2_pre_topology_source = bool(
+            remove_stage2_pre_topology_source
+        )
+        self.last_stage_features = {}
+        self.last_z_struct = None
+        self.highres_structure_fuse_stages = str(highres_structure_fuse_stages).lower()
+        self._highres_structure_shape_logged = False
+        self.last_highres_z_struct = None
+        self.last_highres_structure_skeleton = None
+        if self.highres_structure_fuse_stages not in {"stage2", "stage3", "stage23"}:
+            raise ValueError(
+                "highres_structure_fuse_stages must be one of: stage2, stage3, stage23"
+            )
+        self.highres_structure_fusion_mode = str(highres_structure_fusion_mode).lower()
+        if self.highres_structure_fusion_mode not in {
+            "stage23",
+            "final_correction",
+            "stage23_final_correction",
+            "post_refine_interaction",
+            "none",
+        }:
+            raise ValueError(
+                "highres_structure_fusion_mode must be one of: "
+                "stage23, final_correction, stage23_final_correction, "
+                "post_refine_interaction, none"
+            )
+        self.enable_post_refine_structure_interaction = bool(
+            enable_post_refine_structure_interaction
+            or self.highres_structure_fusion_mode == "post_refine_interaction"
+        )
+        self.enable_h3_surface_fusion = bool(enable_h3_surface_fusion)
+
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
+        num_patches = self.patch_embed.num_patches
+        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+
+        # absolute position embedding
+        if self.ape:
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            trunc_normal_(self.absolute_pos_embed, std=.02)
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+
+        # build encoder and bottleneck layers
+        self.layers = nn.ModuleList()
+        self.encoder_stage1_road_attention_head = RoadAttentionHead(embed_dim)
+        self.encoder_stage2_road_attention_head = RoadAttentionHead(embed_dim * 2)
+        print(
+            "[INFO] Road priors: A1 channels={} and A2 channels={} -> "
+            "Stage3 attention bias; A1/A2 -> residual PatchMerging priors".format(
+                embed_dim,
+                embed_dim * 2,
+            )
+        )
+        for i_layer in range(self.num_layers):
+            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
+                               input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                 patches_resolution[1] // (2 ** i_layer)),
+                               depth=depths[i_layer],
+                               num_heads=num_heads[i_layer],
+                               window_size=window_size,
+                               mlp_ratio=self.mlp_ratio,
+                               qkv_bias=qkv_bias, qk_scale=qk_scale,
+                               drop=drop_rate, attn_drop=attn_drop_rate,
+                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                               norm_layer=norm_layer,
+                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                               use_checkpoint=use_checkpoint,
+                               road_attention_head=(
+                                   self.encoder_stage1_road_attention_head
+                                   if i_layer == 0
+                                   else self.encoder_stage2_road_attention_head
+                                   if i_layer == 1
+                                   else None
+                               ),
+                               road_alpha_init=(
+                                   0.1
+                               ),
+                               use_road_bias=(i_layer == 2),
+                               road_attention_modulates_downsample=(i_layer in (0, 1)),
+                               road_attention_merge_mode=(
+                                   "residual"
+                               ))
+            self.layers.append(layer)
+
+        # build decoder layers
+        self.layers_up = nn.ModuleList()
+        self.concat_back_dim = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            concat_linear = nn.Linear(2 * int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                                      int(embed_dim * 2 ** (
+                                                  self.num_layers - 1 - i_layer))) if i_layer > 0 else nn.Identity()
+            if i_layer == 0:
+                layer_up = PatchExpand(
+                    input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                                      patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                    dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2, norm_layer=norm_layer)
+            else:
+                layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                                         input_resolution=(
+                                         patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                                         patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                                         depth=depths[(self.num_layers - 1 - i_layer)],
+                                         num_heads=num_heads[(self.num_layers - 1 - i_layer)],
+                                         window_size=window_size,
+                                         mlp_ratio=self.mlp_ratio,
+                                         qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                         drop=drop_rate, attn_drop=attn_drop_rate,
+                                         drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                                             depths[:(self.num_layers - 1 - i_layer) + 1])],
+                                         norm_layer=norm_layer,
+                                         upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                                         use_checkpoint=use_checkpoint,
+                                use_decoder_structure_bias=(
+                                    i_layer in (2, 3)
+                                    and not (
+                                        self.remove_stage2_pre_topology_source
+                                        and i_layer == 2
+                                    )
+                                ))
+            self.layers_up.append(layer_up)
+            self.concat_back_dim.append(concat_linear)
+
+        self.norm = norm_layer(self.num_features)
+        self.norm_up = norm_layer(self.embed_dim)
+        self.bottleneck_resolution = (
+            patches_resolution[0] // (2 ** (self.num_layers - 1)),
+            patches_resolution[1] // (2 ** (self.num_layers - 1)),
+        )
+        if self.bottleneck_type in {"global_local", "legacy_global_local", "original", "default"}:
+            self.bottleneck_context_fusion = GlobalLocalContextFusion(
+                channels=self.num_features,
+                input_resolution=self.bottleneck_resolution,
+                reduction=4,
+            )
+            print(
+                "[INFO] GlobalLocalContextFusion bottleneck: final-layer global, "
+                "resolution={}, channels={}".format(
+                    self.bottleneck_resolution, self.num_features
+                )
+            )
+        elif self.bottleneck_type in {"g2l2", "g2l2attention"}:
+            self.bottleneck_context_fusion = G2L2Bottleneck(
+                channels=self.num_features,
+                input_resolution=self.bottleneck_resolution,
+                mlp_ratio=4,
+            )
+            print(
+                "[INFO] G2L2Attention bottleneck: resolution={}, channels={}".format(
+                    self.bottleneck_resolution, self.num_features
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported bottleneck_type: {bottleneck_type}")
+
+        # ===== DCA-FPN skip refinement for decoder stages 2 and 3 =====
+        self.bottleneck_swin_block = SwinTransformerBlock(
+            dim=self.num_features,
+            input_resolution=self.bottleneck_resolution,
+            num_heads=num_heads[-1],
+            window_size=window_size,
+            shift_size=0,
+            mlp_ratio=self.mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop=drop_rate,
+            attn_drop=attn_drop_rate,
+            drop_path=dpr[-1] if len(dpr) > 0 else 0.0,
+            norm_layer=norm_layer,
+        )
+        print(
+            "[INFO] Bottleneck SwinTransformerBlock after fusion: resolution={}, channels={}, heads={}".format(
+                self.bottleneck_resolution, self.num_features, num_heads[-1]
+            )
+        )
+
+        self.dca_blocks = nn.ModuleList()
+        
+        for skip_idx in range(2, self.num_layers):  # inx=2,3: Layer2 和 Layer1
+            # 通道数: skip_idx=2 → 384 (Layer2), skip_idx=3 → 192 (Layer1)
+            skip_channels = int(embed_dim * 2 ** (self.num_layers - 1 - skip_idx))
+            
+            # DCA-FPN-Lite 模块（轻量级可变形交叉注意）
+            dca_block = DCAFPNLite(
+                channels=skip_channels,
+                num_heads=4,
+                num_points=4,
+                max_offset=0.20
+            )
+            self.dca_blocks.append(dca_block)
+            
+            layer_name = "Layer 2" if skip_idx == 2 else "Layer 1"
+            print(f"[INFO] DCA-FPN-Lite {layer_name} (inx={skip_idx}): {skip_channels} channels")
+
+        decoder_structure_channels = {2: embed_dim, 3: embed_dim}
+        if self.use_stage3_global_context:
+            self.global_context_head = GlobalContextHead(
+                in_channels=self.num_features,
+                hidden_channels=128,
+                out_channels=STAGE3_GLOBAL_CONTEXT_CHANNELS,
+            )
+        else:
+            self.global_context_head = None
+
+        self.decoder_structure_blocks = nn.ModuleDict(
+            {
+                str(stage_index):
+                DecoderStructureRefinement(
+                    channels=channels,
+                    context_channels=(
+                        STAGE3_GLOBAL_CONTEXT_CHANNELS
+                        if (
+                            self.use_stage3_global_context
+                            and stage_index == 3
+                        )
+                        else None
+                    ),
+                    enable_direct_feature_refinement=True,
+                    skeleton_gradient_ratio=(
+                        self.stage2_skeleton_gradient_ratio
+                        if stage_index == 2
+                        else self.stage3_skeleton_gradient_ratio
+                        if stage_index == 3
+                        else 0.0
+                    ),
+                    gate_topology_gradient_ratio=(
+                        self.stage3_gate_topology_gradient_ratio
+                        if stage_index == 3
+                        else 0.0
+                    ),
+                    previous_structure_channels=(
+                        channels if stage_index == 3 else None
+                    ),
+                    highres_structure_channels=(
+                        self.highres_structure_channels
+                        if self.enable_highres_structure_stream
+                        else None
+                    ),
+                    use_structure_residual=(stage_index in (2, 3)),
+                )
+                for stage_index, channels in decoder_structure_channels.items()
+            }
+        )
+        self.prepatch_structure_encoder = PrePatchStructureEncoder(
+            struct_channels=self.highres_structure_channels,
+        )
+        self.highres_skeleton_adapter = (
+            HighResSkeletonAdapter(self.highres_structure_channels)
+            if self.enable_highres_structure_stream
+            else None
+        )
+        self.highres_structure_skeleton_head = nn.Conv2d(
+            self.highres_structure_channels,
+            1,
+            kernel_size=1,
+            bias=True,
+        )
+        self.highres_structure_fusion = nn.ModuleDict(
+            {
+                "2": HighResStructureFusion(embed_dim, self.highres_structure_channels),
+                "3": HighResStructureFusion(embed_dim, self.highres_structure_channels),
+            }
+        )
+        self.structure_surface_correction_head = StructureSurfaceCorrectionHead(
+            self.highres_structure_channels,
+        )
+        print(
+            "[INFO] High-res structure stream: {}, source=prepatch, channels={}, fuse_stages={}, fusion_mode={}".format(
+                "enabled" if self.enable_highres_structure_stream else "disabled",
+                self.highres_structure_channels,
+                self.highres_structure_fuse_stages,
+                self.highres_structure_fusion_mode,
+            )
+        )
+        if self.structure_profile in {
+            "stage23_boundary_0626",
+            "stage23_boundary_0626_final_ske",
+        }:
+            print(
+                "[INFO] Decoder structure gates: stage2/stage3 only "
+                "(0626 profile), channels={}".format(
+                    decoder_structure_channels
+                )
+            )
+            print(
+                "[INFO] Stage2 direct topology feature residual enabled; "
+                "stage2 structure gate can refine decoder features"
+            )
+            print(
+                "[INFO] Stage2/3 skeleton prediction mode: {}".format(
+                    "direct H2/H3 predictions"
+                    if self.stage_skeleton_mode == "direct"
+                    else "high-res prior plus decoder residual"
+                )
+            )
+            print(
+                "[INFO] Stage2 pre-topology source and attention bias: {}".format(
+                    "removed"
+                    if self.remove_stage2_pre_topology_source
+                    else "enabled"
+                )
+            )
+            print(
+                "[INFO] Global context calibration: bottleneck GAP -> "
+                "stage3 structure gate only (strength=0.03)"
+            )
+        else:
+            print(
+                "[INFO] Restored 0621 decoder structure gates: channels={}".format(
+                    decoder_structure_channels
+                )
+            )
+        self.stage2_topology_source = (
+            None
+            if self.remove_stage2_pre_topology_source
+            else DecoderStructureRefinement(
+                channels=embed_dim * 2,
+                enable_direct_feature_refinement=False,
+                skeleton_gradient_ratio=self.stage2_skeleton_gradient_ratio,
+            )
+        )
+        if self.final_upsample == "expand_first":
+            print("---final upsample expand_first---")
+            self.up = FinalPatchExpand_X4(input_resolution=(img_size // patch_size, img_size // patch_size),
+                                          dim_scale=4, dim=embed_dim)
+            if self.return_skeleton:
+                self.global_topology = KeypointGuidedGlobalTopology(
+                    channels=embed_dim,
+                    struct_channels=self.highres_structure_channels,
+                    max_nodes=global_topology_max_nodes,
+                    heads=global_topology_heads,
+                    alpha_max=global_topology_alpha_max,
+                    enabled=self.enable_global_topology,
+                    connectivity_channels=8,
+                )
+                self.guided_head = SkeletonGuidedHead(
+                    in_channels=embed_dim,
+                    hidden_channels=max(embed_dim // 2, 32),
+                    init_alpha=0.0,
+                    topology_eta_init=final_topology_eta_init,
+                    gap_rho_init=final_gap_rho_init,
+                    enable_final_structure=(
+                        self.structure_profile != "stage23_boundary_0626"
+                        and self.structure_profile != "stage23_boundary_0626_final_ske"
+                    ),
+                    enable_final_skeleton_aux=(
+                        self.structure_profile == "stage23_boundary_0626_final_ske"
+                    ),
+                    final_skeleton_gradient_ratio=self.final_skeleton_gradient_ratio,
+                    enable_post_refine_structure_interaction=(
+                        self.enable_post_refine_structure_interaction
+                    ),
+                    highres_structure_channels=self.highres_structure_channels,
+                )
+                if self.enable_h3_surface_fusion:
+                    self.h3_surface_proj = nn.Conv2d(
+                        decoder_structure_channels[3],
+                        embed_dim,
+                        kernel_size=1,
+                        bias=True,
+                    )
+                    self.surface_h3_fusion = nn.Conv2d(
+                        embed_dim * 2,
+                        embed_dim,
+                        kernel_size=1,
+                        bias=True,
+                    )
+                    with torch.no_grad():
+                        nn.init.zeros_(self.h3_surface_proj.bias)
+                        nn.init.zeros_(self.surface_h3_fusion.bias)
+                        self.surface_h3_fusion.weight.zero_()
+                        self.surface_h3_fusion.weight[:, :embed_dim, 0, 0].copy_(
+                            torch.eye(embed_dim)
+                        )
+                        self.surface_h3_fusion.weight[:, embed_dim:, 0, 0].normal_(
+                            mean=0.0, std=0.01
+                        )
+                else:
+                    self.h3_surface_proj = None
+                    self.surface_h3_fusion = None
+                if self.structure_profile == "stage23_boundary_0626":
+                    print(
+                        "[INFO] Final head: surface + boundary residual only "
+                        "(0626 profile; final skeleton/connectivity removed)"
+                    )
+                elif self.structure_profile == "stage23_boundary_0626_final_ske":
+                    print(
+                        "[INFO] Final head: surface + boundary residual + "
+                        "final skeleton auxiliary only "
+                        "(0626 profile; final connectivity removed)"
+                    )
+                if self.enable_global_topology:
+                    print(
+                        "[INFO] Global topology residual: anchors=H2*surface, "
+                        "tokens=[H2,decoder_feature,connectivity], "
+                        "relation_bias=relative_xy_distance+connectivity"
+                    )
+            else:
+                self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
+
+        self.apply(self._init_weights)
+        if self.enable_highres_structure_stream:
+            skeleton_bias = 0.0
+            if self.stage_skeleton_bias_init == "prior":
+                prior = min(max(self.stage_skeleton_positive_prior, 1e-5), 1.0 - 1e-5)
+                skeleton_bias = math.log(prior / (1.0 - prior))
+            for stage_index in (2, 3):
+                nn.init.zeros_(self.decoder_structure_blocks[str(stage_index)].skeleton_head.out.weight)
+                nn.init.constant_(
+                    self.decoder_structure_blocks[str(stage_index)].skeleton_head.out.bias,
+                    skeleton_bias,
+                )
+            if self.stage2_topology_source is not None:
+                nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.weight)
+                nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.bias)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    # Encoder and Bottleneck
+    def forward_features(self, x):
+        x = self.patch_embed(x)
+        if self.ape:
+            x = x + self.absolute_pos_embed
+        x = self.pos_drop(x)
+        x_downsample = []
+        road_attentions = []
+        stage1_road_attention = None
+        stage2_road_attention = None
+
+        for i_layer, layer in enumerate(self.layers):
+            x_downsample.append(x)
+            x = layer(
+                x,
+                road_prior=(
+                    (stage1_road_attention, stage2_road_attention)
+                    if i_layer == 2
+                    else None
+                ),
+            )
+            if i_layer == 0 and layer.last_road_attention is not None:
+                stage1_road_attention = layer.last_road_attention
+                road_attentions.append(
+                    {
+                        "stage": "encoder_stage{}_road_attention".format(i_layer + 1),
+                        "road_attention": stage1_road_attention,
+                    }
+                )
+            if i_layer == 1 and layer.last_road_attention is not None:
+                stage2_road_attention = layer.last_road_attention
+                road_attentions.append(
+                    {
+                        "stage": "encoder_stage{}_road_attention".format(i_layer + 1),
+                        "road_attention": stage2_road_attention,
+                    }
+                )
+
+        x = self.bottleneck_context_fusion(x)
+        x = self.bottleneck_swin_block(x)
+        x = self.norm(x)  # B L C
+
+        return x, x_downsample, road_attentions
+
+    def _highres_structure_stage_enabled(self, stage):
+        if not self.enable_highres_structure_stream:
+            return False
+        if self.highres_structure_fusion_mode not in {"stage23", "stage23_final_correction"}:
+            return False
+        if self.highres_structure_fuse_stages == "stage23":
+            return stage in (2, 3)
+        if self.highres_structure_fuse_stages == "stage2":
+            return stage == 2
+        if self.highres_structure_fuse_stages == "stage3":
+            return stage == 3
+        return False
+
+    def _build_highres_structure_outputs(self, structure_input):
+        if structure_input is None or not self.enable_highres_structure_stream:
+            return None
+        z_struct = self.prepatch_structure_encoder(structure_input)
+        if not self._highres_structure_shape_logged:
+            expected_stage1_shape = (
+                structure_input.shape[0],
+                self.highres_structure_channels,
+                self.patches_resolution[0],
+                self.patches_resolution[1],
+            )
+            print(
+                "[HighRes Structure] source=prepatch expected_z_struct={} z_struct={}".format(
+                    expected_stage1_shape,
+                    tuple(z_struct.shape),
+                ),
+                flush=True,
+            )
+            self._highres_structure_shape_logged = True
+        self.last_highres_z_struct = z_struct
+        self.last_z_struct = z_struct
+        return z_struct
+
+    def _apply_highres_structure_fusion(
+        self, x, highres_skeleton_feat, stage, target_hw
+    ):
+        if (
+            highres_skeleton_feat is None
+            or not self._highres_structure_stage_enabled(stage)
+        ):
+            return x
+        feature_map = token_to_map(x, target_hw[0], target_hw[1])
+        feature_map = self.highres_structure_fusion[str(stage)](
+            feature_map,
+            highres_skeleton_feat,
+        )
+        return map_to_token(feature_map)
+
+    def _apply_structure_surface_correction(
+        self, outputs, highres_skeleton_feat, structure_outputs
+    ):
+        if (
+            not self.enable_highres_structure_stream
+            or self.highres_structure_fusion_mode
+            not in {"final_correction", "stage23_final_correction"}
+            or highres_skeleton_feat is None
+            or not isinstance(outputs, tuple)
+        ):
+            return outputs
+
+        base_surface_logits = outputs[0]
+        delta_surface_logits = self.structure_surface_correction_head(
+            highres_skeleton_feat,
+            base_surface_logits.shape[-2:],
+        )
+        final_surface_logits = base_surface_logits + delta_surface_logits
+        if structure_outputs is not None:
+            structure_outputs.append(
+                {
+                    "stage": "structure_surface_correction",
+                    "structure_surface_base_logits": base_surface_logits.detach(),
+                    "structure_surface_delta_logits": delta_surface_logits,
+                }
+            )
+        return (final_surface_logits, *outputs[1:])
+
+    def _decoder_structure_enabled(self, stage):
+        return stage in (2, 3)
+
+    @staticmethod
+    def _placeholder_structure_outputs(feature_map):
+        batch = feature_map.shape[0]
+        height = feature_map.shape[-2]
+        width = feature_map.shape[-1]
+        device = feature_map.device
+        dtype = feature_map.dtype
+        skeleton_logits = torch.zeros(
+            batch,
+            1,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+        )
+        connectivity_logits = torch.zeros(
+            batch,
+            8,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+        )
+        direction_logits = torch.zeros(
+            batch,
+            2,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+        )
+        structure_gate = torch.zeros(
+            batch,
+            1,
+            height,
+            width,
+            device=device,
+            dtype=dtype,
+        )
+        return skeleton_logits, connectivity_logits, direction_logits, structure_gate, None
+
+    def _build_stage3_global_context(self, bottleneck_tokens, target_hw):
+        batch, length, channels = bottleneck_tokens.shape
+        bottleneck_height, bottleneck_width = self.bottleneck_resolution
+        if length != bottleneck_height * bottleneck_width:
+            raise ValueError("Bottleneck token length does not match resolution.")
+        context = bottleneck_tokens.transpose(1, 2).reshape(
+            batch,
+            channels,
+            bottleneck_height,
+            bottleneck_width,
+        )
+        context = F.adaptive_avg_pool2d(context, output_size=1)
+        if self.global_context_head is not None:
+            context = self.global_context_head(context)
+        context = F.interpolate(
+            context,
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return context
+
+    def _run_decoder_structure_block(
+        self,
+        feature_map,
+        stage,
+        bottleneck_tokens,
+        block_stage=None,
+        apply_feature_refinement=True,
+        disable_skeleton_prediction=False,
+        skeleton_prior=None,
+        previous_structure_feat=None,
+        highres_skeleton_feat=None,
+    ):
+        if not self._decoder_structure_enabled(stage):
+            return feature_map, *self._placeholder_structure_outputs(feature_map)
+
+        block_stage = stage if block_stage is None else block_stage
+        if (
+            block_stage == "stage2_topology_source"
+            and self.stage2_topology_source is not None
+        ):
+            block = self.stage2_topology_source
+        else:
+            block = self.decoder_structure_blocks[str(block_stage)]
+        global_context = None
+        if self.use_stage3_global_context and stage == 3:
+            global_context = self._build_stage3_global_context(
+                bottleneck_tokens,
+                feature_map.shape[-2:],
+            )
+        return block(
+            feature_map,
+            global_context=global_context,
+            apply_feature_refinement=apply_feature_refinement,
+            disable_skeleton_prediction=disable_skeleton_prediction,
+            skeleton_prior=skeleton_prior,
+            previous_structure_feat=previous_structure_feat,
+            highres_skeleton_feat=highres_skeleton_feat,
+        )
+
+    def _decoder_skeleton_disabled(self, stage):
+        return (
+            self.stage_skeleton_mode == "prior_residual"
+            and self.enable_highres_structure_stream
+            and stage in (2, 3)
+        )
+
+    @staticmethod
+    def _append_structure_output(
+        structure_outputs,
+        stage,
+        skeleton,
+        connectivity,
+        direction,
+        structure_gate,
+        roadness,
+        refinement_step=None,
+        stage_loss_scale=None,
+    ):
+        diagnostics = roadness if isinstance(roadness, dict) else None
+        roadness = None if diagnostics is not None else roadness
+        item = {
+            "stage": stage,
+            "connectivity": connectivity,
+            "direction": direction,
+            "structure_gate": structure_gate,
+            "roadness": roadness,
+        }
+        if diagnostics:
+            item.update(diagnostics)
+        if skeleton is not None:
+            item["skeleton"] = skeleton
+        if refinement_step is not None:
+            item["refinement_step"] = refinement_step
+        if stage_loss_scale is not None:
+            item["stage_loss_scale"] = stage_loss_scale
+        structure_outputs.append(item)
+
+    @staticmethod
+    def _decoder_connectivity_used(connectivity_logits):
+        return torch.sigmoid(connectivity_logits).detach()
+
+    @staticmethod
+    def _latest_local_topology_features(structure_outputs):
+        if not structure_outputs:
+            return None
+        for item in reversed(structure_outputs):
+            if not isinstance(item, dict):
+                continue
+            connectivity = item.get("connectivity")
+            if connectivity is None:
+                continue
+            connectivity_feature = (
+                torch.sigmoid(connectivity).detach()
+                if connectivity is not None
+                else None
+            )
+            return connectivity_feature
+        return None
+
+    # Decoder and skip connection with DCA-FPN.
+    def forward_up_features(
+        self,
+        x,
+        x_downsample,
+        bottleneck_tokens=None,
+        z_struct=None,
+    ):
+        """
+        Decoder with DCA-FPN-Lite refinement on stage 2 and stage 3 skips.
+        
+        Args:
+            x: bottleneck feature [B, L, C]
+            x_downsample: list of encoder skip features [[B, L, C], ...]
+        
+        Returns:
+            decoder output [B, L, C]
+        """
+        structure_outputs = []
+        stage2_structure_feat = None
+        self.last_stage_features = {}
+        highres_skeleton_feat = (
+            self.highres_skeleton_adapter(z_struct)
+            if z_struct is not None and self.highres_skeleton_adapter is not None
+            else None
+        )
+        if highres_skeleton_feat is not None:
+            self.last_stage_features["H0"] = highres_skeleton_feat
+        highres_structure_skeleton = (
+            self.highres_structure_skeleton_head(highres_skeleton_feat)
+            if highres_skeleton_feat is not None
+            and self.stage_skeleton_mode == "prior_residual"
+            else None
+        )
+        if bottleneck_tokens is None:
+            bottleneck_tokens = x
+        for inx, layer_up in enumerate(self.layers_up):
+            if inx == 0:
+                # Bottleneck layer, no skip connection
+                pass
+            elif inx == 1:
+                # inx=1 (Layer 3 skip, 1/16 resolution): direct concatenation.
+                x = torch.cat([x, x_downsample[3 - inx]], -1)
+                x = self.concat_back_dim[inx](x)
+            else:
+                # inx=2,3 (Layer 2,1 skip): apply DCA-FPN.
+                skip = x_downsample[3 - inx]  # [B, L, C]
+                
+                # 计算当前层的空间分辨率
+                H = self.patches_resolution[0] // (2 ** (3 - inx))
+                W = self.patches_resolution[1] // (2 ** (3 - inx))
+                
+                # 1. Token → Feature Map 转换
+                skip_map = token_to_map(skip, H, W)  # [B, C, H, W]
+                x_map = token_to_map(x, H, W)  # [B, C, H, W]
+                
+                block_idx = inx - 2
+                skip_refined = self.dca_blocks[block_idx](deep=x_map, shallow=skip_map)  # [B, C, H, W]
+                
+                # 4. Feature Map → Token 转换
+                skip_refined = map_to_token(skip_refined)  # [B, L, C]
+                
+                # 5. Skip concatenation
+                x = torch.cat([x, skip_refined], -1)
+                x = self.concat_back_dim[inx](x)
+
+            decoder_structure_gate_enabled = (
+                self._decoder_structure_enabled(inx)
+                and isinstance(layer_up, BasicLayer_up)
+                and inx in (2, 3)
+            )
+            if decoder_structure_gate_enabled:
+                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
+                if inx == 3:
+                    x = layer_up(x)
+                    output_scale = 2 ** max(2 - inx, 0)
+                    output_height = self.patches_resolution[0] // output_scale
+                    output_width = self.patches_resolution[1] // output_scale
+                    x = self._apply_highres_structure_fusion(
+                        x,
+                        highres_skeleton_feat,
+                        inx,
+                        (output_height, output_width),
+                    )
+                    x_map = token_to_map(x, output_height, output_width)
+                    (
+                        x_map,
+                        skeleton_i,
+                        connectivity_i,
+                        direction_i,
+                        structure_gate_i,
+                        roadness_i,
+                    ) = self._run_decoder_structure_block(
+                        x_map,
+                        inx,
+                        bottleneck_tokens,
+                        apply_feature_refinement=True,
+                        disable_skeleton_prediction=decoder_skeleton_disabled,
+                        skeleton_prior=(
+                            highres_structure_skeleton
+                            if self.stage_skeleton_mode == "prior_residual"
+                            else None
+                        ),
+                        previous_structure_feat=stage2_structure_feat,
+                        highres_skeleton_feat=highres_skeleton_feat,
+                    )
+                    if isinstance(roadness_i, dict):
+                        stage3_structure_feat = roadness_i.pop("structure_feat", None)
+                        highres_skeleton_feat = roadness_i.pop(
+                            "highres_skeleton_feat", highres_skeleton_feat
+                        )
+                        self.last_stage_features["G3"] = stage3_structure_feat
+                        self.last_stage_features["H2"] = highres_skeleton_feat
+                    else:
+                        stage3_structure_feat = None
+                    x = map_to_token(x_map)
+                    self._append_structure_output(
+                        structure_outputs,
+                        stage=inx,
+                        skeleton=skeleton_i,
+                        connectivity=connectivity_i,
+                        direction=direction_i,
+                        structure_gate=structure_gate_i,
+                        roadness=roadness_i,
+                        refinement_step=1,
+                        stage_loss_scale=1.0,
+                    )
+                    stage2_structure_feat = None
+                    continue
+                if inx == 2 and self.remove_stage2_pre_topology_source:
+                    x = layer_up(x)
+                    skeleton_0 = connectivity_0 = direction_0 = structure_gate_0 = roadness_0 = None
+                else:
+                    input_height, input_width = layer_up.input_resolution
+                    x_map = token_to_map(x, input_height, input_width)
+                    (
+                        _,
+                        skeleton_0,
+                        connectivity_0,
+                        direction_0,
+                        structure_gate_0,
+                        roadness_0,
+                    ) = self._run_decoder_structure_block(
+                        x_map,
+                        inx,
+                        bottleneck_tokens,
+                        block_stage="stage2_topology_source" if inx == 2 else inx,
+                        apply_feature_refinement=False,
+                        disable_skeleton_prediction=decoder_skeleton_disabled,
+                        skeleton_prior=highres_structure_skeleton,
+                    )
+                    if isinstance(roadness_0, dict):
+                        roadness_0.pop("structure_feat", None)
+                    if decoder_skeleton_disabled:
+                        skeleton_used = None
+                        connectivity_used = self._decoder_connectivity_used(connectivity_0)
+                    else:
+                        skeleton_used = torch.sigmoid(skeleton_0).detach()
+                        connectivity_used = torch.sigmoid(connectivity_0).detach()
+                    x = layer_up(
+                        x,
+                        decoder_skeleton_prob=skeleton_used,
+                        decoder_connectivity_prob=connectivity_used,
+                        decoder_direction_prob=direction_0,
+                    )
+                output_scale = 2 ** max(2 - inx, 0)
+                output_height = self.patches_resolution[0] // output_scale
+                output_width = self.patches_resolution[1] // output_scale
+                x = self._apply_highres_structure_fusion(
+                    x,
+                    highres_skeleton_feat,
+                    inx,
+                    (output_height, output_width),
+                )
+                if skeleton_0 is not None or connectivity_0 is not None or direction_0 is not None:
+                    self._append_structure_output(
+                        structure_outputs,
+                        stage=inx,
+                        skeleton=skeleton_0,
+                        connectivity=connectivity_0,
+                        direction=direction_0,
+                        structure_gate=structure_gate_0,
+                        roadness=roadness_0,
+                        refinement_step=0,
+                        stage_loss_scale=0.5,
+                    )
+
+                x_map = token_to_map(x, output_height, output_width)
+                (
+                    x_map,
+                    skeleton_i,
+                    connectivity_i,
+                    direction_i,
+                    structure_gate_i,
+                    roadness_i,
+                ) = self._run_decoder_structure_block(
+                    x_map,
+                    inx,
+                    bottleneck_tokens,
+                    apply_feature_refinement=True,
+                    disable_skeleton_prediction=decoder_skeleton_disabled,
+                    skeleton_prior=(
+                        highres_structure_skeleton
+                        if self.stage_skeleton_mode == "prior_residual"
+                        else None
+                    ),
+                    highres_skeleton_feat=highres_skeleton_feat,
+                )
+                if inx == 2 and isinstance(roadness_i, dict):
+                    stage2_structure_feat = roadness_i.pop("structure_feat", None)
+                    highres_skeleton_feat = roadness_i.pop(
+                        "highres_skeleton_feat", highres_skeleton_feat
+                    )
+                    self.last_stage_features["G2"] = stage2_structure_feat
+                    self.last_stage_features["H1"] = highres_skeleton_feat
+                x = map_to_token(x_map)
+                self._append_structure_output(
+                    structure_outputs,
+                    stage=inx,
+                    skeleton=skeleton_i,
+                    connectivity=connectivity_i,
+                    direction=direction_i,
+                    structure_gate=structure_gate_i,
+                    roadness=roadness_i,
+                    refinement_step=1,
+                    stage_loss_scale=1.0,
+                )
+                continue
+            else:
+                decoder_skeleton_disabled = self._decoder_skeleton_disabled(inx)
+                if isinstance(layer_up, BasicLayer_up):
+                    x = layer_up(x)
+                else:
+                    x = layer_up(x)
+                output_scale = 2 ** max(2 - inx, 0)
+                output_height = self.patches_resolution[0] // output_scale
+                output_width = self.patches_resolution[1] // output_scale
+                x = self._apply_highres_structure_fusion(
+                    x,
+                    highres_skeleton_feat,
+                    inx,
+                    (output_height, output_width),
+                )
+                x_map = token_to_map(x, output_height, output_width)
+                (
+                    x_map,
+                    skeleton_i,
+                    connectivity_i,
+                    direction_i,
+                    structure_gate_i,
+                    roadness_i,
+                ) = self._run_decoder_structure_block(
+                    x_map,
+                    inx,
+                    bottleneck_tokens,
+                    disable_skeleton_prediction=decoder_skeleton_disabled,
+                    skeleton_prior=highres_structure_skeleton,
+                )
+                x = map_to_token(x_map)
+            if self._decoder_structure_enabled(inx):
+                self._append_structure_output(
+                    structure_outputs,
+                    stage=inx,
+                    skeleton=skeleton_i,
+                    connectivity=connectivity_i,
+                    direction=direction_i,
+                    structure_gate=structure_gate_i,
+                    roadness=roadness_i,
+                )
+
+        x = self.norm_up(x)  # B L C
+
+        return x, structure_outputs, highres_skeleton_feat
+
+    def _surface_prior_for_global_topology(self, x, highres_skeleton_feat):
+        prior_modules = (
+            self.guided_head.surface_proj,
+            self.guided_head.surface_branch,
+            self.guided_head.surface_refine,
+            self.guided_head.surface_head,
+        )
+        if getattr(
+            self.guided_head,
+            "enable_post_refine_structure_interaction",
+            False,
+        ):
+            prior_modules = (
+                *prior_modules,
+                self.guided_head.post_refine_structure_interaction,
+            )
+        prior_training = [module.training for module in prior_modules]
+        for module in prior_modules:
+            module.eval()
+        try:
+            with torch.no_grad():
+                surface_feat = self.guided_head.surface_branch(
+                    self.guided_head.surface_proj(x)
+                )
+                surface_feat = self.guided_head.surface_refine(surface_feat)
+                surface_feat = self.guided_head._apply_post_refine_structure_interaction(
+                    surface_feat,
+                    highres_skeleton_feat,
+                )
+                return torch.sigmoid(self.guided_head.surface_head(surface_feat))
+        finally:
+            for module, was_training in zip(prior_modules, prior_training):
+                module.train(was_training)
+
+    def up_x4(self, x, structure_outputs=None, highres_skeleton_feat=None):
+        H, W = self.patches_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input features has wrong size"
+
+        if self.final_upsample == "expand_first":
+            x = self.up(x)
+            x = x.view(B, 4 * H, 4 * W, -1)
+            x = x.permute(0, 3, 1, 2)  # B,C,H,W
+            if self.return_skeleton:
+                if self.enable_global_topology and highres_skeleton_feat is not None:
+                    surface_prob = self._surface_prior_for_global_topology(
+                        x,
+                        highres_skeleton_feat,
+                    )
+                    connectivity_feature = self._latest_local_topology_features(
+                        structure_outputs
+                    )
+                    x = self.global_topology.forward_feature_anchors(
+                        x,
+                        highres_skeleton_feat,
+                        surface_prob,
+                        connectivity_feature=connectivity_feature,
+                    )
+                if (
+                    self.enable_h3_surface_fusion
+                    and self.h3_surface_proj is not None
+                    and self.surface_h3_fusion is not None
+                ):
+                    g3 = self.last_stage_features.get("G3")
+                    if g3 is not None:
+                        h3_surface = self.h3_surface_proj(g3)
+                        h3_surface = F.interpolate(
+                            h3_surface,
+                            size=x.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        x = self.surface_h3_fusion(
+                            torch.cat([x, h3_surface], dim=1)
+                        )
+                x = self.guided_head(x, z_struct=highres_skeleton_feat)
+            else:
+                x = self.output(x)
+
+        return x
+
+    def forward(
+        self,
+        x,
+    ):
+        structure_input = x
+        x, x_downsample, road_attentions = self.forward_features(x)
+        z_struct = self._build_highres_structure_outputs(structure_input)
+        x, structure_outputs, highres_skeleton_feat = self.forward_up_features(
+            x,
+            x_downsample,
+            bottleneck_tokens=x,
+            z_struct=z_struct,
+        )
+        highres_structure_skeleton = (
+            self.highres_structure_skeleton_head(highres_skeleton_feat)
+            if highres_skeleton_feat is not None
+            else None
+        )
+        self.last_highres_structure_skeleton = highres_structure_skeleton
+        if self.return_skeleton and highres_structure_skeleton is not None:
+            structure_outputs.append(
+                {
+                    "stage": "highres_structure",
+                    "highres_structure_skeleton": highres_structure_skeleton,
+                }
+            )
+        if self.return_skeleton and road_attentions:
+            structure_outputs.extend(road_attentions)
+        x = self.up_x4(
+            x,
+            structure_outputs=structure_outputs if self.return_skeleton else None,
+            highres_skeleton_feat=highres_skeleton_feat,
+        )
+        if self.return_skeleton and isinstance(x, tuple):
+            x = self._apply_structure_surface_correction(
+                x,
+                highres_skeleton_feat,
+                structure_outputs,
+            )
+            x = (*x, structure_outputs)
+
+        return x
+
+    def flops(self):
+        flops = 0
+        flops += self.patch_embed.flops()
+        for i, layer in enumerate(self.layers):
+            flops += layer.flops()
+        flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
+        flops += self.num_features * self.num_classes
+        return flops
