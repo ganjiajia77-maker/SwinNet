@@ -11,11 +11,12 @@ import torch
 from torch import nn
 
 from networks.full_h0_joint import (build_h0,original_criterion,FullH0Control,
-    FullH0Joint,parameter_groups,h0_loss)
+    FullH0Joint,parameter_groups,h0_loss,INITIAL_RATE_BIAS)
 from networks.q3_r3_repair import MultiScaleFeatures
 from networks.v9_selector_transport_training import canonical_state,gradient_norm
 from networks.v9_source_selector import SourceRelationSelector
 from networks.reliable_directional_repair import dynamic_losses
+from networks.reliable_directional_repair import compose_surface_logits
 from networks.v9_source_relation_labels import RelationLabels
 from checks.test_v9_state_gate import model as downstream
 import run_full_h0_joint as runner
@@ -72,13 +73,47 @@ class FullH0Tests(unittest.TestCase):
             joint=model(batch['image'])
         torch.testing.assert_close(control['z0'],joint['z0'],atol=0,rtol=0)
         self.assertLess(float((joint['p1']-joint['p0']).abs().mean()),.001)
+        self.assertLess(float((joint['p1']-joint['p0']).abs().max()),.02)
+
+    def test_trained_rate_logits_cannot_override_initial_small_budget(self):
+        source,q=make_source()
+        source['modules']['dynamics']['rates.2.weight'].fill_(100.)
+        source['modules']['dynamics']['rates.2.bias'].copy_(torch.tensor([-80.,80.,80.,-80.]))
+        model=FullH0Joint(self.model.base,q,source)
+        final=model.original.dynamics.rates[-1]
+        self.assertEqual(int(torch.count_nonzero(final.weight)),0)
+        torch.testing.assert_close(final.bias,torch.tensor([2.5,INITIAL_RATE_BIAS,INITIAL_RATE_BIAS,1.]))
+        torch.testing.assert_close(model.original.dynamics.rates[0].weight,
+                                   source['modules']['dynamics']['rates.0.weight'],atol=0,rtol=0)
+        for name,value in model.selector.state_dict().items():
+            torch.testing.assert_close(value,source['selector'][name],atol=0,rtol=0)
+        rates=model.original.dynamics.rates(torch.randn(2,39,8,8)*1000.).softmax(1)
+        self.assertLess(float(rates[:,1:3].max()),2e-7)
+        self.assertTrue(all(p.requires_grad for p in model.original.dynamics.rates.parameters()))
+
+    def test_extreme_work_probabilities_do_not_amplify_initial_update(self):
+        # A 512px checkerboard can have 0.5 boundary pixels even when bilinear
+        # downsampling reads a nearly zero/one work-grid probability.
+        p0=torch.tensor([1e-7,1e-5,1e-4,.1,.5,.9,1.-1e-4,1.-1e-5,1.-1e-7],dtype=torch.float32)
+        p0=p0.repeat(15)[:128].reshape(1,1,1,128).repeat(2,1,128,1)
+        rate=torch.tensor([2.5,INITIAL_RATE_BIAS,INITIAL_RATE_BIAS,1.]).softmax(0)
+        z0=torch.zeros(2,1,512,512)
+        for target in (torch.zeros_like(p0),torch.ones_like(p0)):
+            state=p0.clone()
+            for _ in range(3):
+                state=state+rate[1]*(target-state)+.2*rate[2]*(target-state)+rate[3]*(p0-state)
+            z1,_=compose_surface_logits(z0,p0,state)
+            self.assertLess(float((z1.sigmoid()-z0.sigmoid()).abs().max()),.02)
+        same,_=compose_surface_logits(z0,p0,p0)
+        torch.testing.assert_close(same,z0,atol=0,rtol=0)
 
     def test_final_segmentation_reaches_H0_Q_selector_and_live_states(self):
         model=self.model;model.train();model.zero_grad(set_to_none=True)
         batch=self.batch();result=model(batch['image'])
         result['states'][1].retain_grad()
         loss,_=dynamic_losses(result,batch['mask'],batch['skeleton'],lambda_cont=0.)
-        for params in (tuple(model.base.parameters()),tuple(model.original.upstream.q_features.parameters()),tuple(model.selector.parameters())):
+        for params in (tuple(model.base.parameters()),tuple(model.original.upstream.q_features.parameters()),
+                       tuple(model.selector.parameters()),tuple(model.original.dynamics.rates[-1].parameters())):
             params=tuple(p for p in params if p.requires_grad)
             self.assertGreater(gradient_norm(loss,params),0.)
         loss.backward()
@@ -126,14 +161,21 @@ class FullH0Tests(unittest.TestCase):
     def test_selector_changes_surface_and_old_scalar_G_does_not(self):
         model=self.model.eval();batch=self.batch();bias=model.selector.stay[-1].bias
         scalar=model.original.relations.direction_head.scalar.bias
+        output=model.original.dynamics.rates[-1]
         with torch.no_grad():
-            before=model(batch['image'])['p1'];saved=bias.clone();old=scalar.clone()
+            saved=bias.clone();old=scalar.clone();rate_weight=output.weight.clone();rate_bias=output.bias.clone()
             try:
+                # Test routing with measurable transport; near-identity startup
+                # and its live gradients are checked independently above.
+                output.weight.zero_();output.bias.copy_(torch.tensor([2.5,-2.,-3.,1.]))
+                before=model(batch['image'])['p1']
                 bias.add_(3.);after=model(batch['image'])['p1'];bias.copy_(saved)
                 self.assertGreater(float((after-before).abs().mean()),0.)
                 scalar.add_(100.);unused=model(batch['image'])['p1']
                 torch.testing.assert_close(unused,before,atol=0,rtol=0)
-            finally:bias.copy_(saved);scalar.copy_(old)
+            finally:
+                bias.copy_(saved);scalar.copy_(old)
+                output.weight.copy_(rate_weight);output.bias.copy_(rate_bias)
 
     def test_full_training_smoke_restores_BN_and_reports_actual_gradients(self):
         batch=self.batch()
@@ -142,6 +184,7 @@ class FullH0Tests(unittest.TestCase):
             def set_epoch(self,epoch):pass
             def __getitem__(self,index):return {key:value[index] for key,value in batch.items()}
         buffers={name:value.clone() for name,value in self.model.named_buffers()}
+        parameters={name:value.clone() for name,value in self.model.named_parameters()}
         with tempfile.TemporaryDirectory(dir=ROOT,prefix='.full_h0_smoke_') as folder:
             args=SimpleNamespace(variant='B',seed=1234,device=torch.device('cpu'),output_dir=Path(folder),
                 config={'lambda_relation':.1,'source_training':{'source_losses':{'lambda_cont':.2},'labels':asdict(RelationLabels())}})
@@ -151,6 +194,7 @@ class FullH0Tests(unittest.TestCase):
             self.assertTrue(report['passed'])
             self.assertGreater(report['final_segmentation_gradients']['Q3'],0.)
         for name,value in self.model.named_buffers():torch.testing.assert_close(value,buffers[name],atol=0,rtol=0)
+        for name,value in self.model.named_parameters():torch.testing.assert_close(value,parameters[name],atol=0,rtol=0)
 
     def test_source_identity_uses_evaluation_record_and_exact_Q(self):
         with tempfile.TemporaryDirectory(dir=ROOT,prefix='.full_h0_identity_') as folder:

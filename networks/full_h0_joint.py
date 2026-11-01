@@ -19,6 +19,7 @@ from networks.v9_source_selector import SourceRelationSelector
 from networks.v9_selector_transport_training import SplitDirectionHead, load_canonical
 
 VERSION = 'full_h0_source_joint_v1'
+INITIAL_RATE_BIAS = -13.
 
 
 def reference_config(size=512):
@@ -95,7 +96,7 @@ class LiveH0Q(nn.Module):
 
 class FullH0Joint(SlimEndToEndRepair):
     """Reuse the exact source dynamics and head equations; retain COMPLETE H0."""
-    def __init__(self,base,q_state,source,rate_bias=-8.):
+    def __init__(self,base,q_state,source,rate_bias=INITIAL_RATE_BIAS):
         nn.Module.__init__(self)
         upstream=LiveH0Q(base,q_state)
         self.original=RepairCore(upstream)
@@ -112,9 +113,14 @@ class FullH0Joint(SlimEndToEndRepair):
         self.original.gate_relation.delta.requires_grad_(False)
         self.original.relations.direction_head.scalar.requires_grad_(False)
         self.rate_bias=float(rate_bias)
-        # Initialization only: reduce the existing transport/proposal rate
-        # logits. No new gate, coefficient, loss, or update equation is added.
-        with torch.no_grad(): self.original.dynamics.rates[-1].bias[1:3].add_(self.rate_bias)
+        # A bias offset cannot bound a trained head's input-dependent logits.
+        # Reset only its final output layer. Small, nonzero transport/proposal
+        # budgets also account for logit amplification near the 1e-5 clamp.
+        # The hidden rate features and every other trained repair head remain.
+        output=self.original.dynamics.rates[-1]
+        with torch.no_grad():
+            output.weight.zero_()
+            output.bias.copy_(output.bias.new_tensor([2.5,self.rate_bias,self.rate_bias,1.]))
         self._context=None; self.mode='source'
 
     @property

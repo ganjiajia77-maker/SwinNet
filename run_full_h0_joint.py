@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from networks.full_h0_joint import (VERSION,build_h0,original_criterion,h0_loss,
+from networks.full_h0_joint import (VERSION,INITIAL_RATE_BIAS,build_h0,original_criterion,h0_loss,
     FullH0Control,FullH0Joint,parameter_groups)
 from networks.reliable_directional_repair import dynamic_losses
 from networks.v9_source_relation_labels import RelationLabels
@@ -62,7 +62,10 @@ def checkpoint_config(args,h0,saved,repair_meta=None,repair_config=None):
         'repair':repair_meta,'source_training':repair_config,'epochs':args.epochs,'seed':args.seed,
         'root_path':str(args.root_path.resolve()),'batch_size':2,'num_workers':args.num_workers,
         'val_interval':5,'fp32':True,'EMA':False,'accumulation':1,'h0_lr':args.h0_lr,
-        'rate_initial_bias':-8.,'lambda_relation':(.1 if repair_config is None else repair_config['lambda_relation']),
+        'rate_initial_bias':(INITIAL_RATE_BIAS if args.variant=='B' else -8.),
+        'rate_initialization':('final rates output weight=0; bias=[2.5,-13,-13,1]; all rate parameters trainable'
+                               if args.variant=='B' else 'not applicable'),
+        'lambda_relation':(.1 if repair_config is None else repair_config['lambda_relation']),
         'lambda_choice':0.,'lambda_G':0.,'appearance_augmentation':False,
         'loss':'A: original H0 loss; B: same H0 loss + original S_selector Lseg + .2Lcont + lambda_relation*Lrelation; Q trained via final loss, no new Q loss',
         'selection_rule':SELECTION_RULE,'checkpoint_threshold':.60,'steps':3,'neighbours':8,
@@ -128,6 +131,9 @@ def batch_loss(args,model,criterion,result,batch,seed):
         relation,info=live_relation_loss(result,batch['mask'],batch['skeleton'],RelationLabels(**cfg['labels']),seed)
         total=total+extra+args.config['lambda_relation']*relation
         terms.update(seg=values['seg'],cont=values['cont'],relation=relation.detach(),matched_pairs=info['matching']['matched_pairs'])
+        terms.update(transport_rate_mean=result['transport_rate'].detach().mean(),
+                     proposal_coefficient_mean=result['beta'].detach().mean(),
+                     P1_minus_P0_abs_mean=(result['p1']-result['p0']).detach().abs().mean())
     return total,terms
 
 
@@ -159,7 +165,8 @@ def smoke(args,model,criterion):
         seg,_=dynamic_losses(result,batch['mask'],batch['skeleton'],lambda_cont=0.)
         groups={'H0':tuple(p for p in model.base.parameters() if p.requires_grad),
             'Q3':tuple(model.original.upstream.q_features.parameters())+tuple(model.original.upstream.q_head.parameters()),
-            'selector':tuple(model.selector.parameters())}
+            'selector':tuple(model.selector.parameters()),
+            'rates_output':tuple(model.original.dynamics.rates[-1].parameters())}
         extra['final_segmentation_gradients']={k:gradient_norm(seg,v) for k,v in groups.items()}
         if any(v<=0 for v in extra['final_segmentation_gradients'].values()): raise RuntimeError('Final repair gradient is blocked')
         for k in range(3):
@@ -186,13 +193,40 @@ def smoke(args,model,criterion):
         report['initial_P1_minus_P0']={'mean_abs':float(delta.mean()),'max_abs':float(delta.max()),
             'changed_binary_at_0_45':int(((initial['p1']>=.45)!=(initial['p0']>=.45)).sum())}
         if args.variant=='B':
-            if float(delta.mean())>.001 or float(delta.max())>.02: raise RuntimeError(f'Initial repair not close enough to identity: {report["initial_P1_minus_P0"]}')
+            report['initial_dynamics']={
+                'transport_rate_max':float(initial['transport_rate'].max()),
+                'proposal_coefficient_max':float(initial['beta'].max()),
+                'work_update_max_abs':float((initial['u3']-initial['u0']).abs().max()),
+                'work_logit_delta_max_abs':float(initial['delta_logit'].abs().max())}
+            if float(delta.mean())>.001 or float(delta.max())>.02:
+                report['passed']=False
+                atomic_json(args.output_dir/'smoke_failed.json',report)
+                raise RuntimeError(f'Initial repair not close enough to identity: {report["initial_P1_minus_P0"]}')
             bias=model.selector.stay[-1].bias; before=bias.clone()
             try:
                 bias.add_(3.); altered=model(batch['image'])
                 report['selector_perturbation_P1_mean_abs']=float((altered['p1']-initial['p1']).abs().mean())
-                if report['selector_perturbation_P1_mean_abs']<=0: raise RuntimeError('Selector does not change final Surface')
             finally: bias.copy_(before)
+            report['initial_selector_perturbation_P1_mean_abs']=report['selector_perturbation_P1_mean_abs']
+            report['selector_probe_uses_initial_rates']=True
+            if report['selector_perturbation_P1_mean_abs']<=0:
+                # The deliberately tiny initial budget can round to identical
+                # FP32 states on flat predictions. Separately test the routing
+                # with a measurable budget; restore ALL probe parameters.
+                output=model.original.dynamics.rates[-1]
+                output_weight=output.weight.clone(); output_bias=output.bias.clone()
+                try:
+                    output.weight.zero_()
+                    output.bias.copy_(output.bias.new_tensor([2.5,-2.,-3.,1.]))
+                    baseline=model(batch['image'])
+                    bias.add_(3.); altered=model(batch['image'])
+                    report['selector_probe_uses_initial_rates']=False
+                    report['selector_probe_rate_bias']=[2.5,-2.,-3.,1.]
+                    report['selector_perturbation_P1_mean_abs']=float((altered['p1']-baseline['p1']).abs().mean())
+                finally:
+                    output.weight.copy_(output_weight); output.bias.copy_(output_bias); bias.copy_(before)
+            if report['selector_perturbation_P1_mean_abs']<=0:
+                raise RuntimeError('Selector does not change final Surface even with a controlled nonzero budget')
     atomic_json(args.output_dir/'smoke.json',report)
     seed_all(args.seed)
     print('[SMOKE] '+json.dumps(report),flush=True)
