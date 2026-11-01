@@ -12,7 +12,7 @@ import torch
 
 from checks.test_full_h0_joint import arguments, make_source
 import diagnostics.diagnose_full_h0_rate_startup as runner
-from diagnostics.diagnose_full_h0_rate_startup import (differences, evaluate, initialize_rates, write_results)
+from diagnostics.diagnose_full_h0_rate_startup import (check_replay, differences, evaluate, initialize_rates, write_results)
 from networks.full_h0_joint import FullH0Joint, build_h0, original_criterion, parameter_groups
 from networks.v9_source_relation_labels import RelationLabels
 from run_full_h0_joint import batch_loss
@@ -106,7 +106,7 @@ class StartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT, prefix='.rate_startup_main_') as folder:
             output = Path(folder)/'result'
             argv = ['audit', '--device', 'cpu', '--steps', '2', '--report_every', '1',
-                    '--output_dir', str(output)]
+                    '--output_dir', str(output), '--save_spatial']
             with patch.object(sys, 'argv', argv), \
                  patch.object(runner, 'load_h0', return_value=(self.model.base, {'epoch': 65}, self.saved)), \
                  patch.object(runner, 'inspect_source', return_value=(source, q, {'sha256': 'fixture'})), \
@@ -117,6 +117,19 @@ class StartupTests(unittest.TestCase):
             self.assertEqual([x['update'] for x in report['history']], [0, 1, 2])
             self.assertEqual(len(report['metadata']['training_cases']), 2)
             self.assertEqual(list(output.glob('*.pth')), [])
+            self.assertEqual(len(list((output/'snapshots').glob('*.npz'))),3)
+            spatial = json.loads((output/'spatial_analysis/spatial_summary.json').read_text())
+            self.assertEqual(spatial['totals']['added_fp'],report['history'][-1]['repair_added_fp'])
+            self.assertEqual(spatial['totals']['added_tp'],report['history'][-1]['repair_added_tp'])
+            self.assertTrue(report['metadata']['repair_parameter_updates'])
+
+    def test_replay_refuses_different_batch_or_weights(self):
+        metadata = {'source_h0_sha256':'base','image_sha256':'batch','seed':1234,'steps':200,
+                    'threshold':.45,'rate_initialization':{'transport':.01},'learning_rates':{'H0':5e-6},
+                    'source_repair':{'sha256':'repair'}}
+        check_replay({'metadata':metadata},dict(metadata))
+        with self.assertRaises(ValueError):
+            check_replay({'metadata':metadata},dict(metadata,image_sha256='other'))
 
 
 if __name__ == '__main__':

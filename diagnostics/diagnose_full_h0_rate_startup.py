@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
+import numpy as np
 from torch.utils.data import DataLoader
 
 from networks.full_h0_joint import FullH0Joint, original_criterion, parameter_groups
@@ -81,7 +82,7 @@ def differences(p0, p1, gt, initial_p0, threshold):
 
 
 @torch.no_grad()
-def evaluate(model, batch, initial_p0, threshold):
+def evaluate(model, batch, initial_p0, threshold, snapshot_path=None):
     model.eval()
     raw_rates = []
     def capture(unused, inputs, output):
@@ -115,7 +116,30 @@ def evaluate(model, batch, initial_p0, threshold):
                    'transport_signed_mean': float(result['transport_delta'][:, k].mean()),
                    'state_change_abs_mean': float((result['states'][k+1] - result['states'][k]).abs().mean())}
                   for k in range(3)]})
+    if snapshot_path is not None:
+        snapshot_path = Path(snapshot_path)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        arrays = {key: result[key].detach().cpu().numpy() for key in (
+            'p0', 'p1', 'transport_delta', 'proposal_delta', 'anchor_delta',
+            'source_choice', 'source_states', 'source_valid', 'r', 'w', 'b', 'a', 'q')}
+        arrays.update(states=np.stack([value.detach().cpu().numpy() for value in result['states']]),
+                      rates=rate.cpu().numpy())
+        temporary = snapshot_path.with_suffix('.tmp')
+        with temporary.open('wb') as stream:
+            np.savez_compressed(stream, **arrays)
+        temporary.replace(snapshot_path)
     return data, initial_p0
+
+
+def check_replay(previous, metadata):
+    """Refuse a different batch, starting weights, or experiment budget."""
+    old = previous['metadata']
+    for key in ('source_h0_sha256', 'image_sha256', 'seed', 'steps', 'threshold',
+                'rate_initialization', 'learning_rates'):
+        if old.get(key) != metadata.get(key):
+            raise ValueError('Replay differs from previous startup: ' + key)
+    if old['source_repair']['sha256'] != metadata['source_repair']['sha256']:
+        raise ValueError('Replay repair checkpoint differs')
 
 
 def write_results(folder, metadata, history):
@@ -152,6 +176,8 @@ def main():
     parser.add_argument('--threshold', type=float, default=.45)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--h0_lr', type=float, default=5e-5)
+    parser.add_argument('--save_spatial', action='store_true', help='Save batch and spatial outputs for offline checks')
+    parser.add_argument('--replay_report', type=Path, help='Verify the same batch and settings as a previous startup report')
     args = parser.parse_args()
     if args.steps < 1 or args.report_every < 1 or not 0. < args.threshold < 1.:
         parser.error('steps/report_every must be positive and threshold must be in (0,1)')
@@ -189,12 +215,28 @@ def main():
                 'repair_loss_config': source_config['source_losses'],
                 'lambda_relation': source_config['lambda_relation'],
                 'warnings': ['Repeated training on one batch can overfit; no conclusion about validation quality.']}
+    previous = None
+    if args.replay_report is not None:
+        previous = json.loads(args.replay_report.read_text(encoding='utf-8'))
+        check_replay(previous, metadata)
+        metadata['replayed_report'] = str(args.replay_report.resolve())
     del h0, source, q
     args.output_dir.mkdir(parents=True, exist_ok=False)
+    if args.save_spatial:
+        rgb = batch['image'].detach().cpu().permute(0, 2, 3, 1).numpy()
+        rgb = np.clip((rgb * np.array([.229,.224,.225]) + np.array([.485,.456,.406])) * 255., 0, 255).astype(np.uint8)
+        np.savez_compressed(args.output_dir/'batch_inputs.npz', rgb=rgb,
+                            gt=(batch['mask'].detach().cpu().numpy() > .5),
+                            skeleton=(batch['skeleton'].detach().cpu().numpy() > .5))
+    # Small repair/Q parameter snapshots quantify actual learning without an
+    # additional full H0 checkpoint or a 300MB H0 parameter copy.
+    repair_initial = {name: value.detach().cpu().clone() for name, value in model.named_parameters()
+                      if value.requires_grad and not name.startswith('original.upstream.base.')}
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
     start = time.perf_counter()
-    initial, initial_p0 = evaluate(model, batch, None, args.threshold)
+    spatial = lambda step: args.output_dir/'snapshots'/f'update_{step:04d}.npz' if args.save_spatial else None
+    initial, initial_p0 = evaluate(model, batch, None, args.threshold, spatial(0))
     initial.update(update=0, loss=None)
     history = [initial]
     write_results(args.output_dir, metadata, history)
@@ -215,7 +257,7 @@ def main():
         current_loss = float(total.detach())
         del total, result
         if step == 1 or step % args.report_every == 0 or step == args.steps:
-            point, _ = evaluate(model, batch, initial_p0, args.threshold)
+            point, _ = evaluate(model, batch, initial_p0, args.threshold, spatial(step))
             point.update(update=step, loss=current_loss, gradient_norm_before_clip=float(grad),
                          elapsed_seconds=time.perf_counter() - start)
             if device.type == 'cuda':
@@ -223,6 +265,32 @@ def main():
             history.append(point)
             write_results(args.output_dir, metadata, history)
             print('[STARTUP] ' + json.dumps(point, ensure_ascii=False), flush=True)
+    updates = {}
+    for name, parameter in model.named_parameters():
+        if name not in repair_initial:
+            continue
+        group = 'selector' if name.startswith('selector.') else name.split('.')[1]
+        old = repair_initial[name].double()
+        diff = parameter.detach().cpu().double() - old
+        row = updates.setdefault(group, {'parameters':0, 'changed_parameters':0, 'delta_squared':0., 'initial_squared':0.})
+        row['parameters'] += diff.numel()
+        row['changed_parameters'] += int((diff != 0).sum())
+        row['delta_squared'] += float(diff.square().sum())
+        row['initial_squared'] += float(old.square().sum())
+    metadata['repair_parameter_updates'] = {key: dict(parameters=row['parameters'],
+        changed_parameters=row['changed_parameters'], delta_l2=math.sqrt(row['delta_squared']),
+        relative_l2=math.sqrt(row['delta_squared']/max(row['initial_squared'],1e-30)))
+        for key, row in updates.items()}
+    if previous is not None:
+        prior = next((row for row in previous['history'] if row['update'] == args.steps), None)
+        if prior is not None:
+            keys = ('transport_rate_mean', 'P1_minus_P0_abs_mean', 'repair_added_tp', 'repair_lost_tp',
+                    'repair_added_fp', 'repair_removed_fp')
+            metadata['replay_final_minus_previous'] = {key: history[-1][key] - prior[key] for key in keys}
+    write_results(args.output_dir, metadata, history)
+    if args.save_spatial:
+        from diagnostics.analyze_full_h0_startup_spatial import analyze
+        analyze(args.output_dir)
     print('[DONE] ' + str(args.output_dir / 'startup_report.json'), flush=True)
 
 
