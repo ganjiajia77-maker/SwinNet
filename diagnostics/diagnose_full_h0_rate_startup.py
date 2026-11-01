@@ -20,7 +20,7 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 
-from networks.full_h0_joint import FullH0Joint, original_criterion, parameter_groups
+from networks.full_h0_joint import FullH0Joint, initialize_rate_budgets, original_criterion, parameter_groups
 from run_full_h0_joint import (DEFAULT_H0, DEFAULT_REPAIR, batch_loss, inspect_source,
                                load_h0, training_dataset)
 from run_slim_end_to_end_mass import digest, schedule, seed_all
@@ -28,22 +28,7 @@ from run_v9_gate_benefit import atomic_json
 
 
 def initialize_rates(model, transport, proposal):
-    """Initialize 4-way softmax budgets exactly; anchor/stay retain their ratio."""
-    if not (0. < transport < 1. and 0. < proposal < 1. and transport + proposal < 1.):
-        raise ValueError('transport and proposal must be positive and sum to less than one')
-    head = model.original.dynamics.rates[-1]
-    if head.out_channels != 4 or head.bias is None:
-        raise ValueError('Expected the four-channel rate output layer')
-    stay, anchor = 2.5, 1.
-    residual_mass = math.exp(stay) + math.exp(anchor)
-    remaining = 1. - transport - proposal
-    logits = [stay, math.log(residual_mass * transport / remaining),
-              math.log(residual_mass * proposal / remaining), anchor]
-    with torch.no_grad():
-        head.weight.zero_()
-        head.bias.copy_(head.bias.new_tensor(logits))
-    return {'transport': transport, 'proposal': proposal, 'logits': logits,
-            'proposal_note': 'effective beta also multiplies 0.2 and the learned acceptance A'}
+    return initialize_rate_budgets(model, transport, proposal)
 
 
 def segmentation_counts(probability, gt, threshold):

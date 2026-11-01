@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import random
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -57,7 +58,7 @@ def inspect_source(run):
 
 
 def checkpoint_config(args,h0,saved,repair_meta=None,repair_config=None):
-    return {'version':VERSION,'variant':args.variant,'h0_checkpoint':str(args.h0_checkpoint.resolve()),
+    result={'version':VERSION,'variant':args.variant,'h0_checkpoint':str(args.h0_checkpoint.resolve()),
         'h0_sha256':digest(args.h0_checkpoint),'h0_epoch':h0['epoch'],'h0_args':saved,
         'repair':repair_meta,'source_training':repair_config,'epochs':args.epochs,'seed':args.seed,
         'root_path':str(args.root_path.resolve()),'batch_size':2,'num_workers':args.num_workers,
@@ -74,6 +75,37 @@ def checkpoint_config(args,h0,saved,repair_meta=None,repair_config=None):
         'code_sha256':{str(p.relative_to(Path(__file__).parent)):digest(p) for p in sorted(
             list((Path(__file__).parent/'reference_h0_599a410').rglob('*.py'))+
             [Path(__file__),Path(__file__).parent/'networks/full_h0_joint.py'])}}
+    if args.variant=='B' and getattr(args,'transport_rate_init',None) is not None:
+        result.update(rate_initial_bias=None,rate_initialization='explicit_softmax_budgets',
+                      initial_transport_rate=args.transport_rate_init,
+                      initial_proposal_rate=args.proposal_rate_init,
+                      run_directory=getattr(args,'b_run_name','B'))
+    return result
+
+
+def check_reusable_A(pair,config):
+    """Read-only verification of the completed control and fixed references."""
+    folder=Path(pair)/'A'
+    old=json.loads((folder/'experiment.json').read_text())
+    complete=json.loads((folder/'training_complete.json').read_text())
+    selection=json.loads((folder/'eval/val_selection.json').read_text())
+    if complete['epochs']!=config['epochs'] or old['variant']!='A':
+        raise ValueError('Existing A is not the completed same-budget control')
+    for key in ('h0_sha256','epochs','seed','root_path','batch_size','num_workers',
+                'val_interval','h0_lr','selection_rule','reference_sha256'):
+        if old[key]!=config[key]: raise ValueError('Cannot reuse A: '+key+' differs')
+    for key,value in old.get('code_sha256',{}).items():
+        if key.startswith('reference_h0_599a410/') and config['code_sha256'].get(key)!=value:
+            raise ValueError('Original H0 implementation differs from A: '+key)
+    if selection['checkpoint_sha256']!=digest(folder/'best.pth'):
+        raise ValueError('A evaluation no longer corresponds to its best checkpoint')
+    for epoch in range(1,config['epochs']+1):
+        record=json.loads((folder/f'epoch_{epoch:03d}.json').read_text())
+        if not all(key in record for key in ('case_order_sha256','augmented_images_sha256')):
+            raise ValueError('A lacks input reproducibility records')
+    if len(list((folder/'eval/val').glob('*.npz')))!=14:
+        raise ValueError('A must have saved predictions for all 14 validation images')
+    print(f'[REUSE A] completed {config["epochs"]} epochs; checkpoint/reference/config verified; no A training',flush=True)
 
 
 def load_h0(path,device):
@@ -134,6 +166,15 @@ def batch_loss(args,model,criterion,result,batch,seed):
         terms.update(transport_rate_mean=result['transport_rate'].detach().mean(),
                      proposal_coefficient_mean=result['beta'].detach().mean(),
                      P1_minus_P0_abs_mean=(result['p1']-result['p0']).detach().abs().mean())
+        terms.update(transport_abs_mean=result['transport_delta'].detach().abs().mean(),
+                     transport_signed_mean=result['transport_delta'].detach().mean(),
+                     proposal_abs_mean=result['proposal_delta'].detach().abs().mean(),
+                     anchor_abs_mean=result['anchor_delta'].detach().abs().mean())
+        old,new=result['p0'].detach()>=.45,result['p1'].detach()>=.45
+        gt=batch['mask']>.5
+        terms.update(repair_added_tp=((new&~old)&gt).sum(),repair_lost_tp=((old&~new)&gt).sum(),
+                     repair_added_fp=((new&~old)&~gt).sum(),repair_removed_fp=((old&~new)&~gt).sum(),
+                     P1_P0_flip_fraction=(new!=old).float().mean())
     return total,terms
 
 
@@ -169,6 +210,11 @@ def smoke(args,model,criterion):
             'rates_output':tuple(model.original.dynamics.rates[-1].parameters())}
         extra['final_segmentation_gradients']={k:gradient_norm(seg,v) for k,v in groups.items()}
         if any(v<=0 for v in extra['final_segmentation_gradients'].values()): raise RuntimeError('Final repair gradient is blocked')
+        repair_groups={'R':model.original.reliable_head,'W_relations':model.original.relations,
+                       'B':model.original.proposal_head,'A':model.original.accept_head,
+                       'relation_features':model.original.gate_relation}
+        extra['repair_segmentation_gradients']={name:gradient_norm(seg,tuple(p for p in module.parameters() if p.requires_grad))
+                                                for name,module in repair_groups.items()}
         for k in range(3):
             a=result['source_choice'][:,k]; u=result['states'][k]
             expected=result['transport_rate'][:,k]*(a[:,1:]*(result['source_states'][:,k]-u)).sum(1,keepdim=True)
@@ -198,7 +244,19 @@ def smoke(args,model,criterion):
                 'proposal_coefficient_max':float(initial['beta'].max()),
                 'work_update_max_abs':float((initial['u3']-initial['u0']).abs().max()),
                 'work_logit_delta_max_abs':float(initial['delta_logit'].abs().max())}
-            if float(delta.mean())>.001 or float(delta.max())>.02:
+            explicit=args.config.get('rate_initialization')=='explicit_softmax_budgets'
+            report['startup_policy']='explicit measurable budgets' if explicit else 'legacy near-identity budgets'
+            if explicit:
+                expected=args.config['initial_transport_rate']
+                torch.testing.assert_close(initial['transport_rate'],torch.full_like(initial['transport_rate'],expected),rtol=1e-5,atol=1e-8)
+                output=model.original.dynamics.rates[-1]
+                actual=output.bias.softmax(0)
+                if abs(float(actual[2])-args.config['initial_proposal_rate'])>1e-7:
+                    raise RuntimeError('Initial proposal budget differs from requested value')
+                report['initial_transport_abs_mean']=float(initial['transport_delta'].abs().mean())
+                if not bool(torch.isfinite(initial['p1']).all()) or report['initial_transport_abs_mean']<=0 or float(delta.mean())<=0:
+                    raise RuntimeError('Explicit-budget repair has no measurable finite forward action')
+            if not explicit and (float(delta.mean())>.001 or float(delta.max())>.02):
                 report['passed']=False
                 atomic_json(args.output_dir/'smoke_failed.json',report)
                 raise RuntimeError(f'Initial repair not close enough to identity: {report["initial_P1_minus_P0"]}')
@@ -263,6 +321,23 @@ def validation(args,model,save_predictions=False):
     return cases
 
 
+def validation_repair_activity(cases,threshold=.6):
+    """Observe current P0/P1 differences without changing checkpoint selection."""
+    count=sum(case['p1'].size for case in cases)
+    result={'threshold':threshold,'pixels':count,'P1_minus_current_P0_abs_mean':0.,
+            'P1_minus_current_P0_abs_max':0.,'flipped_pixels':0,'added_tp':0,'lost_tp':0,'added_fp':0,'removed_fp':0}
+    for case in cases:
+        before,after=case['current_p0']>=threshold,case['p1']>=threshold
+        gt=case['gt']>.5
+        delta=np.abs(case['p1']-case['current_p0'])
+        result['P1_minus_current_P0_abs_mean']+=float(delta.sum(dtype=np.float64))/count
+        result['P1_minus_current_P0_abs_max']=max(result['P1_minus_current_P0_abs_max'],float(delta.max()))
+        result['flipped_pixels']+=int((before!=after).sum())
+        result['added_tp']+=int((after&~before&gt).sum());result['lost_tp']+=int((before&~after&gt).sum())
+        result['added_fp']+=int((after&~before&~gt).sum());result['removed_fp']+=int((before&~after&~gt).sum())
+    return result
+
+
 def train(args,model,criterion,optimizer):
     start=1; best=-float('inf'); last=args.output_dir/'last.pth'
     if last.is_file():
@@ -290,12 +365,27 @@ def train(args,model,criterion,optimizer):
             optimizer.step()
             sums['total']+=float(total.detach());sums['batches']+=1
             for key,value in terms.items(): sums[key]+=float(value)
-            if index%25==0: print(f'[TRAIN {args.variant}] epoch={epoch}/{args.epochs} batch={index+1}/{len(loader)} loss={float(total.detach()):.6f}',flush=True)
+            if index%25==0:
+                activity=(f' rate={float(terms["transport_rate_mean"]):.6g} transport={float(terms["transport_abs_mean"]):.6g}'
+                          f' proposal={float(terms["proposal_abs_mean"]):.6g} P1-P0={float(terms["P1_minus_P0_abs_mean"]):.6g}'
+                          if args.variant=='B' else '')
+                print(f'[TRAIN {args.variant}] epoch={epoch}/{args.epochs} batch={index+1}/{len(loader)} loss={float(total.detach()):.6f}'+activity,flush=True)
         record={'epoch':epoch,'case_order_sha256':order.hexdigest(),'augmented_images_sha256':images.hexdigest(),
             'losses':{k:v/sums['batches'] for k,v in sums.items() if k!='batches'},'gradients':first_grads}
+        if args.variant=='B':
+            record['participation']={'transport_observed':record['losses']['transport_abs_mean']>0,
+                                     'surface_correction_observed':record['losses']['P1_minus_P0_abs_mean']>0,
+                                     'training_monitor_threshold':.45}
+        if args.variant=='B' and getattr(args,'b_run_name','B')!='B':
+            control=json.loads((args.pair_dir/'A'/f'epoch_{epoch:03d}.json').read_text())
+            for key in ('case_order_sha256','augmented_images_sha256'):
+                if control[key]!=record[key]: raise ValueError(f'A/B input data differ at epoch {epoch}: '+key)
+            record['reused_A_input_hashes_match']=True
         if epoch%5==0 or epoch==args.epochs:
             cases=validation(args,model);report=point_metrics(cases,'p1',.6,args.manifest)
             record['val_score_at_0_60']=report['selection_score']
+            if args.variant=='B':
+                record['validation_repair_activity']=validation_repair_activity(cases)
             atomic_json(args.output_dir/f'val_epoch_{epoch:03d}.json',report)
             if report['selection_score']>best:
                 best=report['selection_score'];save(args,model,None,args.output_dir/'best.pth',epoch,best)
@@ -328,9 +418,17 @@ def main():
     parser.add_argument('--device',default='cuda');parser.add_argument('--epochs',type=int,default=80)
     parser.add_argument('--num_workers',type=int,default=4);parser.add_argument('--seed',type=int,default=1234)
     parser.add_argument('--h0_lr',type=float,default=5e-5)
+    parser.add_argument('--b_run_name',default='B',help='Separate B output directory; existing A is reused')
+    parser.add_argument('--transport_rate_init',type=float)
+    parser.add_argument('--proposal_rate_init',type=float)
     args=parser.parse_args();args.device=torch.device(args.device)
     if args.epochs<1: parser.error('epochs must be positive')
-    args.output_dir=args.pair_dir/args.variant;args.output_dir.mkdir(parents=True,exist_ok=True)
+    if not re.fullmatch(r'B(?:_[A-Za-z0-9_.-]+)?',args.b_run_name): parser.error('Invalid B directory name')
+    if (args.transport_rate_init is None)!=(args.proposal_rate_init is None): parser.error('Provide both initial budgets')
+    if args.transport_rate_init is not None and not (0<args.transport_rate_init<1 and 0<args.proposal_rate_init<1 and args.transport_rate_init+args.proposal_rate_init<1):
+        parser.error('Initial budgets must be positive and sum to less than one')
+    args.output_dir=args.pair_dir/(args.variant if args.variant=='A' else args.b_run_name)
+    args.output_dir.mkdir(parents=True,exist_ok=True)
     seed_all(args.seed)
     if args.command=='prepare':reference(args);return
     if not (args.pair_dir/'reference/complete.json').is_file(): raise ValueError('Run shared prepare first')
@@ -340,7 +438,8 @@ def main():
     if args.variant=='A':model=FullH0Control(base)
     else:
         source,q,meta=inspect_source(args.repair_run);source_cfg=source['config']
-        model=FullH0Joint(base,q,source).to(args.device)
+        model=FullH0Joint(base,q,source,transport_rate_init=args.transport_rate_init,
+                          proposal_rate_init=args.proposal_rate_init).to(args.device)
         del source,q
     criterion=original_criterion(saved,args.device)
     args.config=checkpoint_config(args,h0,saved,meta,source_cfg)
@@ -349,6 +448,7 @@ def main():
     # Created once by shared prepare under the shell's pair-level file lock.
     shared=args.pair_dir/'pair_contract.json'
     if not shared.is_file() or json.loads(shared.read_text())!=contract: raise ValueError('A/B training settings differ')
+    if args.variant=='B' and args.b_run_name!='B': check_reusable_A(args.pair_dir,args.config)
     marker=args.output_dir/'experiment.json'
     if marker.is_file() and json.loads(marker.read_text())!=args.config: raise ValueError('Experiment configuration changed')
     atomic_json(marker,args.config)

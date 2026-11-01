@@ -5,6 +5,7 @@ No frozen-forward wrapper is used; GT is never an argument to model.forward.
 """
 import inspect
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,25 @@ from networks.v9_selector_transport_training import SplitDirectionHead, load_can
 
 VERSION = 'full_h0_source_joint_v1'
 INITIAL_RATE_BIAS = -13.
+
+
+def initialize_rate_budgets(model, transport, proposal):
+    """Set separate initial softmax budgets without changing the dynamics."""
+    if not (0. < transport < 1. and 0. < proposal < 1. and transport + proposal < 1.):
+        raise ValueError('transport and proposal must be positive and sum to less than one')
+    head = model.original.dynamics.rates[-1]
+    if head.out_channels != 4 or head.bias is None:
+        raise ValueError('Expected the four-channel rate output layer')
+    stay, anchor = 2.5, 1.
+    residual_mass = math.exp(stay) + math.exp(anchor)
+    remaining = 1. - transport - proposal
+    logits = [stay, math.log(residual_mass * transport / remaining),
+              math.log(residual_mass * proposal / remaining), anchor]
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.copy_(head.bias.new_tensor(logits))
+    return {'transport': transport, 'proposal': proposal, 'logits': logits,
+            'proposal_note': 'effective beta also multiplies 0.2 and the learned acceptance A'}
 
 
 def reference_config(size=512):
@@ -96,7 +116,8 @@ class LiveH0Q(nn.Module):
 
 class FullH0Joint(SlimEndToEndRepair):
     """Reuse the exact source dynamics and head equations; retain COMPLETE H0."""
-    def __init__(self,base,q_state,source,rate_bias=INITIAL_RATE_BIAS):
+    def __init__(self,base,q_state,source,rate_bias=INITIAL_RATE_BIAS,
+                 transport_rate_init=None,proposal_rate_init=None):
         nn.Module.__init__(self)
         upstream=LiveH0Q(base,q_state)
         self.original=RepairCore(upstream)
@@ -121,6 +142,10 @@ class FullH0Joint(SlimEndToEndRepair):
         with torch.no_grad():
             output.weight.zero_()
             output.bias.copy_(output.bias.new_tensor([2.5,self.rate_bias,self.rate_bias,1.]))
+        if transport_rate_init is not None or proposal_rate_init is not None:
+            if transport_rate_init is None or proposal_rate_init is None:
+                raise ValueError('Provide both initial transport and proposal budgets')
+            initialize_rate_budgets(self,transport_rate_init,proposal_rate_init)
         self._context=None; self.mode='source'
 
     @property
