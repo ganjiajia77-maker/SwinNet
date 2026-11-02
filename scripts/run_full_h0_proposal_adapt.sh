@@ -6,7 +6,7 @@ MODE=${1:-all}
 case "$MODE" in all|smoke|train|val|compare) ;; *) echo "Choose all|smoke|train|val|compare"; exit 2;; esac
 PAIR_DIR=${PAIR_DIR:-/home/gjj/SwinNet-roadbias/model_out/full_h0_joint_pair_20e_20261101_085322}
 SOURCE_RUN=${SOURCE_RUN:-B_transport_0p01_proposal_0p001}
-RUN_NAME=${RUN_NAME:-B_unscaled_proposal_20e}
+RUN_NAME=${RUN_NAME:-B_unscaled_same_initial_20e}
 GPU=${GPU:-1}
 [[ "$RUN_NAME" =~ ^B_[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid output run name'; exit 2; }
 [[ "$SOURCE_RUN" =~ ^B_[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid source run name'; exit 2; }

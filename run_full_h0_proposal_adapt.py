@@ -1,8 +1,8 @@
-"""Continue the trained full-H0 B checkpoint with an unscaled proposal logit.
+"""Train the unscaled proposal from the same reconstructed initial state as B.
 
 Original H0 supervision, source relation/segmentation/continuity losses,
-optimizer scope and 3-step dynamics are retained. This is a 20-epoch
-continuation from B best, not a same-initialization causal ablation.
+optimizer scope, rate initialization, data stream and 3-step dynamics are retained.
+The old B best checkpoint is used for provenance/comparison, not initialization.
 """
 import argparse
 from collections import Counter
@@ -18,12 +18,12 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from diagnostics.diagnose_full_h0_optimistic_reachability import rebuild_source,verify_recorded_code
-from networks.full_h0_joint import VERSION,build_h0,original_criterion,parameter_groups
+from diagnostics.diagnose_full_h0_optimistic_reachability import verify_recorded_code
+from networks.full_h0_joint import VERSION,FullH0Joint,original_criterion,parameter_groups
 from networks.full_h0_proposal_adapt import ProposalAdaptedJoint
 from networks.reliable_directional_repair import dynamic_losses
 from networks.v9_selector_transport_training import gradient_norm
-from run_full_h0_joint import (batch_loss,check_reusable_A,norms,restore,save,training_dataset,
+from run_full_h0_joint import (batch_loss,check_reusable_A,inspect_source,load_h0,norms,restore,save,training_dataset,
                                validation,validation_repair_activity,evaluate)
 from run_slim_end_to_end_mass import digest,schedule,seed_all
 from run_v9_gate_benefit import atomic_json
@@ -32,14 +32,52 @@ from run_v9_selector_transport import point_metrics
 ROOT=Path(__file__).resolve().parent
 
 
-def build_model(checkpoint,device,size=512):
-    if checkpoint.get('version')!=VERSION or checkpoint['config']['variant']!='B':
-        raise ValueError('Expected the trained full-H0 B checkpoint')
-    state=checkpoint['model'];source,q=rebuild_source(state)
-    base,_=build_h0(checkpoint['config']['h0_args'],size=size)
-    model=ProposalAdaptedJoint(base,q,source)
-    model.load_state_dict(state,strict=True)
-    return model.to(device)
+def state_fingerprint(state):
+    value=hashlib.sha256()
+    for name,tensor in sorted(state.items()):
+        value.update(name.encode()+b'\0');value.update(str(tensor.dtype).encode()+b'\0')
+        value.update(np.asarray(tensor.shape,dtype=np.int64).tobytes())
+        value.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return value.hexdigest()
+
+
+def build_same_initial_models(previous,device):
+    """Independently reconstruct old-B and new-B initial states from source files."""
+    if previous.get('rate_initialization')!='explicit_softmax_budgets':
+        raise ValueError('Expected the old B explicit transport/proposal rate initialization')
+    h0_path=Path(previous['h0_checkpoint'])
+    repair_path=Path(previous['repair']['checkpoint']).parent
+    if not h0_path.is_file():raise FileNotFoundError('Original starting H0 checkpoint is missing: '+str(h0_path))
+    if not (repair_path/'best.pth').is_file():raise FileNotFoundError('Original source selector checkpoint is missing: '+str(repair_path/'best.pth'))
+    if digest(h0_path)!=previous['h0_sha256']:raise ValueError('Starting H0 checkpoint differs from old B')
+    seed=int(previous['seed']);transport=float(previous['initial_transport_rate']);proposal=float(previous['initial_proposal_rate'])
+    seed_all(seed)
+    base,_,saved=load_h0(h0_path,torch.device('cpu'))
+    source,q,meta=inspect_source(repair_path)
+    if meta['sha256']!=previous['repair']['sha256'] or source['config']!=previous['source_training']:
+        raise ValueError('Starting selector/Q3 source or configuration differs from old B')
+    if saved!=previous['h0_args']:raise ValueError('Starting H0 architecture differs from old B')
+    model=ProposalAdaptedJoint(base,q,source,transport_rate_init=transport,proposal_rate_init=proposal)
+    seed_all(seed)
+    reference_base,_,reference_saved=load_h0(h0_path,torch.device('cpu'))
+    if reference_saved!=saved:raise ValueError('H0 reconstruction changed')
+    reference=FullH0Joint(reference_base,q,source,transport_rate_init=transport,proposal_rate_init=proposal)
+    left=model.state_dict();right=reference.state_dict()
+    if set(left)!=set(right):raise RuntimeError('Old/new initial model keys differ')
+    for name in left:
+        if not torch.equal(left[name],right[name]):raise RuntimeError('Old/new initial tensor differs: '+name)
+    trainable={name:p.requires_grad for name,p in model.named_parameters()}
+    if trainable!={name:p.requires_grad for name,p in reference.named_parameters()}:
+        raise RuntimeError('Old/new trainable parameter sets differ')
+    fingerprint=state_fingerprint(left)
+    proof={'reconstructed_initial_state_sha256':fingerprint,'matching_tensors':len(left),
+           'matching_trainable_parameters':sum(p.numel() for p in model.parameters() if p.requires_grad),
+           'h0_sha256':previous['h0_sha256'],'source_selector_sha256':meta['sha256'],
+           'source_q3':meta['q3'],'initial_transport_rate':transport,'initial_proposal_rate':proposal,
+           'limitation':'Old B epoch-zero state was not saved; its initial state is independently reconstructed from recorded sources, seed, code and settings.'}
+    del reference,reference_base,left,right,source,q,base
+    gc.collect();seed_all(seed)
+    return model.to(device),proof
 
 
 def region_metrics(result,batch):
@@ -86,6 +124,18 @@ def smoke(args,model,criterion):
                  'added_tp':int((after&~before&gt).sum()),'lost_tp':int((before&~after&gt).sum()),
                  'added_fp':int((after&~before&~gt).sum()),'removed_fp':int((before&~after&~gt).sum()),
                  'region_sums':region_metrics(new,batch)}
+        old_delta=(old['p1']-old['p0']).abs()
+        observed={'mean_abs':float(old_delta.mean()),'max_abs':float(old_delta.max()),
+                  'changed_binary_at_0_45':int(((old['p1']>=.45)!=(old['p0']>=.45)).sum())}
+        old_smoke_path=args.pair_dir/args.source_run/'smoke.json'
+        original_smoke=json.loads(old_smoke_path.read_text()).get('initial_P1_minus_P0') if old_smoke_path.is_file() else None
+        smoke_check={'available':original_smoke is not None,'reconstructed_original':observed,
+                     'recorded_original':original_smoke}
+        if original_smoke:
+            smoke_check['mean_abs_difference']=abs(observed['mean_abs']-original_smoke['mean_abs'])
+            smoke_check['max_abs_difference']=abs(observed['max_abs']-original_smoke['max_abs'])
+            if smoke_check['mean_abs_difference']>1e-5 or smoke_check['max_abs_difference']>.01:
+                raise RuntimeError('Reconstructed original B initial smoke output differs from its recorded result')
     del old,new
     seed_all(args.seed);model.train();model.zero_grad(set_to_none=True)
     if args.device.type=='cuda':torch.cuda.reset_peak_memory_stats(args.device)
@@ -104,7 +154,8 @@ def smoke(args,model,criterion):
     with torch.no_grad():
         for name,value in model.named_buffers():value.copy_(buffers[name])
     model.zero_grad(set_to_none=True);seed_all(args.seed)
-    report={'passed':True,'mode':'unscaled','initial_comparison_same_checkpoint':initial,
+    report={'passed':True,'mode':'unscaled','initial_comparison_same_initialization':initial,
+            'original_B_recorded_smoke_check':smoke_check,
             'total_loss':float(total.detach()),'final_segmentation_gradients':gradients,'total_gradient_norms':grad,
             'trainable_parameters':sum(p.numel() for p in model.parameters() if p.requires_grad),
             'seconds':time.perf_counter()-start,
@@ -148,10 +199,11 @@ def train(args,model,criterion,optimizer):
         record={'epoch':epoch,'case_order_sha256':order.hexdigest(),'augmented_images_sha256':images.hexdigest(),
                 'losses':{k:v/sums['batches'] for k,v in sums.items() if k!='batches'},
                 'gradients':first_grads,'proposal_region_sums':{k:dict(v) for k,v in regions.items()}}
-        control=json.loads((args.pair_dir/'A'/f'epoch_{epoch:03d}.json').read_text())
-        for key in ('case_order_sha256','augmented_images_sha256'):
-            if control[key]!=record[key]:raise ValueError(f'Training input differs from prior A at epoch {epoch}: {key}')
-        record['reused_A_input_hashes_match']=True
+        for name in ('A',args.source_run):
+            control=json.loads((args.pair_dir/name/f'epoch_{epoch:03d}.json').read_text())
+            for key in ('case_order_sha256','augmented_images_sha256'):
+                if control[key]!=record[key]:raise ValueError(f'Training input differs from {name} at epoch {epoch}: {key}')
+        record['reused_A_and_B_input_hashes_match']=True
         if epoch%5==0 or epoch==args.epochs:
             cases=validation(args,model);report=point_metrics(cases,'p1',.6,args.manifest)
             record['val_score_at_0_60']=report['selection_score']
@@ -169,7 +221,7 @@ def main():
     p.add_argument('command',choices=('all','smoke','train','val','compare'))
     p.add_argument('--pair_dir',type=Path,required=True)
     p.add_argument('--source_run',default='B_transport_0p01_proposal_0p001')
-    p.add_argument('--run_name',default='B_unscaled_proposal_20e')
+    p.add_argument('--run_name',default='B_unscaled_same_initial_20e')
     p.add_argument('--device',default='cuda');p.add_argument('--epochs',type=int,default=20)
     args=p.parse_args();args.device=torch.device(args.device);args.variant='B';args.b_run_name=args.run_name
     for name in (args.source_run,args.run_name):
@@ -185,6 +237,10 @@ def main():
     previous=checkpoint['config'];verify_recorded_code(previous)
     if checkpoint.get('version')!=VERSION or previous['variant']!='B':raise ValueError('Wrong source B checkpoint')
     if args.epochs!=20 or previous['epochs']!=20:raise ValueError('This comparison requires the completed 20-epoch A and B runs')
+    if json.loads((source/'training_complete.json').read_text())['epochs']!=20:
+        raise ValueError('Original B is not a completed 20-epoch run')
+    if json.loads((source/'experiment.json').read_text())!=previous:
+        raise ValueError('Old B checkpoint and experiment configuration differ')
     manifest_path=args.pair_dir/'reference/fixed_gaps_and_anchors.json'
     if digest(manifest_path)!=previous['reference_sha256']:raise ValueError('Fixed reference differs from source B')
     old_selection=json.loads((source/'eval/val_selection.json').read_text())
@@ -192,28 +248,34 @@ def main():
         raise ValueError('Source B best checkpoint and validation selection do not match')
     args.manifest=json.loads(manifest_path.read_text());args.root_path=Path(previous['root_path'])
     args.seed=int(previous['seed']);args.num_workers=int(previous['num_workers']);args.h0_lr=float(previous['h0_lr'])
+    check_reusable_A(args.pair_dir,previous)
+    # Discard old B trained weights before constructing the independently initialized model.
+    del checkpoint;gc.collect()
+    model,proof=build_same_initial_models(previous,args.device)
     args.config=copy.deepcopy(previous)
     args.config['run_directory']=args.run_name
-    args.config['rate_initialization']='strictly inherited from source B best checkpoint; no rate reset'
-    args.config['proposal_adaptation']={'version':'unscaled_positive_logit_v1','source_B_checkpoint':str(source_path.resolve()),
-        'source_B_sha256':digest(source_path),'source_B_epoch':checkpoint['epoch'],'additional_epochs':20,
+    args.config['proposal_adaptation']={'version':'unscaled_positive_logit_same_initial_v2','source_B_checkpoint':str(source_path.resolve()),
+        'source_B_sha256':digest(source_path),'initialization_mode':'same_reconstructed_pretraining_state_as_old_B',
+        'initialization_proof':proof,'epochs':20,
         'formula':'sigmoid(logit(P0) + DeltaZ_plus - DeltaZ_minus)',
         'positive_support':'retained as proposal/accept input; removed only as positive-logit multiplier',
         'training_scope':'same H0/Q3/selector/repair parameter groups and original losses as B',
-        'comparison_limit':'starts from old B best; not equal cumulative training budget or pure ablation',
+        'comparison_limit':'old B epoch-zero state was not saved; reconstruct from recorded sources, seed and code',
         'code_sha256':{str(path.relative_to(ROOT)):digest(path) for path in
             (ROOT/'run_full_h0_proposal_adapt.py',ROOT/'networks/full_h0_proposal_adapt.py',ROOT/'compare_full_h0_proposal_adapt.py')}}
-    check_reusable_A(args.pair_dir,args.config)
     args.output_dir.mkdir(parents=True,exist_ok=True)
     marker=args.output_dir/'experiment.json'
     if marker.is_file() and json.loads(marker.read_text())!=args.config:raise ValueError('Existing experiment configuration differs')
     atomic_json(marker,args.config)
-    seed_all(args.seed);model=build_model(checkpoint,args.device);del checkpoint;gc.collect()
     criterion=original_criterion(previous['h0_args'],args.device)
     rates={k:v['lr'] for k,v in previous['source_training'].get('optimizer',{}).items()}
     optimizer=parameter_groups(model,args.h0_lr,repair_rates=rates)
-    atomic_json(args.output_dir/'parameter_groups.json',{g['name']:{'parameters':sum(p.numel() for p in g['params']),
-        'initial_lr':g['initial_lr'],'minimum_lr':g['minimum_lr']} for g in optimizer.param_groups})
+    groups={g['name']:{'parameters':sum(p.numel() for p in g['params']),
+        'initial_lr':g['initial_lr'],'minimum_lr':g['minimum_lr']} for g in optimizer.param_groups}
+    if groups!=json.loads((source/'parameter_groups.json').read_text()):
+        raise ValueError('New optimizer parameter counts or learning rates differ from old B')
+    atomic_json(args.output_dir/'parameter_groups.json',groups)
+    atomic_json(args.output_dir/'initialization_check.json',proof)
     if args.command in ('all','train','smoke') and not (args.output_dir/'last.pth').is_file():smoke(args,model,criterion)
     if args.command=='smoke':return
     if args.command in ('all','train'):train(args,model,criterion,optimizer)

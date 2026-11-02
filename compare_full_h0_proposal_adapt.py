@@ -23,7 +23,9 @@ def compare(pair,new_run,old_run='B_transport_0p01_proposal_0p001'):
         selections[name]=selection
     old_sha=digest(runs['old_B']/'best.pth')
     config=json.loads((runs['new_B']/'experiment.json').read_text())
-    if config['proposal_adaptation']['source_B_sha256']!=old_sha:raise ValueError('Adapted run did not start from this old B')
+    if config['proposal_adaptation']['source_B_sha256']!=old_sha:raise ValueError('Original B comparison checkpoint differs from recorded provenance')
+    if config['proposal_adaptation'].get('initialization_mode')!='same_reconstructed_pretraining_state_as_old_B':
+        raise ValueError('This comparison requires the same reconstructed initial state, not continuation from old B')
     cases=[];files=sorted((runs['A']/'eval/val').glob('*.npz'))
     if len(files)!=14 or len(manifest['images'])!=14:raise ValueError('Expected all 14 validation images')
     for path in files:
@@ -94,7 +96,8 @@ def compare(pair,new_run,old_run='B_transport_0p01_proposal_0p001'):
     write_csv(folder/'fixed_gap_length_bins.csv',length_rows)
     atomic_json(folder/'reports.json',reports)
     lines=['# Full H0 / original B / adapted proposal comparison','',
-           'Validation only. New B starts from old B best and trains 20 additional epochs; it is not a same-initialization or equal-total-training-budget ablation.',
+           'Validation only. Old and new B use the same recorded H0, Q3/source selector, initial rate budgets, 20-epoch schedule and input stream.',
+           'Epoch-zero weights of old B were not saved; initial state was reconstructed independently from the recorded sources, seed and code, and checked against the new initial state.',
            'The old B positive_support multiplier is removed only in the new proposal logit; A/rates formulas remain unchanged.',
            'APLS, fixed gap closure and bridge counts are proxies; no test set was used for model or threshold selection.',
            f'Common threshold and matching target: old B validation threshold {anchor}.','',
