@@ -1,4 +1,5 @@
 import math
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -694,6 +695,7 @@ class SurfaceStructureLoss(nn.Module):
         connectivity_gt=None,
         direction_gt=None,
         valid_mask=None,
+        native_relations=None,
     ):
         if not stage_outputs:
             return skeleton_gt.sum() * 0.0
@@ -756,20 +758,53 @@ class SurfaceStructureLoss(nn.Module):
                 loss_skeleton_stage = reference_logits.sum() * 0.0
             loss_connectivity_stage = reference_logits.sum() * 0.0
             if stage_connectivity_logits is not None:
-                stage_connectivity_gt = build_connectivity_target(stage_skel).to(
-                    device=stage_connectivity_logits.device,
-                    dtype=stage_connectivity_logits.dtype,
-                )
-                loss_connectivity_stage = self.stage_connectivity_loss(
-                    stage_connectivity_logits,
-                    stage_connectivity_gt,
-                    stage_skel_dilate,
-                    valid_mask=stage_skel,
-                    use_skeleton_center_mask=self.use_masked_connectivity_center_experiment,
-                    symmetry_weight=0.05 if self.use_masked_connectivity_center_experiment else 0.20,
-                )
+                if native_relations is not None:
+                    target, valid = native_relations['connectivity'], native_relations['connectivity_valid']
+                    if target.shape != stage_connectivity_logits.shape: raise ValueError('Native C grid mismatch')
+                    bce=F.binary_cross_entropy_with_logits(stage_connectivity_logits,target,reduction='none')
+                    weights=target.new_tensor([self.directional_pos_weight_cardinal,self.directional_pos_weight_diagonal]*4).view(1,8,1,1)
+                    bce=bce*torch.where(target>.5,weights,torch.ones_like(weights))
+                    if not self.use_legacy_stage_connectivity_loss or self.use_masked_connectivity_center_experiment:
+                        bce=bce*torch.where(target>.5,target.new_tensor(self.connectivity_pos_weight),target.new_tensor(1.))
+                    if self.connectivity_focal_gamma>0:
+                        prob=stage_connectivity_logits.sigmoid();pt=torch.where(target>.5,prob,1-prob)
+                        bce=bce*(1-pt).clamp_min(1e-6).pow(self.connectivity_focal_gamma)
+                    image_terms=[]
+                    for n in range(target.shape[0]):
+                        classes=[]
+                        for label in (False,True):
+                            take=valid[n] & ((target[n]>.5)==label)
+                            if take.any():classes.append(bce[n][take].mean())
+                        if classes:image_terms.append(torch.stack(classes).mean())
+                    loss_connectivity_stage=torch.stack(image_terms).mean() if image_terms else stage_connectivity_logits.sum()*0.
+                    # Retain the existing Stage-C contrast and symmetry terms, now
+                    # restricted to valid native edges instead of skeleton centres.
+                    probability=stage_connectivity_logits.sigmoid()
+                    loss_connectivity_stage=loss_connectivity_stage+self._edge_contrastive_loss(
+                        probability,target,valid,self.edge_contrastive_margin)
+                    symmetry=[]
+                    for d,(dy,dx) in enumerate(CONNECTIVITY_DIRECTIONS):
+                        inverse=self._shift_map(probability[:,CONNECTIVITY_OPPOSITE[d]:CONNECTIVITY_OPPOSITE[d]+1],dy,dx)
+                        mask=valid[:,d:d+1].to(probability.dtype)
+                        symmetry.append(((probability[:,d:d+1]-inverse).abs()*mask).sum()/mask.sum().clamp_min(1.))
+                    symmetry_weight=.05 if self.use_masked_connectivity_center_experiment else .20
+                    loss_connectivity_stage=loss_connectivity_stage+symmetry_weight*torch.stack(symmetry).mean()
+                else:
+                    stage_connectivity_gt = build_connectivity_target(stage_skel).to(
+                        device=stage_connectivity_logits.device,
+                        dtype=stage_connectivity_logits.dtype,
+                    )
+                    loss_connectivity_stage = self.stage_connectivity_loss(
+                        stage_connectivity_logits,stage_connectivity_gt,stage_skel_dilate,valid_mask=stage_skel,
+                        use_skeleton_center_mask=self.use_masked_connectivity_center_experiment,
+                        symmetry_weight=0.05 if self.use_masked_connectivity_center_experiment else 0.20,
+                    )
             if direction_logits is not None and self.stage_direction_factor > 0:
-                stage_direction_gt, direction_valid = self.build_direction_target(stage_skel)
+                if native_relations is not None:
+                    stage_direction_gt=native_relations['direction'];direction_valid=native_relations['direction_valid']
+                    if stage_direction_gt.shape != direction_logits.shape: raise ValueError('Native D grid mismatch')
+                else:
+                    stage_direction_gt, direction_valid = self.build_direction_target(stage_skel)
                 stage_direction_gt = stage_direction_gt.to(
                     device=direction_logits.device,
                     dtype=direction_logits.dtype,
@@ -801,11 +836,16 @@ class SurfaceStructureLoss(nn.Module):
                 if stage_index < len(self.stage_direction_factors)
                 else self.stage_direction_factor
             )
-            total = total + stage_weight * self.stage_skeleton_loss_factor * (
-                self.stage_skeleton_only_loss_factor * loss_skeleton_stage
-                + connectivity_factor * loss_connectivity_stage
-                + direction_factor * loss_direction_stage
-            )
+            if native_relations is not None:
+                skeleton_weight={2:.008,3:.012}.get(stage_index,0.)*float(stage_output.get('stage_loss_scale',1.))
+                total = total + skeleton_weight*loss_skeleton_stage + stage_weight*self.stage_skeleton_loss_factor*(
+                    connectivity_factor*loss_connectivity_stage+direction_factor*loss_direction_stage)
+            else:
+                total = total + stage_weight * self.stage_skeleton_loss_factor * (
+                    self.stage_skeleton_only_loss_factor * loss_skeleton_stage
+                    + connectivity_factor * loss_connectivity_stage
+                    + direction_factor * loss_direction_stage
+                )
 
         return total
 
@@ -1066,6 +1106,22 @@ class SurfaceStructureLoss(nn.Module):
         else:
             loss_skeleton_stage = surface_logits.sum() * 0.0
 
+        native_relations=None
+        if getattr(self,'native_relation_enabled',False) and stage_outputs and any(
+            isinstance(row,dict) and row.get('stage') in (2,3) for row in stage_outputs
+        ):
+            from datasets.native_relation_targets import native_targets
+            target_rows=[native_targets(surface_gt[i,0].detach().cpu().numpy()>.5,
+                                        skeleton_gt[i,0].detach().cpu().numpy()>.5)
+                         for i in range(surface_gt.shape[0])]
+            native_relations={key:torch.as_tensor(np.stack([row[key] for row in target_rows]),device=surface_gt.device)
+                              for key in ('connectivity','connectivity_valid','direction','direction_valid')}
+            native_relations['direction_valid']=native_relations['direction_valid'][:,None]
+            self.last_native_stats={'valid_positive_edges':sum(int(((row['connectivity']>.5)&row['connectivity_valid']).sum()) for row in target_rows),
+                'valid_negative_edges':sum(int(((row['connectivity']<.5)&row['connectivity_valid']).sum()) for row in target_rows),
+                'ignored_edges':sum(int((~row['connectivity_valid']).sum()) for row in target_rows),
+                'valid_direction_cells':sum(int(row['direction_valid'].sum()) for row in target_rows),
+                'ambiguous_cells':sum(int(row['ambiguous_cells'].sum()) for row in target_rows)}
         loss_stage_structure = self.stage_structure_loss(
             stage_outputs,
             skeleton_gt,
@@ -1075,6 +1131,7 @@ class SurfaceStructureLoss(nn.Module):
             connectivity_gt=connectivity_gt,
             direction_gt=direction_gt,
             valid_mask=valid_mask,
+            native_relations=native_relations,
         )
         loss_road_attention = self.road_attention_loss(stage_outputs, surface_gt)
         loss_highres_structure_skeleton, highres_stats = self.highres_structure_skeleton_loss(

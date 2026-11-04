@@ -2268,6 +2268,13 @@ class SwinTransformerSys(nn.Module):
                     highres_skeleton_feat = roadness_i.pop(
                         "highres_skeleton_feat", highres_skeleton_feat
                     )
+                    if getattr(self, "native_relation_enabled", False):
+                        if any(value is None for value in (stage2_structure_feat, highres_skeleton_feat, skeleton_i, connectivity_i, direction_i)):
+                            raise RuntimeError("Native global context requires live Stage2 H/G/S/C/D")
+                        highres_skeleton_feat = self.native_global_context(
+                            highres_skeleton_feat, stage2_structure_feat,
+                            skeleton_i, connectivity_i, direction_i,
+                        )
                     self.last_stage_features["G2"] = stage2_structure_feat
                     self.last_stage_features["H1"] = highres_skeleton_feat
                 x = map_to_token(x_map)
@@ -2373,7 +2380,7 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                if self.enable_global_topology and highres_skeleton_feat is not None:
+                if self.enable_global_topology and highres_skeleton_feat is not None and not getattr(self, "native_relation_enabled", False):
                     surface_prob = self._surface_prior_for_global_topology(
                         x,
                         highres_skeleton_feat,
@@ -2395,6 +2402,8 @@ class SwinTransformerSys(nn.Module):
                     g3 = self.last_stage_features.get("G3")
                     if g3 is not None:
                         h3_surface = self.h3_surface_proj(g3)
+                        if getattr(self, "native_relation_enabled", False):
+                            h3_surface = h3_surface + self.native_h_surface_proj(highres_skeleton_feat)
                         h3_surface = F.interpolate(
                             h3_surface,
                             size=x.shape[-2:],
@@ -2425,7 +2434,7 @@ class SwinTransformerSys(nn.Module):
         )
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
-            if highres_skeleton_feat is not None
+            if highres_skeleton_feat is not None and not getattr(self, "native_relation_enabled", False)
             else None
         )
         self.last_highres_structure_skeleton = highres_structure_skeleton

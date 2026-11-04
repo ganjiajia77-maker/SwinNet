@@ -1,6 +1,8 @@
 import argparse
 import copy
 import csv
+import hashlib
+import json
 import math
 import os
 import random
@@ -57,6 +59,11 @@ parser.add_argument('--source_patch_size', type=int, default=1024, help='full so
 parser.add_argument('--overlap_stride', type=int, default=256, help='fixed training/validation tile stride')
 parser.add_argument('--direct_resize_train', action='store_true', help='resize the full source patch directly to img_size for training')
 parser.add_argument('--random_crop_train', action='store_true', help='randomly sample native train crops instead of fixed tiles')
+parser.add_argument('--native_relation_experiment', action='store_true', help='use native C/D targets and relation-guided H stream')
+parser.add_argument('--record_initial_state', action='store_true', help='write initial-state fingerprints for paired comparison')
+parser.add_argument('--native_smoke_only', action='store_true', help='check native H0 training paths on one 512 batch then exit')
+parser.add_argument('--initial_manifest_only', action='store_true', help='write initialization fingerprints and exit')
+parser.add_argument('--verify_initial_state', type=str, default='', help='require exact initial weights from this manifest')
 parser.add_argument('--random_crops_per_image', type=int, default=1, help='random train crops sampled per source image each epoch')
 parser.add_argument('--val_crop_list', type=str, default='', help='fixed validation crop list: one line per crop, image: x=..., y=...')
 parser.add_argument('--min_crop_road_pixels', type=int, default=0, help='retained for run metadata; fixed tiles are never filtered')
@@ -1239,6 +1246,9 @@ if __name__ == "__main__":
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
 
+    if args.native_relation_experiment:
+        from networks.native_h0_relations import install_native_relations
+        model = install_native_relations(model).to(device)
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
         pretrain_path = config.MODEL.PRETRAIN_CKPT
@@ -1248,6 +1258,29 @@ if __name__ == "__main__":
                 "Set --pretrain_ckpt or use --no_pretrain."
             )
         loaded_pretrained_names = model.load_from(config)
+
+    if (args.record_initial_state or args.verify_initial_state or args.initial_manifest_only) and not args.resume and not args.warm_start_ckpt:
+        hashes={}
+        for name,value in model.state_dict().items():
+            canonical=name.replace('swin_unet.native_global_context.topology.','swin_unet.global_topology.')
+            tensor=value.detach().cpu().contiguous()
+            hashes[canonical]={'shape':list(tensor.shape),'dtype':str(tensor.dtype),
+                               'sha256':hashlib.sha256(tensor.numpy().tobytes()).hexdigest()}
+        sha=hashlib.sha256()
+        with open(config.MODEL.PRETRAIN_CKPT,'rb') as stream:
+            for chunk in iter(lambda:stream.read(1024*1024),b''):sha.update(chunk)
+        manifest={'seed':args.seed,'pretrain_path':config.MODEL.PRETRAIN_CKPT,
+                  'pretrain_sha256':sha.hexdigest(),'native_relations':args.native_relation_experiment,
+                  'tensors':hashes}
+        if args.verify_initial_state:
+            with open(args.verify_initial_state,encoding='utf-8') as stream: expected=json.load(stream)
+            if expected!=manifest:raise ValueError('Initial model differs from its preflight manifest')
+        with open(os.path.join(args.output_dir,'initial_state.json'),'w',encoding='utf-8') as stream:
+            json.dump(manifest,stream,indent=2)
+        # Shared stochastic streams after new module initialization.
+        random.seed(args.seed);np.random.seed(args.seed);torch.manual_seed(args.seed)
+        if torch.cuda.is_available():torch.cuda.manual_seed_all(args.seed)
+        if args.initial_manifest_only:sys.exit(0)
 
     def build_layerwise_optimizer():
         loaded_params, new_params = [], []
@@ -1439,6 +1472,58 @@ if __name__ == "__main__":
 
     # 优化器 / 损失（graph-only 模式在加载 checkpoint 后再建 optimizer）
     criterion = build_criterion(args, loss_weights, device)
+    if args.native_relation_experiment:
+        criterion.native_relation_enabled = True
+    if args.record_initial_state:
+        effective={}
+        for stage in (2,3):
+            stage_weight=criterion.stage_structure_weights[stage]
+            effective[str(stage)]={'skeleton':({2:.008,3:.012}[stage] if args.native_relation_experiment else
+                stage_weight*criterion.stage_skeleton_loss_factor*criterion.stage_skeleton_only_loss_factor),
+                'connectivity':stage_weight*criterion.stage_skeleton_loss_factor*criterion.stage_connectivity_factors[stage],
+                'direction':stage_weight*criterion.stage_skeleton_loss_factor*criterion.stage_direction_factors[stage]}
+        with open(os.path.join(args.output_dir,'effective_structure_loss_weights.json'),'w',encoding='utf-8') as stream:
+            json.dump(effective,stream,indent=2)
+        print('[EFFECTIVE STRUCTURE WEIGHTS] '+json.dumps(effective),flush=True)
+    if args.native_smoke_only:
+        if not args.native_relation_experiment: raise ValueError('native_smoke_only requires native_relation_experiment')
+        from losses.road_losses import build_soft_stage_skeleton_target
+        core=model.swin_unet;core.native_global_context.calls=0
+        batch=next(iter(train_loader));image=batch['image'].to(device);mask=batch['mask'].to(device)
+        skeleton=batch['skeleton'].to(device);dilated=batch['skeleton_dilate'].to(device)
+        model.eval();outputs=model(image);stage_outputs=outputs[4]
+        rows=[row for row in stage_outputs if row.get('stage') in (2,3)]
+        if len(rows)!=2 or [row['stage'] for row in rows]!=[2,3] or core.native_global_context.calls!=1:
+            raise RuntimeError('Unexpected skeleton/global call count')
+        expected_grid=args.img_size//4
+        if core.last_stage_features['H2'].shape[1:]!=(64,expected_grid,expected_grid):raise RuntimeError('Unexpected H resolution')
+        surface=criterion.surface_loss(outputs[0],mask)[0]
+        local=core.decoder_structure_blocks['3'];global_module=core.native_global_context
+        selected={'global_relation':global_module.pair[0].weight,'local_relation':local.edge[0].weight,
+                  'C3':local.connectivity_head.edge_linear.weight,'D3':local.direction_head[-1].weight,
+                  'S_H':local.skeleton_head.out.weight,'H_surface':core.native_h_surface_proj.weight}
+        gradients=torch.autograd.grad(surface,tuple(selected.values()),retain_graph=True,allow_unused=True)
+        grad_values={name:(float(grad.detach().norm()) if grad is not None else 0.)
+                     for name,grad in zip(selected,gradients)}
+        if any(not np.isfinite(v) or v<=0 for v in grad_values.values()):raise RuntimeError('Surface gradient blocked: '+str(grad_values))
+        _,soft_target=build_soft_stage_skeleton_target(skeleton,rows[1]['skeleton'].shape[-2:])
+        skeleton_loss=criterion.soft_stage_skeleton_loss(rows[1]['skeleton'],soft_target)
+        h2=rows[1]['h2_before_relation'];hgrad=torch.autograd.grad(skeleton_loss,h2,retain_graph=True,allow_unused=True)[0]
+        if hgrad is None or float(hgrad.abs().sum())<=0:raise RuntimeError('S_H does not supervise H2')
+        total,_=criterion(outputs[0],surface_gt=mask,skeleton_gt=skeleton,skeleton_dilate_gt=dilated,
+                          stage_outputs=stage_outputs,boundary_logits=outputs[1],skeleton_logits=outputs[2],connectivity_logits=outputs[3])
+        if not torch.isfinite(total):raise RuntimeError('Native loss is nonfinite')
+        total.backward()
+        report={'passed':True,'batch_shape':list(image.shape),'surface_gradient_norms':grad_values,
+                'skeleton_loss_H2_gradient_norm':float(hgrad.norm()),'total_loss':float(total.detach()),
+                'global_calls':core.native_global_context.calls,'H_shape':list(core.last_stage_features['H2'].shape),
+                'global_delta_abs_mean':float(core.native_global_context.last_delta_abs_mean),
+                'local_delta_abs_mean':float(rows[1]['local_delta'].detach().abs().mean()),
+                'native_target_counts':criterion.last_native_stats,
+                'gt_in_model_forward':False}
+        with open(os.path.join(args.output_dir,'native_smoke.json'),'w',encoding='utf-8') as stream:json.dump(report,stream,indent=2)
+        print('[NATIVE SMOKE] '+json.dumps(report),flush=True)
+        sys.exit(0)
     optimizer = None
 
     # 检查是否恢复训练
@@ -1863,6 +1948,9 @@ if __name__ == "__main__":
                     param_group['lr'] = current_lr
 
             model.train()
+            if args.record_initial_state:
+                loader_generator.manual_seed(args.seed+(epoch+1)*1000003)
+                case_fingerprint=hashlib.sha256();image_fingerprint=hashlib.sha256()
             total_loss = 0
             train_batches = 0
             skipped_batches = 0
@@ -1884,6 +1972,11 @@ if __name__ == "__main__":
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
                     break
                 batch_start_time = time.perf_counter()
+
+                if args.record_initial_state:
+                    for name in batch['case_name']:case_fingerprint.update(str(name).encode()+b'\0')
+                    image_fingerprint.update(batch['image'].contiguous().numpy().tobytes())
+                    torch.manual_seed(args.seed+(epoch+1)*1000003+i)
 
                 images = batch['image'].to(device)
                 masks = batch['mask'].to(device)
@@ -1946,6 +2039,8 @@ if __name__ == "__main__":
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
                 )
+                if args.native_relation_experiment and i==0:
+                    print('[NATIVE TARGETS] '+json.dumps(criterion.last_native_stats),flush=True)
 
                 if not torch.isfinite(loss):
                     skipped_batches += 1
@@ -2067,6 +2162,10 @@ if __name__ == "__main__":
                         flush=True
                     )
 
+            if args.record_initial_state:
+                with open(os.path.join(args.output_dir,f'input_epoch_{epoch+1:03d}.json'),'w',encoding='utf-8') as stream:
+                    json.dump({'epoch':epoch+1,'case_order_sha256':case_fingerprint.hexdigest(),
+                               'augmented_image_sha256':image_fingerprint.hexdigest(),'batches':train_batches},stream,indent=2)
             train_avg_loss = total_loss / max(train_batches, 1)
             highres_epoch_stats = {
                 key: (
