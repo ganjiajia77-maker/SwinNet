@@ -60,6 +60,12 @@ parser.add_argument('--overlap_stride', type=int, default=256, help='fixed train
 parser.add_argument('--direct_resize_train', action='store_true', help='resize the full source patch directly to img_size for training')
 parser.add_argument('--random_crop_train', action='store_true', help='randomly sample native train crops instead of fixed tiles')
 parser.add_argument('--native_relation_experiment', action='store_true', help='use native C/D targets and relation-guided H stream')
+parser.add_argument('--path_training_mode', choices=('off','surface','joint'), default='off')
+parser.add_argument('--path_surface_weight', type=float, default=0.0)
+parser.add_argument('--path_c_weight', type=float, default=0.0)
+parser.add_argument('--path_audit_gradients', action='store_true')
+parser.add_argument('--path_max_initial_gradient_ratio', type=float, default=1.0,
+                    help='stop if first measured weighted path output-gradient exceeds this ratio to baseline')
 parser.add_argument('--record_initial_state', action='store_true', help='write initial-state fingerprints for paired comparison')
 parser.add_argument('--native_smoke_only', action='store_true', help='check native H0 training paths on one 512 batch then exit')
 parser.add_argument('--initial_manifest_only', action='store_true', help='write initialization fingerprints and exit')
@@ -1474,6 +1480,16 @@ if __name__ == "__main__":
     criterion = build_criterion(args, loss_weights, device)
     if args.native_relation_experiment:
         criterion.native_relation_enabled = True
+    if args.path_training_mode != 'off':
+        if not args.native_relation_experiment:
+            raise ValueError('Path training requires --native_relation_experiment')
+        if args.path_surface_weight <= 0 or args.path_c_weight < 0:
+            raise ValueError('Path weights must be specified explicitly; surface > 0, C >= 0')
+        if args.path_training_mode == 'joint' and args.path_c_weight <= 0:
+            raise ValueError('Joint mode requires positive --path_c_weight')
+    criterion.path_training_mode = args.path_training_mode
+    criterion.path_surface_weight = args.path_surface_weight
+    criterion.path_c_weight = args.path_c_weight
     if args.record_initial_state:
         effective={}
         for stage in (2,3):
@@ -1932,6 +1948,7 @@ if __name__ == "__main__":
             print(f"[INFO] Trend validation CSV: {trend_val_csv}", flush=True)
 
         global_train_step = 0
+        path_gradient_audited = False
         for epoch in range(start_epoch, end_epoch):
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
@@ -1954,6 +1971,7 @@ if __name__ == "__main__":
             total_loss = 0
             train_batches = 0
             skipped_batches = 0
+            path_epoch_used = 0
             optimizer.zero_grad(set_to_none=True)
             accumulation_count = 0
             highres_stat_sums = {
@@ -2041,6 +2059,44 @@ if __name__ == "__main__":
                 )
                 if args.native_relation_experiment and i==0:
                     print('[NATIVE TARGETS] '+json.dumps(criterion.last_native_stats),flush=True)
+                if args.path_training_mode != 'off':
+                    path_epoch_used += (criterion.last_path_stats.get('positive_used',0)+
+                                        criterion.last_path_stats.get('negative_used',0))
+                    path_record = {'epoch':epoch+1,'batch':i+1,**criterion.last_path_stats,
+                        'surface_loss':float(loss_dict['path_surface_loss']),
+                        'c_loss':float(loss_dict['path_connectivity_loss']),
+                        'weighted_surface':float(loss_dict['path_surface_weighted']),
+                        'weighted_c':float(loss_dict['path_connectivity_weighted'])}
+                    with open(os.path.join(args.output_dir,'path_training.jsonl'),'a',encoding='utf-8') as f:
+                        f.write(json.dumps(path_record)+'\n')
+                    if i==0: print('[PATH TRAIN] '+json.dumps(path_record),flush=True)
+                    if args.path_audit_gradients and not path_gradient_audited and (
+                        criterion.last_path_stats.get('positive_used',0)+criterion.last_path_stats.get('negative_used',0)>0
+                    ) and (not args.path_c_weight or (
+                        criterion.last_path_stats.get('positive_used',0)+criterion.last_path_stats.get('negative_used',0)
+                        -criterion.last_path_stats.get('negative_surface_only',0)>0)):
+                        base_s,base_c,add_s,add_c,out_s,out_c=criterion.last_path_tensors
+                        def grad_norm(term,output):
+                            grad=torch.autograd.grad(term,output,retain_graph=True,allow_unused=True)[0]
+                            return float(grad.detach().norm()) if grad is not None else 0.
+                        checks={'base_surface_logits':grad_norm(base_s,out_s),
+                            'path_surface_logits':grad_norm(args.path_surface_weight*add_s,out_s),
+                            'base_C3_logits':grad_norm(base_c,out_c),
+                            'path_C3_logits':grad_norm(args.path_c_weight*add_c,out_c) if args.path_c_weight else 0.}
+                        if not all(math.isfinite(v) for v in checks.values()):
+                            raise RuntimeError('Non-finite gradient audit: '+json.dumps(checks))
+                        if checks['path_surface_logits']<=0 or (args.path_c_weight and checks['path_C3_logits']<=0):
+                            raise RuntimeError('Path loss has no expected output gradient: '+json.dumps(checks))
+                        checks['surface_ratio']=checks['path_surface_logits']/max(checks['base_surface_logits'],1e-12)
+                        checks['C3_ratio']=checks['path_C3_logits']/max(checks['base_C3_logits'],1e-12)
+                        with open(os.path.join(args.output_dir,'path_gradient_audit.json'),'w',encoding='utf-8') as f:
+                            json.dump(checks,f,indent=2)
+                        print('[PATH GRADIENT AUDIT] '+json.dumps(checks),flush=True)
+                        if checks['surface_ratio'] > args.path_max_initial_gradient_ratio or (
+                            args.path_c_weight and checks['C3_ratio'] > args.path_max_initial_gradient_ratio
+                        ):
+                            raise RuntimeError('Weighted path gradient exceeds configured pilot limit; inspect path_gradient_audit.json')
+                        path_gradient_audited=True
 
                 if not torch.isfinite(loss):
                     skipped_batches += 1
@@ -2166,6 +2222,10 @@ if __name__ == "__main__":
                 with open(os.path.join(args.output_dir,f'input_epoch_{epoch+1:03d}.json'),'w',encoding='utf-8') as stream:
                     json.dump({'epoch':epoch+1,'case_order_sha256':case_fingerprint.hexdigest(),
                                'augmented_image_sha256':image_fingerprint.hexdigest(),'batches':train_batches},stream,indent=2)
+            if args.path_training_mode != 'off' and path_epoch_used == 0:
+                raise RuntimeError('No valid path supervision in this epoch; inspect path_training.jsonl')
+            if args.path_training_mode != 'off' and args.path_audit_gradients and not path_gradient_audited:
+                raise RuntimeError('No batch qualified for the path gradient audit; inspect path_training.jsonl')
             train_avg_loss = total_loss / max(train_batches, 1)
             highres_epoch_stats = {
                 key: (

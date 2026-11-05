@@ -1156,8 +1156,32 @@ class SurfaceStructureLoss(nn.Module):
             + loss_highres_structure_skeleton
         )
 
+        # Path search is training-only. The model forward never receives GT.
+        path_mode = getattr(self, 'path_training_mode', 'off')
+        self.last_path_stats = {}
+        self.last_path_tensors = None
+        path_surface = surface_logits.sum() * 0.0
+        path_c = surface_logits.sum() * 0.0
+        if path_mode != 'off' and torch.is_grad_enabled():
+            if native_relations is None:
+                raise ValueError('Path training requires native C/D labels')
+            rows = [r for r in stage_outputs if isinstance(r, dict) and r.get('stage') == 3]
+            if len(rows) != 1 or rows[0].get('connectivity') is None:
+                raise ValueError('Path training requires exactly one Stage3 C output')
+            from losses.native_path_supervision import path_supervision
+            path_surface, path_c, self.last_path_stats = path_supervision(
+                surface_logits, rows[0]['connectivity'], surface_gt, skeleton_gt,
+                native_relations, path_mode, torch.initial_seed())
+            self.last_path_tensors = (loss_surface, loss_stage_structure, path_surface,
+                                      path_c, surface_logits, rows[0]['connectivity'])
+            total_loss = total_loss + self.path_surface_weight * path_surface + self.path_c_weight * path_c
+
         loss_dict = {
             "total_loss": total_loss.detach(),
+            "path_surface_loss": path_surface.detach(),
+            "path_connectivity_loss": path_c.detach(),
+            "path_surface_weighted": (getattr(self, 'path_surface_weight', 0.) * path_surface).detach(),
+            "path_connectivity_weighted": (getattr(self, 'path_c_weight', 0.) * path_c).detach(),
             "surface_loss": loss_surface.detach(),
             "surface_total_loss": loss_surface.detach(),
             "skeleton_loss": loss_skeleton.detach(),

@@ -58,10 +58,21 @@ case "$MODE" in
     extra=();if [[ "$variant" == B ]]; then extra+=(--native_relation_experiment); fi
     python -u train_image.py "${common[@]}" --run_name "$run" "${extra[@]}" --resume "$RESULTS/$run/last.pth"
     ;;
+  path_surface|path_joint)
+    : "${PATH_SURFACE_WEIGHT:?Set PATH_SURFACE_WEIGHT after gradient inspection}"
+    : "${PATH_C_WEIGHT:?Set PATH_C_WEIGHT; use the same value in both path groups}"
+    test -s "$RESULTS/${PAIR_NAME}_preflight_B/initial_state.json" || { echo 'Missing native B initialization fingerprint' >&2; exit 1; }
+    run="${PATH_RUN_NAME:-${PAIR_NAME}_${MODE}}"
+    test ! -e "$RESULTS/$run" || { echo "Existing run: $RESULTS/$run" >&2; exit 1; }
+    python -u train_image.py "${common[@]}" --run_name "$run" --native_relation_experiment \
+      --verify_initial_state "$RESULTS/${PAIR_NAME}_preflight_B/initial_state.json" \
+      --path_training_mode "${MODE#path_}" --path_surface_weight "$PATH_SURFACE_WEIGHT" \
+      --path_c_weight "$PATH_C_WEIGHT" --path_audit_gradients
+    ;;
   val)
     python -u scripts/evaluate_native_h0_pair.py --baseline "$RESULTS/${PAIR_NAME}_A/best.pth" \
       --native "$RESULTS/${PAIR_NAME}_B/best.pth" --root_path "$DATA" \
       --output_dir "$RESULTS/${PAIR_NAME}_paired_val" --device cuda
     ;;
-  *) echo 'Usage: bash scripts/run_native_h0_pair.sh prepare|A|B|resume_A|resume_B|val' >&2; exit 2 ;;
+  *) echo 'Usage: bash scripts/run_native_h0_pair.sh prepare|A|B|resume_A|resume_B|path_surface|path_joint|val' >&2; exit 2 ;;
 esac
