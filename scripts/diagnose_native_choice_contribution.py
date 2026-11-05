@@ -42,9 +42,9 @@ def main():
     args=p.parse_args(); prior=json.loads(args.paired_summary.read_text(encoding='utf-8'))
     ckpt_sha=digest(args.checkpoint)
     if ckpt_sha!=prior['B_sha256']:raise ValueError('Checkpoint differs from prior paired audit')
-    cutoff=prior['C']['B/C3/road_road_negative']['0.8']
-    if cutoff is None:raise ValueError('Paired audit has no positive or difficult negative examples')
-    cutoff=float(cutoff['threshold_approx'])
+    cutoff_info=prior['C']['B/C3/road_road_negative']['0.8']
+    if cutoff_info is None:raise ValueError('Paired audit has no positive or difficult negative examples')
+    cutoff=float(cutoff_info['threshold_approx'])
     device=torch.device(args.device);model,_=load_model(args.checkpoint,device,True)
     block=model.swin_unet.decoder_structure_blocks['3']
     if block.out.bias is not None:raise ValueError('Per-edge decomposition requires bias-free output projection')
@@ -115,6 +115,10 @@ def main():
         report['groups'][group]['C_rejected']={'count':int(rejected.sum()),
             'mean_weight':float(w[rejected].mean()) if rejected.any() else None,
             'mean_contribution_norm':float(n[rejected].mean()) if rejected.any() else None}
+    for group,key in (('positive','positive_count'),('road_road_negative','negative_count')):
+        actual=report['groups'][group]['c']['count']
+        if actual!=cutoff_info[key]:
+            raise ValueError(f'Paired audit sample count mismatch for {group}: {actual} vs {cutoff_info[key]}')
     (args.out/'summary.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
     with (args.out/'per_image.csv').open('w',encoding='utf-8',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=list(image_rows[0]));writer.writeheader();writer.writerows(image_rows)
