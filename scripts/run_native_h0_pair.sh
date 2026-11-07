@@ -32,6 +32,19 @@ common=(--root_path "$DATA" --output_dir "$RESULTS" --cfg "$REPO/configs/swin_ti
   --directional_pos_weight_cardinal 1.0 --directional_pos_weight_diagonal 2.5 --surface_focal_gamma 1.0
   --record_initial_state)
 case "$MODE" in
+  local_cs_fresh)
+    : "${LOCAL_CS_RUN:?Set an independent run name}"
+    initial_manifest=${B_INITIAL_MANIFEST:-$RESULTS/${PAIR_NAME}_preflight_B/initial_state.json}
+    test -s "$initial_manifest" || { echo "Original B initialization manifest missing: $initial_manifest" >&2; exit 1; }
+    test ! -e "$RESULTS/$LOCAL_CS_RUN" || { echo 'Output exists; choose a new run name' >&2; exit 1; }
+    echo '[LOCAL CS FRESH] ImageNet initialization; c_guided only; 80 full epochs; no trained checkpoint loaded'
+    python -u train_image.py "${common[@]}" --native_relation_experiment \
+      --run_name "$LOCAL_CS_RUN" --local_cs_mode c_guided \
+      --lambda_local_cs "${LAMBDA_LOCAL_CS:-0.05}" \
+      --verify_initial_state "$initial_manifest" \
+      --finetune_epochs 0 --max_train_batches 0 \
+      --local_cs_audit_interval "${LOCAL_CS_AUDIT_INTERVAL:-50}"
+    ;;
   local_cs)
     : "${LOCAL_CS_INIT:?Set an explicit original native B checkpoint}"
     : "${LOCAL_CS_RUN:?Set an independent run name}"
@@ -74,5 +87,5 @@ case "$MODE" in
       --native "$RESULTS/${PAIR_NAME}_B/best.pth" --root_path "$DATA" \
       --output_dir "$RESULTS/${PAIR_NAME}_paired_val" --device cuda
     ;;
-  *) echo 'Usage: bash scripts/run_native_h0_pair.sh prepare|A|B|resume_A|resume_B|val' >&2; exit 2 ;;
+  *) echo 'Usage: bash scripts/run_native_h0_pair.sh prepare|A|B|resume_A|resume_B|val|local_cs|local_cs_fresh' >&2; exit 2 ;;
 esac

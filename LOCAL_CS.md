@@ -93,3 +93,21 @@ reselection, detached C weights, no weight-sum normalization, empty classes,
 label mismatch failures, batch normalization, original loss preservation in
 off mode and additive loss integration. CPU checks do not establish real GPU
 throughput or Massachusetts performance.
+
+## Full training from the original B initialization
+
+`scripts/run_native_h0_pair.sh local_cs_fresh` runs only c_guided, from the
+original ImageNet initialization, with no trained B weights or optimizer state.
+It uses the original common 80-epoch configuration, unlimited batches, and
+checks the complete initialization manifest against original B before training.
+The manifest defaults to
+`$RESULTS/h0_native_relation_80e_s1234_preflight_B/initial_state.json`;
+`B_INITIAL_MANIFEST` can specify the original B training run's initial_state.json.
+Missing or mismatching evidence stops training rather than silently changing
+initialization. Old LOCAL_CS_INIT/SHORT_EPOCHS/SHORT_BATCHES variables are not
+used by this mode. Set LOCAL_CS_RUN to a new independent directory name.
+
+```
+export LOCAL_CS_RUN=h0_local_cs_guided_fresh80_$(date +%Y%m%d_%H%M%S)
+CUDA_VISIBLE_DEVICES=2 bash scripts/run_native_h0_pair.sh local_cs_fresh
+```
