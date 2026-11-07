@@ -60,6 +60,10 @@ parser.add_argument('--overlap_stride', type=int, default=256, help='fixed train
 parser.add_argument('--direct_resize_train', action='store_true', help='resize the full source patch directly to img_size for training')
 parser.add_argument('--random_crop_train', action='store_true', help='randomly sample native train crops instead of fixed tiles')
 parser.add_argument('--native_relation_experiment', action='store_true', help='use native C/D targets and relation-guided H stream')
+parser.add_argument('--local_cs_mode', choices=['off', 'surface_only', 'c_guided'], default='off')
+parser.add_argument('--lambda_local_cs', type=float, default=0.05)
+parser.add_argument('--local_cs_initial_checkpoint', default='', help='strict model-only initialization; fresh optimizer and epoch zero')
+parser.add_argument('--local_cs_audit_interval', type=int, default=50, help='surface-logit gradient audit interval; first batch always audited')
 parser.add_argument('--record_initial_state', action='store_true', help='write initial-state fingerprints for paired comparison')
 parser.add_argument('--native_smoke_only', action='store_true', help='check native H0 training paths on one 512 batch then exit')
 parser.add_argument('--initial_manifest_only', action='store_true', help='write initialization fingerprints and exit')
@@ -1250,7 +1254,7 @@ if __name__ == "__main__":
         from networks.native_h0_relations import install_native_relations
         model = install_native_relations(model).to(device)
     loaded_pretrained_names = set()
-    if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
+    if not args.resume and not args.warm_start_ckpt and not args.no_pretrain and not args.local_cs_initial_checkpoint:
         pretrain_path = config.MODEL.PRETRAIN_CKPT
         if not os.path.isfile(pretrain_path):
             raise FileNotFoundError(
@@ -1258,6 +1262,27 @@ if __name__ == "__main__":
                 "Set --pretrain_ckpt or use --no_pretrain."
             )
         loaded_pretrained_names = model.load_from(config)
+
+    if args.local_cs_initial_checkpoint:
+        if args.resume or args.warm_start_ckpt or not args.native_relation_experiment:
+            raise ValueError('Local-CS initialization requires native B and no resume/warm_start')
+        initial = torch.load(args.local_cs_initial_checkpoint, map_location='cpu', weights_only=False)
+        saved = initial['args']
+        if not saved.get('native_relation_experiment') or saved.get('path_training_mode', 'off') != 'off':
+            raise ValueError('Initial checkpoint must be original native B without path supervision')
+        model.load_state_dict(initial['model_state_dict'], strict=True)
+        loaded_pretrained_names = set(initial['loaded_pretrained_names'])
+        with open(args.local_cs_initial_checkpoint, 'rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest() if hasattr(hashlib, 'file_digest') else None
+        if digest is None:
+            sha = hashlib.sha256()
+            with open(args.local_cs_initial_checkpoint, 'rb') as stream:
+                for chunk in iter(lambda: stream.read(1024*1024), b''): sha.update(chunk)
+            digest = sha.hexdigest()
+        with open(os.path.join(args.output_dir, 'local_cs_initial.json'), 'w') as stream:
+            json.dump(dict(checkpoint=os.path.abspath(args.local_cs_initial_checkpoint), sha256=digest,
+                           source_epoch=initial.get('epoch'), optimizer='fresh', start_epoch=0), stream, indent=2)
+        del initial
 
     if (args.record_initial_state or args.verify_initial_state or args.initial_manifest_only) and not args.resume and not args.warm_start_ckpt:
         hashes={}
@@ -1472,6 +1497,12 @@ if __name__ == "__main__":
 
     # 优化器 / 损失（graph-only 模式在加载 checkpoint 后再建 optimizer）
     criterion = build_criterion(args, loss_weights, device)
+    if args.local_cs_mode != 'off' and not args.native_relation_experiment:
+        raise ValueError('local_cs requires native_relation_experiment')
+    if args.lambda_local_cs < 0:
+        raise ValueError('lambda_local_cs must be nonnegative')
+    criterion.local_cs_mode = args.local_cs_mode
+    criterion.local_cs_weight = args.lambda_local_cs
     if args.native_relation_experiment:
         criterion.native_relation_enabled = True
     if args.record_initial_state:
@@ -1953,6 +1984,7 @@ if __name__ == "__main__":
                 case_fingerprint=hashlib.sha256();image_fingerprint=hashlib.sha256()
             total_loss = 0
             train_batches = 0
+            local_cs_valid_relations = 0
             skipped_batches = 0
             optimizer.zero_grad(set_to_none=True)
             accumulation_count = 0
@@ -2042,6 +2074,22 @@ if __name__ == "__main__":
                 if args.native_relation_experiment and i==0:
                     print('[NATIVE TARGETS] '+json.dumps(criterion.last_native_stats),flush=True)
 
+                local_record = dict(epoch=epoch+1, batch=i+1, mode=args.local_cs_mode)
+                local = getattr(criterion, 'last_local_cs', None)
+                if local is not None:
+                    local_cs_valid_relations += local['stats']['positive'] + local['stats']['negative']
+                    local_record.update(local['stats'], raw=float(local['raw'].detach()),
+                                        weighted=float(local['weighted'].detach()))
+                    if i == 0 or (args.local_cs_audit_interval > 0 and (i+1) % args.local_cs_audit_interval == 0):
+                        base_grad = torch.autograd.grad(local['surface'], surface_logits, retain_graph=True)[0]
+                        new_grad = torch.autograd.grad(local['weighted'], surface_logits, retain_graph=True)[0]
+                        base_norm = float(base_grad.norm())
+                        new_norm = float(new_grad.norm())
+                        local_record.update(surface_gradient_norm=base_norm, local_gradient_norm=new_norm,
+                                            gradient_ratio=new_norm/max(base_norm, 1e-12))
+                        del base_grad, new_grad
+                        print('[LOCAL CS] '+json.dumps(local_record), flush=True)
+
                 if not torch.isfinite(loss):
                     skipped_batches += 1
                     print(
@@ -2085,6 +2133,13 @@ if __name__ == "__main__":
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 ms_per_batch = (time.perf_counter() - batch_start_time) * 1000.0
+                local_record['ms_per_batch'] = ms_per_batch
+                if args.local_cs_initial_checkpoint or args.local_cs_mode != 'off':
+                    with open(os.path.join(args.output_dir, 'local_cs_training.jsonl'), 'a') as stream:
+                        stream.write(json.dumps(local_record)+'\n')
+                if local is not None:
+                    criterion.last_local_cs = None
+                    del local
                 for key in highres_stat_sums:
                     value = float(loss_dict[key].item())
                     if np.isfinite(value):
@@ -2162,6 +2217,8 @@ if __name__ == "__main__":
                         flush=True
                     )
 
+            if args.local_cs_mode != 'off' and local_cs_valid_relations == 0:
+                raise RuntimeError('Entire epoch has no valid local-CS relations; inspect native targets')
             if args.record_initial_state:
                 with open(os.path.join(args.output_dir,f'input_epoch_{epoch+1:03d}.json'),'w',encoding='utf-8') as stream:
                     json.dump({'epoch':epoch+1,'case_order_sha256':case_fingerprint.hexdigest(),

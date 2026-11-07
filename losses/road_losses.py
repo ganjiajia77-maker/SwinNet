@@ -1156,6 +1156,19 @@ class SurfaceStructureLoss(nn.Module):
             + loss_highres_structure_skeleton
         )
 
+        self.last_local_cs = None
+        if getattr(self, 'local_cs_mode', 'off') != 'off' and torch.is_grad_enabled():
+            if native_relations is None:
+                raise RuntimeError('Local C/surface supervision requires original native labels')
+            from losses.local_cs_loss import local_cs_loss
+            c3 = next(row['connectivity'] for row in stage_outputs if row.get('stage') == 3)
+            local_loss, local_stats = local_cs_loss(
+                surface_logits, c3, surface_gt, native_relations, self.local_cs_mode)
+            weighted = self.local_cs_weight * local_loss
+            self.last_local_cs = dict(stats=local_stats, raw=local_loss, weighted=weighted,
+                                      original=total_loss, surface=loss_surface)
+            total_loss = total_loss + weighted
+
         loss_dict = {
             "total_loss": total_loss.detach(),
             "surface_loss": loss_surface.detach(),

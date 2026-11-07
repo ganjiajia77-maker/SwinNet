@@ -32,6 +32,17 @@ common=(--root_path "$DATA" --output_dir "$RESULTS" --cfg "$REPO/configs/swin_ti
   --directional_pos_weight_cardinal 1.0 --directional_pos_weight_diagonal 2.5 --surface_focal_gamma 1.0
   --record_initial_state)
 case "$MODE" in
+  local_cs)
+    : "${LOCAL_CS_INIT:?Set an explicit original native B checkpoint}"
+    : "${LOCAL_CS_RUN:?Set an independent run name}"
+    test -s "$LOCAL_CS_INIT"
+    test ! -e "$RESULTS/$LOCAL_CS_RUN" || { echo 'Output exists; choose a new run name' >&2; exit 1; }
+    python -u train_image.py "${common[@]}" --native_relation_experiment \
+      --run_name "$LOCAL_CS_RUN" --local_cs_initial_checkpoint "$LOCAL_CS_INIT" \
+      --local_cs_mode "${LOCAL_CS_MODE:-c_guided}" --lambda_local_cs "${LAMBDA_LOCAL_CS:-0.05}" \
+      --finetune_epochs "${SHORT_EPOCHS:-1}" --max_train_batches "${SHORT_BATCHES:-100}" \
+      --local_cs_audit_interval "${LOCAL_CS_AUDIT_INTERVAL:-50}"
+    ;;
   prepare)
     for run in "${PAIR_NAME}_preflight_A" "${PAIR_NAME}_preflight_B"; do
       test ! -e "$RESULTS/$run" || { echo "Existing preflight: $RESULTS/$run" >&2; exit 1; }
