@@ -147,4 +147,7 @@ def install_reassembly_from_args(model, saved):
     if saved.get('no_encoder_a1a2',False):
         from .remove_encoder_road_priors import remove_encoder_road_priors
         remove_encoder_road_priors(model)
+    if saved.get('h_encoder_exchange',False):
+        from .encoder_h_exchange import install_encoder_h_exchange
+        install_encoder_h_exchange(model,saved.get('h_encoder_exchange_init',.05))
     return model

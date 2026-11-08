@@ -66,6 +66,9 @@ parser.add_argument('--native_targets_verify_batches', type=int, default=1)
 parser.add_argument('--h_pixel_reassembly', action='store_true', help='pixel-query reconstruction of the final H contribution only')
 parser.add_argument('--no_encoder_a1a2', action='store_true',
                     help='remove A1/A2 heads, merge modulation and their encoder Stage3 attention bias')
+parser.add_argument('--h_encoder_exchange', action='store_true',
+                    help='carry the same H stream through three encoder exchanges into the decoder')
+parser.add_argument('--h_encoder_exchange_init', type=float, default=.05)
 parser.add_argument('--h_reassembly_channels', type=int, default=16)
 parser.add_argument('--h_reassembly_floor', type=float, default=.1)
 parser.add_argument('--h_reassembly_prior', choices=['predicted','uniform'], default='predicted')
@@ -1271,7 +1274,7 @@ if __name__ == "__main__":
             )
         loaded_pretrained_names = model.load_from(config)
 
-    if args.h_pixel_reassembly or args.no_encoder_a1a2:
+    if args.h_pixel_reassembly or args.no_encoder_a1a2 or args.h_encoder_exchange:
         from networks.h_pixel_reassembly import install_reassembly_from_args
         install_reassembly_from_args(model, vars(args))
         if args.no_encoder_a1a2:
@@ -1293,7 +1296,7 @@ if __name__ == "__main__":
         if args.verify_original_b_initial_state:
             with open(args.verify_original_b_initial_state,encoding='utf-8') as stream:
                 expected=json.load(stream)
-            added_prefix='swin_unet.h_pixel_reassembly.'
+            added_prefix=('swin_unet.h_pixel_reassembly.','swin_unet.encoder_h_exchanges.')
             shared={k:v for k,v in hashes.items() if not k.startswith(added_prefix)}
             removed=set(getattr(model.swin_unet,'encoder_road_prior_ablation',{}).get('removed_keys',[]))
             if not removed.issubset(expected['tensors']):
@@ -1589,6 +1592,21 @@ if __name__ == "__main__":
                           reassembly_stats={k:float(v) for k,v in module.last_stats.items()},
                           peak_cuda_mib=torch.cuda.max_memory_allocated()/1024**2 if torch.cuda.is_available() else None,
                           note='At zero W_out, q/k/value gradients start at zero; they activate after W_out updates.')
+        report['h_encoder_exchange']=args.h_encoder_exchange
+        if args.h_encoder_exchange:
+            exchange_gradients={}
+            for i,exchange in enumerate(core.encoder_h_exchanges):
+                for name in ('to_h','to_e'):
+                    gradient=getattr(exchange,name)[0].weight.grad
+                    value=float(gradient.norm()) if gradient is not None else 0.
+                    if not np.isfinite(value) or value<=0:raise RuntimeError('Encoder H exchange is disconnected')
+                    exchange_gradients[f'E{i+1}_{name}']=value
+            if core.last_stage_features['H_decoder_input'] is not core.last_encoder_features['H_E3']:
+                raise RuntimeError('Decoder did not consume the live final encoder H')
+            report.update(encoder_H_gradient_norms=exchange_gradients,
+                          encoder_H_shape=list(core.last_encoder_features['H_E3'].shape),
+                          encoder_H_consumed_by_decoder=True,
+                          identity_reference='same encoder-H backbone with pixel reconstruction bypassed')
         with open(os.path.join(args.output_dir,'native_smoke.json'),'w',encoding='utf-8') as stream:json.dump(report,stream,indent=2)
         print('[NATIVE SMOKE] '+json.dumps(report),flush=True)
         sys.exit(0)
@@ -2147,6 +2165,11 @@ if __name__ == "__main__":
                     for name in ('query','key','value','out'):
                         grad=getattr(module,name).weight.grad
                         reassembly_gradients['gradient_'+name]=float(grad.norm()) if grad is not None else 0.
+                    if args.h_encoder_exchange:
+                        for j,exchange in enumerate(model.swin_unet.encoder_h_exchanges):
+                            for name in ('to_h','to_e'):
+                                grad=getattr(exchange,name)[0].weight.grad
+                                reassembly_gradients[f'gradient_encoder{j+1}_{name}']=float(grad.norm()) if grad is not None else 0.
                 accumulation_count += 1
                 should_step = (
                     accumulation_count >= accumulation_steps
@@ -2189,6 +2212,9 @@ if __name__ == "__main__":
                         stats=model.swin_unet.h_pixel_reassembly.last_stats
                         timing.update({k:float(v) for k,v in stats.items()})
                         timing.update(reassembly_gradients)
+                    if args.h_encoder_exchange:
+                        for j,exchange in enumerate(model.swin_unet.encoder_h_exchanges):
+                            timing.update({f'encoder{j+1}_{k}':float(v) for k,v in exchange.last_stats.items()})
                     with open(os.path.join(args.output_dir,'h_reassembly_training.jsonl'),'a') as stream:
                         stream.write(json.dumps(timing)+'\n')
                 for key in highres_stat_sums:
