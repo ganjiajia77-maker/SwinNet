@@ -29,6 +29,7 @@ from networks.vision_transformer import (
     print_topology_coefficients,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from datasets.native_relation_batch import transfer_native_targets, verify_native_batch
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
@@ -60,6 +61,10 @@ parser.add_argument('--overlap_stride', type=int, default=256, help='fixed train
 parser.add_argument('--direct_resize_train', action='store_true', help='resize the full source patch directly to img_size for training')
 parser.add_argument('--random_crop_train', action='store_true', help='randomly sample native train crops instead of fixed tiles')
 parser.add_argument('--native_relation_experiment', action='store_true', help='use native C/D targets and relation-guided H stream')
+parser.add_argument('--native_targets_in_loader', action=argparse.BooleanOptionalAction, default=True,
+                    help='prepare identical native targets after final training transforms in DataLoader workers')
+parser.add_argument('--native_targets_verify_batches', type=int, default=1,
+                    help='initial batches checked elementwise against the legacy round-trip; 0 disables')
 parser.add_argument('--local_cs_mode', choices=['off', 'surface_only', 'c_guided'], default='off')
 parser.add_argument('--lambda_local_cs', type=float, default=0.05)
 parser.add_argument('--local_cs_initial_checkpoint', default='', help='strict model-only initialization; fresh optimizer and epoch zero')
@@ -1452,6 +1457,7 @@ if __name__ == "__main__":
         random_crop_train=args.random_crop_train,
         random_crops_per_image=args.random_crops_per_image,
         random_crop_seed=args.seed,
+        native_relations=args.native_relation_experiment and args.native_targets_in_loader,
     )
     if args.tiny_overfit_samples > 0:
         tiny_count = min(int(args.tiny_overfit_samples), len(train_dataset))
@@ -1542,7 +1548,9 @@ if __name__ == "__main__":
         h2=rows[1]['h2_before_relation'];hgrad=torch.autograd.grad(skeleton_loss,h2,retain_graph=True,allow_unused=True)[0]
         if hgrad is None or float(hgrad.abs().sum())<=0:raise RuntimeError('S_H does not supervise H2')
         total,_=criterion(outputs[0],surface_gt=mask,skeleton_gt=skeleton,skeleton_dilate_gt=dilated,
-                          stage_outputs=stage_outputs,boundary_logits=outputs[1],skeleton_logits=outputs[2],connectivity_logits=outputs[3])
+                          stage_outputs=stage_outputs,boundary_logits=outputs[1],skeleton_logits=outputs[2],connectivity_logits=outputs[3],
+                          native_relations=batch.get('native_relations'),
+                          native_relation_stats=batch.get('native_relation_stats'))
         if not torch.isfinite(total):raise RuntimeError('Native loss is nonfinite')
         total.backward()
         report={'passed':True,'batch_shape':list(image.shape),'surface_gradient_norms':grad_values,
@@ -1963,6 +1971,7 @@ if __name__ == "__main__":
             print(f"[INFO] Trend validation CSV: {trend_val_csv}", flush=True)
 
         global_train_step = 0
+        native_verified_batches = 0
         for epoch in range(start_epoch, end_epoch):
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
@@ -2000,10 +2009,14 @@ if __name__ == "__main__":
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
 
+            previous_batch_start = None
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
                     break
                 batch_start_time = time.perf_counter()
+                start_to_start_ms = ((batch_start_time-previous_batch_start)*1000.
+                                     if previous_batch_start is not None else None)
+                previous_batch_start = batch_start_time
 
                 if args.record_initial_state:
                     for name in batch['case_name']:case_fingerprint.update(str(name).encode()+b'\0')
@@ -2014,6 +2027,22 @@ if __name__ == "__main__":
                 masks = batch['mask'].to(device)
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
+
+                native_payload = {}
+                if args.native_relation_experiment and args.native_targets_in_loader:
+                    if 'native_relations' not in batch:
+                        raise RuntimeError('Native target worker path was enabled but batch targets are missing')
+                    if native_verified_batches < args.native_targets_verify_batches:
+                        report = verify_native_batch(batch, masks, skeletons)
+                        report.update(epoch=epoch+1, batch=i+1,
+                                      image_sha256=hashlib.sha256(batch['image'].contiguous().numpy().tobytes()).hexdigest())
+                        with open(os.path.join(args.output_dir, 'native_target_verification.jsonl'), 'a') as stream:
+                            stream.write(json.dumps(report)+'\n')
+                        print('[NATIVE TARGET EQUALITY] '+json.dumps(report), flush=True)
+                        native_verified_batches += 1
+                    native_payload = dict(
+                        native_relations=transfer_native_targets(batch['native_relations'], masks),
+                        native_relation_stats=batch['native_relation_stats'])
 
                 images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
                 masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -2070,6 +2099,7 @@ if __name__ == "__main__":
                     boundary_logits=boundary_logits,
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
+                    **native_payload,
                 )
                 if args.native_relation_experiment and i==0:
                     print('[NATIVE TARGETS] '+json.dumps(criterion.last_native_stats),flush=True)
@@ -2133,6 +2163,15 @@ if __name__ == "__main__":
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 ms_per_batch = (time.perf_counter() - batch_start_time) * 1000.0
+                if args.native_relation_experiment:
+                    timing = dict(epoch=epoch+1, batch=i+1, ms_per_batch=ms_per_batch,
+                                  targets_in_loader=bool(native_payload),
+                                  previous_batch_plus_next_fetch_ms=start_to_start_ms)
+                    if native_payload:
+                        timing.update(worker_target_cpu_seconds_sum=float(batch['native_target_seconds'].sum()),
+                                      worker_target_cpu_seconds_max=float(batch['native_target_seconds'].max()))
+                    with open(os.path.join(args.output_dir, 'native_target_timing.jsonl'), 'a') as stream:
+                        stream.write(json.dumps(timing)+'\n')
                 local_record['ms_per_batch'] = ms_per_batch
                 if args.local_cs_initial_checkpoint or args.local_cs_mode != 'off':
                     with open(os.path.join(args.output_dir, 'local_cs_training.jsonl'), 'a') as stream:

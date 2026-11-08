@@ -1013,6 +1013,8 @@ class SurfaceStructureLoss(nn.Module):
         direction_gt=None,
         boundary_gt=None,
         valid_mask=None,
+        native_relations=None,
+        native_relation_stats=None,
     ):
         if surface_gt is None or skeleton_gt is None:
             raise ValueError("surface_gt and skeleton_gt are required.")
@@ -1106,22 +1108,17 @@ class SurfaceStructureLoss(nn.Module):
         else:
             loss_skeleton_stage = surface_logits.sum() * 0.0
 
-        native_relations=None
         if getattr(self,'native_relation_enabled',False) and stage_outputs and any(
             isinstance(row,dict) and row.get('stage') in (2,3) for row in stage_outputs
         ):
-            from datasets.native_relation_targets import native_targets
-            target_rows=[native_targets(surface_gt[i,0].detach().cpu().numpy()>.5,
-                                        skeleton_gt[i,0].detach().cpu().numpy()>.5)
-                         for i in range(surface_gt.shape[0])]
-            native_relations={key:torch.as_tensor(np.stack([row[key] for row in target_rows]),device=surface_gt.device)
-                              for key in ('connectivity','connectivity_valid','direction','direction_valid')}
-            native_relations['direction_valid']=native_relations['direction_valid'][:,None]
-            self.last_native_stats={'valid_positive_edges':sum(int(((row['connectivity']>.5)&row['connectivity_valid']).sum()) for row in target_rows),
-                'valid_negative_edges':sum(int(((row['connectivity']<.5)&row['connectivity_valid']).sum()) for row in target_rows),
-                'ignored_edges':sum(int((~row['connectivity_valid']).sum()) for row in target_rows),
-                'valid_direction_cells':sum(int(row['direction_valid'].sum()) for row in target_rows),
-                'ambiguous_cells':sum(int(row['ambiguous_cells'].sum()) for row in target_rows)}
+            from datasets.native_relation_batch import (
+                legacy_native_batch, reduce_native_stats, transfer_native_targets)
+            if native_relations is None:
+                native_relations, native_relation_stats = legacy_native_batch(surface_gt, skeleton_gt)
+            elif native_relation_stats is None:
+                raise ValueError('Precomputed native targets require matching CPU statistics')
+            native_relations = transfer_native_targets(native_relations, surface_gt)
+            self.last_native_stats = reduce_native_stats(native_relation_stats)
         loss_stage_structure = self.stage_structure_loss(
             stage_outputs,
             skeleton_gt,
