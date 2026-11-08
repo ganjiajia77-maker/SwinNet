@@ -32,6 +32,35 @@ common=(--root_path "$DATA" --output_dir "$RESULTS" --cfg "$REPO/configs/swin_ti
   --directional_pos_weight_cardinal 1.0 --directional_pos_weight_diagonal 2.5 --surface_focal_gamma 1.0
   --record_initial_state)
 case "$MODE" in
+  pixel_smoke|pixel_train|pixel_resume)
+    : "${PIXEL_RUN_NAME:?Set an independent experiment run name}"
+    reference=${B_INITIAL_MANIFEST:-$RESULTS/h0_native_relation_80e_s1234_B/initial_state.json}
+    test -s "$reference" || { echo "Original B initialization manifest missing: $reference" >&2; exit 1; }
+    run="$PIXEL_RUN_NAME"
+    if [[ "$MODE" == pixel_smoke ]]; then run="${run}_smoke"; fi
+    extra=(--native_relation_experiment --h_pixel_reassembly --native_targets_in_loader
+      --h_reassembly_prior "${H_REASSEMBLY_PRIOR:-predicted}"
+      --h_reassembly_channels 16 --h_reassembly_floor 0.1
+      --h_reassembly_chunk_rows "${H_REASSEMBLY_CHUNK_ROWS:-32}"
+      --verify_original_b_initial_state "$reference")
+    if [[ "$MODE" == pixel_resume ]]; then
+      test -s "$RESULTS/$run/last.pth"
+      extra+=(--resume "$RESULTS/$run/last.pth")
+    else
+      test ! -e "$RESULTS/$run" || { echo "Existing output: $RESULTS/$run" >&2; exit 1; }
+    fi
+    if [[ "$MODE" == pixel_smoke ]]; then extra+=(--native_smoke_only); fi
+    if [[ "$MODE" == pixel_train ]]; then
+      test -s "$RESULTS/${PIXEL_RUN_NAME}_smoke/native_smoke.json"
+      python - "$RESULTS/${PIXEL_RUN_NAME}_smoke/native_smoke.json" "${H_REASSEMBLY_PRIOR:-predicted}" "${H_REASSEMBLY_CHUNK_ROWS:-32}" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d['passed'] and d['initial_output_identity']['exact'] and d['reassembly_output_gradient_norm']>0
+assert d['reassembly_prior']==sys.argv[2] and d['reassembly_chunk_rows']==int(sys.argv[3])
+PY
+    fi
+    python -u train_image.py "${common[@]}" --run_name "$run" "${extra[@]}"
+    ;;
   prepare)
     for run in "${PAIR_NAME}_preflight_A" "${PAIR_NAME}_preflight_B"; do
       test ! -e "$RESULTS/$run" || { echo "Existing preflight: $RESULTS/$run" >&2; exit 1; }
@@ -63,5 +92,5 @@ case "$MODE" in
       --native "$RESULTS/${PAIR_NAME}_B/best.pth" --root_path "$DATA" \
       --output_dir "$RESULTS/${PAIR_NAME}_paired_val" --device cuda
     ;;
-  *) echo 'Usage: bash scripts/run_native_h0_pair.sh prepare|A|B|resume_A|resume_B|val' >&2; exit 2 ;;
+  *) echo 'Usage: bash scripts/run_native_h0_pair.sh prepare|A|B|resume_A|resume_B|val|pixel_smoke|pixel_train|pixel_resume' >&2; exit 2 ;;
 esac

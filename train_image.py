@@ -29,6 +29,7 @@ from networks.vision_transformer import (
     print_topology_coefficients,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
+from datasets.native_relation_batch import transfer_native_targets, verify_native_batch
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
@@ -60,6 +61,15 @@ parser.add_argument('--overlap_stride', type=int, default=256, help='fixed train
 parser.add_argument('--direct_resize_train', action='store_true', help='resize the full source patch directly to img_size for training')
 parser.add_argument('--random_crop_train', action='store_true', help='randomly sample native train crops instead of fixed tiles')
 parser.add_argument('--native_relation_experiment', action='store_true', help='use native C/D targets and relation-guided H stream')
+parser.add_argument('--native_targets_in_loader', action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument('--native_targets_verify_batches', type=int, default=1)
+parser.add_argument('--h_pixel_reassembly', action='store_true', help='pixel-query reconstruction of the final H contribution only')
+parser.add_argument('--h_reassembly_channels', type=int, default=16)
+parser.add_argument('--h_reassembly_floor', type=float, default=.1)
+parser.add_argument('--h_reassembly_prior', choices=['predicted','uniform'], default='predicted')
+parser.add_argument('--h_reassembly_chunk_rows', type=int, default=32)
+parser.add_argument('--h_reassembly_checkpoint', action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument('--verify_original_b_initial_state', default='', help='require identical original-B tensors, seed and ImageNet SHA')
 parser.add_argument('--record_initial_state', action='store_true', help='write initial-state fingerprints for paired comparison')
 parser.add_argument('--native_smoke_only', action='store_true', help='check native H0 training paths on one 512 batch then exit')
 parser.add_argument('--initial_manifest_only', action='store_true', help='write initialization fingerprints and exit')
@@ -1259,7 +1269,11 @@ if __name__ == "__main__":
             )
         loaded_pretrained_names = model.load_from(config)
 
-    if (args.record_initial_state or args.verify_initial_state or args.initial_manifest_only) and not args.resume and not args.warm_start_ckpt:
+    if args.h_pixel_reassembly:
+        from networks.h_pixel_reassembly import install_reassembly_from_args
+        install_reassembly_from_args(model, vars(args))
+
+    if (args.record_initial_state or args.verify_initial_state or args.initial_manifest_only or args.verify_original_b_initial_state) and not args.resume and not args.warm_start_ckpt:
         hashes={}
         for name,value in model.state_dict().items():
             canonical=name.replace('swin_unet.native_global_context.topology.','swin_unet.global_topology.')
@@ -1272,6 +1286,16 @@ if __name__ == "__main__":
         manifest={'seed':args.seed,'pretrain_path':config.MODEL.PRETRAIN_CKPT,
                   'pretrain_sha256':sha.hexdigest(),'native_relations':args.native_relation_experiment,
                   'tensors':hashes}
+        if args.verify_original_b_initial_state:
+            with open(args.verify_original_b_initial_state,encoding='utf-8') as stream:
+                expected=json.load(stream)
+            added_prefix='swin_unet.h_pixel_reassembly.'
+            shared={k:v for k,v in hashes.items() if not k.startswith(added_prefix)}
+            if shared!=expected['tensors'] or any(manifest[k]!=expected[k] for k in ('seed','pretrain_sha256','native_relations')):
+                raise ValueError('Original B initialization differs')
+            with open(os.path.join(args.output_dir,'original_b_initialization_check.json'),'w',encoding='utf-8') as stream:
+                json.dump(dict(passed=True,original_manifest=args.verify_original_b_initial_state,
+                               shared_tensors=len(shared),added_parameters=[k for k in hashes if k.startswith(added_prefix)]),stream,indent=2)
         if args.verify_initial_state:
             with open(args.verify_initial_state,encoding='utf-8') as stream: expected=json.load(stream)
             if expected!=manifest:raise ValueError('Initial model differs from its preflight manifest')
@@ -1427,6 +1451,7 @@ if __name__ == "__main__":
         random_crop_train=args.random_crop_train,
         random_crops_per_image=args.random_crops_per_image,
         random_crop_seed=args.seed,
+        native_relations=args.native_relation_experiment and args.native_targets_in_loader,
     )
     if args.tiny_overfit_samples > 0:
         tiny_count = min(int(args.tiny_overfit_samples), len(train_dataset))
@@ -1491,7 +1516,28 @@ if __name__ == "__main__":
         core=model.swin_unet;core.native_global_context.calls=0
         batch=next(iter(train_loader));image=batch['image'].to(device);mask=batch['mask'].to(device)
         skeleton=batch['skeleton'].to(device);dilated=batch['skeleton_dilate'].to(device)
-        model.eval();outputs=model(image);stage_outputs=outputs[4]
+        model.eval()
+        identity = None
+        if args.h_pixel_reassembly:
+            core.h_pixel_reassembly.train()  # no dropout/BN; enable memory checkpointing for backward smoke
+            if torch.cuda.is_available():torch.cuda.reset_peak_memory_stats()
+            core.disable_h_pixel_reassembly=True
+            try:
+                with torch.no_grad():baseline=model(image)[0].detach()
+            finally:
+                core.disable_h_pixel_reassembly=False
+            core.native_global_context.calls=0
+        outputs=model(image);stage_outputs=outputs[4]
+        if args.h_pixel_reassembly:
+            difference=(outputs[0].detach()-baseline).abs()
+            identity=dict(mean_abs=float(difference.mean()),max_abs=float(difference.max()),
+                          exact=torch.equal(outputs[0].detach(),baseline))
+            if not identity['exact']:raise RuntimeError('Zero initialized reconstruction changed original B output')
+            del baseline,difference
+        if 'native_relations' in batch:
+            native_check=verify_native_batch(batch,mask,skeleton)
+            with open(os.path.join(args.output_dir,'native_target_verification.jsonl'),'a') as stream:
+                stream.write(json.dumps(native_check)+'\n')
         rows=[row for row in stage_outputs if row.get('stage') in (2,3)]
         if len(rows)!=2 or [row['stage'] for row in rows]!=[2,3] or core.native_global_context.calls!=1:
             raise RuntimeError('Unexpected skeleton/global call count')
@@ -1511,7 +1557,8 @@ if __name__ == "__main__":
         h2=rows[1]['h2_before_relation'];hgrad=torch.autograd.grad(skeleton_loss,h2,retain_graph=True,allow_unused=True)[0]
         if hgrad is None or float(hgrad.abs().sum())<=0:raise RuntimeError('S_H does not supervise H2')
         total,_=criterion(outputs[0],surface_gt=mask,skeleton_gt=skeleton,skeleton_dilate_gt=dilated,
-                          stage_outputs=stage_outputs,boundary_logits=outputs[1],skeleton_logits=outputs[2],connectivity_logits=outputs[3])
+                          stage_outputs=stage_outputs,boundary_logits=outputs[1],skeleton_logits=outputs[2],connectivity_logits=outputs[3],
+                          native_relations=batch.get('native_relations'),native_relation_stats=batch.get('native_relation_stats'))
         if not torch.isfinite(total):raise RuntimeError('Native loss is nonfinite')
         total.backward()
         report={'passed':True,'batch_shape':list(image.shape),'surface_gradient_norms':grad_values,
@@ -1521,6 +1568,16 @@ if __name__ == "__main__":
                 'local_delta_abs_mean':float(rows[1]['local_delta'].detach().abs().mean()),
                 'native_target_counts':criterion.last_native_stats,
                 'gt_in_model_forward':False}
+        if args.h_pixel_reassembly:
+            module=core.h_pixel_reassembly
+            new_grad=float(module.out.weight.grad.norm())
+            if not np.isfinite(new_grad) or new_grad<=0:raise RuntimeError('Reconstruction output projection receives no gradient')
+            report.update(initial_output_identity=identity,reassembly_output_gradient_norm=new_grad,
+                          reassembly_prior=args.h_reassembly_prior,
+                          reassembly_chunk_rows=args.h_reassembly_chunk_rows,
+                          reassembly_stats={k:float(v) for k,v in module.last_stats.items()},
+                          peak_cuda_mib=torch.cuda.max_memory_allocated()/1024**2 if torch.cuda.is_available() else None,
+                          note='At zero W_out, q/k/value gradients start at zero; they activate after W_out updates.')
         with open(os.path.join(args.output_dir,'native_smoke.json'),'w',encoding='utf-8') as stream:json.dump(report,stream,indent=2)
         print('[NATIVE SMOKE] '+json.dumps(report),flush=True)
         sys.exit(0)
@@ -1932,6 +1989,7 @@ if __name__ == "__main__":
             print(f"[INFO] Trend validation CSV: {trend_val_csv}", flush=True)
 
         global_train_step = 0
+        native_verified_batches = 0
         for epoch in range(start_epoch, end_epoch):
             if hasattr(train_dataset, "set_epoch"):
                 train_dataset.set_epoch(epoch)
@@ -1968,10 +2026,14 @@ if __name__ == "__main__":
             highres_stat_counts = {key: 0 for key in highres_stat_sums}
             stage_distill_scale = get_stage_distill_scale(epoch)
 
+            previous_batch_start = None
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
                     break
                 batch_start_time = time.perf_counter()
+                start_to_start_ms = ((batch_start_time-previous_batch_start)*1000.
+                                     if previous_batch_start is not None else None)
+                previous_batch_start = batch_start_time
 
                 if args.record_initial_state:
                     for name in batch['case_name']:case_fingerprint.update(str(name).encode()+b'\0')
@@ -1982,6 +2044,20 @@ if __name__ == "__main__":
                 masks = batch['mask'].to(device)
                 skeletons = batch['skeleton'].to(device)
                 skeletons_dilate = batch['skeleton_dilate'].to(device)
+
+                native_payload = {}
+                if args.native_relation_experiment and args.native_targets_in_loader:
+                    if 'native_relations' not in batch:
+                        raise RuntimeError('Enabled worker target generation but batch targets are missing')
+                    if native_verified_batches < args.native_targets_verify_batches:
+                        report=verify_native_batch(batch,masks,skeletons)
+                        report.update(epoch=epoch+1,batch=i+1)
+                        with open(os.path.join(args.output_dir,'native_target_verification.jsonl'),'a') as stream:
+                            stream.write(json.dumps(report)+'\n')
+                        print('[NATIVE TARGET EQUALITY] '+json.dumps(report),flush=True)
+                        native_verified_batches+=1
+                    native_payload=dict(native_relations=transfer_native_targets(batch['native_relations'],masks),
+                                        native_relation_stats=batch['native_relation_stats'])
 
                 images_padded, orig_shape = pad_to_window_multiple(images, window_size=1)
                 masks_padded, _ = pad_to_window_multiple(masks, window_size=1)
@@ -2038,6 +2114,7 @@ if __name__ == "__main__":
                     boundary_logits=boundary_logits,
                     skeleton_logits=skeleton_logits,
                     connectivity_logits=connectivity_logits,
+                    **native_payload,
                 )
                 if args.native_relation_experiment and i==0:
                     print('[NATIVE TARGETS] '+json.dumps(criterion.last_native_stats),flush=True)
@@ -2053,6 +2130,12 @@ if __name__ == "__main__":
                     continue
 
                 (loss / accumulation_steps).backward()
+                reassembly_gradients={}
+                if args.h_pixel_reassembly and (i==0 or (i+1)%50==0):
+                    module=model.swin_unet.h_pixel_reassembly
+                    for name in ('query','key','value','out'):
+                        grad=getattr(module,name).weight.grad
+                        reassembly_gradients['gradient_'+name]=float(grad.norm()) if grad is not None else 0.
                 accumulation_count += 1
                 should_step = (
                     accumulation_count >= accumulation_steps
@@ -2085,6 +2168,18 @@ if __name__ == "__main__":
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 ms_per_batch = (time.perf_counter() - batch_start_time) * 1000.0
+                if args.native_relation_experiment:
+                    timing=dict(epoch=epoch+1,batch=i+1,ms_per_batch=ms_per_batch,
+                                previous_batch_plus_next_fetch_ms=start_to_start_ms,
+                                targets_in_loader=bool(native_payload))
+                    if native_payload:
+                        timing['worker_target_cpu_seconds_sum']=float(batch['native_target_seconds'].sum())
+                    if args.h_pixel_reassembly:
+                        stats=model.swin_unet.h_pixel_reassembly.last_stats
+                        timing.update({k:float(v) for k,v in stats.items()})
+                        timing.update(reassembly_gradients)
+                    with open(os.path.join(args.output_dir,'h_reassembly_training.jsonl'),'a') as stream:
+                        stream.write(json.dumps(timing)+'\n')
                 for key in highres_stat_sums:
                     value = float(loss_dict[key].item())
                     if np.isfinite(value):

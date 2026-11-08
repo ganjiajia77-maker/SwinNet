@@ -43,6 +43,8 @@ def load_model(path,device,native):
     kwargs={k:v for k,v in saved.items() if k in names and k not in ('config','img_size','num_classes','return_skeleton')}
     model=SwinUnet(config,img_size=512,num_classes=1,return_skeleton=True,**kwargs)
     if native:install_native_relations(model)
+    from networks.h_pixel_reassembly import install_reassembly_from_args
+    install_reassembly_from_args(model,saved)
     model.load_state_dict(state['model_state_dict'],strict=True)
     return model.to(device).eval(),saved
 

@@ -1,4 +1,5 @@
 import os
+import time
 
 import cv2
 import numpy as np
@@ -22,6 +23,7 @@ class RoadSkeletonDataset(Dataset):
         random_crops_per_image=1,
         random_crop_seed=1234,
         crop_list_path="",
+        native_relations=False,
     ):
         super().__init__()
 
@@ -38,6 +40,7 @@ class RoadSkeletonDataset(Dataset):
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
         self.epoch = 0
+        self.native_relations = bool(native_relations)
 
         self.image_dir = self._resolve_image_dir(root_dir, split)
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -419,5 +422,12 @@ class RoadSkeletonDataset(Dataset):
 
         if self.transform:
             sample = self.transform(sample)
+
+        if self.native_relations:
+            from datasets.native_relation_batch import pack_native_sample
+            started = time.perf_counter()
+            sample['native_relations'], sample['native_relation_stats'] = pack_native_sample(
+                sample['mask'], sample['skeleton'])
+            sample['native_target_seconds'] = time.perf_counter() - started
 
         return sample

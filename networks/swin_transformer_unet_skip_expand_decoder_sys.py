@@ -2410,6 +2410,11 @@ class SwinTransformerSys(nn.Module):
                             mode="bilinear",
                             align_corners=False,
                         )
+                        if hasattr(self, 'h_pixel_reassembly') and not getattr(self, 'disable_h_pixel_reassembly', False):
+                            c3 = next(row['connectivity'] for row in reversed(structure_outputs)
+                                      if isinstance(row, dict) and row.get('stage') == 3)
+                            h3_surface = h3_surface + self.h_pixel_reassembly(
+                                x, highres_skeleton_feat, g3, c3)
                         x = self.surface_h3_fusion(
                             torch.cat([x, h3_surface], dim=1)
                         )
