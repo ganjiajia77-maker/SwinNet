@@ -53,6 +53,7 @@ def main():
         if not config.get('h_pixel_reassembly'):raise ValueError('Expected H pixel reassembly checkpoint')
         model.requires_grad_(False)
         name='pixel_'+config['h_reassembly_prior']
+        if config.get('no_encoder_a1a2',False):name+='_no_a1a2'
         thresholds=np.round(np.arange(.05,.951,.01),2).astype(np.float32)
         counts=np.zeros((len(thresholds),3),np.int64)
         probabilities=out/'val_probabilities';probabilities.mkdir()

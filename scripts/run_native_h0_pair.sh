@@ -43,6 +43,7 @@ case "$MODE" in
       --h_reassembly_channels 16 --h_reassembly_floor 0.1
       --h_reassembly_chunk_rows "${H_REASSEMBLY_CHUNK_ROWS:-32}"
       --verify_original_b_initial_state "$reference")
+    if [[ ${NO_ENCODER_A1A2:-0} == 1 ]]; then extra+=(--no_encoder_a1a2); fi
     if [[ "$MODE" == pixel_resume ]]; then
       test -s "$RESULTS/$run/last.pth"
       extra+=(--resume "$RESULTS/$run/last.pth")
@@ -52,11 +53,12 @@ case "$MODE" in
     if [[ "$MODE" == pixel_smoke ]]; then extra+=(--native_smoke_only); fi
     if [[ "$MODE" == pixel_train ]]; then
       test -s "$RESULTS/${PIXEL_RUN_NAME}_smoke/native_smoke.json"
-      python - "$RESULTS/${PIXEL_RUN_NAME}_smoke/native_smoke.json" "${H_REASSEMBLY_PRIOR:-predicted}" "${H_REASSEMBLY_CHUNK_ROWS:-32}" <<'PY'
+      python - "$RESULTS/${PIXEL_RUN_NAME}_smoke/native_smoke.json" "${H_REASSEMBLY_PRIOR:-predicted}" "${H_REASSEMBLY_CHUNK_ROWS:-32}" "${NO_ENCODER_A1A2:-0}" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
 assert d['passed'] and d['initial_output_identity']['exact'] and d['reassembly_output_gradient_norm']>0
 assert d['reassembly_prior']==sys.argv[2] and d['reassembly_chunk_rows']==int(sys.argv[3])
+assert d.get('no_encoder_a1a2',False)==(sys.argv[4]=='1')
 PY
     fi
     python -u train_image.py "${common[@]}" --run_name "$run" "${extra[@]}"

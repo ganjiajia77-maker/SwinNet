@@ -64,6 +64,8 @@ parser.add_argument('--native_relation_experiment', action='store_true', help='u
 parser.add_argument('--native_targets_in_loader', action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument('--native_targets_verify_batches', type=int, default=1)
 parser.add_argument('--h_pixel_reassembly', action='store_true', help='pixel-query reconstruction of the final H contribution only')
+parser.add_argument('--no_encoder_a1a2', action='store_true',
+                    help='remove A1/A2 heads, merge modulation and their encoder Stage3 attention bias')
 parser.add_argument('--h_reassembly_channels', type=int, default=16)
 parser.add_argument('--h_reassembly_floor', type=float, default=.1)
 parser.add_argument('--h_reassembly_prior', choices=['predicted','uniform'], default='predicted')
@@ -1269,9 +1271,11 @@ if __name__ == "__main__":
             )
         loaded_pretrained_names = model.load_from(config)
 
-    if args.h_pixel_reassembly:
+    if args.h_pixel_reassembly or args.no_encoder_a1a2:
         from networks.h_pixel_reassembly import install_reassembly_from_args
         install_reassembly_from_args(model, vars(args))
+        if args.no_encoder_a1a2:
+            print('[A1/A2 REMOVED] '+json.dumps(model.swin_unet.encoder_road_prior_ablation),flush=True)
 
     if (args.record_initial_state or args.verify_initial_state or args.initial_manifest_only or args.verify_original_b_initial_state) and not args.resume and not args.warm_start_ckpt:
         hashes={}
@@ -1291,11 +1295,16 @@ if __name__ == "__main__":
                 expected=json.load(stream)
             added_prefix='swin_unet.h_pixel_reassembly.'
             shared={k:v for k,v in hashes.items() if not k.startswith(added_prefix)}
-            if shared!=expected['tensors'] or any(manifest[k]!=expected[k] for k in ('seed','pretrain_sha256','native_relations')):
+            removed=set(getattr(model.swin_unet,'encoder_road_prior_ablation',{}).get('removed_keys',[]))
+            if not removed.issubset(expected['tensors']):
+                raise ValueError('Deleted A1/A2 keys do not match original B initialization')
+            expected_shared={k:v for k,v in expected['tensors'].items() if k not in removed}
+            if shared!=expected_shared or any(manifest[k]!=expected[k] for k in ('seed','pretrain_sha256','native_relations')):
                 raise ValueError('Original B initialization differs')
             with open(os.path.join(args.output_dir,'original_b_initialization_check.json'),'w',encoding='utf-8') as stream:
                 json.dump(dict(passed=True,original_manifest=args.verify_original_b_initial_state,
-                               shared_tensors=len(shared),added_parameters=[k for k in hashes if k.startswith(added_prefix)]),stream,indent=2)
+                               shared_tensors=len(shared),removed_tensors=sorted(removed),
+                               added_parameters=[k for k in hashes if k.startswith(added_prefix)]),stream,indent=2)
         if args.verify_initial_state:
             with open(args.verify_initial_state,encoding='utf-8') as stream: expected=json.load(stream)
             if expected!=manifest:raise ValueError('Initial model differs from its preflight manifest')
@@ -1573,6 +1582,8 @@ if __name__ == "__main__":
             new_grad=float(module.out.weight.grad.norm())
             if not np.isfinite(new_grad) or new_grad<=0:raise RuntimeError('Reconstruction output projection receives no gradient')
             report.update(initial_output_identity=identity,reassembly_output_gradient_norm=new_grad,
+                          no_encoder_a1a2=args.no_encoder_a1a2,
+                          identity_reference='same ablated backbone with H reconstruction bypassed' if args.no_encoder_a1a2 else 'original B',
                           reassembly_prior=args.h_reassembly_prior,
                           reassembly_chunk_rows=args.h_reassembly_chunk_rows,
                           reassembly_stats={k:float(v) for k,v in module.last_stats.items()},

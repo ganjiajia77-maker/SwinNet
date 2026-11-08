@@ -144,4 +144,7 @@ def install_reassembly_from_args(model, saved):
             prior_mode=saved.get('h_reassembly_prior','predicted'),
             chunk_rows=saved.get('h_reassembly_chunk_rows',32),
             checkpoint_chunks=saved.get('h_reassembly_checkpoint',True))
+    if saved.get('no_encoder_a1a2',False):
+        from .remove_encoder_road_priors import remove_encoder_road_priors
+        remove_encoder_road_priors(model)
     return model
