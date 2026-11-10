@@ -3,6 +3,7 @@ import copy
 import csv
 import math
 import os
+import json
 import random
 import sys
 import tempfile
@@ -254,12 +255,21 @@ parser.add_argument(
 parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
+parser.add_argument('--encoder_h_postmerge_phase', action='store_true')
+parser.add_argument('--h0_config_checkpoint', type=str, default='', help='original H0 checkpoint; read configuration only')
+parser.add_argument('--h_phase_initial_strength', type=float, default=.05)
+parser.add_argument('--h_phase_smoke_only', action='store_true')
+parser.add_argument('--h_phase_audit_interval', type=int, default=50)
+parser.add_argument('--h_phase_smoke_manifest', type=str, default='')
 
 args = parser.parse_args()
+from h0_phase_training import inherit_h0_config
+h_phase_reference_report = inherit_h0_config(args, parser)
 
 
 def _cli_has(flag):
-    return any(
+    inherited = h_phase_reference_report['inherited_keys'] if h_phase_reference_report else []
+    return flag.lstrip('-').replace('-', '_') in inherited or any(
         arg == flag or arg.startswith(flag + "=")
         for arg in sys.argv[1:]
     )
@@ -1188,6 +1198,13 @@ if __name__ == "__main__":
     
     inherit_resume_architecture_args(args)
     apply_structure_profile_defaults(args)
+    if h_phase_reference_report is not None:
+        from h0_phase_training import write_report
+        h_phase_reference_report['resolved_args'] = dict(vars(args))
+        write_report(os.path.join(args.output_dir, 'h0_reference_config.json'), h_phase_reference_report)
+        print('[H0 CONFIG] Original H0 settings inherited; reference weights are not loaded.', flush=True)
+        print('[H0 CONFIG] accumulation_steps={} seed={} max_epochs={} EMA={} AMP={}'.format(
+            args.accumulation_steps, args.seed, args.max_epochs, args.use_ema, args.amp_dtype), flush=True)
 
     # 加载配置
     config = get_config(args)
@@ -1248,6 +1265,30 @@ if __name__ == "__main__":
                 "Set --pretrain_ckpt or use --no_pretrain."
             )
         loaded_pretrained_names = model.load_from(config)
+
+    if args.encoder_h_postmerge_phase:
+        from networks.encoder_h_postmerge_phase import install_encoder_h_postmerge_phase
+        from h0_phase_training import tensor_digests, write_report
+        before_phase = tensor_digests(model)
+        install_encoder_h_postmerge_phase(model, args.h_phase_initial_strength)
+        after_phase = tensor_digests(model)
+        retained = [key for key in before_phase if key in after_phase]
+        changed = [key for key in retained if before_phase[key] != after_phase[key]]
+        removed = sorted(set(before_phase)-set(after_phase))
+        if changed or removed != model.swin_unet.encoder_a1a2_removed_keys:
+            raise RuntimeError('Shared H0 initialization changed beyond the explicit A1/A2 deletion')
+        initial_report = dict(base='599a410', shared_tensors_checked=len(retained), mismatches=changed,
+            removed_keys=removed, initial_tensors=after_phase, pretrain_sha256=h_phase_reference_report['pretrain_sha256'],
+            initialization='SwinV2/ImageNet plus original H0 random initialization; no trained road weights')
+        if not args.resume:
+            if args.h_phase_smoke_manifest:
+                with open(args.h_phase_smoke_manifest, encoding='utf-8') as stream:
+                    smoke_initial = json.load(stream)
+                if (smoke_initial['initial_tensors'] != initial_report['initial_tensors'] or
+                        smoke_initial['pretrain_sha256'] != initial_report['pretrain_sha256']):
+                    raise ValueError('Training initialization differs from the successful smoke run')
+            write_report(os.path.join(args.output_dir, 'phase_initial_state.json'), initial_report)
+        print('[PHASE INIT] retained={} changed={} removed={}'.format(len(retained), len(changed), len(removed)), flush=True)
 
     def build_layerwise_optimizer():
         loaded_params, new_params = [], []
@@ -1439,6 +1480,10 @@ if __name__ == "__main__":
 
     # 优化器 / 损失（graph-only 模式在加载 checkpoint 后再建 optimizer）
     criterion = build_criterion(args, loss_weights, device)
+    if args.encoder_h_postmerge_phase and args.h_phase_smoke_only:
+        from h0_phase_training import smoke
+        smoke(model, criterion, train_loader, args, device)
+        sys.exit(0)
     optimizer = None
 
     # 检查是否恢复训练
@@ -1452,6 +1497,10 @@ if __name__ == "__main__":
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
             checkpoint_state = checkpoint["model_state_dict"]
+            if args.encoder_h_postmerge_phase:
+                if not checkpoint.get('args', {}).get('encoder_h_postmerge_phase'):
+                    raise ValueError('Resume requires a checkpoint from this phase experiment')
+                model.load_state_dict(checkpoint_state, strict=True)
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
             skipped_gate_keys = []
@@ -1958,6 +2007,15 @@ if __name__ == "__main__":
                     continue
 
                 (loss / accumulation_steps).backward()
+                if args.encoder_h_postmerge_phase and (i == 0 or (i+1) % max(args.h_phase_audit_interval, 1) == 0):
+                    from h0_phase_training import phase_gradients, phase_stats
+                    gradients = phase_gradients(model)
+                    if not all(np.isfinite(value) and value > 0 for value in gradients.values()):
+                        raise RuntimeError('Missing or invalid task gradients in encoder-H exchange: '+str(gradients))
+                    audit = dict(epoch=epoch+1, batch=i+1, loss=float(loss.detach()),
+                                 gradients=gradients, **phase_stats(model))
+                    with open(os.path.join(args.output_dir, 'encoder_h_phase_training.jsonl'), 'a', encoding='utf-8') as stream:
+                        stream.write(json.dumps(audit)+'\n')
                 accumulation_count += 1
                 should_step = (
                     accumulation_count >= accumulation_steps

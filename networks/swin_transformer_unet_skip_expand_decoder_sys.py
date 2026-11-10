@@ -1004,7 +1004,7 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, road_prior=None):
+    def forward(self, x, road_prior=None, before_merge=None, after_merge=None):
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, None, None, None, None, road_prior)
@@ -1013,6 +1013,8 @@ class BasicLayer(nn.Module):
         self.last_road_attention = None
         self.last_pre_downsample = x
         if self.downsample is not None:
+            if before_merge is not None:
+                before_merge(x, self.input_resolution)
             road_attention = None
             if self.road_attention_head is not None:
                 H, W = self.input_resolution
@@ -1027,6 +1029,8 @@ class BasicLayer(nn.Module):
                     else None
                 ),
             )
+            if after_merge is not None:
+                x = after_merge(x, tuple(value//2 for value in self.input_resolution))
         return x
 
     def extra_repr(self) -> str:
@@ -1768,7 +1772,7 @@ class SwinTransformerSys(nn.Module):
         return {'relative_position_bias_table'}
 
     # Encoder and Bottleneck
-    def forward_features(self, x):
+    def forward_features(self, x, encoder_h=None):
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -1780,6 +1784,14 @@ class SwinTransformerSys(nn.Module):
 
         for i_layer, layer in enumerate(self.layers):
             x_downsample.append(x)
+            before_merge = after_merge = None
+            if encoder_h is not None and i_layer < 3:
+                def before_merge(tokens, resolution, stage=i_layer):
+                    nonlocal encoder_h
+                    encoder_h = self.encoder_h_postmerge_phases[stage].before_merge(tokens, encoder_h, resolution)
+                    self.last_encoder_features[f'H_E{stage+1}'] = encoder_h
+                def after_merge(tokens, resolution, stage=i_layer):
+                    return self.encoder_h_postmerge_phases[stage].after_merge(tokens, encoder_h, resolution)
             x = layer(
                 x,
                 road_prior=(
@@ -1787,6 +1799,8 @@ class SwinTransformerSys(nn.Module):
                     if i_layer == 2
                     else None
                 ),
+                before_merge=before_merge,
+                after_merge=after_merge,
             )
             if i_layer == 0 and layer.last_road_attention is not None:
                 stage1_road_attention = layer.last_road_attention
@@ -1809,6 +1823,8 @@ class SwinTransformerSys(nn.Module):
         x = self.bottleneck_swin_block(x)
         x = self.norm(x)  # B L C
 
+        if encoder_h is not None:
+            return x, x_downsample, road_attentions, encoder_h
         return x, x_downsample, road_attentions
 
     def _highres_structure_stage_enabled(self, stage):
@@ -2062,6 +2078,7 @@ class SwinTransformerSys(nn.Module):
         x_downsample,
         bottleneck_tokens=None,
         z_struct=None,
+        encoder_h=None,
     ):
         """
         Decoder with DCA-FPN-Lite refinement on stage 2 and stage 3 skips.
@@ -2077,12 +2094,16 @@ class SwinTransformerSys(nn.Module):
         stage2_structure_feat = None
         self.last_stage_features = {}
         highres_skeleton_feat = (
-            self.highres_skeleton_adapter(z_struct)
-            if z_struct is not None and self.highres_skeleton_adapter is not None
-            else None
+            encoder_h if encoder_h is not None else (
+                self.highres_skeleton_adapter(z_struct)
+                if z_struct is not None and self.highres_skeleton_adapter is not None
+                else None)
         )
         if highres_skeleton_feat is not None:
             self.last_stage_features["H0"] = highres_skeleton_feat
+        if encoder_h is not None:
+            self.last_stage_features['H0'] = self.last_encoder_features['H_initial']
+            self.last_stage_features['H_decoder_input'] = encoder_h
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
             if highres_skeleton_feat is not None
@@ -2415,13 +2436,21 @@ class SwinTransformerSys(nn.Module):
         x,
     ):
         structure_input = x
-        x, x_downsample, road_attentions = self.forward_features(x)
-        z_struct = self._build_highres_structure_outputs(structure_input)
+        encoder_h = None
+        if hasattr(self, 'encoder_h_postmerge_phases'):
+            z_struct = self._build_highres_structure_outputs(structure_input)
+            encoder_h = self.highres_skeleton_adapter(z_struct)
+            self.last_encoder_features = {'H_initial': encoder_h}
+            x, x_downsample, road_attentions, encoder_h = self.forward_features(x, encoder_h=encoder_h)
+        else:
+            x, x_downsample, road_attentions = self.forward_features(x)
+            z_struct = self._build_highres_structure_outputs(structure_input)
         x, structure_outputs, highres_skeleton_feat = self.forward_up_features(
             x,
             x_downsample,
             bottleneck_tokens=x,
             z_struct=z_struct,
+            encoder_h=encoder_h,
         )
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
