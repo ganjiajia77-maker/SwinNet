@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 
 
-def run(diagnostic_dir, tool, workers=4, module=None):
+def run(diagnostic_dir, tool, workers=4, module=None, models=None):
     root = Path(diagnostic_dir).resolve()
     tool = Path(tool).resolve()
     if workers < 1:
@@ -36,8 +36,13 @@ def run(diagnostic_dir, tool, workers=4, module=None):
         protocol_hash=module.digest(protocol), threshold_protocol_hash=module.threshold_protocol_hash(protocol),
         note='Previously fixed threshold for all modes; no threshold selection or sweep here.', models={})
     expected_modes = {'normal', 'c_prior_one', 'residual_off'}
-    if {model['name'] for model in manifest['models']} != expected_modes:
-        raise ValueError('Expected the three frozen-checkpoint diagnostic modes')
+    actual_modes = {model['name'] for model in manifest['models']}
+    if actual_modes not in (expected_modes, expected_modes | {'bias_only'}):
+        raise ValueError('Expected the three frozen-checkpoint modes with optional bias_only')
+    if models is not None:
+        if not models or not set(models) <= actual_modes:
+            raise ValueError('Requested topology modes are not present in this diagnostic')
+        manifest = dict(manifest, models=[item for item in manifest['models'] if item['name'] in models])
     for model in manifest['models']:
         sources = model['predictions'].get('val', [])
         if len(sources) != 1 or module.threshold_of(sources[0]) != threshold:
@@ -65,5 +70,6 @@ if __name__ == '__main__':
     parser.add_argument('--topo_tool', type=Path, default=Path(
         '/home/gjj/unified-road-six-4b7d37a/evaluation/road_comparison/compare_predictions.py'))
     parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--models', nargs='+', help='Only score these cached modes, e.g. bias_only')
     args = parser.parse_args()
-    run(args.diagnostic_dir, args.topo_tool, args.workers)
+    run(args.diagnostic_dir, args.topo_tool, args.workers, models=args.models)

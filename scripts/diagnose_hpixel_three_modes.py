@@ -227,12 +227,12 @@ def analyse_case(case, gt, logits, maps, difficult, entry, threshold, bias_abs_m
     return pred, comparison, fixed, logit_rows, source_rows, residual_rows
 
 
-def summarize_comparison(rows):
+def summarize_comparison(rows, modes=MODES):
     result = []
     totals = ('closed', 'newly_closed_vs_normal', 'lost_closed_vs_normal',
               'new_bridge_proxy_vs_normal', 'removed_bridge_proxy_vs_normal',
               'added_tp', 'lost_tp', 'added_fp', 'removed_fp')
-    for mode in MODES:
+    for mode in modes:
         selected = [row for row in rows if row['mode'] == mode]
         counts = {key: sum(row[key] for row in selected) for key in ('tp', 'fp', 'fn')}
         result.append(dict(mode=mode, threshold=selected[0]['threshold'], images=len(selected),

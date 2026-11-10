@@ -88,3 +88,15 @@ def test_rejects_provenance_mismatch_without_running_metrics(tmp_path, change):
         run(tmp_path, Path('unused.py'), module=fake_tool(calls))
     assert not calls
     assert not (tmp_path/'topology_fixed_val').exists()
+
+
+def test_bias_only_selection_scores_no_cached_old_modes(tmp_path):
+    setup_case(tmp_path)
+    path=tmp_path/'manifest.json'
+    data=json.loads(path.read_text())
+    import copy
+    bias=copy.deepcopy(data['models'][0]);bias['name']='bias_only'
+    data['models'].append(bias);write(path,data)
+    calls=[]
+    run(tmp_path,Path('unused.py'),module=fake_tool(calls),models=['bias_only'])
+    assert set(calls[0]['selection']['models'])=={'bias_only'}
