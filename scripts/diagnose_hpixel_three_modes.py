@@ -244,12 +244,9 @@ def summarize_comparison(rows):
 def run_topology(args):
     if not args.topo_tool.is_file():
         raise FileNotFoundError(args.topo_tool)
-    command = [sys.executable, '-u', str(args.topo_tool), '--manifest',
-            str(args.output_dir/'manifest.json'), '--split', 'val', '--output_dir',
-            str(args.output_dir/'topology'), '--workers', str(args.workers),
-            '--progress_every', '1']
-    if (args.output_dir/'topology'/'run_state.json').is_file():
-        command.append('--resume')
+    command = [sys.executable, '-u', str(ROOT/'scripts/evaluate_fixed_val_topology.py'),
+               '--diagnostic_dir', str(args.output_dir), '--topo_tool', str(args.topo_tool),
+               '--workers', str(args.workers)]
     print('[TOPOLOGY] Same fixed threshold, 14 val images, 3 modes; see topology.log', flush=True)
     with (args.output_dir/'topology.log').open('a') as stream:
         subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, check=True)

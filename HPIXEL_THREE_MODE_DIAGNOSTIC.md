@@ -16,7 +16,7 @@
 
 固定198缺口沿用原清单ID、像素、锚点。局部判据为缺口覆盖至少80%，锚点在原坐标包围盒外扩16像素范围内共享一个预测连通分量。明确记录该范围，不能与使用不同局部范围的旧表混算。双道路桥接沿用 `selector_transport_reference.bridge_proxy`。正反向代理计数不保证一一对应，不直接相减当净错误桥接数。
 
-外部工具 `/home/gjj/unified-road-six-4b7d37a/evaluation/road_comparison/compare_predictions.py` 读取三组导出的验证mask，同一GT路径复用。APLS上限150、seed1234；TOPO密度0.002、步长0.0002；TLTS参数200。val manifest每组只有一个已经固定的阈值；工具不进行阈值搜索。它输出真正的六项图评价，未调用本仓库旧的近似APLS。
+外部工具 `/home/gjj/unified-road-six-4b7d37a/evaluation/road_comparison/compare_predictions.py` 读取三组导出的验证mask，同一GT路径复用。APLS上限150、seed1234；TOPO密度0.002、步长0.0002；TLTS参数200。每组只有一个已经固定的阈值，不进行阈值搜索。`evaluate_fixed_val_topology.py` 将固定阈值及原来源身份传给工具原有的 `evaluate()`，绕过旧val CLI先写选择文件再拒绝非空目录的问题，不修改其图指标实现。结果保存到 `topology_fixed_val`，原失败目录保留；同一输入和实现支持断点恢复。
 
 ## 偏置与空间修正
 
@@ -47,7 +47,7 @@ logit统计使用融合后的整图输出。权重和特征统计使用互不重
 
 - `TABLES.txt`：可直接cat的所有紧凑结果表。
 - `comparison.csv`、`per_image.csv`：IoU/clDice、闭合、相对normal新增/丢失TP/FP和桥接代理。
-- `topology/val_comparison.csv`：同阈值六项拓扑；APLS列名 `apls_bidirectional`。
+- `topology_fixed_val/val_comparison.csv`：同阈值六项拓扑；APLS列名 `apls_bidirectional`。`topology_result_dir.txt`记录实际目录。
 - `fixed_gap_changes.csv`：原198缺口逐ID、逐模式状态。
 - `logit_changes.csv`：实际道路logit各区域变化，含逐图分位数与偏置条件分解。
 - `source_weights.csv`：逐区域、逐方向权重和L1变化。

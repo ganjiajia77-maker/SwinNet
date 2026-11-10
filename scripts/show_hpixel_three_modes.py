@@ -46,7 +46,9 @@ def show(out):
     render('同阈值结果，所有变化均相对normal',
            ['模式', 'IoU', 'clDice', '闭合', '新增闭合', '丢失闭合', '新增桥接代理', '反向桥接代理', '新增TP', '丢失TP', '新增FP', '消除FP'],
            [[fmt(r[k]) if k in ('iou', 'cldice') else r[k] for k in fields] for r in comparison])
-    path_rows = read(out/'topology'/'val_comparison.csv')
+    topology_pointer = out/'topology_result_dir.txt'
+    topology_dir = Path(topology_pointer.read_text().strip()) if topology_pointer.is_file() else out/'topology'
+    path_rows = read(topology_dir/'val_comparison.csv')
     render('同口径六项拓扑：APLS上限150，TOPO间隔0.002，步长0.0002',
            ['模式', 'clDice', 'TOPO-P', 'TOPO-R', 'TOPO-F1', 'APLS', 'TLTS-Infeasible'],
            [[r.get('name', r.get('model', '?'))] + [fmt(r.get(k)) for k in
