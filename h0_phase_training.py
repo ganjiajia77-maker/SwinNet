@@ -5,6 +5,8 @@ from pathlib import Path
 
 import torch
 
+SAMPLING_PROTOCOL = 'mass-h0-shared-epoch-affine-crop-v1-workers-restarted'
+
 
 def file_digest(path):
     digest = hashlib.sha256()
@@ -49,6 +51,10 @@ def inherit_h0_config(args, parser):
         if key in saved and key not in runtime:
             setattr(args, key, saved[key])
             inherited.append(key)
+    # Explicit user override: recreate workers each epoch. Keep the original
+    # shared epoch as well, so the dataset itself is safe under either policy.
+    args.disable_persistent_workers = True
+    args.sampling_protocol = SAMPLING_PROTOCOL
     if args.warm_start_ckpt:
         raise ValueError('This experiment starts from ImageNet, not a trained road checkpoint')
     required = dict(max_epochs=80, img_size=512, source_patch_size=1500, batch_size=2,
@@ -74,6 +80,10 @@ def inherit_h0_config(args, parser):
         reference_args=saved, pretrain_sha256=pretrain_sha,
         cfg_sha256=file_digest(args.cfg) if hasattr(args, 'cfg') and Path(args.cfg).is_file() else None,
         accumulation_steps_inherited=args.accumulation_steps)
+    report['sampling_protocol'] = SAMPLING_PROTOCOL
+    report['explicit_overrides'] = dict(disable_persistent_workers=dict(
+        reference=saved.get('disable_persistent_workers', False), actual=True,
+        reason='User requested restarting workers and different crop positions every epoch'))
     del checkpoint
     return report
 

@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from mass_protocol import crop_position
 
 
 class RoadSkeletonDataset(Dataset):
@@ -37,7 +38,8 @@ class RoadSkeletonDataset(Dataset):
         self.random_crop_train = bool(random_crop_train and split == "train")
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
-        self.epoch = 0
+        # Share epoch with persistent DataLoader workers, including spawn workers.
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
         self.image_dir = self._resolve_image_dir(root_dir, split)
         self.mask_dir = self._resolve_label_dir(root_dir, split, ("mask", "label"))
@@ -53,6 +55,11 @@ class RoadSkeletonDataset(Dataset):
 
         if len(self.image_files) == 0:
             raise RuntimeError(f"No image files found in {self.image_dir}")
+
+        self.label_files = [self._find_label_name(name, self.mask_dir) for name in self.image_files]
+        available_labels = {name for name in os.listdir(self.mask_dir) if name.lower().endswith(exts)}
+        if len(set(self.label_files)) != len(self.image_files) or set(self.label_files) != available_labels:
+            raise ValueError(f'Image/GT case sets differ in {split}; no silent intersections')
 
         self.fixed_crop_items = self._load_crop_list(crop_list_path)
         self.tile_positions = None if self.fixed_crop_items else self._build_tile_positions()
@@ -77,8 +84,12 @@ class RoadSkeletonDataset(Dataset):
             positions.append(last)
         return positions
 
+    @property
+    def epoch(self):
+        return int(self._epoch.item())
+
     def set_epoch(self, epoch):
-        self.epoch = int(epoch)
+        self._epoch.fill_(int(epoch))
 
     def _load_crop_list(self, crop_list_path):
         if not crop_list_path:
@@ -332,7 +343,7 @@ class RoadSkeletonDataset(Dataset):
                 + image_index * 9176
                 + crop_ordinal * 101
             )
-            rng = np.random.RandomState(rng_seed)
+            rng = np.random.RandomState(rng_seed % (2 ** 32))
             tile_position = None
         elif self.tile_positions is None:
             image_index = idx
@@ -341,7 +352,7 @@ class RoadSkeletonDataset(Dataset):
             image_index = idx // len(self.tile_positions)
             tile_position = self.tile_positions[idx % len(self.tile_positions)]
         image_name = self.image_files[image_index]
-        label_name = self._find_label_name(image_name, self.mask_dir)
+        label_name = self.label_files[image_index]
 
         image_path = os.path.join(self.image_dir, image_name)
         mask_path = os.path.join(self.mask_dir, label_name)
@@ -354,6 +365,14 @@ class RoadSkeletonDataset(Dataset):
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Cannot read mask: {mask_path}")
+
+        expected_shape = (self.source_patch_size, self.source_patch_size)
+        if image.shape[:2] != expected_shape or mask.shape != expected_shape:
+            raise ValueError(f'Expected native {expected_shape}: {image_path}, image={image.shape}, GT={mask.shape}')
+        values = np.unique(mask)
+        if not np.isin(values, (0, 1, 255)).all() or (1 in values and 255 in values):
+            raise ValueError(f'Expected binary 0/1 or 0/255 GT: {mask_path}')
+        mask = (mask > 0).astype(np.uint8) * 255
 
         if self.source_patch_size is not None:
             source_size = (self.source_patch_size, self.source_patch_size)
@@ -373,10 +392,8 @@ class RoadSkeletonDataset(Dataset):
             if crop_size is None:
                 raise ValueError("random_crop_train requires tile_size or image_size.")
             height, width = image.shape[:2]
-            max_top = max(height - crop_size, 0)
-            max_left = max(width - crop_size, 0)
-            top = rng.randint(0, max_top + 1) if max_top > 0 else 0
-            left = rng.randint(0, max_left + 1) if max_left > 0 else 0
+            top, left = crop_position(self.random_crop_seed, image_index, crop_ordinal,
+                                      self.epoch, height, width, crop_size)
             tile_position = (top, left)
 
         if tile_position is not None:

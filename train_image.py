@@ -70,7 +70,7 @@ parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_windo
 parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument('--loader_prefetch_factor', default=2, type=int, help='DataLoader prefetch factor when num_workers > 0')
-parser.add_argument('--disable_persistent_workers', action='store_true', help='disable persistent DataLoader workers')
+parser.add_argument('--disable_persistent_workers', action='store_true', default=True, help='workers restart every epoch; persistent workers disabled in this experiment')
 parser.add_argument('--tiny_overfit_samples', default=0, type=int, help='use the first N training samples for tiny-set overfit debugging')
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
@@ -1205,6 +1205,7 @@ if __name__ == "__main__":
         print('[H0 CONFIG] Original H0 settings inherited; reference weights are not loaded.', flush=True)
         print('[H0 CONFIG] accumulation_steps={} seed={} max_epochs={} EMA={} AMP={}'.format(
             args.accumulation_steps, args.seed, args.max_epochs, args.use_ema, args.amp_dtype), flush=True)
+        print('[SAMPLING] original Mass H0 shared epoch and crop sequence restored; persistent_workers=False', flush=True)
 
     # 加载配置
     config = get_config(args)
@@ -1500,6 +1501,9 @@ if __name__ == "__main__":
             if args.encoder_h_postmerge_phase:
                 if not checkpoint.get('args', {}).get('encoder_h_postmerge_phase'):
                     raise ValueError('Resume requires a checkpoint from this phase experiment')
+                from h0_phase_training import SAMPLING_PROTOCOL
+                if checkpoint.get('args', {}).get('sampling_protocol') != SAMPLING_PROTOCOL:
+                    raise ValueError('Cannot resume the old sampling experiment; start a fresh 80-epoch run')
                 model.load_state_dict(checkpoint_state, strict=True)
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -1932,6 +1936,14 @@ if __name__ == "__main__":
             for i, batch in enumerate(train_loader):
                 if args.max_train_batches > 0 and train_batches >= args.max_train_batches:
                     break
+                if args.encoder_h_postmerge_phase and i == 0:
+                    sampling_record = dict(epoch=epoch+1, dataset_epoch=train_dataset.epoch,
+                        persistent_workers=False, samples=[dict(image=name,
+                            top=int(batch['tile_top'][j]), left=int(batch['tile_left'][j]))
+                            for j, name in enumerate(batch['image_name'])])
+                    with open(os.path.join(args.output_dir, 'sampling_epochs.jsonl'), 'a', encoding='utf-8') as handle:
+                        handle.write(json.dumps(sampling_record)+'\n')
+                    print('[EPOCH CROP]', json.dumps(sampling_record), flush=True)
                 batch_start_time = time.perf_counter()
 
                 images = batch['image'].to(device)
