@@ -256,6 +256,7 @@ parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 parser.add_argument('--encoder_h_postmerge_phase', action='store_true')
+parser.add_argument('--complete_no_h_ablation', action='store_true', help='remove all H and H-dependent final global topology; retain G and original losses')
 parser.add_argument('--h0_config_checkpoint', type=str, default='', help='original H0 checkpoint; read configuration only')
 parser.add_argument('--h_phase_initial_strength', type=float, default=.05)
 parser.add_argument('--h_phase_smoke_only', action='store_true')
@@ -1272,15 +1273,27 @@ if __name__ == "__main__":
         from h0_phase_training import tensor_digests, write_report
         before_phase = tensor_digests(model)
         install_encoder_h_postmerge_phase(model, args.h_phase_initial_strength)
+        if args.complete_no_h_ablation:
+            from networks.complete_no_h import install_complete_no_h
+            install_complete_no_h(model)
         after_phase = tensor_digests(model)
         retained = [key for key in before_phase if key in after_phase]
         changed = [key for key in retained if before_phase[key] != after_phase[key]]
         removed = sorted(set(before_phase)-set(after_phase))
-        if changed or removed != model.swin_unet.encoder_a1a2_removed_keys:
-            raise RuntimeError('Shared H0 initialization changed beyond the explicit A1/A2 deletion')
+        expected_removed = sorted(set(model.swin_unet.encoder_a1a2_removed_keys) |
+            set(getattr(model.swin_unet, 'no_h_removed_keys', [])))
+        expected_removed = [key for key in expected_removed if key in before_phase]
+        if changed or removed != expected_removed:
+            raise RuntimeError('Shared H0 initialization changed beyond the explicit ablation deletion')
         initial_report = dict(base='599a410', shared_tensors_checked=len(retained), mismatches=changed,
             removed_keys=removed, initial_tensors=after_phase, pretrain_sha256=h_phase_reference_report['pretrain_sha256'],
             initialization='SwinV2/ImageNet plus original H0 random initialization; no trained road weights')
+        if args.complete_no_h_ablation:
+            from networks.complete_no_h import architecture_checks
+            initial_report['variant'] = 'complete_no_h'
+            initial_report['architecture_checks'] = architecture_checks(model)
+            if not all(initial_report['architecture_checks'].values()):
+                raise RuntimeError('Incomplete H deletion')
         if not args.resume:
             if args.h_phase_smoke_manifest:
                 with open(args.h_phase_smoke_manifest, encoding='utf-8') as stream:
@@ -1504,6 +1517,8 @@ if __name__ == "__main__":
                 from h0_phase_training import SAMPLING_PROTOCOL
                 if checkpoint.get('args', {}).get('sampling_protocol') != SAMPLING_PROTOCOL:
                     raise ValueError('Cannot resume the old sampling experiment; start a fresh 80-epoch run')
+                if bool(checkpoint.get('args', {}).get('complete_no_h_ablation')) != args.complete_no_h_ablation:
+                    raise ValueError('Resume variant differs: complete-no-H and H baseline must remain separate')
                 model.load_state_dict(checkpoint_state, strict=True)
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -2026,7 +2041,8 @@ if __name__ == "__main__":
                         raise RuntimeError('Missing or invalid task gradients in encoder-H exchange: '+str(gradients))
                     audit = dict(epoch=epoch+1, batch=i+1, loss=float(loss.detach()),
                                  gradients=gradients, **phase_stats(model))
-                    with open(os.path.join(args.output_dir, 'encoder_h_phase_training.jsonl'), 'a', encoding='utf-8') as stream:
+                    audit_name = 'no_h_training.jsonl' if args.complete_no_h_ablation else 'encoder_h_phase_training.jsonl'
+                    with open(os.path.join(args.output_dir, audit_name), 'a', encoding='utf-8') as stream:
                         stream.write(json.dumps(audit)+'\n')
                 accumulation_count += 1
                 should_step = (

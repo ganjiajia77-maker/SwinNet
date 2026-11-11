@@ -23,6 +23,8 @@ def tensor_digests(model):
 
 def inherit_h0_config(args, parser):
     """Read only saved args, never load trained reference weights into the model."""
+    if getattr(args, 'complete_no_h_ablation', False) and not args.encoder_h_postmerge_phase:
+        raise ValueError('Complete-no-H must use the inherited ccc7992 phase training protocol')
     if not args.encoder_h_postmerge_phase:
         return None
     path = Path(args.h0_config_checkpoint)
@@ -33,7 +35,7 @@ def inherit_h0_config(args, parser):
     if not isinstance(saved, dict):
         raise ValueError('Original H0 checkpoint must contain its training args')
     for key in ('native_relation_experiment', 'static_h0_stage_fusion', 'h_pixel_reassembly',
-                'h_encoder_exchange', 'encoder_h_postmerge_phase'):
+                'h_encoder_exchange', 'encoder_h_postmerge_phase', 'complete_no_h_ablation'):
         if saved.get(key):
             raise ValueError('Configuration reference is not the original full H0: '+key)
     state = checkpoint.get('model_state_dict', {})
@@ -44,7 +46,7 @@ def inherit_h0_config(args, parser):
     runtime = {'root_path', 'output_dir', 'run_name', 'cfg', 'pretrain_ckpt', 'resume',
                'warm_start_ckpt', 'h0_config_checkpoint', 'encoder_h_postmerge_phase',
                'h_phase_initial_strength', 'h_phase_smoke_only', 'h_phase_audit_interval',
-               'h_phase_smoke_manifest'}
+               'h_phase_smoke_manifest', 'complete_no_h_ablation'}
     inherited = []
     for action in parser._actions:
         key = action.dest
@@ -84,6 +86,14 @@ def inherit_h0_config(args, parser):
     report['explicit_overrides'] = dict(disable_persistent_workers=dict(
         reference=saved.get('disable_persistent_workers', False), actual=True,
         reason='User requested restarting workers and different crop positions every epoch'))
+    if getattr(args, 'complete_no_h_ablation', False):
+        if getattr(args, 'highres_structure_skeleton_weight', 0.) != 0.:
+            raise ValueError('H-specific auxiliary loss must already have zero weight in this ablation')
+        report['variant'] = 'complete_no_h'
+        report['effective_architecture'] = dict(H_stream=False, H_encoder_exchange=False,
+            H_decoder_exchange=False, H_global_topology=False, A1A2=False,
+            G_refinement=True, G3_surface_fusion=True,
+            construction_args='Original H0 is initialized first; H-specific modules are then removed')
     del checkpoint
     return report
 
@@ -93,6 +103,9 @@ def write_report(path, value):
 
 
 def phase_gradients(model):
+    if getattr(model.swin_unet, 'complete_no_h_ablation', False):
+        from networks.complete_no_h import task_gradients
+        return task_gradients(model)
     result = {}
     for index, module in enumerate(model.swin_unet.encoder_h_postmerge_phases, 1):
         for name in ('to_h', 'to_e'):
@@ -102,6 +115,9 @@ def phase_gradients(model):
 
 
 def phase_stats(model):
+    if getattr(model.swin_unet, 'complete_no_h_ablation', False):
+        from networks.complete_no_h import forward_stats
+        return forward_stats(model)
     core = model.swin_unet
     return dict(stages=[{key: float(value) for key, value in module.last_stats.items()}
                         for module in core.encoder_h_postmerge_phases],
@@ -110,6 +126,9 @@ def phase_stats(model):
 
 
 def smoke(model, criterion, loader, args, device):
+    if getattr(model.swin_unet, 'complete_no_h_ablation', False):
+        from networks.complete_no_h import smoke as no_h_smoke
+        return no_h_smoke(model, criterion, loader, args, device)
     model.train()
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)

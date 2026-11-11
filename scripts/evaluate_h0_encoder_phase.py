@@ -65,6 +65,9 @@ def build_model(saved):
               if key in keys and key not in ('config', 'img_size', 'num_classes', 'return_skeleton')}
     model = SwinUnet(config, img_size=size, num_classes=1, return_skeleton=True, **kwargs)
     install_encoder_h_postmerge_phase(model, saved.get('h_phase_initial_strength', .05))
+    if saved.get('complete_no_h_ablation'):
+        from networks.complete_no_h import install_complete_no_h
+        install_complete_no_h(model)
     return model
 
 

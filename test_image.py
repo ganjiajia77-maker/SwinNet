@@ -326,6 +326,9 @@ if __name__ == "__main__":
         if isinstance(checkpoint, dict) and checkpoint.get('args', {}).get('encoder_h_postmerge_phase', False):
             from networks.encoder_h_postmerge_phase import install_encoder_h_postmerge_phase
             install_encoder_h_postmerge_phase(model, checkpoint['args'].get('h_phase_initial_strength', .05))
+            if checkpoint['args'].get('complete_no_h_ablation'):
+                from networks.complete_no_h import install_complete_no_h
+                install_complete_no_h(model)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             adapt_connectivity_modules_for_checkpoint(
                 model,

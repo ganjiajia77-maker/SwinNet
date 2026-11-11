@@ -31,12 +31,13 @@ for title,path in [('参考H0配置',root/'h0_reference_config.json'),
         data={k:v for k,v in data.items() if k not in ('reference_args','resolved_args','inherited_keys')}
         data['resolved_training']={k:resolved.get(k) for k in ('max_epochs','batch_size','accumulation_steps',
             'seed','amp_dtype','use_ema','img_size','source_patch_size','random_crop_train','random_crops_per_image',
-            'disable_persistent_workers','num_workers','sampling_protocol',
+            'disable_persistent_workers','num_workers','sampling_protocol','complete_no_h_ablation',
             'max_train_batches','pretrained_lr','new_lr','warmup_epochs','val_interval','threshold',
             'stage2_skeleton_weight','stage3_skeleton_weight','stage_connectivity_factor','stage_direction_factor')}
     print(json.dumps(data,ensure_ascii=False,indent=2))
-print('\n========== 最近5条编码器H更新与梯度 ==========')
-path=root/'encoder_h_phase_training.jsonl'
+no_h=(root/'no_h_training.jsonl').is_file()
+print('\n========== 最近5条'+('无H模型G分支与梯度' if no_h else '编码器H更新与梯度')+' ==========')
+path=root/('no_h_training.jsonl' if no_h else 'encoder_h_phase_training.jsonl')
 if path.is_file():
     for line in path.read_text().splitlines()[-5:]:print(line)
 else:print('尚未生成')

@@ -787,7 +787,7 @@ class DecoderStructureRefinement(nn.Module):
             )
         if (
             self.highres_skeleton_fusion is not None
-            and highres_skeleton_feat is not None
+            and (highres_skeleton_feat is not None or getattr(self, 'complete_no_h_ablation', False))
         ):
             structure_feat, highres_skeleton_feat = self.highres_skeleton_fusion(
                 highres_skeleton_feat,

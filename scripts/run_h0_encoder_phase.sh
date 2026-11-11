@@ -21,6 +21,9 @@ if [[ "$MODE" == check ]]; then
     --seed 1234 --num_workers 4 --output "$RESULTS/${run}_sampling.json"
 fi
 extra=()
+if [[ "${NO_H_ABLATION:-0}" == 1 ]]; then
+  extra+=(--complete_no_h_ablation)
+fi
 if [[ "$MODE" == smoke ]]; then
   run="${run}_smoke"
   extra+=(--h_phase_smoke_only)
@@ -47,7 +50,7 @@ assert report['persistent_workers'] is False and config['disable_persistent_work
 assert config['random_crop_train'] and config['random_crops_per_image']==1
 assert Path(report['data_root']).resolve()==Path(config['root_path']).resolve()
 PY
-  python - "$RESULTS/${run}_smoke/phase_smoke.json" "$H0_REFERENCE" "$PRETRAIN" <<'PY'
+  python - "$RESULTS/${run}_smoke/phase_smoke.json" "$H0_REFERENCE" "$PRETRAIN" "${NO_H_ABLATION:-0}" <<'PY'
 import hashlib,json,sys
 def sha(path):
     value=hashlib.sha256()
@@ -55,9 +58,15 @@ def sha(path):
         for chunk in iter(lambda:f.read(1024*1024),b''):value.update(chunk)
     return value.hexdigest()
 report=json.load(open(sys.argv[1]))
-assert report['passed'] and report['optimizer_steps']==0 and report['H_consumed_by_decoder']
+assert report['passed'] and report['optimizer_steps']==0
+if sys.argv[4]=='1':
+    assert report['variant']=='complete_no_h' and not report['H_consumed_by_decoder']
+    assert report['no_H_tensors'] and all(report['checks'].values())
+else:
+    assert report.get('variant')!='complete_no_h' and report['H_consumed_by_decoder']
 assert report['reference_checkpoint_sha256']==sha(sys.argv[2])
-assert report['pretrain_sha256']==sha(sys.argv[3]) and report['initial_strength']==.05
+assert report['pretrain_sha256']==sha(sys.argv[3])
+if sys.argv[4]!='1':assert report['initial_strength']==.05
 PY
   extra+=(--h_phase_smoke_manifest "$RESULTS/${run}_smoke/phase_initial_state.json")
 fi
