@@ -95,6 +95,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
             device=anchor_score.device,
             dtype=torch.bool,
         )
+        capture = getattr(self, 'capture_anchor_selection', False)
+        selected_candidate_indices = torch.full_like(scores, -1, dtype=torch.long) if capture else None
 
         for batch_index in range(batch):
             candidate_valid = values[batch_index] > 0
@@ -132,6 +134,20 @@ class KeypointGuidedGlobalTopology(nn.Module):
             coords[batch_index, :count] = sample_coords[selected_tensor]
             scores[batch_index, :count] = sample_scores[selected_tensor]
             valid[batch_index, :count] = True
+            if capture:
+                selected_candidate_indices[batch_index, :count] = selected_tensor
+        if capture:
+            # Actual topk/FPS tensors, not an independently rerun approximation.
+            self.last_anchor_selection = {
+                'anchor_hw': (height, width),
+                'candidate_coords': candidate_coords.detach().cpu(),
+                'candidate_scores': values.detach().cpu(),
+                'candidate_valid': (values > 0).detach().cpu(),
+                'selected_coords': coords.detach().cpu(),
+                'selected_scores': scores.detach().cpu(),
+                'selected_valid': valid.detach().cpu(),
+                'selected_candidate_indices': selected_candidate_indices.detach().cpu(),
+            }
         return coords, valid, scores, candidate_count
 
     def _sample_features_at_anchor_coords(self, feature, coords, anchor_hw):
