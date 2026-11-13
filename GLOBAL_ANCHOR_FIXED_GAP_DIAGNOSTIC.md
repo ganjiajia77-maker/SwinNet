@@ -20,6 +20,15 @@ One validation replay uses the same native1500/512-window/256-stride FP32,
 no-TTA, tapered-logit blend minimum0.1 protocol. Only RGB is passed to the model.
 Candidates and final nodes use the exact window-pixel coordinates of the current
 global module; native coordinates are `(window_top+y, window_left+x)`.
+For the Stage2 relocation, one node spans a 4×4 native cell. The diagnostic
+uses its center representative (offset + 4 × grid index + 2) and stores both
+the original grid coordinate and the native representative in the node table.
+The optional `--baseline_evaluation_dir` compares closure and the existing
+off-road bridge proxy at the baseline's validation-selected threshold, using
+both caches and the same GT. The `baseline_disconnected_common` cohort fixes
+the reference gap population for node-coverage comparison. The usual coverage
+cohorts retain each checkpoint's own validation-selected threshold.
+
 The real pre-global candidate score remains normalized H norm times the module's
 surface prior, followed by topk256 (or the actual configured higher node budget),
 score>0 validity, then the original FPS. Invalid zero-padded slots never count.

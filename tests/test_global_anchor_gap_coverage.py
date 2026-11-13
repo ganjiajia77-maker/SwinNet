@@ -180,9 +180,11 @@ def test_cohort_uses_unique_gaps_and_excludes_uncertain_side_labels():
 def test_complete_198_gap_report_reuses_cached_masks_and_threshold(tmp_path, monkeypatch):
     root = tmp_path/'data'
     evaluation = tmp_path/'evaluation'
+    baseline = tmp_path/'baseline'
     output = tmp_path/'diagnostic'
     for folder in ('val_probabilities', 'val_masks'):
         (evaluation/folder).mkdir(parents=True)
+    (baseline/'val_probabilities').mkdir(parents=True)
     checkpoint = tmp_path/'best.pth'; checkpoint.write_bytes(b'fixed checkpoint')
     sha = diagnostic.file_digest(checkpoint)
     names = [f'case{i}' for i in range(14)]
@@ -193,12 +195,17 @@ def test_complete_198_gap_report_reuses_cached_masks_and_threshold(tmp_path, mon
         gaps = [dict(example, id=j) for j in range(16 if index == 0 else 14)]
         images[case] = dict(shape=[1500, 1500], gaps=gaps)
         np.save(evaluation/'val_probabilities'/(case+'.npy'), probability)
+        np.save(baseline/'val_probabilities'/(case+'.npy'), gt.astype(np.float32))
         cv2.imwrite(str(evaluation/'val_masks'/(case+'.png')), np.zeros_like(gt, np.uint8))
     fixed = tmp_path/'fixed.json'
     fixed.write_text(json.dumps(dict(count=198, p0_reference_threshold=.45, images=images)))
     (evaluation/'val_selection.json').write_text(json.dumps(dict(selected_on='val',
         criterion='global_iou', checkpoint_sha256=sha, threshold=.48)))
     (evaluation/'protocol.json').write_text(json.dumps(dict(checkpoint_sha256=sha,
+        window=512, stride=256, ramp_min=.1, data_root=str(root.resolve()))))
+    (baseline/'val_selection.json').write_text(json.dumps(dict(selected_on='val',
+        criterion='global_iou', checkpoint_sha256='baseline', threshold=.45)))
+    (baseline/'protocol.json').write_text(json.dumps(dict(checkpoint_sha256='baseline',
         window=512, stride=256, ramp_min=.1, data_root=str(root.resolve()))))
     class Data:
         def __init__(self, *args, **kwargs):self.image_files = [case+'.png' for case in names]
@@ -219,13 +226,17 @@ def test_complete_198_gap_report_reuses_cached_masks_and_threshold(tmp_path, mon
     monkeypatch.setattr(diagnostic, 'capture_image', lambda model, image, device, check_first:
         (probability.copy(), records, True if check_first else None))
     args = SimpleNamespace(checkpoint=checkpoint, evaluation_dir=evaluation, root_path=root,
-        fixed_gaps=fixed, output_dir=output, device='cpu', tolerance=12., no_visuals=True)
+        fixed_gaps=fixed, output_dir=output, device='cpu', tolerance=12., no_visuals=True,
+        baseline_evaluation_dir=baseline)
     diagnostic.run(args)
     summary = json.loads((output/'summary.json').read_text())
     assert summary['complete'] and summary['fixed_gaps'] == 198 and summary['threshold'] == .48
     primary = next(row for row in summary['cohorts'] if row['cohort'] == 'still_disconnected')
     assert primary['gaps'] == 198 and primary['valid_two_side_gaps'] == 198
     assert primary['selected_correct_pair'] == 198
+    assert summary['comparison']['threshold'] == .45
+    assert summary['comparison']['baseline_closed'] == summary['comparison']['lost'] == 198
+    assert summary['comparison']['gained'] == 0
     assert (output/'nodes.csv').is_file() and (output/'gap_windows.csv').is_file()
     assert json.loads((output/'checks.json').read_text())['model_unchanged']
 

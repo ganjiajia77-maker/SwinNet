@@ -175,3 +175,21 @@ def summarize_gap(records, geometry):
     if len(geometry['anchors']) != 2:
         result['candidates_both_geometric'] = result['selected_both_geometric'] = None
     return result, rows
+
+
+def bridge_proxy(reference, prediction, gt):
+    """Existing proxy: new off-road components joining two reference components."""
+    _, old = cv2.connectedComponents(reference.astype(np.uint8), connectivity=8)
+    gt_buffer = cv2.dilate(gt.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    added = prediction & ~reference & ~gt_buffer
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(added.astype(np.uint8), connectivity=8)
+    count = 0
+    for index in range(1, n):
+        if stats[index, cv2.CC_STAT_AREA] < 3:
+            continue
+        x, y, width, height = map(int, stats[index, :4])
+        y0, y1 = max(y-2, 0), min(y+height+2, gt.shape[0])
+        x0, x1 = max(x-2, 0), min(x+width+2, gt.shape[1])
+        near = cv2.dilate((labels[y0:y1, x0:x1] == index).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        count += int((np.unique(old[y0:y1, x0:x1][near]) > 0).sum() >= 2)
+    return count

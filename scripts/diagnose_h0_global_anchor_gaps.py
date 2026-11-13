@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
-from diagnostics.global_anchor_gap_geometry import gap_geometry, local_status, summarize_gap
+from diagnostics.global_anchor_gap_geometry import bridge_proxy, gap_geometry, local_status, summarize_gap
 from h0_phase_training import SAMPLING_PROTOCOL, file_digest, tensor_digests
 from scripts.evaluate_h0_encoder_phase import blend_weight, load_model, positions
 
@@ -90,10 +90,16 @@ def capture_image(model, image, device, check_first=False, tile=512, stride=256)
                 if observer.calls != 1 or module.last_anchor_selection is None:
                     raise RuntimeError('Expected exactly one actual global anchor selection per window')
                 trace = module.last_anchor_selection
-                if trace['anchor_hw'] != (tile, tile):
-                    raise RuntimeError('Global anchor coordinates are not native window pixels')
+                scale = 4 if getattr(model.swin_unet, 'global_topology_stage2', False) else 1
+                if trace['anchor_hw'] != (tile//scale, tile//scale):
+                    raise RuntimeError('Unexpected anchor grid for the configured topology location')
                 record = {key: value[0].numpy().copy() for key, value in trace.items() if key != 'anchor_hw'}
-                record.update(top=top, left=left, tile=tile, alpha_global=float(module.alpha_global))
+                for kind in ('candidate', 'selected'):
+                    key = kind+'_coords'
+                    record[kind+'_grid_coords'] = record[key]
+                    record[key] = record[key]*scale + scale//2
+                record.update(top=top, left=left, tile=tile, anchor_scale=scale,
+                              alpha_global=float(module.alpha_global))
             logits = outputs[0]
             if ordinary is not None:
                 identical = bool(torch.equal(ordinary, logits))
@@ -215,6 +221,20 @@ def run(args):
         if actual != set(cases):
             raise ValueError('Missing/extra cases in existing '+folder)
     threshold = float(selection['threshold'])
+    baseline_eval = getattr(args, 'baseline_evaluation_dir', None)
+    common_threshold = None
+    if baseline_eval is not None:
+        baseline_protocol = json.loads((baseline_eval/'protocol.json').read_text())
+        baseline_selection = json.loads((baseline_eval/'val_selection.json').read_text())
+        if (baseline_protocol.get('global_topology_location', 'after_final_x4') != 'after_final_x4'
+                or baseline_selection.get('selected_on') != 'val'
+                or baseline_selection.get('criterion') != 'global_iou'
+                or baseline_selection['checkpoint_sha256'] != baseline_protocol['checkpoint_sha256']
+                or baseline_selection['checkpoint_sha256'] == checkpoint_sha
+                or any(baseline_protocol.get(key) != cached_protocol.get(key)
+                       for key in ('data_root', 'image_size', 'window', 'stride', 'ramp_min', 'stitch', 'amp', 'EMA', 'TTA'))):
+            raise ValueError('Baseline comparison requires a different final-x4 checkpoint and matched validation protocol')
+        common_threshold = float(baseline_selection['threshold'])
     out = args.output_dir
     out.mkdir(parents=True)
     for name in ('nodes', 'cases_visual'):
@@ -224,6 +244,11 @@ def run(args):
         root_path=str(args.root_path.resolve()), fixed_gaps=str(args.fixed_gaps.resolve()),
         fixed_gaps_sha256=file_digest(args.fixed_gaps), declared_reference_fingerprint=reference.get('sha256'),
         fixed_reference_origin=reference.get('origin'), threshold=threshold,
+        global_topology_location='after_decoder_stage2' if saved.get('global_topology_stage2') else 'after_final_x4',
+        anchor_native_mapping='window offset + grid index * scale + scale // 2, scale=4 for Stage2, 1 for final-x4',
+        baseline_evaluation_dir=str(baseline_eval.resolve()) if baseline_eval else None,
+        baseline_checkpoint_sha256=baseline_selection['checkpoint_sha256'] if baseline_eval else None,
+        comparison_threshold=common_threshold,
         reference_P0_threshold=.45, tolerance_native_pixels=args.tolerance,
         side_validation='GT-local eight-neighbor geodesic within tolerance; closer to own anchors than other side or gap',
         closure_margin=16, closure_coverage=.8, primary_cohort='locally disconnected anchors at current final surface threshold',
@@ -236,7 +261,7 @@ def run(args):
     write_json(out/'protocol.json', protocol)
     before = state_digest(model)
     gap_rows, window_rows, per_image, node_rows = [], [], [], []
-    cache_checks = []
+    cache_checks, bridge_rows = [], []
     first_equal = None
     for index in range(len(data)):
         sample = data[index]
@@ -258,6 +283,15 @@ def run(args):
         if difference > 1e-6 or not np.array_equal(probability >= threshold, cached_mask > 0):
             raise ValueError(f'Current forward differs from cached predictions: {case} max_abs={difference}')
         pred = cached_mask > 0
+        if baseline_eval is not None:
+            baseline = np.load(baseline_eval/'val_probabilities'/(case+'.npy'), allow_pickle=False)
+            if baseline.shape != gt.shape or not np.isfinite(baseline).all() or baseline.min() < 0 or baseline.max() > 1:
+                raise ValueError('Invalid baseline probabilities: '+case)
+            baseline_pred = baseline >= common_threshold
+            common_pred = cached >= common_threshold
+            bridge_rows.append(dict(case=case, threshold=common_threshold,
+                added_bridge_proxy=bridge_proxy(baseline_pred, common_pred, gt),
+                removed_bridge_proxy=bridge_proxy(common_pred, baseline_pred, gt)))
         cache_checks.append(dict(case=case, probability_max_abs=difference,
             cached_probability_sha256=file_digest(args.evaluation_dir/'val_probabilities'/(case+'.npy')),
             cached_mask_sha256=file_digest(mask_file), GT_sha256=hashlib.sha256(gt.tobytes()).hexdigest()))
@@ -268,8 +302,10 @@ def run(args):
                 valid = record[kind+'_valid']
                 for ni in np.flatnonzero(valid):
                     y, x = record[kind+'_coords'][ni]
+                    gy, gx = record.get(kind+'_grid_coords', record[kind+'_coords'])[ni]
                     node_rows.append(dict(case=case, window=wi, window_top=record['top'], window_left=record['left'],
                         kind=kind, index=int(ni), y=int(y)+record['top'], x=int(x)+record['left'],
+                        grid_y=int(gy), grid_x=int(gx),
                         score=float(record[kind+'_scores'][ni]),
                         selected_candidate_index=int(record['selected_candidate_indices'][ni]) if kind == 'selected' else int(ni)))
         case_rows = []
@@ -280,6 +316,12 @@ def run(args):
             row = dict(case=case, gap_id=gap['id'], length=gap.get('length', len(gap['pixels'])),
                 length_bin=gap.get('length_bin', 'unknown'), anchor_groups=len(gap['anchors']),
                 side_GT_valid=geometry['valid'], exclusion_reason=geometry['reason'], **status, **coverage)
+            if baseline_eval is not None:
+                old = local_status(baseline_pred, gap)
+                new = local_status(common_pred, gap)
+                row.update(comparison_threshold=common_threshold,
+                    baseline_closed_proxy=old['closed_proxy'], current_closed_proxy_common=new['closed_proxy'],
+                    baseline_connected=old['anchor_connected_local'], current_connected_common=new['anchor_connected_local'])
             gap_rows.append(row); case_rows.append(row)
             for detail in details:
                 window_rows.append(dict(case=case, gap_id=gap['id'], side_GT_valid=geometry['valid'], **detail))
@@ -300,6 +342,9 @@ def run(args):
         aggregate([r for r in gap_rows if r['still_disconnected']], 'still_disconnected'),
         aggregate([r for r in gap_rows if not r['closed_proxy']], 'legacy_unclosed_proxy'),
         aggregate([r for r in gap_rows if r['closed_proxy']], 'closed_control')]
+    if baseline_eval is not None:
+        cohorts.append(aggregate([r for r in gap_rows if not r['baseline_connected']],
+                                 'baseline_disconnected_common'))
     summary = dict(complete=True, images=len(data), fixed_gaps=len(gap_rows), threshold=threshold,
         tolerance=args.tolerance, cohorts=cohorts,
         exclusion_reasons=dict(Counter(r['exclusion_reason'] for r in gap_rows if not r['side_GT_valid'])),
@@ -307,6 +352,15 @@ def run(args):
     checks = dict(model_unchanged=before == after, state_before=before, state_after=after,
         first_window_capture_bitwise_equal=first_equal, cached_predictions_equal=True,
         no_training=True, GT_in_forward=False, cache_checks=cache_checks)
+    if baseline_eval is not None:
+        summary['comparison'] = dict(threshold=common_threshold,
+            baseline_closed=sum(r['baseline_closed_proxy'] for r in gap_rows),
+            current_closed=sum(r['current_closed_proxy_common'] for r in gap_rows),
+            gained=sum(r['current_closed_proxy_common'] and not r['baseline_closed_proxy'] for r in gap_rows),
+            lost=sum(r['baseline_closed_proxy'] and not r['current_closed_proxy_common'] for r in gap_rows),
+            added_bridge_proxy=sum(r['added_bridge_proxy'] for r in bridge_rows),
+            removed_bridge_proxy=sum(r['removed_bridge_proxy'] for r in bridge_rows))
+        write_csv(out/'bridge_comparison.csv', bridge_rows)
     write_csv(out/'summary.csv', cohorts)
     write_csv(out/'per_image.csv', per_image)
     write_csv(out/'gap_windows.csv', window_rows)
@@ -332,6 +386,14 @@ def write_report(out, summary):
         '局部GT道路距离不能区分标注中已连成一体的立交/交叉；高分案例仍需检查图像。',
         '可用节点对不等于高注意力权重、有效回写或实际补通。可视化每幅图只显示一个窗口的节点。',
         'GT仅用于离线核验；模型权重与缓冲区不变，输出与原评价缓存一致。']
+    if 'comparison' in summary:
+        comparison = summary['comparison']
+        lines += ['', f"同阈值对照使用基线验证集阈值 {comparison['threshold']:.6f}。", '',
+            '| 基线闭合 | 当前闭合 | 新增闭合 | 丢失闭合 | 新增桥接代理 | 反向桥接代理 |',
+            '|---:|---:|---:|---:|---:|---:|',
+            '| ' + ' | '.join(str(comparison[key]) for key in (
+                'baseline_closed', 'current_closed', 'gained', 'lost',
+                'added_bridge_proxy', 'removed_bridge_proxy')) + ' |']
     (out/'REPORT.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
 
 
@@ -341,12 +403,16 @@ def show(out):
     for row in summary['cohorts']:
         print(f"{row['cohort']:30} {row['gaps']:4d} {row['valid_two_side_gaps']:5d} {row['candidates_both_geometric']:15d} {row['selected_both_geometric']:13d} {row['selected_correct_pair']:12d}")
     print('排除原因：', json.dumps(summary['exclusion_reasons'], ensure_ascii=False))
+    if 'comparison' in summary:
+        print('\n同阈值闭合及桥接代理对照')
+        print(' | '.join(f'{key}={value}' for key, value in summary['comparison'].items()))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--evaluation_dir', type=Path)
+    parser.add_argument('--baseline_evaluation_dir', type=Path, help='existing final-x4 validation cache for same-threshold closure and bridge comparison')
     parser.add_argument('--root_path', type=Path, default=Path('/home/gjj/Swin-Unet-main/Massachusetts/tiff'))
     parser.add_argument('--fixed_gaps', type=Path, default=Path('/home/gjj/SwinNet-roadbias/model_out/full_h0_joint_pair_v1/reference/fixed_gaps_and_anchors.json'))
     parser.add_argument('--output_dir', type=Path, required=True)

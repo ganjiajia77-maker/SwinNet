@@ -325,7 +325,8 @@ if __name__ == "__main__":
     if checkpoint is not None:
         if isinstance(checkpoint, dict) and checkpoint.get('args', {}).get('encoder_h_postmerge_phase', False):
             from networks.encoder_h_postmerge_phase import install_encoder_h_postmerge_phase
-            install_encoder_h_postmerge_phase(model, checkpoint['args'].get('h_phase_initial_strength', .05))
+            install_encoder_h_postmerge_phase(model, checkpoint['args'].get('h_phase_initial_strength', .05),
+                global_topology_stage2=bool(checkpoint['args'].get('global_topology_stage2')))
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             adapt_connectivity_modules_for_checkpoint(
                 model,

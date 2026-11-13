@@ -2291,6 +2291,14 @@ class SwinTransformerSys(nn.Module):
                     )
                     self.last_stage_features["G2"] = stage2_structure_feat
                     self.last_stage_features["H1"] = highres_skeleton_feat
+                    if self.enable_global_topology and getattr(self, 'global_topology_stage2', False):
+                        # Stage2 is complete. Stage3 consumes the updated main
+                        # feature through its usual skip fusion on the next iteration.
+                        p2 = self._surface_prior_for_global_topology(x_map, highres_skeleton_feat)
+                        x_map = self.global_topology.forward_feature_anchors(
+                            x_map, highres_skeleton_feat, p2,
+                            connectivity_feature=self._decoder_connectivity_used(connectivity_i),
+                        )
                 x = map_to_token(x_map)
                 self._append_structure_output(
                     structure_outputs,
@@ -2394,7 +2402,8 @@ class SwinTransformerSys(nn.Module):
             x = x.view(B, 4 * H, 4 * W, -1)
             x = x.permute(0, 3, 1, 2)  # B,C,H,W
             if self.return_skeleton:
-                if self.enable_global_topology and highres_skeleton_feat is not None:
+                if (self.enable_global_topology and highres_skeleton_feat is not None
+                        and not getattr(self, 'global_topology_stage2', False)):
                     surface_prob = self._surface_prior_for_global_topology(
                         x,
                         highres_skeleton_feat,

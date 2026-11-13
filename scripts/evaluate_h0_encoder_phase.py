@@ -64,7 +64,8 @@ def build_model(saved):
     kwargs = {key: value for key, value in saved.items()
               if key in keys and key not in ('config', 'img_size', 'num_classes', 'return_skeleton')}
     model = SwinUnet(config, img_size=size, num_classes=1, return_skeleton=True, **kwargs)
-    install_encoder_h_postmerge_phase(model, saved.get('h_phase_initial_strength', .05))
+    install_encoder_h_postmerge_phase(model, saved.get('h_phase_initial_strength', .05),
+        global_topology_stage2=bool(saved.get('global_topology_stage2')))
     return model
 
 
@@ -116,9 +117,9 @@ def select_threshold(curve):
     return max(curve, key=lambda row: (row['iou'], -row['threshold']))
 
 
-def manifest(root, out, checkpoint, sha, threshold):
+def manifest(root, out, checkpoint, sha, threshold, name=NAME):
     return dict(data_root=str(root.resolve()), protocol=TOPOLOGY_PROTOCOL,
-        models=[dict(name=NAME, provenance=dict(checkpoint=str(checkpoint.resolve()), sha256=sha,
+        models=[dict(name=name, provenance=dict(checkpoint=str(checkpoint.resolve()), sha256=sha,
             protocol='native1500 FP32; 512/256 triangular logit fusion, ramp min0.1; no EMA/TTA'),
             validation_selection=dict(selected_on='val', criterion='global_iou', threshold=threshold,
                                       evidence=str((out/'val_selection.json').resolve())),
@@ -136,6 +137,7 @@ def inference(args):
     if args.output_dir.exists():raise ValueError('Use a new inference output directory')
     device = torch.device(args.device)
     model, saved, epoch = load_model(args.checkpoint, device)
+    name = 'h0_encoder_postmerge_global_stage2' if saved.get('global_topology_stage2') else NAME
     if saved.get('img_size') != 512 or saved.get('amp_dtype') != 'none':
         raise ValueError('Expected the FP32/512 experiment checkpoint')
     sha = file_digest(args.checkpoint)
@@ -145,6 +147,7 @@ def inference(args):
         checkpoint_epoch=epoch, data_root=str(args.root_path.resolve()), image_size=1500,
         window=512, stride=256, ramp_min=.1, stitch='weighted logits then sigmoid',
         amp=False, EMA=False, TTA=False, threshold_selected_on='val only; global IoU',
+        global_topology_location='after_decoder_stage2' if saved.get('global_topology_stage2') else 'after_final_x4',
         thresholds=[float(t) for t in THRESHOLDS], topology=TOPOLOGY_PROTOCOL))
     val = RoadSkeletonDataset(str(args.root_path), 'val', image_size=None, source_patch_size=1500,
                               augment=False, return_full_image=True)
@@ -179,8 +182,8 @@ def inference(args):
         write_csv(out/'test_per_image.csv', rows)
         print(f'[TEST] {index+1}/49 {case}', flush=True)
     total = [sum(row[key] for row in rows) for key in ('tp', 'fp', 'fn')]
-    write_csv(out/'test_segmentation.csv', [dict(model=NAME, threshold=threshold, **metrics(*total))])
-    dump(out/'manifest.json', manifest(args.root_path, out, args.checkpoint, sha, threshold))
+    write_csv(out/'test_segmentation.csv', [dict(model=name, threshold=threshold, **metrics(*total))])
+    dump(out/'manifest.json', manifest(args.root_path, out, args.checkpoint, sha, threshold, name))
     dump(out/'inference_complete.json', dict(complete=True, val_images=14, test_images=49,
          checkpoint_sha256=sha, threshold=threshold))
     print('[INFERENCE DONE]', out, flush=True)
