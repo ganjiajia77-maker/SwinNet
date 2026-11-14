@@ -1,0 +1,276 @@
+# coding=utf-8
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import copy
+import logging
+import math
+
+from os.path import join as pjoin
+
+import torch
+import torch.nn as nn
+import numpy as np
+
+from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
+from torch.nn.modules.utils import _pair
+from scipy import ndimage
+from .swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys
+
+logger = logging.getLogger(__name__)
+
+TOPOLOGY_ATTENTION_VERSION = "stage-topology-roadness-gap-v1"
+STRUCTURE_PROFILE_FULL = "full"
+STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626 = "stage23_boundary_0626"
+STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE = "stage23_boundary_0626_final_ske"
+
+
+def _core_swin_unet(model):
+    module = model.module if hasattr(model, "module") else model
+    return module.swin_unet
+
+
+def get_topology_coefficients(model):
+    module = model.module if hasattr(model, "module") else model
+    swin_unet = module.swin_unet
+    guided_head = swin_unet.guided_head
+    coefficients = {
+        "structure_profile": getattr(swin_unet, "structure_profile", "full"),
+        "final_structure_enabled": bool(guided_head.enable_final_structure),
+        "highres_structure_stream": {
+            "enabled": bool(getattr(swin_unet, "enable_highres_structure_stream", False)),
+            "source": "prepatch",
+            "channels": int(getattr(swin_unet, "highres_structure_channels", 0)),
+            "fuse_stages": getattr(swin_unet, "highres_structure_fuse_stages", "stage23"),
+            "fusion_mode": getattr(swin_unet, "highres_structure_fusion_mode", "stage23"),
+        },
+        "global_topology_enabled": bool(getattr(swin_unet, "enable_global_topology", False)),
+    }
+
+    for stage in (2, 3):
+        structure_block = swin_unet.decoder_structure_blocks[str(stage)]
+        coefficients[f"decoder_stage{stage}"] = {
+            "gamma1": float(structure_block.gamma1.detach().cpu()),
+            "structure_enabled": bool(swin_unet._decoder_structure_enabled(stage)),
+        }
+
+    if guided_head.enable_final_structure:
+        topology_attention = guided_head.final_topology_attention
+        coefficients["final_topology"] = {
+            "active": True,
+            "raw_eta": float(topology_attention.raw_eta.detach().cpu()),
+            "eta_eff": float(topology_attention.effective_eta().detach().cpu()),
+            "raw_rho_gap": float(guided_head.raw_rho_gap.detach().cpu()),
+            "rho_gap_eff": float(guided_head.effective_rho_gap().detach().cpu()),
+        }
+    else:
+        coefficients["final_topology"] = {
+            "active": False,
+            "raw_eta": 0.0,
+            "eta_eff": 0.0,
+            "raw_rho_gap": 0.0,
+            "rho_gap_eff": 0.0,
+        }
+
+    return coefficients
+
+
+def apply_structure_profile_runtime(model):
+    """Sync frozen topology flags after checkpoint load for 0626-style profiles."""
+    module = model.module if hasattr(model, "module") else model
+    swin_unet = module.swin_unet
+    guided_head = swin_unet.guided_head
+    if guided_head.enable_final_structure:
+        return
+
+    topology_attention = guided_head.final_topology_attention
+    with torch.no_grad():
+        if topology_attention is not None:
+            topology_attention.fixed_eta.zero_()
+            topology_attention.raw_eta.zero_()
+        guided_head.fixed_rho_gap.zero_()
+        guided_head.raw_rho_gap.zero_()
+    if topology_attention is not None:
+        topology_attention.raw_eta.requires_grad_(False)
+    guided_head.raw_rho_gap.requires_grad_(False)
+
+
+def format_topology_coefficients(model):
+    coefficients = get_topology_coefficients(model)
+    fields = [
+        f"version={TOPOLOGY_ATTENTION_VERSION}",
+        f"profile={coefficients['structure_profile']}",
+        f"final_structure={'on' if coefficients['final_structure_enabled'] else 'off'}",
+    ]
+    highres_values = coefficients["highres_structure_stream"]
+    fields.append(
+        "highres_structure={} source={} channels={} fuse_stages={} fusion_mode={}".format(
+            "on" if highres_values["enabled"] else "off",
+            highres_values["source"],
+            highres_values["channels"],
+            highres_values["fuse_stages"],
+            highres_values["fusion_mode"],
+        )
+    )
+    fields.append(
+        "global_topology={}".format(
+            "on" if coefficients["global_topology_enabled"] else "off"
+        )
+    )
+    for stage in ("decoder_stage2", "decoder_stage3"):
+        values = coefficients[stage]
+        enabled = "active" if values.get("structure_enabled") else "bypass"
+        fields.append(
+            "{}[{}] gamma1={:.6f}".format(
+                stage,
+                enabled,
+                values["gamma1"],
+            )
+        )
+    final_values = coefficients["final_topology"]
+    if final_values.get("active"):
+        fields.append(
+            "final_topology raw_eta={:.6f} eta_eff={:.8f} "
+            "raw_rho_gap={:.6f} rho_gap_eff={:.8f}".format(
+                final_values["raw_eta"],
+                final_values["eta_eff"],
+                final_values["raw_rho_gap"],
+                final_values["rho_gap_eff"],
+            )
+        )
+    else:
+        fields.append("final_topology=disabled")
+    return " | ".join(fields)
+
+
+def print_topology_coefficients(model, prefix="[TOPOLOGY]"):
+    message = f"{prefix} {format_topology_coefficients(model)}"
+    print(message, flush=True)
+    return message
+
+
+class SwinUnet(nn.Module):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False,
+                 return_skeleton=False, bottleneck_type="global_local",
+                 final_topology_eta_init=0.005, final_gap_rho_init=0.005,
+                 structure_profile=STRUCTURE_PROFILE_FULL,
+                 stage2_skeleton_gradient_ratio=0.5,
+                 stage3_skeleton_gradient_ratio=0.5,
+                 stage3_gate_topology_gradient_ratio=0.0,
+                 final_skeleton_gradient_ratio=0.0,
+                 enable_highres_structure_stream=False,
+                 highres_structure_channels=64,
+                 highres_structure_fuse_stages="stage23",
+                 highres_structure_fusion_mode="stage23",
+                 enable_post_refine_structure_interaction=False,
+                 enable_h3_surface_fusion=False,
+                 enable_global_topology=False,
+                 global_topology_max_nodes=32,
+                 global_topology_heads=4,
+                 global_topology_alpha_max=0.05,
+                 stage_skeleton_mode="prior_residual",
+                 stage_skeleton_bias_init="zero",
+                 stage_skeleton_positive_prior=0.05,
+                 remove_stage2_pre_topology_source=False):
+        super(SwinUnet, self).__init__()
+        self.num_classes = num_classes
+        self.zero_head = zero_head
+        self.config = config
+        self.return_skeleton = return_skeleton
+        self.bottleneck_type = bottleneck_type
+
+        self.swin_unet = SwinTransformerSys(img_size=config.DATA.IMG_SIZE,
+                                patch_size=config.MODEL.SWIN.PATCH_SIZE,
+                                in_chans=config.MODEL.SWIN.IN_CHANS,
+                                num_classes=self.num_classes,
+                                embed_dim=config.MODEL.SWIN.EMBED_DIM,
+                                depths=config.MODEL.SWIN.DEPTHS,
+                                num_heads=config.MODEL.SWIN.NUM_HEADS,
+                                window_size=config.MODEL.SWIN.WINDOW_SIZE,
+                                mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
+                                qkv_bias=config.MODEL.SWIN.QKV_BIAS,
+                                qk_scale=config.MODEL.SWIN.QK_SCALE,
+                                drop_rate=config.MODEL.DROP_RATE,
+                                drop_path_rate=config.MODEL.DROP_PATH_RATE,
+                                ape=config.MODEL.SWIN.APE,
+                                patch_norm=config.MODEL.SWIN.PATCH_NORM,
+                                use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+                                return_skeleton=self.return_skeleton,
+                                bottleneck_type=self.bottleneck_type,
+                                final_topology_eta_init=final_topology_eta_init,
+                                final_gap_rho_init=final_gap_rho_init,
+                                structure_profile=structure_profile,
+                                stage2_skeleton_gradient_ratio=stage2_skeleton_gradient_ratio,
+                                stage3_skeleton_gradient_ratio=stage3_skeleton_gradient_ratio,
+                                stage3_gate_topology_gradient_ratio=stage3_gate_topology_gradient_ratio,
+                                final_skeleton_gradient_ratio=final_skeleton_gradient_ratio,
+                                enable_highres_structure_stream=enable_highres_structure_stream,
+                                highres_structure_channels=highres_structure_channels,
+                                highres_structure_fuse_stages=highres_structure_fuse_stages,
+                                highres_structure_fusion_mode=highres_structure_fusion_mode,
+                                enable_post_refine_structure_interaction=(
+                                    enable_post_refine_structure_interaction
+                                ),
+                                enable_h3_surface_fusion=enable_h3_surface_fusion,
+                                enable_global_topology=enable_global_topology,
+                                global_topology_max_nodes=global_topology_max_nodes,
+                                 global_topology_heads=global_topology_heads,
+                                 global_topology_alpha_max=global_topology_alpha_max,
+                                 stage_skeleton_mode=stage_skeleton_mode,
+                                  stage_skeleton_bias_init=stage_skeleton_bias_init,
+                                 stage_skeleton_positive_prior=stage_skeleton_positive_prior,
+                                 remove_stage2_pre_topology_source=remove_stage2_pre_topology_source)
+    def forward(
+        self,
+        x,
+    ):
+        if x.size()[1] == 1:
+            x = x.repeat(1,3,1,1)
+        outputs = self.swin_unet(x)
+
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+            aux_outputs = outputs[1:]
+        else:
+            logits = outputs
+            aux_outputs = ()
+
+        if self.return_skeleton:
+            return (logits, *aux_outputs)
+        return logits
+
+    def load_from(self, config):
+        pretrained_path = config.MODEL.PRETRAIN_CKPT
+        if pretrained_path is None:
+            print("[INFO] No ImageNet checkpoint configured.")
+            return set()
+
+        print("[INFO] Loading encoder-only ImageNet checkpoint: {}".format(pretrained_path))
+        checkpoint = torch.load(
+            pretrained_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        pretrained_dict = checkpoint.get("model", checkpoint)
+        model_dict = self.swin_unet.state_dict()
+        compatible = {}
+        for key, value in pretrained_dict.items():
+            if key.startswith("head.") or "relative_position_index" in key or "attn_mask" in key:
+                continue
+            target_key = key
+            if ".downsample.reduction.weight" in key:
+                target_key = key.replace(".downsample.reduction.weight", ".downsample.linear_reduction.weight")
+            if target_key in model_dict and model_dict[target_key].shape == value.shape:
+                compatible[target_key] = value
+
+        result = self.swin_unet.load_state_dict(compatible, strict=False)
+        loaded = set(compatible)
+        print(
+            "[INFO] Loaded {} compatible ImageNet tensors; {} skipped/missing. "
+            "Decoder mirror weights are intentionally not loaded.".format(
+                len(loaded), len(result.missing_keys)
+            ),
+            flush=True,
+        )
+        return {"swin_unet." + key for key in loaded}

@@ -1,0 +1,13 @@
+torch
+torchvision
+numpy
+tqdm
+opencv-python
+scikit-image
+scipy
+h5py
+timm
+einops
+Pillow
+PyYAML
+yacs
