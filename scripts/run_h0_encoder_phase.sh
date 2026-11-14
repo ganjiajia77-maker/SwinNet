@@ -27,6 +27,8 @@ case "$no_s" in
   1) extra+=(--no_s) ;;
   *) echo 'NO_S must be 0 or 1' >&2; exit 2 ;;
 esac
+h_road_loss_weight=${H_ROAD_LOSS_WEIGHT:-0}
+extra+=(--h_road_loss_weight "$h_road_loss_weight")
 if [[ "$MODE" == smoke ]]; then
   run="${run}_smoke"
   extra+=(--h_phase_smoke_only)
@@ -53,7 +55,7 @@ assert report['persistent_workers'] is False and config['disable_persistent_work
 assert config['random_crop_train'] and config['random_crops_per_image']==1
 assert Path(report['data_root']).resolve()==Path(config['root_path']).resolve()
 PY
-  python - "$RESULTS/${run}_smoke/phase_smoke.json" "$H0_REFERENCE" "$PRETRAIN" "$no_s" <<'PY'
+  python - "$RESULTS/${run}_smoke/phase_smoke.json" "$H0_REFERENCE" "$PRETRAIN" "$no_s" "$h_road_loss_weight" <<'PY'
 import hashlib,json,sys
 def sha(path):
     value=hashlib.sha256()
@@ -66,6 +68,7 @@ assert report['reference_checkpoint_sha256']==sha(sys.argv[2])
 assert report['pretrain_sha256']==sha(sys.argv[3]) and report['initial_strength']==.05
 assert report.get('global_topology_stage2', False)
 assert bool(report.get('no_s')) == (sys.argv[4] == '1')
+assert float(report.get('h_road_loss_weight', 0)) == float(sys.argv[5])
 PY
   extra+=(--h_phase_smoke_manifest "$RESULTS/${run}_smoke/phase_initial_state.json")
 fi

@@ -44,7 +44,7 @@ def inherit_h0_config(args, parser):
     runtime = {'root_path', 'output_dir', 'run_name', 'cfg', 'pretrain_ckpt', 'resume',
                'warm_start_ckpt', 'h0_config_checkpoint', 'encoder_h_postmerge_phase',
                'h_phase_initial_strength', 'h_phase_smoke_only', 'h_phase_audit_interval',
-               'h_phase_smoke_manifest', 'global_topology_stage2', 'no_s'}
+               'h_phase_smoke_manifest', 'global_topology_stage2', 'no_s', 'h_road_loss_weight'}
     inherited = []
     for action in parser._actions:
         key = action.dest
@@ -122,7 +122,7 @@ def smoke(model, criterion, loader, args, device):
     images = batch['image'].to(device)
     mask, skel, dilated = (batch[key].to(device) for key in ('mask', 'skeleton', 'skeleton_dilate'))
     outputs = model(images)
-    loss, _ = criterion(outputs[0], surface_gt=mask, skeleton_gt=skel,
+    loss, loss_stats = criterion(outputs[0], surface_gt=mask, skeleton_gt=skel,
         skeleton_dilate_gt=dilated, boundary_logits=outputs[1], skeleton_logits=outputs[2],
         connectivity_logits=outputs[3], stage_outputs=outputs[4])
     surface = criterion.surface_loss(outputs[0], mask)[0]
@@ -136,6 +136,19 @@ def smoke(model, criterion, loader, args, device):
     grads = torch.autograd.grad(surface, parameters, retain_graph=True, allow_unused=True)
     surface_grads = {name: float(grad.float().norm()) if grad is not None else 0.
                      for name, grad in zip(names, grads)}
+    h_road_weight = float(getattr(args, 'h_road_loss_weight', 0.0))
+    h_road_grads = {}
+    if h_road_weight > 0:
+        logits = next(entry['h_road_logits'] for entry in outputs[4] if 'h_road_logits' in entry)
+        resized = torch.nn.functional.interpolate(
+            logits, size=mask.shape[-2:], mode='bilinear', align_corners=False,
+        )
+        auxiliary = criterion.surface_loss(resized, mask)[0]
+        head = model.swin_unet.h_road_head
+        h2 = model.swin_unet.last_stage_features['H2']
+        h_road_grads = {name: float(grad.norm()) for name, grad in zip(
+            ('head', 'H2'), torch.autograd.grad(auxiliary * h_road_weight, (head.weight, h2), retain_graph=True)
+        )}
     loss.backward()
     total_grads = phase_gradients(model)
     grad = model.swin_unet.global_topology.raw_alpha.grad
@@ -143,12 +156,14 @@ def smoke(model, criterion, loader, args, device):
     stats = phase_stats(model)
     passed = (torch.isfinite(loss).item() and stats['H_consumed_by_decoder'] and
         stats['H_shape'] == [args.batch_size, 64, args.img_size//4, args.img_size//4] and
-        all(value > 0 and torch.isfinite(torch.tensor(value)) for value in [*surface_grads.values(), *total_grads.values()]))
+        all(value > 0 and torch.isfinite(torch.tensor(value)) for value in [*surface_grads.values(), *total_grads.values(), *h_road_grads.values()]))
     report = dict(passed=bool(passed), loss=float(loss.detach()),
         surface_gradient_norms=surface_grads, original_total_gradient_norms=total_grads,
         image_shape=list(images.shape), **stats,
         peak_cuda_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type == 'cuda' else None,
-        optimizer_steps=0, no_new_loss=True, initial_strength=args.h_phase_initial_strength,
+        optimizer_steps=0, no_new_loss=h_road_weight == 0, initial_strength=args.h_phase_initial_strength,
+        h_road_loss_weight=h_road_weight, h_road_loss=float(loss_stats['h_road_loss']),
+        h_road_gradient_norms=h_road_grads,
         global_topology_stage2=True, no_s=bool(getattr(args, 'no_s', False)),
         reference_checkpoint_sha256=file_digest(args.h0_config_checkpoint),
         pretrain_sha256=file_digest(args.pretrain_ckpt), seed=args.seed)

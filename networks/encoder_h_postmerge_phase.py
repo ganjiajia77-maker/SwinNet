@@ -45,7 +45,11 @@ class EncoderHPostMergePhase(nn.Module):
         return tokens+update.flatten(2).transpose(1, 2)
 
 
-def install_encoder_h_postmerge_phase(model, initial_strength=.05, *, no_s=False):
+def install_encoder_h_postmerge_phase(model, initial_strength=.05, *, no_s=False, h_road_loss_weight=0.0):
+    if not math.isfinite(h_road_loss_weight) or h_road_loss_weight < 0:
+        raise ValueError('H road loss weight must be finite and nonnegative')
+    if h_road_loss_weight > 0 and not no_s:
+        raise ValueError('H road supervision requires the No-S variant')
     core = model.swin_unet
     if hasattr(core, 'encoder_h_postmerge_phases'):
         raise ValueError('Encoder-H post-merge phases already installed')
@@ -73,6 +77,10 @@ def install_encoder_h_postmerge_phase(model, initial_strength=.05, *, no_s=False
         for stage in ('2', '3'):
             core.decoder_structure_blocks[stage].skeleton_head = None
         core.highres_structure_skeleton_head = None
+    if h_road_loss_weight > 0:
+        with torch.random.fork_rng(devices=[]):
+            core.h_road_head = nn.Conv2d(core.highres_structure_channels, 1, 1)
+        core.h_road_head.to(next(core.parameters()))
     print('[ENCODER PHASE] '
           'H64 stays high resolution; E->H before merge, phase H->E after merge.', flush=True)
     return model

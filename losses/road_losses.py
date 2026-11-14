@@ -357,6 +357,7 @@ class SurfaceStructureLoss(nn.Module):
         stage_direction_factors=None,
         stage_skeleton_loss_factor=1.0,
         stage_skeleton_only_loss_factor=1.0,
+        h_road_loss_weight=0.0,
     ):
         super().__init__()
 
@@ -396,6 +397,7 @@ class SurfaceStructureLoss(nn.Module):
         self.connectivity_focal_gamma = float(connectivity_focal_gamma)
         self.edge_contrastive_margin = float(edge_contrastive_margin)
         self.highres_structure_skeleton_weight = float(highres_structure_skeleton_weight)
+        self.h_road_loss_weight = float(h_road_loss_weight)
         self.stage_connectivity_factors = tuple(stage_connectivity_factors or ())
         self.stage_direction_factors = tuple(stage_direction_factors or ())
         self.stage_skeleton_loss_factor = float(stage_skeleton_loss_factor)
@@ -1070,6 +1072,19 @@ class SurfaceStructureLoss(nn.Module):
             + loss_highres_structure_skeleton
         )
 
+        h_road_loss = surface_logits.new_zeros(())
+        if self.h_road_loss_weight > 0:
+            for stage_output in stage_outputs or ():
+                h_road_logits = stage_output.get("h_road_logits")
+                if h_road_logits is not None:
+                    resized = F.interpolate(
+                        h_road_logits, size=surface_gt.shape[-2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                    h_road_loss = self.surface_loss(resized, surface_gt)[0]
+                    break
+            total_loss = total_loss + self.h_road_loss_weight * h_road_loss
+
         loss_dict = {
             "total_loss": total_loss.detach(),
             "surface_loss": loss_surface.detach(),
@@ -1077,6 +1092,7 @@ class SurfaceStructureLoss(nn.Module):
             "skeleton_loss": loss_skeleton.detach(),
             "connectivity_loss": loss_connectivity.detach(),
             "boundary_loss": loss_boundary.detach(),
+            "h_road_loss": h_road_loss.detach(),
             "skeleton_stage_loss": loss_skeleton_stage.detach(),
             "stage_structure_loss": loss_stage_structure.detach(),
             "loss_highres_structure_skeleton": loss_highres_structure_skeleton.detach(),

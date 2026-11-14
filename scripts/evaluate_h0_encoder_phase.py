@@ -65,7 +65,8 @@ def build_model(saved):
               if key in keys and key not in ('config', 'img_size', 'num_classes', 'return_skeleton')}
     model = SwinUnet(config, img_size=size, num_classes=1, return_skeleton=True, **kwargs)
     install_encoder_h_postmerge_phase(model, saved.get('h_phase_initial_strength', .05),
-                                      no_s=bool(saved.get('no_s')))
+                                      no_s=bool(saved.get('no_s')),
+                                      h_road_loss_weight=float(saved.get('h_road_loss_weight', 0.0)))
     return model
 
 
@@ -138,6 +139,8 @@ def inference(args):
     device = torch.device(args.device)
     model, saved, epoch = load_model(args.checkpoint, device)
     name = NAME + '_no_s' if saved.get('no_s') else NAME
+    if saved.get('h_road_loss_weight', 0.0) > 0:
+        name += '_h_road'
     if saved.get('img_size') != 512 or saved.get('amp_dtype') != 'none':
         raise ValueError('Expected the FP32/512 experiment checkpoint')
     sha = file_digest(args.checkpoint)

@@ -10,10 +10,11 @@ import torch
 from scripts import evaluate_h0_encoder_phase as evaluate
 
 
-@pytest.mark.parametrize('no_s', [False, True])
-def test_strict_phase_checkpoint_restore_and_EMA_wrong_variant_rejection(tmp_path, monkeypatch, no_s):
+@pytest.mark.parametrize('no_s,h_road_weight', [(False, 0.0), (True, 0.0), (True, 0.1)])
+def test_strict_phase_checkpoint_restore_and_EMA_wrong_variant_rejection(tmp_path, monkeypatch, no_s, h_road_weight):
     torch.set_num_threads(2)
     saved = dict(encoder_h_postmerge_phase=True, global_topology_stage2=True, use_ema=False, img_size=128, no_s=no_s,
+        h_road_loss_weight=h_road_weight,
         structure_profile='stage23_boundary_0626', enable_highres_structure_stream=True,
         highres_structure_channels=64, enable_h3_surface_fusion=True, enable_global_topology=True,
         stage_skeleton_mode='direct', remove_stage2_pre_topology_source=True)
@@ -27,7 +28,16 @@ def test_strict_phase_checkpoint_restore_and_EMA_wrong_variant_rejection(tmp_pat
     assert not any(p.requires_grad for p in restored.parameters())
     image = torch.randn(1, 3, 128, 128)
     with torch.inference_mode():
-        assert torch.equal(original(image)[0], restored(image)[0])
+        output = restored(image)
+        assert torch.equal(original(image)[0], output[0])
+        assert all('h_road_logits' not in entry for entry in output[4])
+        if h_road_weight:
+            baseline = evaluate.build_model(dict(saved, h_road_loss_weight=0.0)).eval()
+            baseline.load_state_dict({
+                key: value for key, value in original.state_dict().items()
+                if not key.startswith('swin_unet.h_road_head.')
+            }, strict=True)
+            assert torch.equal(baseline(image)[0], output[0])
     state['model_state_dict'] = dict(state['model_state_dict'])
     state['model_state_dict'].pop(next(iter(state['model_state_dict'])))
     with pytest.raises(RuntimeError, match='Missing key'):

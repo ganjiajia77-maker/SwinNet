@@ -256,6 +256,7 @@ parser.add_argument('--throughput', action='store_true', help='test throughput o
 parser.add_argument('--encoder_h_postmerge_phase', action='store_true')
 parser.add_argument('--global_topology_stage2', action='store_true',
                     help='move the final H-driven global topology to the decoder Stage2 output')
+parser.add_argument('--h_road_loss_weight', type=float, default=0.0)
 parser.add_argument('--no_s', action='store_true', help='remove explicit S heads and their supervision')
 parser.add_argument('--h0_config_checkpoint', type=str, default='', help='original H0 checkpoint; read configuration only')
 parser.add_argument('--h_phase_initial_strength', type=float, default=.05)
@@ -412,6 +413,7 @@ def build_criterion(args, loss_weights, device):
         ),
         stage_skeleton_loss_factor=args.stage_skeleton_loss_factor,
         stage_skeleton_only_loss_factor=args.stage_skeleton_only_loss_factor,
+        h_road_loss_weight=args.h_road_loss_weight,
     ).to(device)
 
 
@@ -429,6 +431,8 @@ def format_training_config_lines(args, loss_weights):
                 args.enable_h3_surface_fusion
             ),
     ]
+    if args.h_road_loss_weight > 0:
+        lines.append(f"  H2 road auxiliary loss weight: {args.h_road_loss_weight:g}")
     if args.enable_highres_structure_stream:
         lines.append(
             "  Skeleton feature flow: z_struct -> H0 <-> G2 -> H1 <-> G3 -> H2"
@@ -1268,7 +1272,10 @@ if __name__ == "__main__":
         from networks.encoder_h_postmerge_phase import install_encoder_h_postmerge_phase
         from h0_phase_training import tensor_digests, write_report
         before_phase = tensor_digests(model)
-        install_encoder_h_postmerge_phase(model, args.h_phase_initial_strength, no_s=args.no_s)
+        install_encoder_h_postmerge_phase(
+            model, args.h_phase_initial_strength, no_s=args.no_s,
+            h_road_loss_weight=args.h_road_loss_weight,
+        )
         if args.global_topology_stage2:
             print('[GLOBAL TOPOLOGY] after decoder Stage2, using H1, shared surface prior P2 and C2', flush=True)
         after_phase = tensor_digests(model)
@@ -1453,6 +1460,8 @@ if __name__ == "__main__":
                     raise ValueError('Resume checkpoint has a different global topology location')
                 if bool(checkpoint['args'].get('no_s')) != args.no_s:
                     raise ValueError('Resume checkpoint has a different S ablation setting')
+                if float(checkpoint['args'].get('h_road_loss_weight', 0.0)) != args.h_road_loss_weight:
+                    raise ValueError('Resume checkpoint has a different H road loss weight')
                 if 'swin_unet.layers.2.downsample.road_alpha' in checkpoint_state:
                     raise ValueError('Resume the archived run using ab60f17 to preserve its optimizer state')
                 load_stage2_weights(model, checkpoint_state)
@@ -1886,7 +1895,9 @@ if __name__ == "__main__":
                     f"StageStruct: {loss_dict['stage_structure_loss'].item():.4f}, "
                     f"HighResSkel: {loss_dict['highres_structure_skeleton_raw'].item():.4f}, "
                         f"DeltaAbs: {loss_dict['structure_delta_abs_mean'].item():.4f}, "
-                        f"ms/batch: {ms_per_batch:.1f}",
+                        + (f"H-road: {loss_dict['h_road_loss'].item():.4f}, "
+                           if args.h_road_loss_weight > 0 else "")
+                        + f"ms/batch: {ms_per_batch:.1f}",
                         flush=True
                     )
 

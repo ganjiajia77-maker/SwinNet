@@ -2270,6 +2270,11 @@ class SwinTransformerSys(nn.Module):
                 highres_skeleton_feat,
                 structure_outputs,
             )
+            if self.training and hasattr(self, "h_road_head"):
+                structure_outputs.append({
+                    "stage": "highres_road",
+                    "h_road_logits": self.h_road_head(highres_skeleton_feat),
+                })
             x = (*x, structure_outputs)
 
         return x

@@ -183,8 +183,8 @@ def test_profile_defaults_cannot_overwrite_inherited_original_loss_budget(monkey
     assert args.stage2_skeleton_weight==.008 and args.stage3_skeleton_weight==.012 and args.max_epochs==80
 
 
-@pytest.mark.parametrize('no_s', [False, True])
-def test_real_original_loss_smoke_writes_a_passed_report_without_optimizer_steps(tmp_path, no_s):
+@pytest.mark.parametrize('no_s,h_road_weight', [(False, 0.0), (True, 0.0), (True, 0.1)])
+def test_real_original_loss_smoke_writes_a_passed_report_without_optimizer_steps(tmp_path, no_s, h_road_weight):
     import json
     from h0_phase_training import smoke
     from losses.road_losses import SurfaceStructureLoss
@@ -192,18 +192,22 @@ def test_real_original_loss_smoke_writes_a_passed_report_without_optimizer_steps
     model=nn.Module();model.swin_unet=core
     # Module wrapper with the same SwinUnet forwarding contract.
     model.forward=lambda image: model.swin_unet(image)
-    install_encoder_h_postmerge_phase(model, no_s=no_s)
-    criterion=SurfaceStructureLoss(stage_structure_weights=(0.,0.,.008,.012),stage_direction_factor=.2,stage_connectivity_factor=3., stage_skeleton_only_loss_factor=float(not no_s))
+    install_encoder_h_postmerge_phase(model, no_s=no_s, h_road_loss_weight=h_road_weight)
+    criterion=SurfaceStructureLoss(stage_structure_weights=(0.,0.,.008,.012),stage_direction_factor=.2,stage_connectivity_factor=3., stage_skeleton_only_loss_factor=float(not no_s), h_road_loss_weight=h_road_weight)
     mask=torch.zeros(2,1,128,128);mask[:,:,60:67,8:120]=1
     skel=torch.zeros_like(mask);skel[:,:,63,8:120]=1
     loader=[dict(image=torch.randn(2,3,128,128),mask=mask,skeleton=skel,skeleton_dilate=skel)]
     reference=tmp_path/'reference.pth';reference.write_bytes(b'configuration reference')
     pretrain=tmp_path/'pretrain.pth';pretrain.write_bytes(b'ImageNet')
     args=SimpleNamespace(output_dir=str(tmp_path),batch_size=2,img_size=128,
-        h_phase_initial_strength=.05,h0_config_checkpoint=str(reference),pretrain_ckpt=str(pretrain),seed=1234,no_s=no_s)
+        h_phase_initial_strength=.05,h0_config_checkpoint=str(reference),pretrain_ckpt=str(pretrain),seed=1234,no_s=no_s,h_road_loss_weight=h_road_weight)
     smoke(model,criterion,loader,args,torch.device('cpu'))
     value=json.loads((tmp_path/'phase_smoke.json').read_text())
-    assert value['passed'] and value['optimizer_steps']==0 and value['no_new_loss']
+    assert value['passed'] and value['optimizer_steps']==0
+    assert value['no_new_loss'] == (h_road_weight == 0)
+    if h_road_weight:
+        assert value['h_road_loss'] > 0
+        assert min(value['h_road_gradient_norms'].values()) > 0
     assert value['no_s'] is no_s
     assert value['H_consumed_by_decoder'] and value['H_shape']==[2,64,32,32]
     assert min(value['surface_gradient_norms'].values())>0
