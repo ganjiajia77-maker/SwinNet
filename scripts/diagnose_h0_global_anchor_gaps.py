@@ -17,6 +17,7 @@ import torch
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from diagnostics.global_anchor_gap_geometry import bridge_proxy, gap_geometry, local_status, summarize_gap
 from h0_phase_training import SAMPLING_PROTOCOL, file_digest, tensor_digests
+from losses.road_losses import SurfaceStructureLoss, build_connectivity_target, build_stage_skeleton_target
 from scripts.evaluate_h0_encoder_phase import blend_weight, load_model, positions
 
 
@@ -65,10 +66,13 @@ class AnchorCapture:
 
 
 @torch.inference_mode()
-def capture_image(model, image, device, check_first=False, tile=512, stride=256):
+def capture_image(model, image, device, check_first=False, tile=512, stride=256,
+                  skeleton=None, connectivity_counts=None):
     """Only RGB enters the model. GT/gap definitions never enter this function."""
     image = image[None].to(device)
     size = image.shape[-1]
+    if skeleton is not None:
+        skeleton = skeleton[None].to(device)
     if image.shape[-2:] != (size, size) or size < tile:
         raise ValueError('Expected a native square RGB image')
     canvas = torch.zeros((1, 1, size, size), device=device)
@@ -100,6 +104,20 @@ def capture_image(model, image, device, check_first=False, tile=512, stride=256)
                     record[key] = record[key]*scale + scale//2
                 record.update(top=top, left=left, tile=tile, anchor_scale=scale,
                               alpha_global=float(module.alpha_global))
+            if skeleton is not None:
+                skeleton_tile = skeleton[:, :, top:top+tile, left:left+tile]
+                for stage in outputs[4]:
+                    if stage.get('stage') not in (2, 3):
+                        continue
+                    c = stage['connectivity']
+                    center = build_stage_skeleton_target(skeleton_tile, c.shape[-2:])
+                    truth = build_connectivity_target(center) > .5
+                    valid = SurfaceStructureLoss._connectivity_boundary_mask(c, center).bool()
+                    pred = c >= 0  # C probability threshold 0.5
+                    counts = connectivity_counts[stage['stage']]
+                    counts.update(tp=int((valid & pred & truth).sum()),
+                                  fp=int((valid & pred & ~truth).sum()),
+                                  fn=int((valid & ~pred & truth).sum()))
             logits = outputs[0]
             if ordinary is not None:
                 identical = bool(torch.equal(ordinary, logits))
@@ -226,14 +244,14 @@ def run(args):
     if baseline_eval is not None:
         baseline_protocol = json.loads((baseline_eval/'protocol.json').read_text())
         baseline_selection = json.loads((baseline_eval/'val_selection.json').read_text())
-        if (baseline_protocol.get('global_topology_location', 'after_final_x4') != 'after_final_x4'
+        if (baseline_protocol.get('global_topology_location', 'after_final_x4') not in ('after_final_x4', 'after_decoder_stage2')
                 or baseline_selection.get('selected_on') != 'val'
                 or baseline_selection.get('criterion') != 'global_iou'
                 or baseline_selection['checkpoint_sha256'] != baseline_protocol['checkpoint_sha256']
                 or baseline_selection['checkpoint_sha256'] == checkpoint_sha
                 or any(baseline_protocol.get(key) != cached_protocol.get(key)
                        for key in ('data_root', 'image_size', 'window', 'stride', 'ramp_min', 'stitch', 'amp', 'EMA', 'TTA'))):
-            raise ValueError('Baseline comparison requires a different final-x4 checkpoint and matched validation protocol')
+            raise ValueError('Baseline comparison requires a different Stage2 or final-x4 checkpoint and matched validation protocol')
         common_threshold = float(baseline_selection['threshold'])
     out = args.output_dir
     out.mkdir(parents=True)
@@ -263,6 +281,8 @@ def run(args):
     gap_rows, window_rows, per_image, node_rows = [], [], [], []
     cache_checks, bridge_rows = [], []
     first_equal = None
+    connectivity_counts = {stage: Counter() for stage in (2, 3)}
+    measure_connectivity = getattr(args, 'connectivity_metrics', False)
     for index in range(len(data)):
         sample = data[index]
         case = sample['case_name']
@@ -276,7 +296,8 @@ def run(args):
         if (cached.shape != gt.shape or not np.isfinite(cached).all() or cached.min() < 0 or cached.max() > 1
                 or cached_mask is None or not np.array_equal(cached_mask > 0, cached >= threshold)):
             raise ValueError('Invalid or inconsistent original prediction cache: '+case)
-        probability, records, same = capture_image(model, sample['image'], device, check_first=index == 0)
+        c_options = dict(skeleton=sample['skeleton'], connectivity_counts=connectivity_counts) if measure_connectivity else {}
+        probability, records, same = capture_image(model, sample['image'], device, check_first=index == 0, **c_options)
         if same is not None:
             first_equal = same
         difference = float(np.abs(probability-cached).max())
@@ -361,6 +382,14 @@ def run(args):
             added_bridge_proxy=sum(r['added_bridge_proxy'] for r in bridge_rows),
             removed_bridge_proxy=sum(r['removed_bridge_proxy'] for r in bridge_rows))
         write_csv(out/'bridge_comparison.csv', bridge_rows)
+    if measure_connectivity:
+        rows = []
+        for stage, counts in connectivity_counts.items():
+            tp, fp, fn = (counts[key] for key in ('tp', 'fp', 'fn'))
+            rows.append(dict(stage=stage, threshold=.5, tp=tp, fp=fp, fn=fn,
+                             precision=tp/max(tp+fp, 1), recall=tp/max(tp+fn, 1),
+                             f1=2*tp/max(2*tp+fp+fn, 1)))
+        write_csv(out/'connectivity.csv', rows)
     write_csv(out/'summary.csv', cohorts)
     write_csv(out/'per_image.csv', per_image)
     write_csv(out/'gap_windows.csv', window_rows)
@@ -412,13 +441,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--evaluation_dir', type=Path)
-    parser.add_argument('--baseline_evaluation_dir', type=Path, help='existing final-x4 validation cache for same-threshold closure and bridge comparison')
+    parser.add_argument('--baseline_evaluation_dir', type=Path, help='existing Stage2 or final-x4 validation cache for same-threshold closure and bridge comparison')
     parser.add_argument('--root_path', type=Path, default=Path('/home/gjj/Swin-Unet-main/Massachusetts/tiff'))
     parser.add_argument('--fixed_gaps', type=Path, default=Path('/home/gjj/SwinNet-roadbias/model_out/full_h0_joint_pair_v1/reference/fixed_gaps_and_anchors.json'))
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--tolerance', type=float, default=12.)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--no_visuals', action='store_true')
+    parser.add_argument('--connectivity_metrics', action='store_true',
+        help='score C2/C3 at probability 0.5 on skeleton-centered in-tile edges; overlapping tiles count separately')
     parser.add_argument('--command', choices=('run', 'show'), default='run')
     args = parser.parse_args()
     if args.command == 'show':

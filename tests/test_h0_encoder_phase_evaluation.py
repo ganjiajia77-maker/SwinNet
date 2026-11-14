@@ -10,9 +10,10 @@ import torch
 from scripts import evaluate_h0_encoder_phase as evaluate
 
 
-def test_strict_phase_checkpoint_restore_and_EMA_wrong_variant_rejection(tmp_path, monkeypatch):
+@pytest.mark.parametrize('no_s', [False, True])
+def test_strict_phase_checkpoint_restore_and_EMA_wrong_variant_rejection(tmp_path, monkeypatch, no_s):
     torch.set_num_threads(2)
-    saved = dict(encoder_h_postmerge_phase=True, global_topology_stage2=True, use_ema=False, img_size=128,
+    saved = dict(encoder_h_postmerge_phase=True, global_topology_stage2=True, use_ema=False, img_size=128, no_s=no_s,
         structure_profile='stage23_boundary_0626', enable_highres_structure_stream=True,
         highres_structure_channels=64, enable_h3_surface_fusion=True, enable_global_topology=True,
         stage_skeleton_mode='direct', remove_stage2_pre_topology_source=True)

@@ -256,6 +256,7 @@ parser.add_argument('--throughput', action='store_true', help='test throughput o
 parser.add_argument('--encoder_h_postmerge_phase', action='store_true')
 parser.add_argument('--global_topology_stage2', action='store_true',
                     help='move the final H-driven global topology to the decoder Stage2 output')
+parser.add_argument('--no_s', action='store_true', help='remove explicit S heads and their supervision')
 parser.add_argument('--h0_config_checkpoint', type=str, default='', help='original H0 checkpoint; read configuration only')
 parser.add_argument('--h_phase_initial_strength', type=float, default=.05)
 parser.add_argument('--h_phase_smoke_only', action='store_true')
@@ -1267,17 +1268,23 @@ if __name__ == "__main__":
         from networks.encoder_h_postmerge_phase import install_encoder_h_postmerge_phase
         from h0_phase_training import tensor_digests, write_report
         before_phase = tensor_digests(model)
-        install_encoder_h_postmerge_phase(model, args.h_phase_initial_strength)
+        install_encoder_h_postmerge_phase(model, args.h_phase_initial_strength, no_s=args.no_s)
         if args.global_topology_stage2:
             print('[GLOBAL TOPOLOGY] after decoder Stage2, using H1, shared surface prior P2 and C2', flush=True)
         after_phase = tensor_digests(model)
         retained = [key for key in before_phase if key in after_phase]
         changed = [key for key in retained if before_phase[key] != after_phase[key]]
         removed = sorted(set(before_phase)-set(after_phase))
-        if changed or removed:
-            raise RuntimeError('Installing encoder H changed an existing tensor')
+        s_prefixes = (
+            'swin_unet.decoder_structure_blocks.2.skeleton_head.',
+            'swin_unet.decoder_structure_blocks.3.skeleton_head.',
+            'swin_unet.highres_structure_skeleton_head.',
+        )
+        expected_removed = sorted(key for key in before_phase if key.startswith(s_prefixes)) if args.no_s else []
+        if changed or removed != expected_removed:
+            raise RuntimeError('Unexpected tensor changes while installing encoder H')
         initial_report = dict(base='599a410', shared_tensors_checked=len(retained), mismatches=changed,
-            removed_keys=removed, initial_tensors=after_phase, pretrain_sha256=h_phase_reference_report['pretrain_sha256'],
+            no_s=args.no_s, removed_keys=removed, initial_tensors=after_phase, pretrain_sha256=h_phase_reference_report['pretrain_sha256'],
             initialization='SwinV2/ImageNet plus original H0 random initialization; no trained road weights')
         if not args.resume:
             if args.h_phase_smoke_manifest:
@@ -1444,6 +1451,8 @@ if __name__ == "__main__":
                     raise ValueError('Cannot resume the old sampling experiment; start a fresh 80-epoch run')
                 if bool(checkpoint['args'].get('global_topology_stage2')) != args.global_topology_stage2:
                     raise ValueError('Resume checkpoint has a different global topology location')
+                if bool(checkpoint['args'].get('no_s')) != args.no_s:
+                    raise ValueError('Resume checkpoint has a different S ablation setting')
                 if 'swin_unet.layers.2.downsample.road_alpha' in checkpoint_state:
                     raise ValueError('Resume the archived run using ab60f17 to preserve its optimizer state')
                 load_stage2_weights(model, checkpoint_state)

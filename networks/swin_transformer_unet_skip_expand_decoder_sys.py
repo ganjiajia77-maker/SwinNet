@@ -1830,9 +1830,10 @@ class SwinTransformerSys(nn.Module):
 
     def _decoder_skeleton_disabled(self, stage):
         return (
-            self.stage_skeleton_mode == "prior_residual"
-            and self.enable_highres_structure_stream
-            and stage in (2, 3)
+            stage in (2, 3)
+            and (self.decoder_structure_blocks[str(stage)].skeleton_head is None
+                 or (self.stage_skeleton_mode == "prior_residual"
+                     and self.enable_highres_structure_stream))
         )
 
     @staticmethod
@@ -1906,6 +1907,7 @@ class SwinTransformerSys(nn.Module):
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
             if highres_skeleton_feat is not None
+            and self.highres_structure_skeleton_head is not None
             and self.stage_skeleton_mode == "prior_residual"
             else None
         )
@@ -2247,7 +2249,7 @@ class SwinTransformerSys(nn.Module):
         )
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
-            if highres_skeleton_feat is not None
+            if highres_skeleton_feat is not None and self.highres_structure_skeleton_head is not None
             else None
         )
         self.last_highres_structure_skeleton = highres_structure_skeleton

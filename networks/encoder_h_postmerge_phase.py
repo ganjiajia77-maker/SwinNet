@@ -45,7 +45,7 @@ class EncoderHPostMergePhase(nn.Module):
         return tokens+update.flatten(2).transpose(1, 2)
 
 
-def install_encoder_h_postmerge_phase(model, initial_strength=.05):
+def install_encoder_h_postmerge_phase(model, initial_strength=.05, *, no_s=False):
     core = model.swin_unet
     if hasattr(core, 'encoder_h_postmerge_phases'):
         raise ValueError('Encoder-H post-merge phases already installed')
@@ -65,6 +65,14 @@ def install_encoder_h_postmerge_phase(model, initial_strength=.05):
                                    initial_strength=initial_strength) for i in range(3)])
     core.encoder_h_postmerge_phases = modules.to(next(core.parameters()).device)
     core.last_encoder_features = {}
+    if no_s:
+        # Remove heads after initialization so shared tensors retain the baseline values.
+        if (core.structure_profile != 'stage23_boundary_0626'
+                or core.guided_head.final_skeleton_aux_head is not None):
+            raise ValueError('No-S requires the Stage2-global surface/boundary profile')
+        for stage in ('2', '3'):
+            core.decoder_structure_blocks[stage].skeleton_head = None
+        core.highres_structure_skeleton_head = None
     print('[ENCODER PHASE] '
           'H64 stays high resolution; E->H before merge, phase H->E after merge.', flush=True)
     return model

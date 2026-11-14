@@ -183,7 +183,8 @@ def test_profile_defaults_cannot_overwrite_inherited_original_loss_budget(monkey
     assert args.stage2_skeleton_weight==.008 and args.stage3_skeleton_weight==.012 and args.max_epochs==80
 
 
-def test_real_original_loss_smoke_writes_a_passed_report_without_optimizer_steps(tmp_path):
+@pytest.mark.parametrize('no_s', [False, True])
+def test_real_original_loss_smoke_writes_a_passed_report_without_optimizer_steps(tmp_path, no_s):
     import json
     from h0_phase_training import smoke
     from losses.road_losses import SurfaceStructureLoss
@@ -191,17 +192,59 @@ def test_real_original_loss_smoke_writes_a_passed_report_without_optimizer_steps
     model=nn.Module();model.swin_unet=core
     # Module wrapper with the same SwinUnet forwarding contract.
     model.forward=lambda image: model.swin_unet(image)
-    install_encoder_h_postmerge_phase(model)
-    criterion=SurfaceStructureLoss(stage_structure_weights=(0.,0.,.008,.012),stage_direction_factor=.2,stage_connectivity_factor=3.)
+    install_encoder_h_postmerge_phase(model, no_s=no_s)
+    criterion=SurfaceStructureLoss(stage_structure_weights=(0.,0.,.008,.012),stage_direction_factor=.2,stage_connectivity_factor=3., stage_skeleton_only_loss_factor=float(not no_s))
     mask=torch.zeros(2,1,128,128);mask[:,:,60:67,8:120]=1
     skel=torch.zeros_like(mask);skel[:,:,63,8:120]=1
     loader=[dict(image=torch.randn(2,3,128,128),mask=mask,skeleton=skel,skeleton_dilate=skel)]
     reference=tmp_path/'reference.pth';reference.write_bytes(b'configuration reference')
     pretrain=tmp_path/'pretrain.pth';pretrain.write_bytes(b'ImageNet')
     args=SimpleNamespace(output_dir=str(tmp_path),batch_size=2,img_size=128,
-        h_phase_initial_strength=.05,h0_config_checkpoint=str(reference),pretrain_ckpt=str(pretrain),seed=1234)
+        h_phase_initial_strength=.05,h0_config_checkpoint=str(reference),pretrain_ckpt=str(pretrain),seed=1234,no_s=no_s)
     smoke(model,criterion,loader,args,torch.device('cpu'))
     value=json.loads((tmp_path/'phase_smoke.json').read_text())
     assert value['passed'] and value['optimizer_steps']==0 and value['no_new_loss']
+    assert value['no_s'] is no_s
     assert value['H_consumed_by_decoder'] and value['H_shape']==[2,64,32,32]
     assert min(value['surface_gradient_norms'].values())>0
+
+
+def test_no_s_keeps_shared_weights_and_exercises_c_d_gradients():
+    baseline = nn.Module()
+    baseline.swin_unet = make_core().eval()
+    install_encoder_h_postmerge_phase(baseline)
+    expected = tensor_digests(baseline)
+    model = nn.Module()
+    model.swin_unet = make_core().eval()
+    install_encoder_h_postmerge_phase(model, no_s=True)
+    actual = tensor_digests(model)
+    assert all(expected[name] == value for name, value in actual.items())
+    removed = set(expected) - set(actual)
+    for prefix in ('decoder_structure_blocks.2.skeleton_head.',
+                   'decoder_structure_blocks.3.skeleton_head.',
+                   'highres_structure_skeleton_head.'):
+        group = {key for key in removed if key.startswith('swin_unet.' + prefix)}
+        assert group
+        removed -= group
+    assert not removed
+    stages = model.swin_unet(torch.randn(1, 3, 128, 128))[4]
+    assert [item['stage'] for item in stages] == [2, 3]
+    assert all('skeleton' not in item for item in stages)
+    from losses.road_losses import SurfaceStructureLoss
+    criterion = SurfaceStructureLoss(stage_structure_weights=(0., 0., .008, .012),
+        stage_skeleton_only_loss_factor=0., stage_direction_factor=.2, stage_connectivity_factor=3.)
+    skeleton = torch.zeros(1, 1, 128, 128)
+    skeleton[:, :, 64, 8:120] = 1
+    loss = criterion.stage_structure_loss(stages, skeleton, skeleton)
+    gradients = torch.autograd.grad(loss, [item[key] for item in stages
+                                          for key in ('connectivity', 'direction')])
+    assert all(grad.isfinite().all() and grad.abs().sum() > 0 for grad in gradients)
+
+
+def test_no_s_configuration_zeros_only_explicit_s_terms(tmp_path):
+    args, parser, _, saved = fake_reference(tmp_path)
+    args.no_s = True
+    inherit_h0_config(args, parser)
+    assert args.stage_skeleton_only_loss_factor == args.highres_structure_skeleton_weight == args.final_skeleton_weight == 0.
+    assert args.stage2_skeleton_weight == saved['stage2_skeleton_weight']
+    assert args.stage3_skeleton_weight == saved['stage3_skeleton_weight']

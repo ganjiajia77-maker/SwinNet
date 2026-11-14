@@ -44,13 +44,17 @@ def inherit_h0_config(args, parser):
     runtime = {'root_path', 'output_dir', 'run_name', 'cfg', 'pretrain_ckpt', 'resume',
                'warm_start_ckpt', 'h0_config_checkpoint', 'encoder_h_postmerge_phase',
                'h_phase_initial_strength', 'h_phase_smoke_only', 'h_phase_audit_interval',
-               'h_phase_smoke_manifest', 'global_topology_stage2'}
+               'h_phase_smoke_manifest', 'global_topology_stage2', 'no_s'}
     inherited = []
     for action in parser._actions:
         key = action.dest
         if key in saved and key not in runtime:
             setattr(args, key, saved[key])
             inherited.append(key)
+    if getattr(args, 'no_s', False):
+        args.stage_skeleton_only_loss_factor = 0.0
+        args.highres_structure_skeleton_weight = 0.0
+        args.final_skeleton_weight = 0.0
     # Explicit user override: recreate workers each epoch. Keep the original
     # shared epoch as well, so the dataset itself is safe under either policy.
     args.disable_persistent_workers = True
@@ -145,7 +149,7 @@ def smoke(model, criterion, loader, args, device):
         image_shape=list(images.shape), **stats,
         peak_cuda_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type == 'cuda' else None,
         optimizer_steps=0, no_new_loss=True, initial_strength=args.h_phase_initial_strength,
-        global_topology_stage2=True,
+        global_topology_stage2=True, no_s=bool(getattr(args, 'no_s', False)),
         reference_checkpoint_sha256=file_digest(args.h0_config_checkpoint),
         pretrain_sha256=file_digest(args.pretrain_ckpt), seed=args.seed)
     write_report(Path(args.output_dir)/'phase_smoke.json', report)

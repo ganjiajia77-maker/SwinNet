@@ -39,3 +39,21 @@ python scripts/evaluate_h0_encoder_phase.py \
 Evaluation selects the IoU threshold on 14 validation images and applies it to 49 test images. It uses native 1500 × 1500 images, 512 × 512 windows at stride 256 and triangular logit blending. `--topo_tool` expects the unified six-metric evaluator from revision `4b7d37a`. Use `--command infer` for segmentation metrics without that external evaluator.
 
 The released evaluator loads the original Stage2 checkpoint by discarding its single unused third-merge scalar before strict loading. Model and optimizer checkpoints are external to this source release.
+
+## Explicit skeleton prediction ablation
+
+Set `NO_S=1` for both the smoke check and training. Set a separate `PHASE_RUN_NAME`.
+The ablation removes S2, S3 and the high resolution skeleton readout after shared
+initialization, so surviving weights and random initialization are identical.
+The skeleton probability channels in the C heads and structure gates receive zeros.
+H, the Stage2 global module, and the C/D targets and loss coefficients are preserved.
+The evaluator reconstructs the variant from checkpoint metadata.
+
+Compare with the existing Stage2 global run. For fixed-gap closure at a common
+threshold, pass its validation evaluation directory to
+`scripts/diagnose_h0_global_anchor_gaps.py --baseline_evaluation_dir`.
+Running the diagnostic with `--connectivity_metrics` also writes
+`connectivity.csv` with C2/C3 edge precision, recall and F1 at 0.5 on
+the fixed validation tiles. Overlapping tile observations count separately.
+Use the same diagnostic with the baseline checkpoint and baseline evaluation
+directory to obtain its C2/C3 results.

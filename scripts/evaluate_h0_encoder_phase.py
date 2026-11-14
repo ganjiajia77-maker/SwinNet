@@ -64,7 +64,8 @@ def build_model(saved):
     kwargs = {key: value for key, value in saved.items()
               if key in keys and key not in ('config', 'img_size', 'num_classes', 'return_skeleton')}
     model = SwinUnet(config, img_size=size, num_classes=1, return_skeleton=True, **kwargs)
-    install_encoder_h_postmerge_phase(model, saved.get('h_phase_initial_strength', .05))
+    install_encoder_h_postmerge_phase(model, saved.get('h_phase_initial_strength', .05),
+                                      no_s=bool(saved.get('no_s')))
     return model
 
 
@@ -136,17 +137,17 @@ def inference(args):
     if args.output_dir.exists():raise ValueError('Use a new inference output directory')
     device = torch.device(args.device)
     model, saved, epoch = load_model(args.checkpoint, device)
-    name = NAME
+    name = NAME + '_no_s' if saved.get('no_s') else NAME
     if saved.get('img_size') != 512 or saved.get('amp_dtype') != 'none':
         raise ValueError('Expected the FP32/512 experiment checkpoint')
     sha = file_digest(args.checkpoint)
     out = args.output_dir; out.mkdir(parents=True)
-    for name in ('val_probabilities', 'val_masks', 'test_masks'):(out/name).mkdir()
+    for subdir in ('val_probabilities', 'val_masks', 'test_masks'):(out/subdir).mkdir()
     dump(out/'protocol.json', dict(checkpoint=str(args.checkpoint.resolve()), checkpoint_sha256=sha,
         checkpoint_epoch=epoch, data_root=str(args.root_path.resolve()), image_size=1500,
         window=512, stride=256, ramp_min=.1, stitch='weighted logits then sigmoid',
         amp=False, EMA=False, TTA=False, threshold_selected_on='val only; global IoU',
-        global_topology_location='after_decoder_stage2',
+        global_topology_location='after_decoder_stage2', no_s=bool(saved.get('no_s')),
         thresholds=[float(t) for t in THRESHOLDS], topology=TOPOLOGY_PROTOCOL))
     val = RoadSkeletonDataset(str(args.root_path), 'val', image_size=None, source_patch_size=1500,
                               augment=False, return_full_image=True)
