@@ -69,7 +69,7 @@ parser.add_argument('--cfg', type=str, default='./configs/swin_tiny_patch4_windo
 parser.add_argument('--n_class', default=2, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
 parser.add_argument('--loader_prefetch_factor', default=2, type=int, help='DataLoader prefetch factor when num_workers > 0')
-parser.add_argument('--disable_persistent_workers', action='store_true', default=True, help='workers restart every epoch; persistent workers disabled in this experiment')
+parser.add_argument('--disable_persistent_workers', action='store_true', help='disable persistent DataLoader workers')
 parser.add_argument('--tiny_overfit_samples', default=0, type=int, help='use the first N training samples for tiny-set overfit debugging')
 parser.add_argument('--print_freq', default=10, type=int, help='print loss every N batches')
 parser.add_argument('--threshold', default=0.2, type=float, help='binary threshold for validation')
@@ -256,6 +256,7 @@ parser.add_argument('--throughput', action='store_true', help='test throughput o
 parser.add_argument('--encoder_h_postmerge_phase', action='store_true')
 parser.add_argument('--global_topology_stage2', action='store_true',
                     help='move the final H-driven global topology to the decoder Stage2 output')
+parser.add_argument('--h0_data1', action='store_true', help='use the original Data1 H0 training protocol')
 parser.add_argument('--h0_config_checkpoint', type=str, default='', help='original H0 checkpoint; read configuration only')
 parser.add_argument('--h_phase_initial_strength', type=float, default=.05)
 parser.add_argument('--h_phase_smoke_only', action='store_true')
@@ -1201,7 +1202,8 @@ if __name__ == "__main__":
         print('[H0 CONFIG] Original H0 settings inherited; reference weights are not loaded.', flush=True)
         print('[H0 CONFIG] accumulation_steps={} seed={} max_epochs={} EMA={} AMP={}'.format(
             args.accumulation_steps, args.seed, args.max_epochs, args.use_ema, args.amp_dtype), flush=True)
-        print('[SAMPLING] original Mass H0 shared epoch and crop sequence restored; persistent_workers=False', flush=True)
+        print(f'[SAMPLING] {args.sampling_protocol}; '
+              f'persistent_workers={args.num_workers > 0 and not args.disable_persistent_workers}', flush=True)
 
     # 加载配置
     config = get_config(args)
@@ -1378,6 +1380,7 @@ if __name__ == "__main__":
         random_crop_train=args.random_crop_train,
         random_crops_per_image=args.random_crops_per_image,
         random_crop_seed=args.seed,
+        original_data1=args.h0_data1,
     )
     if args.tiny_overfit_samples > 0:
         tiny_count = min(int(args.tiny_overfit_samples), len(train_dataset))
@@ -1410,6 +1413,7 @@ if __name__ == "__main__":
         source_patch_size=args.source_patch_size,
         return_full_image=not args.direct_resize_train and not args.val_crop_list,
         crop_list_path=args.val_crop_list,
+        original_data1=args.h0_data1,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -1434,14 +1438,17 @@ if __name__ == "__main__":
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            checkpoint_state = checkpoint["model_state_dict"]
+            checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+            checkpoint_state = checkpoint.get('training_model_state_dict')
+            if checkpoint_state is None:
+                if checkpoint.get('ema_state_dict') is not None:
+                    raise ValueError('EMA resume requires the raw training model weights')
+                checkpoint_state = checkpoint["model_state_dict"]
             if args.encoder_h_postmerge_phase:
                 if not checkpoint.get('args', {}).get('encoder_h_postmerge_phase'):
                     raise ValueError('Resume requires a checkpoint from this phase experiment')
-                from h0_phase_training import SAMPLING_PROTOCOL
-                if checkpoint.get('args', {}).get('sampling_protocol') != SAMPLING_PROTOCOL:
-                    raise ValueError('Cannot resume the old sampling experiment; start a fresh 80-epoch run')
+                if checkpoint.get('args', {}).get('sampling_protocol') != args.sampling_protocol:
+                    raise ValueError('Resume checkpoint has a different sampling protocol')
                 if bool(checkpoint['args'].get('global_topology_stage2')) != args.global_topology_stage2:
                     raise ValueError('Resume checkpoint has a different global topology location')
                 if 'swin_unet.layers.2.downsample.road_alpha' in checkpoint_state:
@@ -1530,7 +1537,7 @@ if __name__ == "__main__":
     best_val_f1 = -1.0
     if args.resume and os.path.isfile(best_path):
         try:
-            best_checkpoint_for_score = torch.load(best_path, map_location='cpu')
+            best_checkpoint_for_score = torch.load(best_path, map_location='cpu', weights_only=False)
             best_val_f1 = float(best_checkpoint_for_score.get('val_f1', -1.0))
             print(
                 f"[INFO] Resuming with existing best.pth F1={best_val_f1:.6f}",
@@ -1683,7 +1690,8 @@ if __name__ == "__main__":
                     break
                 if args.encoder_h_postmerge_phase and i == 0:
                     sampling_record = dict(epoch=epoch+1, dataset_epoch=train_dataset.epoch,
-                        persistent_workers=False, samples=[dict(image=name,
+                        persistent_workers=loader_kwargs.get('persistent_workers', False),
+                        samples=[dict(image=name,
                             top=int(batch['tile_top'][j]), left=int(batch['tile_left'][j]))
                             for j, name in enumerate(batch['image_name'])])
                     with open(os.path.join(args.output_dir, 'sampling_epochs.jsonl'), 'a', encoding='utf-8') as handle:
@@ -2061,7 +2069,7 @@ if __name__ == "__main__":
 
     best_path = os.path.join(args.output_dir, 'best.pth')
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location='cuda')
+        best_checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
         load_stage2_weights(model, best_checkpoint['model_state_dict'])
         if args.direct_resize_train or args.val_crop_list:
             best_val_metrics = evaluate_skeleton(

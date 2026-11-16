@@ -14,7 +14,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from mass_protocol import crop_position
 
 ORIGINAL_SOURCES = {
-    'datasets/dataset_road_skeleton.py': 'd2a8b42801d7458cbe59ed5d45dee378bc89da554a82fba960fd2805cf63b1bb',
+    'datasets/dataset_road_skeleton.py': '0f0d6c942f9dac4eab85d0aeb77e7cfb66988d2cbcd617486d381ada67185ef5',
     'mass_protocol.py': '1cfdc7cf14ddf498970ce61dea86cc6ea268a4222993ed1f6141ab147e386128',
 }
 TENSORS = ('image', 'mask', 'skeleton', 'skeleton_dilate')
@@ -24,7 +24,7 @@ def check_original_sources():
     actual = {name: hashlib.sha256((ROOT/name).read_bytes().replace(b'\r\n', b'\n')).hexdigest()
               for name in ORIGINAL_SOURCES}
     if actual != ORIGINAL_SOURCES:
-        raise ValueError('Dataset/crop implementation differs from original Mass H0 fe3b730')
+        raise ValueError('Dataset/crop implementation differs from the audited Massachusetts configuration')
     return actual
 
 

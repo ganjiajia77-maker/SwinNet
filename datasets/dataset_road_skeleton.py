@@ -23,6 +23,7 @@ class RoadSkeletonDataset(Dataset):
         random_crops_per_image=1,
         random_crop_seed=1234,
         crop_list_path="",
+        original_data1=False,
     ):
         super().__init__()
 
@@ -38,6 +39,7 @@ class RoadSkeletonDataset(Dataset):
         self.random_crop_train = bool(random_crop_train and split == "train")
         self.random_crops_per_image = max(1, int(random_crops_per_image))
         self.random_crop_seed = int(random_crop_seed)
+        self.original_data1 = original_data1
         # Share epoch with persistent DataLoader workers, including spawn workers.
         self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
 
@@ -367,12 +369,13 @@ class RoadSkeletonDataset(Dataset):
             raise FileNotFoundError(f"Cannot read mask: {mask_path}")
 
         expected_shape = (self.source_patch_size, self.source_patch_size)
-        if image.shape[:2] != expected_shape or mask.shape != expected_shape:
-            raise ValueError(f'Expected native {expected_shape}: {image_path}, image={image.shape}, GT={mask.shape}')
-        values = np.unique(mask)
-        if not np.isin(values, (0, 1, 255)).all() or (1 in values and 255 in values):
-            raise ValueError(f'Expected binary 0/1 or 0/255 GT: {mask_path}')
-        mask = (mask > 0).astype(np.uint8) * 255
+        if not self.original_data1:
+            if image.shape[:2] != expected_shape or mask.shape != expected_shape:
+                raise ValueError(f'Expected native {expected_shape}: {image_path}, image={image.shape}, GT={mask.shape}')
+            values = np.unique(mask)
+            if not np.isin(values, (0, 1, 255)).all() or (1 in values and 255 in values):
+                raise ValueError(f'Expected binary 0/1 or 0/255 GT: {mask_path}')
+            mask = (mask > 0).astype(np.uint8) * 255
 
         if self.source_patch_size is not None:
             source_size = (self.source_patch_size, self.source_patch_size)
@@ -392,8 +395,14 @@ class RoadSkeletonDataset(Dataset):
             if crop_size is None:
                 raise ValueError("random_crop_train requires tile_size or image_size.")
             height, width = image.shape[:2]
-            top, left = crop_position(self.random_crop_seed, image_index, crop_ordinal,
-                                      self.epoch, height, width, crop_size)
+            if self.original_data1:
+                # The original Data1 loader uses the post-augmentation RNG for crop coordinates.
+                max_top, max_left = max(height - crop_size, 0), max(width - crop_size, 0)
+                top = rng.randint(0, max_top + 1) if max_top else 0
+                left = rng.randint(0, max_left + 1) if max_left else 0
+            else:
+                top, left = crop_position(self.random_crop_seed, image_index, crop_ordinal,
+                                          self.epoch, height, width, crop_size)
             tile_position = (top, left)
 
         if tile_position is not None:

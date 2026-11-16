@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 SAMPLING_PROTOCOL = 'mass-h0-shared-epoch-affine-crop-v1-workers-restarted'
+DATA1_SAMPLING_PROTOCOL = 'data1-h0-original-shared-epoch-random-crop'
 
 
 def file_digest(path):
@@ -44,17 +45,17 @@ def inherit_h0_config(args, parser):
     runtime = {'root_path', 'output_dir', 'run_name', 'cfg', 'pretrain_ckpt', 'resume',
                'warm_start_ckpt', 'h0_config_checkpoint', 'encoder_h_postmerge_phase',
                'h_phase_initial_strength', 'h_phase_smoke_only', 'h_phase_audit_interval',
-               'h_phase_smoke_manifest', 'global_topology_stage2'}
+               'h_phase_smoke_manifest', 'global_topology_stage2', 'h0_data1'}
     inherited = []
     for action in parser._actions:
         key = action.dest
         if key in saved and key not in runtime:
             setattr(args, key, saved[key])
             inherited.append(key)
-    # Explicit user override: recreate workers each epoch. Keep the original
-    # shared epoch as well, so the dataset itself is safe under either policy.
-    args.disable_persistent_workers = True
-    args.sampling_protocol = SAMPLING_PROTOCOL
+    data1 = getattr(args, 'h0_data1', False)
+    if not data1:
+        args.disable_persistent_workers = True
+    args.sampling_protocol = DATA1_SAMPLING_PROTOCOL if data1 else SAMPLING_PROTOCOL
     if args.warm_start_ckpt:
         raise ValueError('This experiment starts from ImageNet, not a trained road checkpoint')
     required = dict(max_epochs=80, img_size=512, source_patch_size=1500, batch_size=2,
@@ -63,6 +64,11 @@ def inherit_h0_config(args, parser):
         enable_global_topology=True, enable_h3_surface_fusion=True, highres_structure_channels=64,
         highres_structure_fusion_mode='stage23', stage_skeleton_mode='direct',
         max_train_batches=0, finetune_epochs=0, tiny_overfit_samples=0, no_pretrain=False)
+    if data1:
+        required.update(source_patch_size=1024, use_ema=True, ema_decay=.999,
+                        accumulation_steps=2, num_workers=4, overlap_stride=256, val_interval=5)
+        if saved.get('road_attention_weight', 0.) != 0.:
+            raise ValueError('The original Data1 H0 reference must have zero road attention loss')
     mismatch = {key: dict(actual=getattr(args, key, None), required=value)
                 for key, value in required.items() if getattr(args, key, None) != value}
     if mismatch:
@@ -80,11 +86,13 @@ def inherit_h0_config(args, parser):
         reference_args=saved, pretrain_sha256=pretrain_sha,
         cfg_sha256=file_digest(args.cfg) if hasattr(args, 'cfg') and Path(args.cfg).is_file() else None,
         accumulation_steps_inherited=args.accumulation_steps)
-    report['sampling_protocol'] = SAMPLING_PROTOCOL
+    report['sampling_protocol'] = args.sampling_protocol
     report['global_topology_location'] = 'after_decoder_stage2'
-    report['explicit_overrides'] = dict(disable_persistent_workers=dict(
-        reference=saved.get('disable_persistent_workers', False), actual=True,
-        reason='User requested restarting workers and different crop positions every epoch'))
+    report['explicit_overrides'] = {}
+    if not data1:
+        report['explicit_overrides']['disable_persistent_workers'] = dict(
+            reference=saved.get('disable_persistent_workers', False), actual=True,
+            reason='User requested restarting workers and different crop positions every epoch')
     del checkpoint
     return report
 
