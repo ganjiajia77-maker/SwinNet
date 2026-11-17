@@ -63,7 +63,9 @@ def remove_encoder_a1a2(core):
     return sorted(before-set(core.state_dict()))
 
 
-def install_encoder_h_postmerge_phase(model, initial_strength=.05, *, global_topology_stage2=False):
+def install_encoder_h_postmerge_phase(
+    model, initial_strength=.05, *, global_topology_stage2=False, disable_stage2_anchor_relations=False,
+):
     core = model.swin_unet
     if hasattr(core, 'encoder_h_postmerge_phases'):
         raise ValueError('Encoder-H post-merge phases already installed')
@@ -71,6 +73,8 @@ def install_encoder_h_postmerge_phase(model, initial_strength=.05, *, global_top
         raise ValueError('Expected the original full H0 with a 64-channel H stream')
     if getattr(core, 'native_relation_enabled', False) or hasattr(core, 'h_pixel_reassembly'):
         raise ValueError('This experiment is based on original 599a410 H0, not native B')
+    if disable_stage2_anchor_relations and not global_topology_stage2:
+        raise ValueError('Disabling Stage2 anchor relations requires Stage2 global topology')
     if global_topology_stage2 and (
         not core.enable_global_topology or core.stage_skeleton_mode != 'direct'
         or not core.remove_stage2_pre_topology_source
@@ -85,6 +89,8 @@ def install_encoder_h_postmerge_phase(model, initial_strength=.05, *, global_top
     core.encoder_h_postmerge_phases = modules.to(next(core.parameters()).device)
     core.last_encoder_features = {}
     core.global_topology_stage2 = bool(global_topology_stage2)
+    if global_topology_stage2:
+        core.global_topology.enable_anchor_relations = not disable_stage2_anchor_relations
     core.encoder_a1a2_removed_keys = ['swin_unet.'+key for key in removed]
     print('[ENCODER PHASE] A1/A2 heads, first-two merge modulation and Stage3 A bias removed; '
           'H64 stays high resolution; E->H before merge, phase H->E after merge.', flush=True)

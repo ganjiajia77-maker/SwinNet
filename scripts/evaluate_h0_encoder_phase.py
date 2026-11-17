@@ -65,7 +65,8 @@ def build_model(saved):
               if key in keys and key not in ('config', 'img_size', 'num_classes', 'return_skeleton')}
     model = SwinUnet(config, img_size=size, num_classes=1, return_skeleton=True, **kwargs)
     install_encoder_h_postmerge_phase(model, saved.get('h_phase_initial_strength', .05),
-        global_topology_stage2=bool(saved.get('global_topology_stage2')))
+        global_topology_stage2=bool(saved.get('global_topology_stage2')),
+        disable_stage2_anchor_relations=bool(saved.get('disable_stage2_anchor_relations')))
     return model
 
 
@@ -138,6 +139,8 @@ def inference(args):
     device = torch.device(args.device)
     model, saved, epoch = load_model(args.checkpoint, device)
     name = 'h0_encoder_postmerge_global_stage2' if saved.get('global_topology_stage2') else NAME
+    if saved.get('disable_stage2_anchor_relations'):
+        name += '_no_anchor_relations'
     if saved.get('img_size') != 512 or saved.get('amp_dtype') != 'none':
         raise ValueError('Expected the FP32/512 experiment checkpoint')
     sha = file_digest(args.checkpoint)
@@ -148,6 +151,7 @@ def inference(args):
         window=512, stride=256, ramp_min=.1, stitch='weighted logits then sigmoid',
         amp=False, EMA=False, TTA=False, threshold_selected_on='val only; global IoU',
         global_topology_location='after_decoder_stage2' if saved.get('global_topology_stage2') else 'after_final_x4',
+        disable_stage2_anchor_relations=bool(saved.get('disable_stage2_anchor_relations')),
         thresholds=[float(t) for t in THRESHOLDS], topology=TOPOLOGY_PROTOCOL))
     val = RoadSkeletonDataset(str(args.root_path), 'val', image_size=None, source_patch_size=1500,
                               augment=False, return_full_image=True)

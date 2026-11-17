@@ -24,6 +24,8 @@ def tensor_digests(model):
 def inherit_h0_config(args, parser):
     """Read only saved args, never load trained reference weights into the model."""
     stage2 = getattr(args, 'global_topology_stage2', False)
+    if getattr(args, 'disable_stage2_anchor_relations', False) and not stage2:
+        raise ValueError('--disable_stage2_anchor_relations requires --global_topology_stage2')
     if stage2 and not args.encoder_h_postmerge_phase:
         raise ValueError('Stage2 global topology requires --encoder_h_postmerge_phase')
     if not args.encoder_h_postmerge_phase:
@@ -36,7 +38,8 @@ def inherit_h0_config(args, parser):
     if not isinstance(saved, dict):
         raise ValueError('Original H0 checkpoint must contain its training args')
     for key in ('native_relation_experiment', 'static_h0_stage_fusion', 'h_pixel_reassembly',
-                'h_encoder_exchange', 'encoder_h_postmerge_phase', 'global_topology_stage2'):
+                'h_encoder_exchange', 'encoder_h_postmerge_phase', 'global_topology_stage2',
+                'disable_stage2_anchor_relations'):
         if saved.get(key):
             raise ValueError('Configuration reference is not the original full H0: '+key)
     state = checkpoint.get('model_state_dict', {})
@@ -47,7 +50,7 @@ def inherit_h0_config(args, parser):
     runtime = {'root_path', 'output_dir', 'run_name', 'cfg', 'pretrain_ckpt', 'resume',
                'warm_start_ckpt', 'h0_config_checkpoint', 'encoder_h_postmerge_phase',
                'h_phase_initial_strength', 'h_phase_smoke_only', 'h_phase_audit_interval',
-               'h_phase_smoke_manifest', 'global_topology_stage2'}
+               'h_phase_smoke_manifest', 'global_topology_stage2', 'disable_stage2_anchor_relations'}
     inherited = []
     for action in parser._actions:
         key = action.dest
@@ -152,6 +155,7 @@ def smoke(model, criterion, loader, args, device):
         peak_cuda_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type == 'cuda' else None,
         optimizer_steps=0, no_new_loss=True, initial_strength=args.h_phase_initial_strength,
         global_topology_stage2=stage2,
+        disable_stage2_anchor_relations=bool(getattr(args, 'disable_stage2_anchor_relations', False)),
         reference_checkpoint_sha256=file_digest(args.h0_config_checkpoint),
         pretrain_sha256=file_digest(args.pretrain_ckpt), seed=args.seed)
     write_report(Path(args.output_dir)/'phase_smoke.json', report)

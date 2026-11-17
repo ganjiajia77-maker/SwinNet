@@ -27,6 +27,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.heads = int(heads)
         self.alpha_max = float(alpha_max)
         self.enable_global_topology = bool(enabled)
+        self.enable_anchor_relations = True
         self.connectivity_channels = int(connectivity_channels)
         self.node_type_embedding = nn.Embedding(1, 8)
         token_input_channels = (
@@ -399,17 +400,16 @@ class KeypointGuidedGlobalTopology(nn.Module):
             dim=-1,
         )
         node_feature = self.node_projection(node_input)
-        (
-            node_feature,
-            topology_bias,
-            local_topology_bias,
-        ) = self._refine_tokens_with_relative_topology(
-            node_feature,
-            coords,
-            valid,
-            anchor_hw=(height, width),
-            connectivity_feature=sampled_connectivity,
-        )
+        if self.enable_anchor_relations:
+            node_feature, topology_bias, local_topology_bias = (
+                self._refine_tokens_with_relative_topology(
+                    node_feature, coords, valid, anchor_hw=(height, width),
+                    connectivity_feature=sampled_connectivity,
+                )
+            )
+        else:
+            node_feature = node_feature * valid.unsqueeze(-1).to(dtype=node_feature.dtype)
+            topology_bias = local_topology_bias = node_feature.new_zeros(())
         context = self._cross_attention_from_structure_tokens(
             feature,
             node_feature,
@@ -422,6 +422,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
         if self.capture_diagnostics:
             with torch.no_grad():
                 self.last_diagnostics = {
+                    "anchor_relations_enabled": self.enable_anchor_relations,
                     "anchor_count": valid.sum(dim=1).float().detach(),
                     "candidate_count": feature.new_full(
                         (batch,),
