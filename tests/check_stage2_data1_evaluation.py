@@ -16,6 +16,10 @@ from scripts import evaluate_h0_stage2_data1 as evaluate
 
 class Checks(unittest.TestCase):
     def test_custom_grid_exact_counts_and_boundary_inclusion(self):
+        default = evaluate.threshold_grid()
+        self.assertEqual(len(default), 46)
+        np.testing.assert_array_equal(default,
+            np.array([i/100 for i in range(20, 66)], dtype=np.float32))
         grid = evaluate.threshold_grid(.2, .65, .001)
         self.assertEqual(len(grid), 451)
         self.assertEqual(grid[0], np.float32(.2))

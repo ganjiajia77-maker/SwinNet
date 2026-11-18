@@ -24,7 +24,7 @@ PROTOCOL = dict(image_size=SIZE, short_area_threshold=20,
     tlts_n_paths=200, tlts_seed=1234)
 
 
-def threshold_grid(lower=.05, upper=.95, step=.01):
+def threshold_grid(lower=.20, upper=.65, step=.01):
     lo, hi, stride = (Decimal(str(value)) for value in (lower, upper, step))
     if not all(v.is_finite() for v in (lo, hi, stride)):
         raise ValueError('Threshold range and step must be finite')
@@ -150,8 +150,8 @@ def require_same(path, expected):
 
 def validation(args):
     out = args.output_dir
-    thresholds = threshold_grid(getattr(args, 'threshold_min', .05),
-        getattr(args, 'threshold_max', .95), getattr(args, 'threshold_step', .01))
+    thresholds = threshold_grid(getattr(args, 'threshold_min', .20),
+        getattr(args, 'threshold_max', .65), getattr(args, 'threshold_step', .01))
     identity = run_identity(args, thresholds)
     out.mkdir(parents=True, exist_ok=True)
     record = out/'inference_protocol.json'
@@ -271,8 +271,8 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--threshold_min', type=float, default=.05, help='Validation sweep lower bound')
-    parser.add_argument('--threshold_max', type=float, default=.95, help='Validation sweep upper bound')
+    parser.add_argument('--threshold_min', type=float, default=.20, help='Validation sweep lower bound')
+    parser.add_argument('--threshold_max', type=float, default=.65, help='Validation sweep upper bound')
     parser.add_argument('--threshold_step', type=float, default=.01, help='Validation sweep interval')
     args = parser.parse_args()
     if args.workers < 1:
