@@ -24,6 +24,9 @@ def tensor_digests(model):
 def inherit_h0_config(args, parser):
     """Read only saved args, never load trained reference weights into the model."""
     stage2 = getattr(args, 'global_topology_stage2', False)
+    disable_global = getattr(args, 'disable_phase_global_topology', False)
+    if disable_global and not stage2:
+        raise ValueError('--disable_phase_global_topology requires --global_topology_stage2')
     if stage2 and not args.encoder_h_postmerge_phase:
         raise ValueError('Stage2 global topology requires --encoder_h_postmerge_phase')
     if not args.encoder_h_postmerge_phase:
@@ -47,7 +50,7 @@ def inherit_h0_config(args, parser):
     runtime = {'root_path', 'output_dir', 'run_name', 'cfg', 'pretrain_ckpt', 'resume',
                'warm_start_ckpt', 'h0_config_checkpoint', 'encoder_h_postmerge_phase',
                'h_phase_initial_strength', 'h_phase_smoke_only', 'h_phase_audit_interval',
-               'h_phase_smoke_manifest', 'global_topology_stage2'}
+               'h_phase_smoke_manifest', 'global_topology_stage2', 'disable_phase_global_topology'}
     inherited = []
     for action in parser._actions:
         key = action.dest
@@ -70,6 +73,8 @@ def inherit_h0_config(args, parser):
                 for key, value in required.items() if getattr(args, key, None) != value}
     if mismatch:
         raise ValueError('Original H0 configuration differs from the full-80-epoch protocol: '+str(mismatch))
+    if disable_global:
+        args.enable_global_topology = False
     reference_pretrain = saved.get('pretrain_ckpt')
     if not args.pretrain_ckpt:
         args.pretrain_ckpt = reference_pretrain or './pretrained_ckpt/swinv2_tiny_patch4_window8_256.pth'
@@ -84,12 +89,21 @@ def inherit_h0_config(args, parser):
         cfg_sha256=file_digest(args.cfg) if hasattr(args, 'cfg') and Path(args.cfg).is_file() else None,
         accumulation_steps_inherited=args.accumulation_steps)
     report['sampling_protocol'] = SAMPLING_PROTOCOL
-    report['global_topology_location'] = 'after_decoder_stage2' if stage2 else 'after_final_x4'
+    report['global_topology_location'] = phase_global_topology_location(stage2, disable_global)
     report['explicit_overrides'] = dict(disable_persistent_workers=dict(
         reference=saved.get('disable_persistent_workers', False), actual=True,
         reason='User requested restarting workers and different crop positions every epoch'))
+    if disable_global:
+        report['explicit_overrides']['enable_global_topology'] = dict(
+            reference=True, actual=False, reason='Remove the full Stage2 global topology module')
     del checkpoint
     return report
+
+
+def phase_global_topology_location(stage2, disabled):
+    if disabled:
+        return 'disabled'
+    return 'after_decoder_stage2' if stage2 else 'after_final_x4'
 
 
 def write_report(path, value):
@@ -131,7 +145,11 @@ def smoke(model, criterion, loader, args, device):
             names.append(f'stage{index}_{name}')
             parameters.append(getattr(module, name)[0].weight)
     stage2 = bool(getattr(args, 'global_topology_stage2', False))
-    if stage2:
+    disable_global = bool(getattr(args, 'disable_phase_global_topology', False))
+    core = model.swin_unet
+    if disable_global and (core.enable_global_topology or hasattr(core, 'global_topology')):
+        raise RuntimeError('The global topology module was not removed')
+    if stage2 and not disable_global:
         names.append('global_stage2_raw_alpha')
         parameters.append(model.swin_unet.global_topology.raw_alpha)
     grads = torch.autograd.grad(surface, parameters, retain_graph=True, allow_unused=True)
@@ -139,7 +157,7 @@ def smoke(model, criterion, loader, args, device):
                      for name, grad in zip(names, grads)}
     loss.backward()
     total_grads = phase_gradients(model)
-    if stage2:
+    if stage2 and not disable_global:
         grad = model.swin_unet.global_topology.raw_alpha.grad
         total_grads['global_stage2_raw_alpha'] = float(grad.abs()) if grad is not None else 0.
     stats = phase_stats(model)
@@ -152,6 +170,8 @@ def smoke(model, criterion, loader, args, device):
         peak_cuda_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type == 'cuda' else None,
         optimizer_steps=0, no_new_loss=True, initial_strength=args.h_phase_initial_strength,
         global_topology_stage2=stage2,
+        disable_phase_global_topology=disable_global,
+        global_topology_location=phase_global_topology_location(stage2, disable_global),
         reference_checkpoint_sha256=file_digest(args.h0_config_checkpoint),
         pretrain_sha256=file_digest(args.pretrain_ckpt), seed=args.seed)
     write_report(Path(args.output_dir)/'phase_smoke.json', report)

@@ -258,6 +258,8 @@ parser.add_argument('--throughput', action='store_true', help='test throughput o
 parser.add_argument('--encoder_h_postmerge_phase', action='store_true')
 parser.add_argument('--global_topology_stage2', action='store_true',
                     help='move the final H-driven global topology to the decoder Stage2 output')
+parser.add_argument('--disable_phase_global_topology', action='store_true',
+                    help='remove the whole Stage2 global topology module from the encoder-H phase model')
 parser.add_argument('--h0_config_checkpoint', type=str, default='', help='original H0 checkpoint; read configuration only')
 parser.add_argument('--h_phase_initial_strength', type=float, default=.05)
 parser.add_argument('--h_phase_smoke_only', action='store_true')
@@ -1274,15 +1276,21 @@ if __name__ == "__main__":
         from h0_phase_training import tensor_digests, write_report
         before_phase = tensor_digests(model)
         install_encoder_h_postmerge_phase(model, args.h_phase_initial_strength,
-                                          global_topology_stage2=args.global_topology_stage2)
-        if args.global_topology_stage2:
+            global_topology_stage2=args.global_topology_stage2,
+            disable_phase_global_topology=args.disable_phase_global_topology)
+        if args.disable_phase_global_topology:
+            print('[GLOBAL TOPOLOGY] disabled at both decoder Stage2 and final upsampling', flush=True)
+        elif args.global_topology_stage2:
             print('[GLOBAL TOPOLOGY] after decoder Stage2, using H1, shared surface prior P2 and C2', flush=True)
         after_phase = tensor_digests(model)
         retained = [key for key in before_phase if key in after_phase]
         changed = [key for key in retained if before_phase[key] != after_phase[key]]
         removed = sorted(set(before_phase)-set(after_phase))
-        if changed or removed != model.swin_unet.encoder_a1a2_removed_keys:
-            raise RuntimeError('Shared H0 initialization changed beyond the explicit A1/A2 deletion')
+        expected_removed = set(model.swin_unet.encoder_a1a2_removed_keys)
+        if args.disable_phase_global_topology:
+            expected_removed.update(key for key in before_phase if key.startswith('swin_unet.global_topology.'))
+        if changed or set(removed) != expected_removed:
+            raise RuntimeError('Shared H0 initialization changed beyond the requested module removals')
         initial_report = dict(base='599a410', shared_tensors_checked=len(retained), mismatches=changed,
             removed_keys=removed, initial_tensors=after_phase, pretrain_sha256=h_phase_reference_report['pretrain_sha256'],
             initialization='SwinV2/ImageNet plus original H0 random initialization; no trained road weights')
@@ -1511,6 +1519,8 @@ if __name__ == "__main__":
                     raise ValueError('Cannot resume the old sampling experiment; start a fresh 80-epoch run')
                 if bool(checkpoint['args'].get('global_topology_stage2')) != args.global_topology_stage2:
                     raise ValueError('Resume checkpoint has a different global topology location')
+                if bool(checkpoint['args'].get('disable_phase_global_topology')) != args.disable_phase_global_topology:
+                    raise ValueError('Resume checkpoint has a different global topology ablation setting')
                 model.load_state_dict(checkpoint_state, strict=True)
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
