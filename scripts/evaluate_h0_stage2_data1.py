@@ -1,5 +1,6 @@
 """Data1 Stage2-global EMA evaluation: validation sweep, fixed test, six metrics."""
 import argparse
+from decimal import Decimal
 import json
 from pathlib import Path
 import subprocess
@@ -21,6 +22,24 @@ PROTOCOL = dict(image_size=SIZE, short_area_threshold=20,
     topo_seed_density_deg=.002, topo_step_deg=.0002, apls_max_control_nodes=150,
     apls_control_sampling_seed=1234, apls_snap_radius=5., apls_min_path_px=10.,
     tlts_n_paths=200, tlts_seed=1234)
+
+
+def threshold_grid(lower=.05, upper=.95, step=.01):
+    lo, hi, stride = (Decimal(str(value)) for value in (lower, upper, step))
+    if not all(v.is_finite() for v in (lo, hi, stride)):
+        raise ValueError('Threshold range and step must be finite')
+    if not (0 <= lo <= hi <= 1 and stride > 0):
+        raise ValueError('Require 0 <= threshold_min <= threshold_max <= 1 and step > 0')
+    count = int((hi-lo)//stride)+1
+    if count > 100001:
+        raise ValueError('Threshold grid is too dense; use at most 100001 values')
+    values = [lo+i*stride for i in range(count)]
+    if values[-1] != hi:
+        values.append(hi)
+    grid = np.array([float(value) for value in values], dtype=np.float32)
+    if len(np.unique(grid)) != len(grid):
+        raise ValueError('Threshold step is smaller than float32 resolution')
+    return grid
 
 
 def dump(path, value):
@@ -99,25 +118,29 @@ def infer(model, image, device):
     return (canvas/divisor.clamp_min(1e-8)).sigmoid()[0, 0].cpu().numpy()
 
 
-def sweep_counts(probability, gt):
+def sweep_counts(probability, gt, thresholds=THRESHOLDS):
     # Exactly counts probability >= threshold, including equality, without
     # materializing 91 separate masks or storing floating-point prediction maps.
-    bins = np.searchsorted(THRESHOLDS, probability, side='right')
-    pos = np.bincount(bins[gt], minlength=len(THRESHOLDS)+1)
-    neg = np.bincount(bins[~gt], minlength=len(THRESHOLDS)+1)
+    bins = np.searchsorted(thresholds, probability, side='right')
+    pos = np.bincount(bins[gt], minlength=len(thresholds)+1)
+    neg = np.bincount(bins[~gt], minlength=len(thresholds)+1)
     tp = np.cumsum(pos[::-1], dtype=np.int64)[::-1][1:]
     fp = np.cumsum(neg[::-1], dtype=np.int64)[::-1][1:]
     return np.stack((tp, fp, gt.sum()-tp), axis=1)
 
 
-def run_identity(args):
+def run_identity(args, thresholds=None):
+    if thresholds is None:
+        record = args.output_dir/'inference_protocol.json'
+        thresholds = (json.loads(record.read_text(encoding='utf-8'))['thresholds']
+                      if record.is_file() else THRESHOLDS)
     return dict(checkpoint=str(args.checkpoint.resolve()),
         checkpoint_sha256=common.file_digest(args.checkpoint),
         data_root=str(args.root_path.resolve()), image_size=SIZE,
         window=512, stride=256, ramp_min=.1, stitch='weighted logits then sigmoid',
         precision='FP32', weights='ema_state_dict', TTA=False,
         global_topology_location='after_decoder_stage2', topology=PROTOCOL,
-        thresholds=[float(t) for t in THRESHOLDS])
+        thresholds=[float(t) for t in thresholds])
 
 
 def require_same(path, expected):
@@ -127,7 +150,9 @@ def require_same(path, expected):
 
 def validation(args):
     out = args.output_dir
-    identity = run_identity(args)
+    thresholds = threshold_grid(getattr(args, 'threshold_min', .05),
+        getattr(args, 'threshold_max', .95), getattr(args, 'threshold_step', .01))
+    identity = run_identity(args, thresholds)
     out.mkdir(parents=True, exist_ok=True)
     record = out/'inference_protocol.json'
     if record.is_file():
@@ -141,24 +166,30 @@ def validation(args):
         return
     model, _, epoch = load_model(args.checkpoint, torch.device(args.device))
     data = dataset(args.root_path, 'val')
-    total = np.zeros((len(THRESHOLDS), 3), np.int64)
+    print(f'[SWEEP] {thresholds[0]:.6f}..{thresholds[-1]:.6f}; {len(thresholds)} thresholds; one inference per image', flush=True)
+    total = np.zeros((len(thresholds), 3), np.int64)
     seen = set()
     for i in range(len(data)):
         case, image, gt = read_sample(data, i)
         if case in seen:
             raise ValueError(f'Duplicate case: {case}')
         seen.add(case)
-        total += sweep_counts(infer(model, image, torch.device(args.device)), gt)
+        total += sweep_counts(infer(model, image, torch.device(args.device)), gt, thresholds)
         print(f'[VAL] {i+1}/{len(data)} {case}', flush=True)
     curve = [dict(threshold=float(t), tp=int(c[0]), fp=int(c[1]), fn=int(c[2]),
-                  **common.metrics(*map(int, c))) for t, c in zip(THRESHOLDS, total)]
+                  **common.metrics(*map(int, c))) for t, c in zip(thresholds, total)]
     common.write_csv(out/'val_threshold_scores.csv', curve)
     selected = common.select_threshold(curve)
     dump(out/'val_selection.json', dict(selected_on='val', criterion='global_iou',
         checkpoint_sha256=identity['checkpoint_sha256'], checkpoint_epoch=epoch,
-        eval_weights='ema', val_images=len(data), **selected))
+        eval_weights='ema', val_images=len(data),
+        search_range=[float(thresholds[0]), float(thresholds[-1])],
+        at_search_boundary=selected['threshold'] in (float(thresholds[0]), float(thresholds[-1])),
+        **selected))
     dump(out/'val_complete.json', dict(complete=True, images=len(data)))
     print('[VAL SELECTED]', selected, flush=True)
+    if selected['threshold'] in (float(thresholds[0]), float(thresholds[-1])):
+        print('[SWEEP] Best threshold is at the search boundary; expand the range to check outside it.', flush=True)
 
 
 def testing(args):
@@ -240,9 +271,16 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--threshold_min', type=float, default=.05, help='Validation sweep lower bound')
+    parser.add_argument('--threshold_max', type=float, default=.95, help='Validation sweep upper bound')
+    parser.add_argument('--threshold_step', type=float, default=.01, help='Validation sweep interval')
     args = parser.parse_args()
     if args.workers < 1:
         parser.error('--workers must be positive')
+    try:
+        threshold_grid(args.threshold_min, args.threshold_max, args.threshold_step)
+    except ValueError as error:
+        parser.error(str(error))
     torch.set_num_threads(2)
     cv2.setNumThreads(1)
     {'val': validation, 'test': testing, 'topology': topology}[args.command](args)

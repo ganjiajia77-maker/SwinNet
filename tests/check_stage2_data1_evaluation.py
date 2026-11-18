@@ -15,6 +15,18 @@ from scripts import evaluate_h0_stage2_data1 as evaluate
 
 
 class Checks(unittest.TestCase):
+    def test_custom_grid_exact_counts_and_boundary_inclusion(self):
+        grid = evaluate.threshold_grid(.2, .65, .001)
+        self.assertEqual(len(grid), 451)
+        self.assertEqual(grid[0], np.float32(.2))
+        self.assertEqual(grid[-1], np.float32(.65))
+        p = grid[:12].reshape(3, 4)
+        gt = np.arange(12).reshape(3, 4) % 2 == 0
+        np.testing.assert_array_equal(evaluate.sweep_counts(p, gt, grid),
+            [evaluate.common.counts(p >= t, gt) for t in grid])
+        with self.assertRaises(ValueError):
+            evaluate.threshold_grid(.65, .2, .001)
+
     def test_sweep_equality_and_all_background_foreground(self):
         random = np.random.default_rng(1234)
         probability = random.random((64, 64), dtype=np.float32)
@@ -60,7 +72,8 @@ class Checks(unittest.TestCase):
             checkpoint = root/'best.pth'
             checkpoint.write_bytes(b'checkpoint')
             args = SimpleNamespace(checkpoint=checkpoint, root_path=root/'data',
-                output_dir=root/'report', device='cpu', workers=4)
+                output_dir=root/'report', device='cpu', workers=4,
+                threshold_min=.2, threshold_max=.65, threshold_step=.001)
             calls = []
             def sample(data, i):
                 return f'{data}_{i}', torch.zeros(3, 2, 2), np.array([[1, 0], [1, 0]], bool)
@@ -77,6 +90,7 @@ class Checks(unittest.TestCase):
                 selected = json.loads((args.output_dir/'val_selection.json').read_text())
                 self.assertEqual(selected['iou'], 1.)
                 self.assertEqual(selected['selected_on'], 'val')
+                self.assertEqual(len(json.loads((args.output_dir/'inference_protocol.json').read_text())['thresholds']), 451)
                 evaluate.testing(args)
                 manifest = json.loads((args.output_dir/'comparison.json').read_text())
                 self.assertEqual(manifest['models'][0]['predictions']['test'][0]['threshold'], selected['threshold'])
