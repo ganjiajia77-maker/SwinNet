@@ -54,6 +54,9 @@ class KeypointGuidedGlobalTopology(nn.Module):
         self.raw_alpha = nn.Parameter(torch.tensor(0.0))
         self.capture_diagnostics = False
         self.last_diagnostics = None
+        # Read-only export flags; no parameters/buffers or state-dict changes.
+        self.capture_scgra_trace = False
+        self.last_scgra_trace = None
 
     @property
     def alpha_global(self):
@@ -95,6 +98,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
             device=anchor_score.device,
             dtype=torch.bool,
         )
+        capture = getattr(self, 'capture_anchor_selection', False)
+        selected_candidate_indices = torch.full_like(scores, -1, dtype=torch.long) if capture else None
 
         for batch_index in range(batch):
             candidate_valid = values[batch_index] > 0
@@ -132,6 +137,20 @@ class KeypointGuidedGlobalTopology(nn.Module):
             coords[batch_index, :count] = sample_coords[selected_tensor]
             scores[batch_index, :count] = sample_scores[selected_tensor]
             valid[batch_index, :count] = True
+            if capture:
+                selected_candidate_indices[batch_index, :count] = selected_tensor
+        if capture:
+            # Actual topk/FPS tensors, not an independently rerun approximation.
+            self.last_anchor_selection = {
+                'anchor_hw': (height, width),
+                'candidate_coords': candidate_coords.detach().cpu(),
+                'candidate_scores': values.detach().cpu(),
+                'candidate_valid': (values > 0).detach().cpu(),
+                'selected_coords': coords.detach().cpu(),
+                'selected_scores': scores.detach().cpu(),
+                'selected_valid': valid.detach().cpu(),
+                'selected_candidate_indices': selected_candidate_indices.detach().cpu(),
+            }
         return coords, valid, scores, candidate_count
 
     def _sample_features_at_anchor_coords(self, feature, coords, anchor_hw):
@@ -255,6 +274,8 @@ class KeypointGuidedGlobalTopology(nn.Module):
             -torch.finfo(logits.dtype).max,
         )
         attention = torch.softmax(logits, dim=-1)
+        if self.capture_scgra_trace:
+            self._scgra_node_attention = attention.detach().float().cpu()
         attended = torch.matmul(attention, value).transpose(1, 2).reshape(
             batch,
             nodes,
@@ -312,6 +333,9 @@ class KeypointGuidedGlobalTopology(nn.Module):
         connectivity_feature=None,
     ):
         batch, channels, height, width = feature.shape
+        if self.capture_scgra_trace:
+            self._scgra_trace_calls = getattr(self, '_scgra_trace_calls', 0)+1
+            self.last_scgra_trace = None
         if not self.enable_global_topology or z_struct is None or surface_prob is None:
             return feature
 
@@ -400,8 +424,26 @@ class KeypointGuidedGlobalTopology(nn.Module):
             valid,
         )
         delta = self.grid_projection(context)
+        if self.capture_scgra_trace:
+            ungated_rms = delta.detach().float().square().mean(dim=1).sqrt().cpu()
         delta = delta * surface_gate.clamp(0.0, 1.0)
         output = feature + self.alpha_global * delta
+
+        if self.capture_scgra_trace:
+            with torch.no_grad():
+                self.last_scgra_trace = {
+                    'road_prior': surface_gate.detach().float().cpu(),
+                    'structure_score': z_score.detach().float().cpu(),
+                    'anchor_score': anchor_score.detach().float().cpu(),
+                    'node_attention': self._scgra_node_attention,
+                    'relative_position_bias': topology_bias.detach().float().cpu(),
+                    'connectivity_bias': local_topology_bias.detach().float().cpu(),
+                    'ungated_delta_rms': ungated_rms,
+                    'gated_delta_rms': delta.detach().float().square().mean(dim=1).sqrt().cpu(),
+                    'effective_residual_rms': (output-feature).detach().float().square().mean(dim=1).sqrt().cpu(),
+                    'alpha_global': self.alpha_global.detach().float().cpu(),
+                    'feature_hw': (height, width),
+                }
 
         if self.capture_diagnostics:
             with torch.no_grad():
