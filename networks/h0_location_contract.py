@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 
 
-ARCHITECTURE_ID = "h0_stage2_location_v1"
+ARCHITECTURE_ID = "h0_stage2_location_decoder_global_stage2_v1"
 BASE_MODEL_COMMIT = "599a410de8d341850e1810417307e4b3bbdfc82d"
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_contract(config, constructor):
+    if constructor["stage2_structure_location"] != "decoder":
+        raise ValueError("This architecture requires decoder Stage2 structure learning")
     required = dict(return_skeleton=True, structure_profile="stage23_boundary_0626",
                     enable_highres_structure_stream=True, highres_structure_channels=64,
                     highres_structure_fuse_stages="stage23", highres_structure_fusion_mode="stage23",
@@ -43,6 +45,7 @@ def make_contract(config, constructor):
         constructor=arguments,
         H=dict(channels=64, stride=4, grid=[config.DATA.IMG_SIZE // 4] * 2),
         A1A2_enabled=True, global_topology_enabled=True,
+        global_topology_location="after_decoder_stage2",
         stage2_unit_executions=1, stage3_unit_executions=1,
     ), sort_keys=True))
 
