@@ -132,6 +132,14 @@ class KeypointGuidedGlobalTopology(nn.Module):
             coords[batch_index, :count] = sample_coords[selected_tensor]
             scores[batch_index, :count] = sample_scores[selected_tensor]
             valid[batch_index, :count] = True
+        if getattr(self, "capture_anchor_selection", False):
+            self.last_anchor_selection = {
+                "anchor_hw": (height, width),
+                "candidate_coords": candidate_coords.detach().cpu(),
+                "candidate_valid": (values > 0).detach().cpu(),
+                "selected_coords": coords.detach().cpu(),
+                "selected_valid": valid.detach().cpu(),
+            }
         return coords, valid, scores, candidate_count
 
     def _sample_features_at_anchor_coords(self, feature, coords, anchor_hw):

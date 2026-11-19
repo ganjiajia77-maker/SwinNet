@@ -1,0 +1,14 @@
+{
+  "compare_predictions.py": "6dfe5c0f6b6e2a09865b527dc64d1d93016391c6bf161165c4491853d430f659",
+  "official_graph_metrics.py": "affb48ade6cba7446d2f326941ff4521a09d9df8174ad10de31d447c50194332",
+  "road_metrics.py": "2ba2d7c6aec783557f47b4221ac3403e9c15b47e02a4c50cc35f5c80fe0da32f",
+  "vendor/cosmiq/apls.upstream.py.txt": "7f42bff9391f56d9939db6689424d42aad44e40b89d6cb933b101ae3d5ae5a3a",
+  "vendor/cosmiq/apls_utils.upstream.py.txt": "27a3270f1309ad49eb453b13c1b571abf5f9c913bf48c560c560ba9198d99319",
+  "vendor/metrics_delin/toolong_tooshort_metric.upstream.py.txt": "be08b4798e9f4e5544bf8d31a51ac43f4a02d3c22568fb962809737fa9912e3f",
+  "vendor/metrics_delin/utils.upstream.py.txt": "84cd9de3de109bccbfc1228b15ff2149fd91e3bac2abc836830b20c99dfc0339",
+  "vendor/sat2graph/graph.py": "73316f3b0d6aa0f42b56186ada7a2d54abacd7aa000ac4e10caea7d6fe2bfce0",
+  "vendor/sat2graph/graph.upstream.py.txt": "4ccb508074b5fc665445e7f2a08aa21229993a565f4b680ab95176c5d966ff6f",
+  "vendor/sat2graph/main.upstream.py.txt": "99b9374aa42c9f1e0ed0be02e6bbdf60bc6dc69f49f53584f9452adda1b96f8c",
+  "vendor/sat2graph/topo.py": "24c6d8ba8ded6b6668a1b00b8c492da372e319d214f727e44bc84e2853b88cd9",
+  "vendor/sat2graph/topo.upstream.py.txt": "e67e5f89c568d411b8fe55482cd4f80c68725d6b2cbf3607f20813af722ea152"
+}
