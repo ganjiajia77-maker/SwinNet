@@ -577,7 +577,7 @@ class SwinUnet(nn.Module):
         if architecture_id not in {None, ARCHITECTURE_ID}:
             raise ValueError(f"Unknown architecture_id: {architecture_id}")
         if architecture_id is None and stage2_structure_location != "decoder":
-            raise ValueError("encoder_e1 requires architecture_id=h0_stage2_location_v1")
+            raise ValueError("An explicit architecture ID is required for a non-decoder structure location")
         super(SwinUnet, self).__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -627,7 +627,8 @@ class SwinUnet(nn.Module):
                                   stage_skeleton_bias_init=stage_skeleton_bias_init,
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source,
-                                 stage2_structure_location=stage2_structure_location)
+                                 stage2_structure_location=stage2_structure_location,
+                                 global_topology_stage2=architecture_id == ARCHITECTURE_ID)
     def forward(
         self,
         x,

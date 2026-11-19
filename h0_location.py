@@ -11,14 +11,14 @@ import subprocess
 import sys
 
 from mass_protocol import BASE_COMMIT, validate_training_args
+from networks.h0_location_contract import ARCHITECTURE_ID
 
 
 ROOT = Path(__file__).resolve().parent
 CFG = ROOT / 'configs' / 'swin_tiny_patch4_window7_224_lite.yaml'
 EVAL = ROOT / 'evaluation' / 'road_comparison' / 'compare_predictions.py'
-ARCHITECTURE_ID = 'h0_stage2_location_v1'
-LOCATIONS = ('decoder', 'encoder_e1')
-MODEL_NAMES = {location: f'{ARCHITECTURE_ID}_{location}_mass_random512_fp32_80e_bs2'
+LOCATIONS = ('decoder',)
+MODEL_NAMES = {location: f'{ARCHITECTURE_ID}_mass_random512_fp32_80e_bs2'
                for location in LOCATIONS}
 PROTOCOL = {'image_size': 1500, 'short_area_threshold': 20,
             'apls_max_nodes': 64, 'apls_snap_radius': 5.0}
@@ -141,7 +141,7 @@ def verify_checkpoint(path, location):
         raise ValueError('Expected an experiment checkpoint containing model_state_dict')
     contract = checkpoint.get('architecture_contract')
     expected = {'architecture_id': ARCHITECTURE_ID, 'stage2_structure_location': location,
-                'base_model_commit': BASE_COMMIT}
+                'base_model_commit': BASE_COMMIT, 'global_topology_location': 'after_decoder_stage2'}
     if not isinstance(contract, dict) or any(contract.get(k) != v for k, v in expected.items()):
         raise ValueError(f'Checkpoint architecture_contract must match {expected}; got {contract}')
     saved = checkpoint.get('args')
