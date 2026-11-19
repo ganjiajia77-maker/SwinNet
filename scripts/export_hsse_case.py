@@ -1,4 +1,4 @@
-"""Export aligned source data for the H0/H1/H2 state evolution figure."""
+"""Export aligned H state evidence for the decoder control and static H0_B."""
 
 import argparse
 import hashlib
@@ -23,6 +23,8 @@ TILE = 512
 SOURCE_SIZE = 1500
 H_STATES = ("H0", "H1", "H2")
 CFG = ROOT / "configs/swin_tiny_patch4_window7_224_lite.yaml"
+DECODER_ID = "h0_stage2_location_v1"
+H0_BASE = "599a410de8d341850e1810417307e4b3bbdfc82d"
 BASE_REQUIRED = {
     "img_size": TILE,
     "source_patch_size": SOURCE_SIZE,
@@ -58,8 +60,40 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def decoder_options(checkpoint, cfg, common_options):
+    # The original location experiment's decoder path is the dynamic path here.
+    contract = checkpoint.get("architecture_contract") or {}
+    expected_identity = dict(
+        architecture_id=DECODER_ID, stage2_structure_location="decoder",
+        base_model_commit=H0_BASE, A1A2_enabled=True, global_topology_enabled=True,
+    )
+    constructor = dict(contract.get("constructor", {}))
+    if (any(contract.get(key) != value for key, value in expected_identity.items())
+            or contract.get("global_topology_location") not in (None, "after_final_upsample")
+            or constructor.pop("architecture_id", None) != DECODER_ID
+            or constructor.pop("stage2_structure_location", None) != "decoder"):
+        raise ValueError("Dynamic H requires the original 892e5d0 decoder control checkpoint")
+
+    expected_config = dict(
+        swin=dict(cfg.MODEL.SWIN), image_size=TILE, drop_rate=cfg.MODEL.DROP_RATE,
+        drop_path_rate=cfg.MODEL.DROP_PATH_RATE, use_checkpoint=cfg.TRAIN.USE_CHECKPOINT,
+    )
+    if contract.get("model_config") != json.loads(json.dumps(expected_config)):
+        raise ValueError("Decoder checkpoint model configuration differs from the export configuration")
+
+    required = dict(common_options, img_size=TILE, num_classes=1, return_skeleton=True,
+                    enable_post_refine_structure_interaction=False)
+    required.pop("static_h0_stage_fusion")
+    mismatches = {name: (constructor.get(name), value) for name, value in required.items()
+                  if constructor.get(name) != value}
+    if mismatches:
+        raise ValueError(f"Unexpected decoder constructor options: {mismatches}")
+    return dict(constructor, static_h0_stage_fusion=False)
+
+
 def load_model(path, static, device):
-    print(f"Loading {'Static' if static else 'Dynamic'} H checkpoint: {path}", flush=True)
+    variant = "H0_B (Static H)" if static else "decoder control (Dynamic H)"
+    print(f"Loading {variant}: {path}", flush=True)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     saved = checkpoint["args"]
     required = dict(BASE_REQUIRED, static_h0_stage_fusion=static)
@@ -78,14 +112,21 @@ def load_model(path, static, device):
         zip=False, cache_mode=None, resume=None, accumulation_steps=1,
         use_checkpoint=False, amp_opt_level=None, tag=None, eval=True, throughput=False,
     ))
-    options = {key: value for key, value in required.items()
-               if key not in ("img_size", "source_patch_size", "use_ema")}
-    options.update({key: saved[key] for key in MODEL_OPTIONS if key in saved})
-    model = SwinUnet(cfg, img_size=TILE, num_classes=1, return_skeleton=True, **options)
+    common_options = {key: value for key, value in required.items()
+                      if key not in ("img_size", "source_patch_size", "use_ema")}
+    if static:
+        if checkpoint.get("architecture_contract") is not None:
+            raise ValueError("Static H requires the original H0_B checkpoint")
+        options = dict(common_options, img_size=TILE, num_classes=1, return_skeleton=True)
+        options.update({key: saved[key] for key in MODEL_OPTIONS if key in saved})
+    else:
+        options = decoder_options(checkpoint, cfg, common_options)
+    model = SwinUnet(cfg, **options)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     info = dict(
         path=str(path.resolve()), sha256=sha256(path),
         epoch=checkpoint.get("epoch"), weights="model_state_dict (raw)",
+        variant=variant, architecture_id=None if static else DECODER_ID,
         model_options=options, training={key: saved.get(key) for key in TRAINING_FIELDS},
     )
     return model.to(device).eval(), info
@@ -207,7 +248,7 @@ def main():
         dynamic=dict(threshold=args.dynamic_threshold, **dynamic_info),
         static=dict(threshold=args.static_threshold, **static_info),
         feature_response=dict(states=list(H_STATES), shape=[64, 128, 128],
-                              statistic="channel L2 norm in FP32", source="Dynamic H"),
+                              statistic="channel L2 norm in FP32", source=dynamic_info["variant"]),
         changed_pixels=dict(
             gt_foreground=int(gt.sum()), true_road_gained=int((gained & gt).sum()),
             true_road_lost=int((lost & gt).sum()), false_positive_removed=int((lost & ~gt).sum()),
