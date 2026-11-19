@@ -573,8 +573,8 @@ class SwinUnet(nn.Module):
         constructor = dict(locals())
         stage2_structure_location = stage2_structure_location or "decoder"
         constructor["stage2_structure_location"] = stage2_structure_location
-        from .h0_location_contract import ARCHITECTURE_ID, make_contract
-        if architecture_id not in {None, ARCHITECTURE_ID}:
+        from .h0_location_contract import ARCHITECTURE_ID, ARCHITECTURE_IDS, make_contract
+        if architecture_id is not None and architecture_id not in ARCHITECTURE_IDS:
             raise ValueError(f"Unknown architecture_id: {architecture_id}")
         if architecture_id is None and stage2_structure_location != "decoder":
             raise ValueError("An explicit architecture ID is required for a non-decoder structure location")
@@ -628,7 +628,24 @@ class SwinUnet(nn.Module):
                                  stage_skeleton_positive_prior=stage_skeleton_positive_prior,
                                  remove_stage2_pre_topology_source=remove_stage2_pre_topology_source,
                                  stage2_structure_location=stage2_structure_location,
-                                 global_topology_stage2=architecture_id == ARCHITECTURE_ID)
+                                 global_topology_stage2=architecture_id in ARCHITECTURE_IDS)
+        if architecture_id == ARCHITECTURE_ID:
+            # Remove the priors after initialization so the shared weights and
+            # RNG state match the decoder control.
+            core = self.swin_unet
+            for layer in core.layers[:2]:
+                layer.road_attention_head = None
+                layer.road_attention_modulates_downsample = False
+                layer.downsample.road_alpha = None
+            del core.encoder_stage1_road_attention_head
+            del core.encoder_stage2_road_attention_head
+            core.layers[2].use_road_bias = False
+            for block in core.layers[2].blocks:
+                block.use_road_bias = False
+                block.road_bias_scale_a1 = None
+                block.road_bias_scale_a2 = None
+            print("[A1/A2] Removed encoder road heads, merge modulation and Stage 3 attention bias", flush=True)
+
     def forward(
         self,
         x,

@@ -5,7 +5,9 @@ import json
 from pathlib import Path
 
 
-ARCHITECTURE_ID = "h0_stage2_location_decoder_global_stage2_v1"
+CONTROL_ARCHITECTURE_ID = "h0_stage2_location_decoder_global_stage2_v1"
+ARCHITECTURE_ID = "h0_stage2_location_decoder_global_stage2_no_a1a2_v1"
+ARCHITECTURE_IDS = (CONTROL_ARCHITECTURE_ID, ARCHITECTURE_ID)
 BASE_MODEL_COMMIT = "599a410de8d341850e1810417307e4b3bbdfc82d"
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,7 +35,7 @@ def make_contract(config, constructor):
     arguments = {key: value for key, value in constructor.items()
                  if key not in {"self", "config", "__class__"}}
     return json.loads(json.dumps(dict(
-        architecture_id=ARCHITECTURE_ID,
+        architecture_id=constructor["architecture_id"],
         stage2_structure_location=constructor["stage2_structure_location"],
         base_model_commit=BASE_MODEL_COMMIT,
         protocol_version="h0-mass-native1500-random512-fp32-80e-bs2-v1",
@@ -44,7 +46,8 @@ def make_contract(config, constructor):
                           use_checkpoint=config.TRAIN.USE_CHECKPOINT),
         constructor=arguments,
         H=dict(channels=64, stride=4, grid=[config.DATA.IMG_SIZE // 4] * 2),
-        A1A2_enabled=True, global_topology_enabled=True,
+        A1A2_enabled=constructor["architecture_id"] == CONTROL_ARCHITECTURE_ID,
+        global_topology_enabled=True,
         global_topology_location="after_decoder_stage2",
         stage2_unit_executions=1, stage3_unit_executions=1,
     ), sort_keys=True))
@@ -70,7 +73,7 @@ def load_checkpoint_strict(model, checkpoint):
 
 def inherit_location_args(args, checkpoint, explicit):
     contract = checkpoint.get("architecture_contract")
-    if contract is None and checkpoint.get("args", {}).get("architecture_id") == ARCHITECTURE_ID:
+    if contract is None and checkpoint.get("args", {}).get("architecture_id") in ARCHITECTURE_IDS:
         raise ValueError("Location-experiment checkpoint is missing its architecture contract")
     for name in ("architecture_id", "stage2_structure_location"):
         saved = contract.get(name) if contract else None

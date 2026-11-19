@@ -32,7 +32,7 @@ from losses.cldice_loss import soft_skeletonize
 from config import get_config
 from mass_protocol import BASE_COMMIT, stitch_logits, validate_training_args
 from networks.h0_location_contract import (
-    ARCHITECTURE_ID, inherit_location_args, load_checkpoint_strict, validate_checkpoint_contract,
+    ARCHITECTURE_IDS, inherit_location_args, load_checkpoint_strict, validate_checkpoint_contract,
 )
 
 
@@ -43,7 +43,7 @@ def seed_worker(worker_id):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--architecture_id', choices=[ARCHITECTURE_ID], default=None)
+parser.add_argument('--architecture_id', choices=ARCHITECTURE_IDS, default=None)
 parser.add_argument('--stage2_structure_location', choices=['decoder', 'encoder_e1'], default=None)
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
 parser.add_argument('--dataset', type=str, default='ImageData', help='dataset name')

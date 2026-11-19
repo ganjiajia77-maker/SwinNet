@@ -8,7 +8,7 @@
   "evaluation/road_comparison/compare_predictions.py": "0bd4c4d0042bb3d0ce0cff281aae857d301d10a820eaff316e7b7204528f7de9",
   "evaluation/road_comparison/requirements.txt": "2eb188e961cf81c41202eac04a8c1b61676a485a0c0ddcd4605cb3254edb9dc4",
   "evaluation/road_comparison/road_metrics.py": "c5a7c7f3586f928b6f20e61c073a7059813c49b0b02816dd66c99b7ef1cb692e",
-  "h0_location.py": "96d44040030110593b3b34bf170fdedf4297d3583ecf57137a38c3f83cbe4100",
+  "h0_location.py": "360b1ce108c23d4ab89488191930a643d4a50fa090bce494aff747ce551f7a60",
   "losses/cldice_loss.py": "a466aabd475e1fb92ef66e795889752bb0f3d59575210bb98457cdcde9006fe9",
   "losses/road_losses.py": "a3780cd42f6ede6579a6c0a9e9ecd4e86ec64591137cf054cd8142827966bc3e",
   "mass_protocol.py": "1cfdc7cf14ddf498970ce61dea86cc6ea268a4222993ed1f6141ab147e386128",
@@ -16,14 +16,14 @@
   "networks/dca_fpn_lite.py": "350d1ba7ccee8d8e7cd7a519776ecfde4c78f5a64dad795cdec4b17a53cbf55f",
   "networks/dilated_asterisk.py": "00c0dcbfee602569c3ec9741a0cd1b365a7754a6e091e4f76cb5ac85d5509a1d",
   "networks/g2l2_bottleneck.py": "e0432092bb88d96c0ca9ce8daf519c01a34b845c3ceeeb97488299c8ef1615fc",
-  "networks/h0_location_contract.py": "d06113f5fdac6d0987013aa8fc453a8a44cbe2ecfcc6a69c8edc690c7b1090ed",
+  "networks/h0_location_contract.py": "a95446931fae7fd83805a77ece5b25fdbd169202942d22fcf1c0743c9a0b113b",
   "networks/keypoint_global_topology.py": "f1d330b36bb4e0b6fe4091c0b771c351a9a622212d628c47955dc3b6efd09a5d",
   "networks/msfe_block.py": "68c074fa758906407e36a4f52780ba3937e4ed02c35f081804d859ff53ed980b",
   "networks/road_attention_head.py": "492501a598b8777022669982dda284b48d12df1fc465574529e77ac6ec2a4656",
   "networks/skeleton_guided_head.py": "91f77358e3bb7d4645f8193c43e11fafa37942a521016ba17c4b191e88f30fca",
   "networks/swin_transformer_unet_skip_expand_decoder_sys.py": "919217f8067e7ae7e9832f94fac224ca306241683088cf81c659cf1668192272",
-  "networks/vision_transformer.py": "9a7e0fdbd7eee5aecc1ffd005e6a89d0f24f94136b9013f5ea1768ea718fa4f2",
-  "test_image.py": "86ac12e5057cad0d3ccca578b4dfb38021cee81e4aea95e2cdec4e4d2be942b0",
+  "networks/vision_transformer.py": "489cf9f93e2f4b7bb4442930d91388b1183f314156876711d7c0e3633388af51",
+  "test_image.py": "90803801fb57a7bb67d416c2312daa3525b3f592aa59b4f62e5a681df4ad1eb6",
   "topology_direction_constants.py": "d5ae0c32c5d4a8830995cff7cd0944b9c03ede523a1b85f84f52736248a8557a",
-  "train_image.py": "d001c101a18f98c7a3035c6f327868c77b1c28c0f073f5808a6106cb59d4cc74"
+  "train_image.py": "8f69aa07c8739bb36c685d7cbfcd5c02f9ba56ad013d02dd6ab58e569224bb58"
 }

@@ -141,7 +141,8 @@ def verify_checkpoint(path, location):
         raise ValueError('Expected an experiment checkpoint containing model_state_dict')
     contract = checkpoint.get('architecture_contract')
     expected = {'architecture_id': ARCHITECTURE_ID, 'stage2_structure_location': location,
-                'base_model_commit': BASE_COMMIT, 'global_topology_location': 'after_decoder_stage2'}
+                'base_model_commit': BASE_COMMIT, 'global_topology_location': 'after_decoder_stage2',
+                'A1A2_enabled': False, 'global_topology_enabled': True}
     if not isinstance(contract, dict) or any(contract.get(k) != v for k, v in expected.items()):
         raise ValueError(f'Checkpoint architecture_contract must match {expected}; got {contract}')
     saved = checkpoint.get('args')
@@ -273,9 +274,34 @@ def compare_command(args, split, path, output, selection=None):
     return command
 
 
+def run_six_metrics(args, data, selection_path, threshold, env):
+    test_source = data['models'][0]['predictions']['test']
+    if len(test_source) != 1 or test_source[0]['threshold'] != threshold:
+        raise ValueError('Run the test mode first to generate masks at the selected val threshold')
+    tool = args.topo_tool.resolve()
+    if not tool.is_file():
+        raise FileNotFoundError(tool)
+    model = dict(data['models'][0], validation_selection=dict(
+        selected_on='val', criterion='global_iou', threshold=threshold,
+        evidence=str(selection_path)))
+    manifest_path = args.output_dir / 'comparison_six.json'
+    write_json(manifest_path, dict(data_root=data['data_root'], models=[model],
+        protocol=dict(image_size=1500, apls_max_control_nodes=150,
+                      apls_control_sampling_seed=1234, topo_seed_density_deg=.002,
+                      topo_step_deg=.0002, tlts_n_paths=200, tlts_seed=1234)))
+    output = args.output_dir / 'test_six'
+    command = [sys.executable, '-u', str(tool), '--manifest', str(manifest_path),
+        '--split', 'test', '--import_val_selection', '--output_dir', str(output),
+        '--workers', '1', '--progress_every', '1']
+    if output.is_dir() and any(output.iterdir()):
+        command.append('--resume')
+    run(command, env)
+    print((output / 'test_comparison.csv').read_text(encoding='utf-8'))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['inspect', 'train', 'resume', 'sweep', 'test', 'topology'])
+    parser.add_argument('mode', choices=['inspect', 'train', 'resume', 'sweep', 'test', 'topology', 'six'])
     parser.add_argument('--location', required=True, choices=LOCATIONS)
     parser.add_argument('--root_path', type=Path)
     parser.add_argument('--output_dir', type=Path)
@@ -288,6 +314,8 @@ def main():
     parser.add_argument('--thresholds', type=float, nargs='+',
                         default=[round(i / 100, 2) for i in range(5, 100, 5)])
     parser.add_argument('--recompute', action='store_true')
+    parser.add_argument('--topo_tool', type=Path, default=Path(
+        '/home/gjj/unified-road-six-4b7d37a/evaluation/road_comparison/compare_predictions.py'))
     parser.add_argument('--dry_run', action='store_true', help='print train/resume command without executing or writing pointers')
     parser.add_argument('--implementation_manifest', type=Path, default=ROOT / 'IMPLEMENTATION_SHA256.json')
     args = parser.parse_args()
@@ -381,6 +409,9 @@ def main():
         return
     selection_path, selection, threshold = selected_threshold(args, data)
     print(f'Validation-selected threshold: {threshold:.2f}', flush=True)
+    if args.mode == 'six':
+        run_six_metrics(args, data, selection_path, threshold, env)
+        return
     metric_dir = args.output_dir / 'test'
     if args.recompute:
         metric_dir = args.output_dir / ('test_topology_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))

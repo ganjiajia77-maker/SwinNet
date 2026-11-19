@@ -26,7 +26,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
 from mass_protocol import stitch_logits, validate_training_args
-from networks.h0_location_contract import ARCHITECTURE_ID, inherit_location_args, load_checkpoint_strict
+from networks.h0_location_contract import ARCHITECTURE_IDS, inherit_location_args, load_checkpoint_strict
 
 
 def _cli_has(flag_name):
@@ -41,7 +41,7 @@ def _cli_has(flag_name):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--architecture_id', choices=[ARCHITECTURE_ID], default=None)
+parser.add_argument('--architecture_id', choices=ARCHITECTURE_IDS, default=None)
 parser.add_argument('--stage2_structure_location', choices=['decoder', 'encoder_e1'], default=None)
 parser.add_argument('--root_path', type=str, default='./data1', help='root dir for data')
 parser.add_argument('--split', choices=['val', 'test'], default='test')
