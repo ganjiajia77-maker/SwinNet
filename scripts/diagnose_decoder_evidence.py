@@ -28,6 +28,10 @@ from scripts.decoder_evidence_geometry import (
 
 ORIGINAL_ID = "h0_stage2_location_v1"
 TOPO = dict(image_size=1500, topo_seed_density_deg=.002, topo_step_deg=.0002)
+INT64_FIX_PREVIOUS_SCRIPTS = {
+    "diagnose_decoder_evidence.py": "66178141cc4e5787548121d15d0faad37b488a0bd3fae525b6df63d4136af629",
+    "decoder_evidence_geometry.py": "1f54c23f9307a428b6384b1e6442a1384705ef4ffd31b9fa53bc1bee17ca0c6c",
+}
 
 
 def load_model(path, device):
@@ -118,6 +122,19 @@ def write_csv(path, rows):
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def record_protocol(metadata, protocol):
+    if metadata.exists():
+        saved_protocol = read_json(metadata)
+        if saved_protocol != protocol:
+            # The exact 4ba55e1 reports differ only in JSON serialization of
+            # bounding boxes. Any complete case from that version is reusable.
+            previous = dict(protocol, scripts_sha256=INT64_FIX_PREVIOUS_SCRIPTS)
+            if saved_protocol != previous:
+                raise ValueError("This output belongs to a different run; use a different --output_dir")
+            print("[RESUME] Reusing compatible cases from 4ba55e1", flush=True)
+    write_json(metadata, protocol)
 
 
 def comparison_index(directory):
@@ -354,10 +371,7 @@ def main():
         road_cohort_priority=["occluded_marked", "junction", "narrow", "ordinary"],
         source_size=SOURCE_SIZE, tile=TILE_SIZE, stride=STRIDE)
     out.mkdir(parents=True, exist_ok=True)
-    metadata = out / "protocol.json"
-    if metadata.exists() and read_json(metadata) != protocol:
-        raise ValueError("This output belongs to a different run; use a different --output_dir")
-    write_json(metadata, protocol)
+    record_protocol(out / "protocol.json", protocol)
     total = min(len(data), args.max_images) if args.max_images else len(data)
     results = []
     for index in range(total):

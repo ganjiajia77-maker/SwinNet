@@ -28,8 +28,8 @@ def groups(labels):
 
 
 def bounds(points, shape, pad):
-    top, left = np.maximum(points.min(axis=0) - pad, 0)
-    bottom, right = np.minimum(points.max(axis=0) + pad + 1, shape)
+    top, left = map(int, np.maximum(points.min(axis=0) - pad, 0))
+    bottom, right = map(int, np.minimum(points.max(axis=0) + pad + 1, shape))
     return slice(top, bottom), slice(left, right)
 
 
