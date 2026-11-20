@@ -153,6 +153,10 @@ parser.add_argument('--skeleton_pos_weight', type=float, default=None,
                     help='positive-class weight for skeleton BCE losses')
 parser.add_argument('--stage_direction_factor', type=float, default=0.0)
 parser.add_argument('--stage_connectivity_factor', type=float, default=2.0)
+parser.add_argument('--disable_stage_connectivity', action='store_true',
+                    help='remove decoder C prediction and supervision in the original H0 profile')
+parser.add_argument('--h0_no_c_reference', type=str, default='',
+                    help='original Massachusetts H0 checkpoint, read for training options only')
 parser.add_argument('--stage2_direction_factor', type=float, default=None)
 parser.add_argument('--stage3_direction_factor', type=float, default=None)
 parser.add_argument('--stage2_connectivity_factor', type=float, default=None)
@@ -259,6 +263,44 @@ parser.add_argument('--throughput', action='store_true', help='test throughput o
 
 args = parser.parse_args()
 
+if args.h0_no_c_reference:
+    if not args.disable_stage_connectivity or args.warm_start_ckpt:
+        parser.error('--h0_no_c_reference requires --disable_stage_connectivity and no warm start')
+    reference = torch.load(args.h0_no_c_reference, map_location='cpu', weights_only=False)
+    saved = reference.get('args', {})
+    expected = {
+        'structure_profile': 'stage23_boundary_0626',
+        'source_patch_size': 1500,
+        'img_size': 512,
+        'max_epochs': 80,
+        'use_ema': False,
+        'enable_highres_structure_stream': True,
+        'enable_global_topology': True,
+        'enable_h3_surface_fusion': True,
+        'remove_stage2_pre_topology_source': True,
+        'stage_skeleton_mode': 'direct',
+    }
+    excluded = ('ablate_h0_stream', 'static_h0_stage_fusion', 'native_relation_experiment',
+                'encoder_h_postmerge_phase', 'global_topology_stage2', 'disable_stage_connectivity')
+    if (
+        not isinstance(saved, dict)
+        or any(saved.get(key) != value for key, value in expected.items())
+        or any(saved.get(key) for key in excluded)
+        or any(
+            f'swin_unet.decoder_structure_blocks.{stage}.highres_skeleton_fusion.stage_to_highres.0.weight'
+            not in reference.get('model_state_dict', {})
+            for stage in (2, 3)
+        )
+    ):
+        parser.error('--h0_no_c_reference must be the original full Massachusetts H0 checkpoint')
+    local = {'root_path', 'output_dir', 'run_name', 'cfg', 'pretrain_ckpt',
+             'resume', 'warm_start_ckpt', 'h0_no_c_reference', 'disable_stage_connectivity'}
+    for key in vars(args).keys() - local:
+        if key in saved:
+            setattr(args, key, saved[key])
+    print(f'[H0 no-C] Inherited training options from {args.h0_no_c_reference}', flush=True)
+    del reference, saved
+
 
 def _cli_has(flag):
     return any(
@@ -268,6 +310,8 @@ def _cli_has(flag):
 
 
 def apply_structure_profile_defaults(args):
+    if args.h0_no_c_reference:
+        return  # The reference contains already-resolved training options.
     if args.structure_profile not in {
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_0626,
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
@@ -436,7 +480,11 @@ def format_training_config_lines(args, loss_weights):
         STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
     }:
         lines.extend([
-            "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only",
+            (
+                "  Structure head: Stage2/3 S and D; C heads and loss removed"
+                if args.disable_stage_connectivity else
+                "  Structure head: con0 -> decoder attention bias; ske1 -> gate feature, con1 prediction/loss only"
+            ),
             (
                 "  Final head: surface branch + boundary residual + final skeleton auxiliary only; "
                 "final connectivity removed"
@@ -470,20 +518,24 @@ def format_training_config_lines(args, loss_weights):
             "  Global context calibration: bottleneck GAP -> stage3 structure gate only",
             "  Global context gate strength: 0.03",
             "  Decoder stage3 step0: removed; only post-upsampling refinement is active",
-            "  Decoder gate input: [decoder gate feature, Skeleton, Connectivity]",
+            "  Decoder gate input: [decoder gate feature, Skeleton, {}]".format(
+                "zero C" if args.disable_stage_connectivity else "Connectivity"
+            ),
             "  Decoder gate: structure gate plus local+dilated semantic context; no direction-confidence input",
             "  Connectivity directional positive weight: cardinal={:.3f}, diagonal={:.3f}".format(
                 args.directional_pos_weight_cardinal,
                 args.directional_pos_weight_diagonal,
             ),
-            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,connectivity], relation_bias=relative_xy_distance+connectivity, max_nodes={}, heads={}, alpha_max={:.3f}".format(
+            "  Global topology residual: {}, anchors=z_struct*surface, tokens=[z_struct,decoder_feature,{}], relation_bias=relative_xy_distance{}, max_nodes={}, heads={}, alpha_max={:.3f}".format(
                 "enabled" if args.enable_global_topology else "disabled",
+                "zero C" if args.disable_stage_connectivity else "connectivity",
+                "" if args.disable_stage_connectivity else "+connectivity",
                 args.global_topology_max_nodes,
                 args.global_topology_heads,
                 args.global_topology_alpha_max,
             ),
         ])
-        if args.masked_connectivity_center_experiment:
+        if args.masked_connectivity_center_experiment and not args.disable_stage_connectivity:
             lines.extend([
                 "  Connectivity experiment: skeleton-center connectivity BCE + small reciprocal symmetry regularizer",
                 f"  Connectivity loss balance: pos_weight={args.connectivity_pos_weight:.3f}, focal_gamma={args.connectivity_focal_gamma:.3f}, edge_contrastive_margin={args.edge_contrastive_margin:.3f}",
@@ -581,6 +633,10 @@ def inherit_resume_architecture_args(args):
         return
 
     saved_args = checkpoint["args"]
+    saved_no_c = bool(saved_args.get("disable_stage_connectivity", False))
+    if args.disable_stage_connectivity and not saved_no_c:
+        parser.error('Cannot resume the no-C ablation from a checkpoint with C')
+    args.disable_stage_connectivity = saved_no_c
     for name, cast in (
         ("surface_focal_gamma", float),
         ("amp_dtype", str),
@@ -1198,6 +1254,11 @@ if __name__ == "__main__":
     
     inherit_resume_architecture_args(args)
     apply_structure_profile_defaults(args)
+    if args.disable_stage_connectivity:
+        args.stage_connectivity_factor = 0.0
+        args.stage2_connectivity_factor = 0.0
+        args.stage3_connectivity_factor = 0.0
+        print('[H0 no-C] Stage2/3 C heads and connectivity supervision disabled', flush=True)
 
     # 加载配置
     config = get_config(args)
@@ -1235,6 +1296,7 @@ if __name__ == "__main__":
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
                     ablate_h0_stream=args.ablate_h0_stream,
                     static_h0_stage_fusion=args.static_h0_stage_fusion,
+                    disable_stage_connectivity=args.disable_stage_connectivity,
                     highres_structure_channels=args.highres_structure_channels,
                     highres_structure_fuse_stages=args.highres_structure_fuse_stages,
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,

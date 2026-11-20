@@ -49,6 +49,9 @@ def main():
             p.error('Massachusetts checkpoint must record a positive accumulation_steps')
         if accumulation_steps != 2:
             name += f'_acc{accumulation_steps}'
+    no_c = bool(saved.get('disable_stage_connectivity', False))
+    if no_c:
+        name += '_no_c'
     expected = dict(img_size=512, source_patch_size=source_size, random_crop_train=True,
                     random_crops_per_image=1, direct_resize_train=False,
                     amp_dtype='none', use_ema=use_ema, ema_decay=0.999, max_epochs=80,
@@ -105,6 +108,7 @@ def main():
                         checkpoint_args_verified=True, base_model_commit=BASE,
                         ablate_h0_stream=ablated,
                         static_h0_stage_fusion=static,
+                        disable_stage_connectivity=no_c,
                         seed=saved.get('seed'),
                         physical_batch_size=saved.get('batch_size'),
                         accumulation_steps=accumulation_steps,

@@ -15,8 +15,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd "$REPO"
 
 MODE=${1:-}
-if [[ "$VARIANT" != a && "$VARIANT" != b && "$VARIANT" != full ]]; then
-  echo "VARIANT must be a, b or full" >&2
+if [[ "$VARIANT" != a && "$VARIANT" != b && "$VARIANT" != full && "$VARIANT" != no_c ]]; then
+  echo "VARIANT must be a, b, full or no_c" >&2
   exit 2
 fi
 if [[ "$USE_EMA" != 0 && "$USE_EMA" != 1 ]]; then
@@ -28,7 +28,7 @@ if [[ ! "$ACCUMULATION_STEPS" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 if [[ "$MODE" != train && "$MODE" != resume && "$MODE" != val && "$MODE" != test && "$MODE" != topology ]]; then
-  echo "Usage: VARIANT=a|b|full bash scripts/run_h0_mass1500.sh train|resume|val|test|topology" >&2
+  echo "Usage: VARIANT=a|b|full|no_c bash scripts/run_h0_mass1500.sh train|resume|val|test|topology" >&2
   exit 2
 fi
 mkdir -p "$RESULTS"
@@ -60,6 +60,11 @@ if [[ "$MODE" == train || "$MODE" == resume ]]; then
     extra+=(--enable_highres_structure_stream --static_h0_stage_fusion)
   else
     extra+=(--enable_highres_structure_stream)
+  fi
+  if [[ "$VARIANT" == no_c ]]; then
+    H0_REFERENCE=${H0_REFERENCE:-/home/gjj/SwinNet-h0-mass/model_out/mass_h0_599a410_random512_fp32_80e_bs2_20261011_113054/best.pth}
+    test -s "$H0_REFERENCE" || { echo "Missing original H0 reference: $H0_REFERENCE" >&2; exit 1; }
+    extra+=(--disable_stage_connectivity --h0_no_c_reference "$H0_REFERENCE")
   fi
   if [[ "$MODE" == resume ]]; then
     test -s "$RUN_DIR/last.pth" || { echo "Missing $RUN_DIR/last.pth" >&2; exit 1; }

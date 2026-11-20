@@ -1277,6 +1277,7 @@ class SwinTransformerSys(nn.Module):
                  stage_skeleton_bias_init="zero",
                  stage_skeleton_positive_prior=0.05,
                  remove_stage2_pre_topology_source=False,
+                 disable_stage_connectivity=False,
                   **kwargs):
         super().__init__()
 
@@ -1289,6 +1290,9 @@ class SwinTransformerSys(nn.Module):
         )
 
         self.num_classes = num_classes
+        self.disable_stage_connectivity = bool(disable_stage_connectivity)
+        if self.disable_stage_connectivity and structure_profile != "stage23_boundary_0626":
+            raise ValueError("The no-C H0 ablation requires the stage23_boundary_0626 profile")
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.ape = ape
@@ -1746,8 +1750,10 @@ class SwinTransformerSys(nn.Module):
                     )
                     print(
                         f"[INFO] Global topology residual: anchors={anchor_source}*surface, "
-                        f"tokens=[{anchor_source},decoder_feature,connectivity], "
-                        "relation_bias=relative_xy_distance+connectivity"
+                        f"tokens=[{anchor_source},decoder_feature,"
+                        f"{'zero C' if self.disable_stage_connectivity else 'connectivity'}], "
+                        f"relation_bias=relative_xy_distance"
+                        f"{'' if self.disable_stage_connectivity else '+connectivity'}"
                     )
             else:
                 self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
@@ -1767,6 +1773,15 @@ class SwinTransformerSys(nn.Module):
             if self.stage2_topology_source is not None:
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.weight)
                 nn.init.zeros_(self.stage2_topology_source.skeleton_head.out.bias)
+        if self.disable_stage_connectivity:
+            # Remove C after the original initialization so all shared tensors
+            # and the RNG state are identical at the same seed.
+            for block in self.decoder_structure_blocks.values():
+                block.connectivity_context = None
+                block.connectivity_head = None
+            if self.stage2_topology_source is not None:
+                self.stage2_topology_source.connectivity_context = None
+                self.stage2_topology_source.connectivity_head = None
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -2053,6 +2068,8 @@ class SwinTransformerSys(nn.Module):
 
     @staticmethod
     def _decoder_connectivity_used(connectivity_logits):
+        if connectivity_logits is None:
+            return None
         return torch.sigmoid(connectivity_logits).detach()
 
     @staticmethod
@@ -2232,7 +2249,7 @@ class SwinTransformerSys(nn.Module):
                         connectivity_used = self._decoder_connectivity_used(connectivity_0)
                     else:
                         skeleton_used = torch.sigmoid(skeleton_0).detach()
-                        connectivity_used = torch.sigmoid(connectivity_0).detach()
+                        connectivity_used = self._decoder_connectivity_used(connectivity_0)
                     x = layer_up(
                         x,
                         decoder_skeleton_prob=skeleton_used,

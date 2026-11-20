@@ -844,17 +844,20 @@ class DecoderStructureRefinement(nn.Module):
             runtime_connectivity_skeleton = connectivity_override
 
         direction_logits = self.direction_head(structure_feat)
-        connectivity_feat = self.connectivity_context(structure_feat)
-        connectivity_logits = self.connectivity_head(
-            connectivity_feat,
-            skeleton_prob=runtime_connectivity_skeleton.detach(),
-        )
-
-        connectivity_prob = torch.sigmoid(connectivity_logits)
-        topk = min(2, self.connectivity_channels)
-        conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
-        if self.runtime_ablate_connectivity_gate:
-            conn_strength = torch.zeros_like(conn_strength)
+        if self.connectivity_head is None:
+            connectivity_logits = None
+            conn_strength = torch.zeros_like(runtime_gate_skeleton)
+        else:
+            connectivity_feat = self.connectivity_context(structure_feat)
+            connectivity_logits = self.connectivity_head(
+                connectivity_feat,
+                skeleton_prob=runtime_connectivity_skeleton.detach(),
+            )
+            connectivity_prob = torch.sigmoid(connectivity_logits)
+            topk = min(2, self.connectivity_channels)
+            conn_strength = connectivity_prob.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
+            if self.runtime_ablate_connectivity_gate:
+                conn_strength = torch.zeros_like(conn_strength)
         gate_skeleton = scale_gradient(
             runtime_gate_skeleton,
             self.gate_topology_gradient_ratio,

@@ -746,7 +746,6 @@ class SurfaceStructureLoss(nn.Module):
             stage_skel, stage_skel_soft = build_soft_stage_skeleton_target(
                 source_stage_skel, target_size
             )
-            stage_skel_dilate = build_stage_skeleton_target(source_stage_skel_dilate, target_size)
             if stage_skeleton_logits is not None:
                 loss_skeleton_stage = self.soft_stage_skeleton_loss(
                     stage_skeleton_logits,
@@ -756,6 +755,9 @@ class SurfaceStructureLoss(nn.Module):
                 loss_skeleton_stage = reference_logits.sum() * 0.0
             loss_connectivity_stage = reference_logits.sum() * 0.0
             if stage_connectivity_logits is not None:
+                stage_skel_dilate = build_stage_skeleton_target(
+                    source_stage_skel_dilate, target_size
+                )
                 stage_connectivity_gt = build_connectivity_target(stage_skel).to(
                     device=stage_connectivity_logits.device,
                     dtype=stage_connectivity_logits.dtype,
@@ -981,7 +983,11 @@ class SurfaceStructureLoss(nn.Module):
         if skeleton_dilate_gt is None:
             skeleton_dilate_gt = skeleton_gt
 
-        if self.use_masked_connectivity_center_experiment:
+        if (
+            self.use_masked_connectivity_center_experiment
+            and connectivity_logits is not None
+            and self.connectivity_weight > 0
+        ):
             connectivity_gt = build_connectivity_target(
                 skeleton_gt,
                 erode_kernel_size=self.connectivity_erode_kernel_size,

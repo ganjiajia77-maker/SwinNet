@@ -101,6 +101,7 @@ parser.add_argument(
 parser.add_argument('--enable_highres_structure_stream', action='store_true')
 parser.add_argument('--ablate_h0_stream', action='store_true')
 parser.add_argument('--static_h0_stage_fusion', action='store_true')
+parser.add_argument('--disable_stage_connectivity', action='store_true')
 parser.add_argument('--highres_structure_channels', type=int, default=64)
 parser.add_argument(
     '--highres_structure_fuse_stages',
@@ -282,6 +283,7 @@ if __name__ == "__main__":
                 "enable_highres_structure_stream",
                 "ablate_h0_stream",
                 "static_h0_stage_fusion",
+                "disable_stage_connectivity",
                 "highres_structure_channels",
                 "highres_structure_fuse_stages",
                 "highres_structure_fusion_mode",
@@ -324,6 +326,7 @@ if __name__ == "__main__":
                     enable_highres_structure_stream=args.enable_highres_structure_stream,
                     ablate_h0_stream=args.ablate_h0_stream,
                     static_h0_stage_fusion=args.static_h0_stage_fusion,
+                    disable_stage_connectivity=args.disable_stage_connectivity,
                     highres_structure_channels=args.highres_structure_channels,
                     highres_structure_fuse_stages=args.highres_structure_fuse_stages,
                     highres_structure_fusion_mode=args.highres_structure_fusion_mode,
