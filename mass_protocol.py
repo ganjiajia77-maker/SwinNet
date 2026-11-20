@@ -9,7 +9,7 @@ SOURCE_SIZE = 1500
 TILE_SIZE = 512
 STRIDE = 256
 BASE_COMMIT = '599a410de8d341850e1810417307e4b3bbdfc82d'
-MODEL_NAME = 'h0_599a410_mass_random512_fp32_80e_bs2'
+MODEL_NAME = 'h0_599a410_no_s_mass_random512_fp32_80e_bs2'
 
 
 def blend_weight(size, device):
@@ -85,10 +85,28 @@ def validate_training_args(args):
                     enable_highres_structure_stream=True, enable_global_topology=True,
                     enable_h3_surface_fusion=True, remove_stage2_pre_topology_source=True,
                     highres_structure_channels=64, highres_structure_fuse_stages='stage23',
-                    highres_structure_fusion_mode='stage23', stage_skeleton_mode='direct')
+                    highres_structure_fusion_mode='stage23', stage_skeleton_mode='direct',
+                    no_s=True, stage_skeleton_only_loss_factor=0.0,
+                    final_skeleton_weight=0.0, highres_structure_skeleton_weight=0.0,
+                    stage_skeleton_loss_factor=1.0,
+                    stage2_skeleton_weight=0.008, stage3_skeleton_weight=0.012,
+                    stage_connectivity_factor=3.0, stage_direction_factor=0.2,
+                    stage2_connectivity_factor=None, stage3_connectivity_factor=None,
+                    stage2_direction_factor=None, stage3_direction_factor=None)
     actual = vars(args) if hasattr(args, '__dict__') else args
     mismatch = {key: (actual.get(key), value) for key, value in expected.items()
                 if actual.get(key) != value}
     if mismatch:
         raise ValueError(f'Mass H0 protocol was overridden (actual, required): {mismatch}')
     return expected
+
+
+def validate_checkpoint(checkpoint):
+    if (not isinstance(checkpoint, dict)
+            or checkpoint.get('experiment_base_commit') != BASE_COMMIT
+            or checkpoint.get('experiment_variant') != MODEL_NAME
+            or 'model_state_dict' not in checkpoint):
+        raise ValueError('Expected an original H0 No-S Massachusetts checkpoint')
+    if checkpoint.get('ema_state_dict') is not None:
+        raise ValueError('This experiment requires raw weights without EMA')
+    validate_training_args(checkpoint.get('args', {}))

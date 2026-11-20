@@ -793,7 +793,10 @@ class DecoderStructureRefinement(nn.Module):
                 highres_skeleton_feat,
                 structure_feat,
             )
-        if disable_skeleton_prediction:
+        if self.skeleton_head is None:
+            skeleton_logits = None
+            skeleton_prob = x.new_zeros((x.shape[0], 1, x.shape[-2], x.shape[-1]))
+        elif disable_skeleton_prediction:
             if skeleton_prior is None:
                 skeleton_logits = None
                 skeleton_prob = x.new_zeros((x.shape[0], 1, x.shape[-2], x.shape[-1]))

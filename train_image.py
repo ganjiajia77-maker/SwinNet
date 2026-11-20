@@ -30,7 +30,7 @@ from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from losses.cldice_loss import soft_skeletonize
 from config import get_config
-from mass_protocol import BASE_COMMIT, stitch_logits, validate_training_args
+from mass_protocol import BASE_COMMIT, MODEL_NAME, stitch_logits, validate_checkpoint, validate_training_args
 
 
 def seed_worker(worker_id):
@@ -256,6 +256,7 @@ parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
+parser.add_argument('--no_s', action='store_true', help='remove S2, S3 and the high-resolution skeleton readout')
 args = parser.parse_args()
 
 
@@ -1217,6 +1218,8 @@ if __name__ == "__main__":
                     stage_skeleton_bias_init=args.stage_skeleton_bias_init,
                     stage_skeleton_positive_prior=args.stage_skeleton_positive_prior,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).to(device)
+    model.swin_unet.remove_explicit_skeleton_heads()
+    print('[H0 NO-S] S2/S3 and H skeleton readouts removed; C/D and global topology active.', flush=True)
 
     loaded_pretrained_names = set()
     if not args.resume and not args.warm_start_ckpt and not args.no_pretrain:
@@ -1430,6 +1433,7 @@ if __name__ == "__main__":
         if os.path.isfile(args.resume):
             print(f"加载checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            validate_checkpoint(checkpoint)
             checkpoint_state = checkpoint["model_state_dict"]
             model_state = model.state_dict()
             filtered_checkpoint_state = {}
@@ -2185,6 +2189,7 @@ if __name__ == "__main__":
             checkpoint_model = ema.ema if ema is not None else model
             checkpoint = {
                 'experiment_base_commit': BASE_COMMIT,
+                'experiment_variant': MODEL_NAME,
                 'experiment_protocol': 'h0-mass-native1500-random512-fp32-80e-bs2-v1',
                 'epoch': epoch + 1,
                 'model_state_dict': checkpoint_model.state_dict(),

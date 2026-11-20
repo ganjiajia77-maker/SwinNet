@@ -1,4 +1,4 @@
-"""Run the original 599a410 H0 on Massachusetts with a fixed native-image protocol."""
+"""Train and evaluate the original H0 No-S ablation on Massachusetts."""
 import argparse
 from datetime import datetime
 import hashlib
@@ -11,12 +11,13 @@ import sys
 
 import torch
 
-from mass_protocol import BASE_COMMIT, MODEL_NAME, validate_training_args
+from mass_protocol import BASE_COMMIT, MODEL_NAME, validate_checkpoint
 
 
 ROOT = Path(__file__).resolve().parent
 EVAL = ROOT / 'evaluation' / 'road_comparison'
 CFG = ROOT / 'configs' / 'swin_tiny_patch4_window7_224_lite.yaml'
+DEFAULT_TOPO_TOOL = Path('/home/gjj/unified-road-six-4b7d37a/evaluation/road_comparison/compare_predictions.py')
 
 
 def architecture_flags():
@@ -43,7 +44,8 @@ def train_command(args):
             '--pretrained_lr', '5e-5', '--pretrained_min_lr', '5e-6',
             '--new_lr', '2e-4', '--new_min_lr', '1e-5', '--warmup_epochs', '10',
             '--stage2_skeleton_weight', '0.008', '--stage3_skeleton_weight', '0.012',
-            '--stage_skeleton_loss_factor', '1.0', '--stage_skeleton_only_loss_factor', '1.0',
+            '--no_s', '--stage_skeleton_loss_factor', '1.0',
+            '--stage_skeleton_only_loss_factor', '0.0', '--final_skeleton_weight', '0.0',
             '--stage2_skeleton_gradient_ratio', '0.5', '--stage3_skeleton_gradient_ratio', '0.5',
             '--stage3_gate_topology_gradient_ratio', '0.0', '--skeleton_pos_weight', '2.0',
             '--highres_structure_skeleton_weight', '0.0', '--stage_direction_factor', '0.2',
@@ -59,23 +61,17 @@ def run(command, env):
     subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
-def verify_base_model():
-    expected = json.loads((ROOT / 'BASE_MODEL_SHA256.json').read_text(encoding='utf-8'))
+def verify_implementation():
+    expected = json.loads((ROOT / 'IMPLEMENTATION_SHA256.json').read_text(encoding='utf-8'))
     changed = [name for name, digest in expected.items()
-               if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest]
+               if hashlib.sha256((ROOT / name).read_bytes().replace(b'\r\n', b'\n')).hexdigest() != digest]
     if changed:
-        raise ValueError(f'Model/loss differs from original {BASE_COMMIT}: {changed}')
+        raise ValueError(f'No-S implementation source differs from the release: {changed}')
 
 
 def verify_checkpoint(path):
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
-        raise ValueError('Expected a checkpoint produced by this Massachusetts H0 training entry')
-    if checkpoint.get('experiment_base_commit') != BASE_COMMIT:
-        raise ValueError('Checkpoint does not record the original 599a410 H0 architecture')
-    validate_training_args(checkpoint.get('args', {}))
-    if checkpoint.get('ema_state_dict') is not None:
-        raise ValueError('This experiment requires raw weights without EMA')
+    validate_checkpoint(checkpoint)
     result = {'epoch': checkpoint.get('epoch'), 'args': checkpoint['args']}
     del checkpoint
     return result
@@ -110,6 +106,7 @@ def manifest(args, checkpoint_info, selection=None):
             'models': [{'name': MODEL_NAME, 'provenance': {
                 'checkpoint': str(args.model_path), 'checkpoint_epoch': checkpoint_info['epoch'],
                 'base_model_commit': BASE_COMMIT, 'checkpoint_args_verified': True,
+                'variant': MODEL_NAME, 'no_s': True,
                 'training_crop': 'one random512 crop per native1500 image per epoch; shared epoch',
                 'training_precision': 'FP32', 'training_max_epochs': 80,
                 'micro_batch_size': 2, 'accumulation_steps': 1, 'weights': 'raw; no EMA',
@@ -144,9 +141,33 @@ def compare_command(args, split, manifest_path, selection_path=None, output_dir=
     return command
 
 
+def run_six(args, destination, selection_path, threshold, env):
+    tool = args.topo_tool.resolve()
+    if not tool.is_file():
+        raise FileNotFoundError(f'Unified six-metric evaluator not found: {tool}')
+    data = json.loads(destination.read_text(encoding='utf-8'))
+    data['protocol'] = dict(image_size=1500, apls_max_control_nodes=150,
+                            apls_control_sampling_seed=1234, topo_seed_density_deg=.002,
+                            topo_step_deg=.0002, tlts_n_paths=200, tlts_seed=1234)
+    data['models'][0]['validation_selection'] = dict(
+        selected_on='val', criterion='global_iou', threshold=threshold,
+        evidence=str(selection_path),
+    )
+    manifest_path = args.output_dir / 'comparison_six.json'
+    manifest_path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+    output = args.output_dir / 'test_six'
+    command = [sys.executable, '-u', str(tool), '--manifest', str(manifest_path),
+               '--split', 'test', '--import_val_selection', '--output_dir', str(output),
+               '--workers', '1', '--progress_every', '1']
+    if output.is_dir() and any(output.iterdir()):
+        command.append('--resume')
+    run(command, env)
+    print((output / 'test_comparison.csv').read_text(encoding='utf-8'))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['train', 'sweep', 'test', 'topology'])
+    parser.add_argument('mode', choices=['train', 'sweep', 'test', 'topology', 'six'])
     parser.add_argument('--root_path', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--pretrain_ckpt', type=Path)
@@ -158,18 +179,19 @@ def main():
     parser.add_argument('--thresholds', type=float, nargs='+',
                         default=[round(i / 100, 2) for i in range(5, 100, 5)])
     parser.add_argument('--recompute', action='store_true', help='recompute cached test topology metrics')
+    parser.add_argument('--topo_tool', type=Path, default=DEFAULT_TOPO_TOOL)
     args = parser.parse_args()
     args.root_path, args.output_dir = args.root_path.resolve(), args.output_dir.resolve()
     if args.num_workers < 0:
         parser.error('num_workers must be nonnegative')
-    verify_base_model()
+    verify_implementation()
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.gpu, OPENCV_LOG_LEVEL='ERROR',
                PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True', PYTHONUNBUFFERED='1')
     if args.mode == 'train':
         if args.pretrain_ckpt is None or not args.pretrain_ckpt.is_file():
             parser.error('Provide the ImageNet SwinV2 Tiny --pretrain_ckpt')
         args.pretrain_ckpt = args.pretrain_ckpt.resolve()
-        args.run_name = args.run_name or 'mass_h0_599a410_random512_fp32_80e_bs2_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.run_name = args.run_name or MODEL_NAME + '_' + datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = args.output_dir / args.run_name
         if run_dir.exists():
             parser.error(f'Fresh run directory already exists: {run_dir}')
@@ -199,6 +221,9 @@ def main():
     if args.mode == 'test':
         run(infer_command(args, 'test', [threshold]), env)
     destination = manifest(args, checkpoint_info, selection)
+    if args.mode == 'six':
+        run_six(args, destination, selection_path, threshold, env)
+        return
     metric_dir = args.output_dir / 'test'
     if args.recompute:
         metric_dir = args.output_dir / ('test_topology_' + datetime.now().strftime('%Y%m%d_%H%M%S'))

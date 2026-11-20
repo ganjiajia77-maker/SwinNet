@@ -19,13 +19,12 @@ from networks.vision_transformer import (
     STRUCTURE_PROFILE_STAGE23_BOUNDARY_FINAL_SKE,
     SwinUnet as ViT_seg,
     format_topology_coefficients,
-    load_topology_checkpoint_state,
     print_topology_coefficients,
 )
 from datasets.dataset_road_skeleton import RoadSkeletonDataset
 from losses.road_losses import SurfaceStructureLoss
 from config import get_config
-from mass_protocol import stitch_logits, validate_training_args
+from mass_protocol import stitch_logits, validate_checkpoint
 
 
 def _cli_has(flag_name):
@@ -253,12 +252,11 @@ if __name__ == "__main__":
     
     # 创建网络
     args.num_classes = 1
-    checkpoint = None
     if os.path.exists(args.model_path):
         checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
+        validate_checkpoint(checkpoint)
         if isinstance(checkpoint, dict):
             saved_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
-            validate_training_args(saved_args)
             if args.img_size != 512 or args.source_patch_size != 1500 or not args.overlap_infer:
                 raise ValueError('Mass H0 evaluation requires native1500 with 512 overlap inference')
             if args.require_ema:
@@ -304,6 +302,9 @@ if __name__ == "__main__":
             ):
                 args.disable_msfe_skip = bool(saved_args["disable_msfe_skip"])
 
+    else:
+        raise FileNotFoundError(args.model_path)
+
     for name, default in (
         ("stage_skeleton_mode", "prior_residual"),
         ("enable_h3_surface_fusion", False),
@@ -336,41 +337,14 @@ if __name__ == "__main__":
                     global_topology_alpha_max=args.global_topology_alpha_max,
                     stage_skeleton_mode=args.stage_skeleton_mode,
                     remove_stage2_pre_topology_source=args.remove_stage2_pre_topology_source).cuda()
+    model.swin_unet.remove_explicit_skeleton_heads()
     device = next(model.parameters()).device
     
-    # The unified experiment requires the EMA snapshot, never raw fallback.
-    if args.require_ema:
-        if not isinstance(checkpoint, dict) or checkpoint.get('ema_state_dict') is None:
-            raise ValueError('--require_ema: checkpoint has no EMA state')
-        checkpoint['model_state_dict'] = checkpoint['ema_state_dict']
-        print('[INFERENCE] explicitly loading EMA weights', flush=True)
-    # 加载模型
-    if checkpoint is not None:
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            load_topology_checkpoint_state(
-                model,
-                checkpoint['model_state_dict'],
-                checkpoint.get("topology_attention_version", "legacy-unrecorded"),
-                strict=True,
-            )
-        else:
-            model.load_state_dict(checkpoint, strict=(args.bottleneck_type == 'global_local'))
-        print(f"已加载模型: {args.model_path}")
-        print("Using topology attention constrained version", flush=True)
-        print_topology_coefficients(model)
-        if isinstance(checkpoint, dict):
-            saved_version = checkpoint.get(
-                "topology_attention_version",
-                "legacy-unrecorded",
-            )
-            print(
-                f"[TOPOLOGY] checkpoint_version={saved_version}; "
-                f"runtime_version={TOPOLOGY_ATTENTION_VERSION}",
-                flush=True,
-            )
-    else:
-        print(f"错误: 模型文件不存在 {args.model_path}")
-        exit(1)
+    if checkpoint.get("topology_attention_version") != TOPOLOGY_ATTENTION_VERSION:
+        raise ValueError("Unexpected checkpoint topology attention version")
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    print(f"已加载模型: {args.model_path}")
+    print_topology_coefficients(model)
     test_image_dir = os.path.join(args.root_path, args.split, 'image')
     if not os.path.exists(test_image_dir):
         test_image_dir = os.path.join(args.root_path, args.split)

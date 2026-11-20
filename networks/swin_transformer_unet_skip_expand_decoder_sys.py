@@ -2002,6 +2002,19 @@ class SwinTransformerSys(nn.Module):
             and stage in (2, 3)
         )
 
+    def remove_explicit_skeleton_heads(self):
+        """Remove S readouts after shared initialization, preserving the H stream."""
+        if (self.structure_profile != "stage23_boundary_0626"
+                or self.stage_skeleton_mode != "direct"
+                or not self.enable_highres_structure_stream
+                or not self.remove_stage2_pre_topology_source
+                or self.guided_head.final_skeleton_aux_head is not None
+                or set(self.decoder_structure_blocks) != {"2", "3"}):
+            raise ValueError("No-S requires the original H0 Massachusetts direct profile")
+        for block in self.decoder_structure_blocks.values():
+            block.skeleton_head = None
+        self.highres_structure_skeleton_head = None
+
     @staticmethod
     def _append_structure_output(
         structure_outputs,
@@ -2085,7 +2098,8 @@ class SwinTransformerSys(nn.Module):
             self.last_stage_features["H0"] = highres_skeleton_feat
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
-            if highres_skeleton_feat is not None
+            if self.highres_structure_skeleton_head is not None
+            and highres_skeleton_feat is not None
             and self.stage_skeleton_mode == "prior_residual"
             else None
         )
@@ -2208,7 +2222,7 @@ class SwinTransformerSys(nn.Module):
                     )
                     if isinstance(roadness_0, dict):
                         roadness_0.pop("structure_feat", None)
-                    if decoder_skeleton_disabled:
+                    if decoder_skeleton_disabled or skeleton_0 is None:
                         skeleton_used = None
                         connectivity_used = self._decoder_connectivity_used(connectivity_0)
                     else:
@@ -2425,7 +2439,8 @@ class SwinTransformerSys(nn.Module):
         )
         highres_structure_skeleton = (
             self.highres_structure_skeleton_head(highres_skeleton_feat)
-            if highres_skeleton_feat is not None
+            if self.highres_structure_skeleton_head is not None
+            and highres_skeleton_feat is not None
             else None
         )
         self.last_highres_structure_skeleton = highres_structure_skeleton

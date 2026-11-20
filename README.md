@@ -1,9 +1,13 @@
-# Original H0 on Massachusetts Roads
+# Original H0 No-S ablation on Massachusetts Roads
 
 Base architecture: `599a410de8d341850e1810417307e4b3bbdfc82d`.
-The 14 model, loss, and direction-target files in `BASE_MODEL_SHA256.json` are
-byte-for-byte identical to that commit. This package changes data handling,
-training/evaluation entry points, and the unified metric adapter.
+The original Massachusetts package is `fe3b730`. The ablation removes the S2,
+S3 and high-resolution skeleton readouts after shared model initialization.
+C and the structure gate receive zeros in their former S input slots. The H
+feature stream, C/D heads, A1/A2, final surface head and global topology stay active.
+Stage 2/3 shared loss weights stay at 0.008 and 0.012. Only the dedicated
+skeleton prediction losses are disabled. GT skeletons still supervise C and D.
+`IMPLEMENTATION_SHA256.json` records the released implementation.
 
 ## Fixed experiment
 
@@ -21,7 +25,7 @@ training/evaluation entry points, and the unified metric adapter.
 - Training validation every 5 epochs; step-based trend validation disabled.
 - ImageNet SwinV2 Tiny window8/256 pretraining; no data1 checkpoint warm start.
 - Original H0 learning rates: pretrained 5e-5 -> 5e-6, new 2e-4 -> 1e-5,
-  warmup 10 epochs. Original H0 skeleton/connectivity/direction/surface losses.
+  warmup 10 epochs. Original H0 connectivity, direction and surface losses.
 
 Required dataset layout:
 
@@ -45,9 +49,9 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate swinunet
 
 DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
-OUT=/home/gjj/SwinNet-h0-mass/model_out
-RUN="mass_h0_599a410_random512_fp32_80e_bs2_$(date +%Y%m%d_%H%M%S)"
-printf '%s\n' "$RUN" > mass_run_name.txt
+OUT=/home/gjj/SwinNet-roadbias/model_out
+RUN="mass_h0_599a410_no_s_fp32_80e_s1234_$(date +%Y%m%d_%H%M%S)"
+printf '%s\n' "$RUN" > mass_no_s_run_name.txt
 
 python -u mass_h0.py train --gpu 2 \
   --root_path "$DATA" --output_dir "$OUT" --run_name "$RUN" \
@@ -59,8 +63,8 @@ After training, including in a new terminal in the same package directory:
 
 ```bash
 DATA=/home/gjj/Swin-Unet-main/Massachusetts/tiff
-OUT=/home/gjj/SwinNet-h0-mass/model_out
-RUN=$(cat mass_run_name.txt)
+OUT=/home/gjj/SwinNet-roadbias/model_out
+RUN=$(cat mass_no_s_run_name.txt)
 CKPT="$OUT/$RUN/best.pth"
 REPORT="$OUT/$RUN/unified"
 
@@ -70,7 +74,7 @@ python -u mass_h0.py sweep --gpu 2 \
 python -u mass_h0.py test --gpu 2 \
   --root_path "$DATA" --model_path "$CKPT" --output_dir "$REPORT"
 
-python -u mass_h0.py topology --gpu 2 \
+python -u mass_h0.py six --gpu 2 \
   --root_path "$DATA" --model_path "$CKPT" --output_dir "$REPORT"
 ```
 
@@ -88,6 +92,9 @@ image size is 1500 for Massachusetts.
 - Topology: display the report already computed by `test`. Add `--recompute`
   to generate a fresh topology report from the existing masks, without GPU
   inference or overwriting the previous report.
+- Six: read the selected test masks with the unified `4b7d37a` evaluator.
+  Supply its `compare_predictions.py` with `--topo_tool` if it is not installed
+  at the default server path. The final result is `test_six/test_comparison.csv`.
 - Fixed Zhang-Suen skeletonization, 8-neighbor connectivity, short-component
   area <20 pixels, APLS proxy maximum 64 nodes, matching distance <=5 pixels.
   Reports GT-to-prediction, prediction-to-GT, and bidirectional approximate
