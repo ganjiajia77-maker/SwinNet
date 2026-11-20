@@ -261,6 +261,8 @@ parser.add_argument('--tag', type=str, default='', help='experiment tag')
 parser.add_argument('--eval', action='store_true', help='evaluation only')
 parser.add_argument('--throughput', action='store_true', help='test throughput only')
 
+parser.add_argument('--freeze_scgra_off', action='store_true',
+                    help='Freeze decoder SCGRA at zero writeback throughout training')
 args = parser.parse_args()
 
 
@@ -1240,6 +1242,22 @@ if __name__ == "__main__":
                 "Set --pretrain_ckpt or use --no_pretrain."
             )
         loaded_pretrained_names = model.load_from(config)
+
+    if args.freeze_scgra_off:
+        if args.architecture_id != 'h0_stage2_location_v1' or args.stage2_structure_location != 'decoder':
+            raise ValueError('The SCGRA training control requires the original decoder architecture')
+        if args.warm_start_ckpt:
+            raise ValueError('SCGRA control must start from the original backbone pretraining')
+        if args.resume:
+            resume_header = torch.load(args.resume, map_location='cpu', weights_only=False)
+            if not resume_header.get('args', {}).get('freeze_scgra_off'):
+                raise ValueError('SCGRA control cannot resume a full-model checkpoint')
+            del resume_header
+        topology = model.swin_unet.global_topology
+        topology.requires_grad_(False)
+        with torch.no_grad():
+            topology.raw_alpha.zero_()
+        print('[SCGRA CONTROL] Global writeback fixed at zero for training and validation', flush=True)
 
     def build_layerwise_optimizer():
         loaded_params, new_params = [], []

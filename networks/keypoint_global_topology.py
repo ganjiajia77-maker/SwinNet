@@ -276,6 +276,10 @@ class KeypointGuidedGlobalTopology(nn.Module):
         attention = torch.softmax(logits, dim=-1)
         if self.capture_scgra_trace:
             self._scgra_node_attention = attention.detach().float().cpu()
+        if getattr(self, 'capture_relation_attention', False):
+            self.last_relation_attention = (
+                attention.detach().float().cpu(), valid.detach().cpu(), coords.detach().cpu()
+            )
         attended = torch.matmul(attention, value).transpose(1, 2).reshape(
             batch,
             nodes,

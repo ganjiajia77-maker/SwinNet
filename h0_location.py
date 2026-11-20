@@ -186,6 +186,9 @@ def train_command(args, checkpoint_info=None):
         pretrained = checkpoint_info['args'].get('pretrain_ckpt')
         if pretrained:
             command += ['--pretrain_ckpt', str(pretrained)]
+    if getattr(args, 'freeze_scgra_off', False) or (
+            checkpoint_info and checkpoint_info['args'].get('freeze_scgra_off')):
+        command.append('--freeze_scgra_off')
     return command
 
 
@@ -288,6 +291,8 @@ def main():
     parser.add_argument('--thresholds', type=float, nargs='+',
                         default=[round(i / 100, 2) for i in range(5, 100, 5)])
     parser.add_argument('--recompute', action='store_true')
+    parser.add_argument('--freeze_scgra_off', action='store_true',
+                        help='Fresh decoder control with SCGRA frozen at zero writeback')
     parser.add_argument('--dry_run', action='store_true', help='print train/resume command without executing or writing pointers')
     parser.add_argument('--implementation_manifest', type=Path, default=ROOT / 'IMPLEMENTATION_SHA256.json')
     args = parser.parse_args()
@@ -319,6 +324,8 @@ def main():
     args.root_path, args.output_dir = args.root_path.resolve(), args.output_dir.resolve()
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.gpu, OPENCV_LOG_LEVEL='ERROR',
                PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True', PYTHONUNBUFFERED='1')
+    if args.freeze_scgra_off and (args.mode != 'train' or args.location != 'decoder'):
+        parser.error('--freeze_scgra_off is for fresh decoder training; resume inherits the checkpoint setting')
     if args.mode in ('train', 'resume'):
         if args.mode == 'train':
             if info is not None:
@@ -355,7 +362,8 @@ def main():
             print(shlex.join(train_command(args, info)), flush=True)
             return
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        pointer = args.output_dir / f'{ARCHITECTURE_ID}_{args.location}_latest.json'
+        suffix = '_scgra_off' if '--freeze_scgra_off' in train_command(args, info) else ''
+        pointer = args.output_dir / f'{ARCHITECTURE_ID}_{args.location}{suffix}_latest.json'
         write_json(pointer, {'architecture_id': ARCHITECTURE_ID, 'stage2_structure_location': args.location,
                              'run_dir': str(run_dir), 'best': str(run_dir / 'best.pth'),
                              'last': str(run_dir / 'last.pth'), 'seed': args.seed})
