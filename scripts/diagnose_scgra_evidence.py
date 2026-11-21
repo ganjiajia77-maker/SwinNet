@@ -74,7 +74,7 @@ def summarize_attention(captured, reference=None):
 
 
 @torch.inference_mode()
-def infer(model, image, mode):
+def infer(model, image, mode, *, on_relation_terms=None):
     module = model.swin_unet.global_topology
     captured = []
     collect = mode in MODES and mode != 'alpha_zero'
@@ -84,14 +84,25 @@ def infer(model, image, mode):
         if collect:
             captured.append(module.last_relation_attention)
             module.last_relation_attention = None
+        if on_relation_terms is not None:
+            on_relation_terms({key: (val[0] if val.ndim else val).numpy()
+                               for key, val in module.last_relation_terms.items()})
+            del module.last_relation_terms
         return result[0]
 
     module.capture_relation_attention = collect
+    previous_term_capture = getattr(module, 'capture_relation_terms', False)
+    if on_relation_terms is not None:
+        module.capture_relation_terms = True
     try:
         with zero_parameters(module, MODES.get(mode, ())):
             logits, _ = stitch_logits(forward, image)
     finally:
         module.capture_relation_attention = False
+        if on_relation_terms is not None:
+            module.capture_relation_terms = previous_term_capture
+            if hasattr(module, 'last_relation_terms'):
+                del module.last_relation_terms
     if collect and (len(captured) != 25 or any(x is None for x in captured)):
         raise RuntimeError('Expected one attention matrix in each of the 25 windows')
     return logits.sigmoid()[0, 0].cpu().numpy(), captured
