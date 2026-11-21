@@ -258,7 +258,7 @@ class KeypointGuidedGlobalTopology(nn.Module):
             channels // self.heads,
         ).permute(2, 0, 3, 1, 4)
         query, key, value = qkv[0], qkv[1], qkv[2]
-        logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
+        base_logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(
             channels // self.heads
         )
         topology_bias = self._relative_topology_bias(coords, valid, anchor_hw)
@@ -268,12 +268,35 @@ class KeypointGuidedGlobalTopology(nn.Module):
                 connectivity_feature,
                 valid,
             )
-        logits = logits + self.token_relation_scale * topology_bias + local_topology_bias
+        spatial_bias = self.token_relation_scale * topology_bias
+        logits = base_logits + spatial_bias + local_topology_bias
         logits = logits.masked_fill(
             ~valid[:, None, None, :],
             -torch.finfo(logits.dtype).max,
         )
         attention = torch.softmax(logits, dim=-1)
+        if getattr(self, 'capture_relation_terms', False):
+            with torch.no_grad():
+                def weights(term):
+                    return term.masked_fill(~valid[:, None, None, :], -torch.finfo(term.dtype).max).softmax(-1)
+
+                terms = {
+                    'base_qk_logits': base_logits,
+                    'connectivity_bias_effective': local_topology_bias,
+                    'spatial_bias_effective': spatial_bias,
+                    'connectivity_scale': self.connectivity_topology_bias_scale,
+                    'spatial_scale': self.token_relation_scale,
+                    'attention_base': weights(base_logits),
+                    'attention_conn': weights(base_logits + local_topology_bias),
+                    'attention_pos': weights(base_logits + spatial_bias),
+                    'attention_full': attention,
+                    'anchor_valid': valid,
+                    'anchor_yx': coords,
+                }
+                if connectivity_feature is not None:
+                    terms['anchor_connectivity_features'] = connectivity_feature
+                self.last_relation_terms = {k: v.detach().cpu() for k, v in terms.items()}
+                self.relation_term_calls = getattr(self, 'relation_term_calls', 0) + 1
         if self.capture_scgra_trace:
             self._scgra_node_attention = attention.detach().float().cpu()
         if getattr(self, 'capture_relation_attention', False):
