@@ -23,7 +23,11 @@ def main():
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--selection', type=Path)
     p.add_argument('--check_only', action='store_true')
+    p.add_argument('--overlap_weight_floor', type=float,
+                   help='Explicit taper floor used for both validation and test masks')
     args = p.parse_args()
+    if args.overlap_weight_floor is not None and not 0 < args.overlap_weight_floor <= 1:
+        p.error('--overlap_weight_floor must be in (0, 1]')
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     saved = checkpoint.get('args', {})
     source_size = int(saved.get('source_patch_size', 0))
@@ -129,6 +133,8 @@ def main():
                         source_sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                                        for name in source_files}),
                         predictions=dict(val=candidates, test=test))])
+    if args.overlap_weight_floor is not None:
+        manifest['models'][0]['provenance']['overlap_weight_floor'] = args.overlap_weight_floor
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(f'Wrote {args.output}: {len(candidates)} val thresholds, {len(test)} test threshold')
