@@ -1,4 +1,4 @@
-"""Fixed-checkpoint ablation of SCGRA anchor projection inputs on Massachusetts val."""
+"""Fixed-checkpoint ablation of SCGRA anchor projection inputs on Massachusetts."""
 
 import argparse
 from contextlib import ExitStack
@@ -103,7 +103,7 @@ def infer(model, image):
     return predictions, audit
 
 
-def infer_validation(args):
+def infer_split(args):
     sys.path.insert(0, str(args.repo.resolve(strict=True)))
     import cv2
     import torch
@@ -126,11 +126,11 @@ def infer_validation(args):
     if abs(threshold - .45) > 1e-7:
         raise ValueError('Use the original Full val-selected threshold of 0.45')
     root = args.root_path.resolve(strict=True)
-    data = mass.dataset(root, 'val')
+    data = mass.dataset(root, args.split)
     cases = [Path(name).stem for name in data.image_files]
-    if len(set(cases)) != 14:
-        raise ValueError('Expected 14 distinct Massachusetts validation images')
-    config = dict(split='val', case_ids=cases, data_root=str(root), checkpoint=str(checkpoint),
+    if len(set(cases)) != len(cases):
+        raise ValueError(f'Duplicate Massachusetts {args.split} image identifiers')
+    config = dict(split=args.split, case_ids=cases, data_root=str(root), checkpoint=str(checkpoint),
                   checkpoint_sha256=sha, threshold=threshold, threshold_source=str(selection),
                   threshold_sha256=mass.file_digest(selection), modes={m:list(s) for m,s in MODES.items()},
                   tile_size=512, stride=256, anchor_policy='replay Full selector outputs per patch',
@@ -158,7 +158,7 @@ def infer_validation(args):
                   ((data.image_dir, data.image_files[i]), (data.mask_dir, data.label_files[i]))]
         record = load(progress) if progress.is_file() else None
         if record is not None and record['inputs'] != inputs:
-            raise ValueError(f'Validation image or label changed: {case}')
+            raise ValueError(f'Input image or label changed: {case}')
         cached = record is not None and all((out/name).is_file() and mass.file_digest(out/name) == digest
                                             for name, digest in record['masks'].items())
         if not cached:
@@ -183,7 +183,7 @@ def infer_validation(args):
             dump(progress, record)
         audits.append(dict(case_id=case, **record['audit']))
         rows.extend(record['rows'])
-        print(f'[SCGRA token] {i+1}/{len(cases)} {case} cached={cached}', flush=True)
+        print(f'[SCGRA token {args.split}] {i+1}/{len(cases)} {case} cached={cached}', flush=True)
 
     if before != mass.tensor_digests(model) or mass.file_digest(checkpoint) != sha:
         raise RuntimeError('Model weights or checkpoint were modified')
@@ -205,24 +205,28 @@ def infer_validation(args):
                    provenance=dict(checkpoint_sha256=sha, checkpoint_epoch=epoch, zeroed_token_fields=list(parts)),
                    validation_selection=dict(selected_on='val', criterion='global_iou', threshold=threshold,
                                              evidence=str(selection)),
-                   predictions=dict(val=[dict(path=str(out/'masks'/mode), threshold=threshold)]))
+                   predictions={args.split:[dict(path=str(out/'masks'/mode), threshold=threshold)]})
               for mode, parts in MODES.items()]
     dump(out/'comparison.json', dict(data_root=str(root), protocol=PROTOCOL, models=models))
     print(f'[INFERENCE DONE] {out}', flush=True)
 
 
-def evaluate_validation(args):
+def evaluate_split(args):
     sys.path.insert(0, str(args.tool.resolve(strict=True)))
     import compare_predictions as cp
 
     out = args.output_dir.resolve(strict=True)
+    metadata = json.loads((out/'metadata.json').read_text(encoding='utf-8'))
+    split = metadata['split']
+    if split not in ('val', 'test'):
+        raise ValueError(f'Unsupported inference split: {split}')
     manifest = json.loads((out/'comparison.json').read_text(encoding='utf-8'))
     protocol = cp.validate_manifest(manifest)
     selection = cp.import_declared_selection(manifest, out, protocol)
     topology = out/'topology'
     topology.mkdir(exist_ok=True)
     cp.write_json(topology/'imported_val_selection.json', selection)
-    report = cp.evaluate(manifest, out, protocol, 'val', selection, topology, 1,
+    report = cp.evaluate(manifest, out, protocol, split, selection, topology, 1,
                          workers=args.workers, resume=True)
     metrics = {row['name']:row for row in report['summaries']}
     with (out/'segmentation_summary.csv').open(encoding='utf-8-sig', newline='') as stream:
@@ -242,13 +246,15 @@ def main():
     inference = phases.add_parser('infer')
     for key in ('repo', 'checkpoint', 'selection', 'root_path', 'output_dir'):
         inference.add_argument('--'+key, type=Path, required=True)
+    inference.add_argument('--split', choices=('val', 'test'), default='val',
+                           help='Inference split. Both use the original Full validation threshold.')
     inference.add_argument('--device', default='cuda:0')
-    inference.set_defaults(run=infer_validation)
+    inference.set_defaults(run=infer_split)
     topology = phases.add_parser('topology')
     topology.add_argument('--tool', type=Path, required=True)
     topology.add_argument('--output_dir', type=Path, required=True)
     topology.add_argument('--workers', type=int, default=4)
-    topology.set_defaults(run=evaluate_validation)
+    topology.set_defaults(run=evaluate_split)
     args = parser.parse_args()
     args.run(args)
 
